@@ -637,7 +637,9 @@ mod tests {
             let lines: Vec<serde_json::Value> = std::fs::read_to_string(&self.log)
                 .unwrap_or_default()
                 .lines()
-                .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad log line {l:?}: {e}")))
+                .map(|l| {
+                    serde_json::from_str(l).unwrap_or_else(|e| panic!("bad log line {l:?}: {e}"))
+                })
                 .collect();
             let mut out = Vec::new();
             for start in lines.iter().filter(|l| l["event"] == "start") {

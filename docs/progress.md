@@ -7,6 +7,9 @@ Earlier slice: M1 day-1 spikes done and recorded (below). Next: fix the inventor
 
 Previous slice: Read-only inventory of the real Claude Code config, restyle (Catppuccin Mocha, JetBrains Mono, bigger controls), and a light theme (Latte-based) with a System option.
 
+## Engine test failure on Linux (2026-10-17)
+`engine::tests::at_most_three_checks_run_at_once` failed 3 of 3 runs on Linux: `fake-claude` wrote each log line with several `write` calls, so parallel runs tore each other's lines. Not a flake. Reproducer first: `cli::runner::tests::concurrent_stub_runs_never_interleave_log_lines` (128 parallel runs) failed, then passed after the approved stub change (one `write_all` per line, `docs/proposals/fake-claude-atomic-log.md`). Evidence: `cargo test -p klefki-core --lib` 126 passed, 5 runs in a row; `cargo test --workspace` 126 core + 51 app passed; clippy and fmt exit 0. The earlier "176 passed" count is now 177 on Linux. `cargo deny` still not run.
+
 ## Live status (2026-10-17)
 - Cause of the original "Unknown" on `azure-devops`: Claude's health cache only holds remote servers, so a stdio server has no hint. Claude itself reports it Connected (`claude mcp get`, about 7 s).
 - Core: `cli/locate.rs` (native executable only, never `.cmd`/`.bat`/`.ps1`, relative PATH entries ignored), `cli/runner.rs` (no shell, `CREATE_NO_WINDOW`, `NO_COLOR`, timeout and kill, capped and sanitised output, secret only in env), `cli/parse.rs` (reads `mcp get`; keeps only the status and a clipped issue line), `engine.rs` (engine thread, 3 workers, events).
