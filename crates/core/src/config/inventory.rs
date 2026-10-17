@@ -325,6 +325,21 @@ pub(crate) fn is_safe_project_path(path: &str) -> bool {
         && Path::new(path).is_absolute()
 }
 
+/// The definition of one server in a project's `.mcp.json`, as Claude Code would read it (a later duplicate wins).
+pub(crate) fn project_server(project: &str, name: &str) -> Result<Value, String> {
+    if !is_safe_project_path(project) {
+        return Err("the project is not a local absolute path".to_owned());
+    }
+    let path = Path::new(project).join(".mcp.json");
+    let (servers, _) = read_project_servers(&path)?
+        .ok_or_else(|| format!("{} does not exist", display_path(&path)))?;
+    servers
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v)
+        .ok_or_else(|| format!("{} no longer defines that server", display_path(&path)))
+}
+
 /// Names of servers in a project's `.mcp.json`, plus any names defined twice.
 type ProjectServers = (Vec<(String, Value)>, Vec<String>);
 

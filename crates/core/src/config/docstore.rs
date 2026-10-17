@@ -1,4 +1,5 @@
-//! Writes to `~/.claude.json`, next to a running Claude Code (`docs/decisions/001-claude-json-locking.md`).
+//! Writes to `~/.claude.json`, next to a running Claude Code (`docs/decisions/001-claude-json-locking.md`), and to
+//! a project's `.claude/settings.local.json` when the user approves one of its servers.
 //!
 //! Every change is a [`Plan`] made from [`Op`]s: `prepare` shows what would change, `apply` re-reads the file under
 //! Claude's own lock directory, re-applies the ops to that fresh copy, backs the old bytes up, and replaces the file
@@ -31,6 +32,20 @@ pub(crate) enum Op {
         name: String,
         disabled: bool,
     },
+    /// Take `name` out of `projects[<project>].disabledMcpjsonServers` (a rejection recorded in `.claude.json`),
+    /// for every spelling of the project. Needed so that an approval is not overruled by an old rejection.
+    ClearRejection { project: String, name: String },
+    /// For the project's `.claude/settings.local.json`: add `name` to `enabledMcpjsonServers` and remove it from
+    /// `disabledMcpjsonServers`. The only thing klefki ever writes inside a repository.
+    Approve { name: String },
+}
+
+/// Which file a [`Docstore`] writes, and so which ops it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    ClaudeJson,
+    /// `<project>/.claude/settings.local.json`, created when missing.
+    ProjectSettings,
 }
 
 /// What a plan changes in one file, in words that are safe to show: names are sanitised and nothing else from the
@@ -103,12 +118,16 @@ impl From<io::Error> for StoreError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Applied {
-    /// Where the previous contents were saved, when anything was written.
+    /// Whether the file was written at all.
+    pub wrote: bool,
+    /// Where the previous contents were saved. `None` when nothing was written or the file did not exist.
     pub backup: Option<PathBuf>,
 }
 
+#[derive(Clone)]
 pub(crate) struct Docstore {
-    /// The `.claude.json` file.
+    pub kind: Kind,
+    /// The file to change.
     pub path: PathBuf,
     /// Our own rotating backups, kept private. Never Claude's `backups/` folder.
     pub backup_dir: PathBuf,
@@ -122,6 +141,7 @@ pub(crate) struct Docstore {
 impl Docstore {
     pub(crate) fn new(path: PathBuf, backup_dir: PathBuf) -> Self {
         Self {
+            kind: Kind::ClaudeJson,
             path,
             backup_dir,
             keep_backups: 20,
@@ -130,11 +150,19 @@ impl Docstore {
         }
     }
 
+    /// A store for the `.claude/settings.local.json` of one project.
+    pub(crate) fn project_settings(path: PathBuf, backup_dir: PathBuf) -> Self {
+        Self {
+            kind: Kind::ProjectSettings,
+            ..Self::new(path, backup_dir)
+        }
+    }
+
     /// Reads the file and works out what `ops` would change. Writes nothing.
     pub(crate) fn prepare(&self, ops: Vec<Op>) -> Result<Plan, StoreError> {
         let current = self.read()?;
         let mut doc = current.parse()?;
-        let changes = patch(&mut doc, &ops)?;
+        let changes = self.patch(&mut doc, &ops)?;
         Ok(Plan {
             ops,
             base_hash: current.hash(),
@@ -142,13 +170,51 @@ impl Docstore {
         })
     }
 
+    /// Applies `ops` to `doc` and reports what changed. Ops meant for the other kind of file are refused.
+    fn patch(&self, doc: &mut Value, ops: &[Op]) -> Result<Vec<FileChange>, StoreError> {
+        let mut lines = Vec::new();
+        for op in ops {
+            match (self.kind, op) {
+                (
+                    Kind::ClaudeJson,
+                    Op::SetDisabled {
+                        project,
+                        name,
+                        disabled,
+                    },
+                ) => set_disabled(doc, project, name, *disabled, &mut lines)?,
+                (Kind::ClaudeJson, Op::ClearRejection { project, name }) => {
+                    clear_rejection(doc, project, name, &mut lines)?
+                }
+                (Kind::ProjectSettings, Op::Approve { name }) => approve(doc, name, &mut lines)?,
+                _ => {
+                    return Err(StoreError::Invalid(
+                        "that change does not belong in this file".to_owned(),
+                    ));
+                }
+            }
+        }
+        let path = match self.kind {
+            Kind::ClaudeJson => ".claude.json".to_owned(),
+            Kind::ProjectSettings => sanitize(&self.path.display().to_string()),
+        };
+        Ok(vec![FileChange { path, lines }])
+    }
+
     /// Writes the plan's change. The file is re-read under the lock and the ops are applied to that fresh copy; if
     /// the file changed since `prepare` and that alters what the user was shown, nothing is written.
     pub(crate) fn apply(&self, plan: &Plan) -> Result<Applied, StoreError> {
+        // The lock directory lives next to the file, so the folder has to exist first.
+        if self.kind == Kind::ProjectSettings
+            && !plan.is_empty()
+            && let Some(dir) = self.path.parent()
+        {
+            ensure_plain_dir(dir)?;
+        }
         let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
         let current = self.read()?;
         let mut doc = current.parse()?;
-        let changes = patch(&mut doc, &plan.ops)?;
+        let changes = self.patch(&mut doc, &plan.ops)?;
         if current.hash() != plan.base_hash && changes != plan.changes {
             return Err(StoreError::Changed);
         }
@@ -164,7 +230,7 @@ impl Docstore {
             let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
             let current = self.read()?;
             let mut doc = current.parse()?;
-            let changes = patch(&mut doc, &plan.ops)?;
+            let changes = self.patch(&mut doc, &plan.ops)?;
             if changes.iter().all(|c| c.lines.is_empty()) {
                 return Ok(reapplied);
             }
@@ -185,7 +251,17 @@ impl Docstore {
 
     fn read(&self) -> Result<Current, StoreError> {
         match fsx::read_limited_bom(&self.path, MAX_CLAUDE_JSON)? {
-            Some((text, bom)) => Ok(Current { text, bom }),
+            Some((text, bom)) => Ok(Current {
+                text,
+                bom,
+                missing: false,
+            }),
+            // An approval may create the file; the main configuration is never created.
+            None if self.kind == Kind::ProjectSettings => Ok(Current {
+                text: "{}".to_owned(),
+                bom: false,
+                missing: true,
+            }),
             None => Err(StoreError::Invalid(format!(
                 "{} does not exist; there is nothing to change.",
                 sanitize(&self.path.display().to_string())
@@ -200,12 +276,22 @@ impl Docstore {
         changes: &[FileChange],
     ) -> Result<Applied, StoreError> {
         if changes.iter().all(|c| c.lines.is_empty()) {
-            return Ok(Applied { backup: None });
+            return Ok(Applied {
+                wrote: false,
+                backup: None,
+            });
         }
-        let backup = self.backup(current)?;
         let dir = self.path.parent().ok_or_else(|| {
             StoreError::Invalid("the configuration file has no parent folder".to_owned())
         })?;
+        if self.kind == Kind::ProjectSettings {
+            ensure_plain_dir(dir)?;
+        }
+        let backup = if current.missing {
+            None
+        } else {
+            Some(self.backup(current)?)
+        };
         let mut tmp = tempfile::Builder::new()
             .prefix(".claude.json.tmp.")
             .tempfile_in(dir)?;
@@ -213,7 +299,8 @@ impl Docstore {
         tmp.as_file().sync_all()?;
         tmp.persist(&self.path).map_err(|e| e.error)?;
         Ok(Applied {
-            backup: Some(backup),
+            wrote: true,
+            backup,
         })
     }
 
@@ -228,7 +315,7 @@ impl Docstore {
         let (path, mut file) = loop {
             let path = self
                 .backup_dir
-                .join(format!("claude.json.{ms:016}-{n}.bak"));
+                .join(format!("{}.{ms:016}-{n}.bak", self.backup_label()));
             match create_private_file(&path) {
                 Ok(f) => break (path, f),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
@@ -241,16 +328,28 @@ impl Docstore {
         Ok(path)
     }
 
+    /// Backups of different files must not push each other out of the rotation.
+    fn backup_label(&self) -> String {
+        match self.kind {
+            Kind::ClaudeJson => "claude.json".to_owned(),
+            Kind::ProjectSettings => {
+                let digest = Sha256::digest(self.path.to_string_lossy().as_bytes());
+                format!("settings.local-{:.12}", format!("{digest:x}"))
+            }
+        }
+    }
+
     fn rotate_backups(&self) {
         let Ok(entries) = std::fs::read_dir(&self.backup_dir) else {
             return;
         };
+        let prefix = format!("{}.", self.backup_label());
         let mut names: Vec<_> = entries
             .filter_map(|e| e.ok())
             .map(|e| e.file_name())
             .filter(|n| {
                 let n = n.to_string_lossy();
-                n.starts_with("claude.json.") && n.ends_with(".bak")
+                n.starts_with(&prefix) && n.ends_with(".bak")
             })
             .collect();
         names.sort();
@@ -258,6 +357,22 @@ impl Docstore {
         for name in names.into_iter().take(surplus) {
             let _ = std::fs::remove_file(self.backup_dir.join(name));
         }
+    }
+}
+
+/// The `.claude` folder of a project: created if missing, but never followed when it is a link, because a
+/// repository could point it somewhere else.
+fn ensure_plain_dir(dir: &Path) -> Result<(), StoreError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.file_type().is_symlink() => Err(StoreError::Invalid(
+            "the project's .claude folder is a link; refusing to write through it".to_owned(),
+        )),
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(StoreError::Invalid(
+            "the project's .claude is not a folder".to_owned(),
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(std::fs::create_dir(dir)?),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -297,6 +412,8 @@ fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
 struct Current {
     text: String,
     bom: bool,
+    /// The file does not exist yet; `text` is an empty object.
+    missing: bool,
 }
 
 impl Current {
@@ -333,7 +450,7 @@ impl Current {
     fn render(&self, doc: &Value) -> Result<String, StoreError> {
         let mut out = serde_json::to_string_pretty(doc)
             .map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))?;
-        if self.text.ends_with('\n') {
+        if self.text.ends_with('\n') || self.missing {
             out.push('\n');
         }
         if self.text.contains("\r\n") {
@@ -395,24 +512,6 @@ fn is_stale(dir: &Path) -> bool {
         .is_some_and(|age| age > LOCK_STALE)
 }
 
-/// Applies `ops` to `doc` and reports what changed.
-fn patch(doc: &mut Value, ops: &[Op]) -> Result<Vec<FileChange>, StoreError> {
-    let mut lines = Vec::new();
-    for op in ops {
-        match op {
-            Op::SetDisabled {
-                project,
-                name,
-                disabled,
-            } => set_disabled(doc, project, name, *disabled, &mut lines)?,
-        }
-    }
-    Ok(vec![FileChange {
-        path: ".claude.json".to_owned(),
-        lines,
-    }])
-}
-
 fn set_disabled(
     doc: &mut Value,
     project: &str,
@@ -471,6 +570,91 @@ fn set_disabled(
             sanitize(&wanted)
         )))
     }
+}
+
+fn clear_rejection(
+    doc: &mut Value,
+    project: &str,
+    name: &str,
+    lines: &mut Vec<String>,
+) -> Result<(), StoreError> {
+    let wanted = normalise_project(project);
+    let projects = doc
+        .get_mut("projects")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| StoreError::Invalid("the configuration has no projects".to_owned()))?;
+    let mut found = false;
+    for (key, entry) in projects.iter_mut() {
+        if normalise_project(key) != wanted {
+            continue;
+        }
+        found = true;
+        // A list of the wrong shape is ignored by the reader too, so there is nothing to clear in it.
+        let Some(list) = entry
+            .get_mut("disabledMcpjsonServers")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let before = list.len();
+        list.retain(|v| v.as_str() != Some(name));
+        if list.len() != before {
+            lines.push(format!(
+                "  projects[\"{}\"].disabledMcpjsonServers",
+                sanitize(&key.replace('"', "\\\""))
+            ));
+            lines.push(format!("- {}", sanitize(name)));
+        }
+    }
+    if found {
+        Ok(())
+    } else {
+        Err(StoreError::Invalid(format!(
+            "{} is not a project Claude Code knows about",
+            sanitize(&wanted)
+        )))
+    }
+}
+
+fn approve(doc: &mut Value, name: &str, lines: &mut Vec<String>) -> Result<(), StoreError> {
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| StoreError::Invalid("the settings file is not a JSON object".to_owned()))?;
+    let wrong_shape = |key: &str| {
+        StoreError::Invalid(format!(
+            "{key} in the settings file is not a list; refusing to change it"
+        ))
+    };
+    // Check both lists before changing either, so a refusal leaves the document alone.
+    for key in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
+        if root.get(key).is_some_and(|v| !v.is_array()) {
+            return Err(wrong_shape(key));
+        }
+    }
+    let is_name = |v: &Value| v.as_str() == Some(name);
+    let enabled = root
+        .entry("enabledMcpjsonServers")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let enabled = enabled
+        .as_array_mut()
+        .ok_or_else(|| wrong_shape("enabledMcpjsonServers"))?;
+    if !enabled.iter().any(is_name) {
+        enabled.push(Value::String(name.to_owned()));
+        lines.push("  enabledMcpjsonServers".to_owned());
+        lines.push(format!("+ {}", sanitize(name)));
+    }
+    if let Some(rejected) = root
+        .get_mut("disabledMcpjsonServers")
+        .and_then(Value::as_array_mut)
+    {
+        let before = rejected.len();
+        rejected.retain(|v| !is_name(v));
+        if rejected.len() != before {
+            lines.push("  disabledMcpjsonServers".to_owned());
+            lines.push(format!("- {}", sanitize(name)));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1037,5 +1221,258 @@ mod tests {
         names.sort();
         assert_eq!(names, ["s0", "s1", "s2", "s3", "s4", "s5"]);
         drop(f.dir);
+    }
+
+    // ---- approval: the project's .claude/settings.local.json, and rejections in .claude.json
+
+    fn settings_store(dir: &Path) -> Docstore {
+        let mut store = Docstore::project_settings(
+            dir.join(".claude").join("settings.local.json"),
+            dir.join("backups"),
+        );
+        store.lock_wait = Duration::from_millis(300);
+        store.verify_delay = Duration::ZERO;
+        store
+    }
+
+    fn approve_op(name: &str) -> Op {
+        Op::Approve {
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn approving_creates_the_settings_file_and_folder_when_they_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = settings_store(dir.path());
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        assert!(!store.path.exists(), "prepare writes nothing");
+        let applied = store.apply(&plan).unwrap();
+        assert!(applied.wrote);
+        assert_eq!(applied.backup, None, "there was nothing to back up");
+        let text = std::fs::read_to_string(&store.path).unwrap();
+        assert_eq!(
+            text,
+            "{\n  \"enabledMcpjsonServers\": [\n    \"ps\"\n  ]\n}\n"
+        );
+        assert!(
+            !store
+                .path
+                .with_file_name("settings.local.json.lock")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn approving_keeps_everything_else_in_an_existing_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let original = json!({
+            "permissions": {"allow": ["Bash(ls)"]},
+            "enabledMcpjsonServers": ["a"],
+            "disabledMcpjsonServers": ["ps", "z"],
+            "zzz": 1.5
+        });
+        let store = settings_store(dir.path());
+        std::fs::write(&store.path, pretty(&original)).unwrap();
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        let applied = store.apply(&plan).unwrap();
+        let mut expected = original.clone();
+        expected["enabledMcpjsonServers"] = json!(["a", "ps"]);
+        expected["disabledMcpjsonServers"] = json!(["z"]);
+        assert_eq!(
+            std::fs::read_to_string(&store.path).unwrap(),
+            pretty(&expected)
+        );
+        // The old file is backed up, and under its own name, not as claude.json.
+        let backup = applied.backup.unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), pretty(&original));
+        assert!(
+            backup
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("settings.local-")
+        );
+        assert_eq!(
+            plan.changes()[0].lines,
+            [
+                "  enabledMcpjsonServers",
+                "+ ps",
+                "  disabledMcpjsonServers",
+                "- ps"
+            ]
+        );
+    }
+
+    #[test]
+    fn approving_twice_changes_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = settings_store(dir.path());
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        store.apply(&plan).unwrap();
+        let after_first = std::fs::read_to_string(&store.path).unwrap();
+        let again = store.prepare(vec![approve_op("ps")]).unwrap();
+        assert!(again.is_empty());
+        assert!(!store.apply(&again).unwrap().wrote);
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), after_first);
+    }
+
+    #[test]
+    fn a_settings_file_of_the_wrong_shape_is_refused_untouched() {
+        for original in [
+            json!({"enabledMcpjsonServers": "ps"}),
+            json!({"disabledMcpjsonServers": {"ps": true}}),
+            json!({"enabledMcpjsonServers": [], "disabledMcpjsonServers": 3}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".claude")).unwrap();
+            let store = settings_store(dir.path());
+            std::fs::write(&store.path, pretty(&original)).unwrap();
+            assert!(matches!(
+                store.prepare(vec![approve_op("ps")]),
+                Err(StoreError::Invalid(_))
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&store.path).unwrap(),
+                pretty(&original)
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let store = settings_store(dir.path());
+        std::fs::write(&store.path, "[]").unwrap();
+        assert!(store.prepare(vec![approve_op("ps")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_claude_folder_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".claude")).unwrap();
+        let store = settings_store(dir.path());
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        assert!(matches!(store.apply(&plan), Err(StoreError::Invalid(_))));
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+        // A link in place of the file itself is refused too.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let target = dir.path().join("real.json");
+        std::fs::write(&target, "{}").unwrap();
+        let store = settings_store(dir.path());
+        std::os::unix::fs::symlink(&target, &store.path).unwrap();
+        assert!(store.prepare(vec![approve_op("ps")]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+    }
+
+    #[test]
+    fn a_settings_store_refuses_claude_json_ops_and_the_other_way_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = settings_store(dir.path());
+        assert!(settings.prepare(vec![disable("/p", "x")]).is_err());
+        let f = Fixture::new(&pretty(&sample()));
+        assert!(f.store.prepare(vec![approve_op("x")]).is_err());
+        assert!(
+            !dir.path().join(".claude").exists(),
+            "a refused plan creates nothing"
+        );
+    }
+
+    #[test]
+    fn settings_and_main_backups_do_not_push_each_other_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = settings_store(dir.path());
+        store.keep_backups = 2;
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        std::fs::write(&store.path, "{}").unwrap();
+        let mut main = Docstore::new(dir.path().join(".claude.json"), dir.path().join("backups"));
+        main.keep_backups = 2;
+        std::fs::write(&main.path, pretty(&sample())).unwrap();
+        for i in 0..4 {
+            let plan = store.prepare(vec![approve_op(&format!("s{i}"))]).unwrap();
+            store.apply(&plan).unwrap();
+            let op = if i % 2 == 0 {
+                disable("C:/work/app", "g")
+            } else {
+                enable("C:/work/app", "g")
+            };
+            let plan = main.prepare(vec![op]).unwrap();
+            main.apply(&plan).unwrap();
+        }
+        let names: Vec<String> = std::fs::read_dir(dir.path().join("backups"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("claude.json."))
+                .count(),
+            2,
+            "{names:?}"
+        );
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("settings.local-"))
+                .count(),
+            2,
+            "{names:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_a_rejection_touches_only_that_list_in_every_spelling() {
+        let f = Fixture::new(&pretty(&json!({"projects": {
+            "C:/p": {"disabledMcpjsonServers": ["ps", "z"], "disabledMcpServers": ["ps"]},
+            "c:\\p": {"disabledMcpjsonServers": ["ps"]},
+            "C:/q": {"disabledMcpjsonServers": ["ps"]}
+        }})));
+        let op = Op::ClearRejection {
+            project: "C:/p".to_owned(),
+            name: "ps".to_owned(),
+        };
+        let plan = f.store.prepare(vec![op.clone()]).unwrap();
+        f.store.apply(&plan).unwrap();
+        let j = f.json();
+        assert_eq!(
+            j["projects"]["C:/p"]["disabledMcpjsonServers"],
+            json!(["z"])
+        );
+        assert_eq!(j["projects"]["c:\\p"]["disabledMcpjsonServers"], json!([]));
+        assert_eq!(
+            j["projects"]["C:/p"]["disabledMcpServers"],
+            json!(["ps"]),
+            "the on/off toggle is a different list"
+        );
+        assert_eq!(
+            j["projects"]["C:/q"]["disabledMcpjsonServers"],
+            json!(["ps"]),
+            "another project"
+        );
+        assert!(f.store.prepare(vec![op]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clearing_a_rejection_that_is_not_there_is_not_an_error() {
+        let f = Fixture::new(&pretty(
+            &json!({"projects": {"/p": {}, "/q": {"disabledMcpjsonServers": "x"}}}),
+        ));
+        for project in ["/p", "/q"] {
+            let op = Op::ClearRejection {
+                project: project.to_owned(),
+                name: "ps".to_owned(),
+            };
+            assert!(f.store.prepare(vec![op]).unwrap().is_empty());
+        }
+        let op = Op::ClearRejection {
+            project: "/nowhere".to_owned(),
+            name: "ps".to_owned(),
+        };
+        assert!(matches!(
+            f.store.prepare(vec![op]),
+            Err(StoreError::Invalid(_))
+        ));
     }
 }

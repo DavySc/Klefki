@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 pub use crate::config::ConfigPaths;
 pub use crate::engine::{
-    Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Hint, PlanView,
+    Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Hint, PlanView, Review,
 };
 pub use crate::model::{NameError, ServerName};
 

@@ -183,15 +183,20 @@ impl ShellApp {
                     ok: false,
                 })
             }
-            Event::Applied { plan, backup } => {
+            Event::Applied {
+                plan,
+                changed,
+                backup,
+            } => {
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.plan = None;
                     self.applying = false;
                 }
                 self.outcome = Some(Outcome {
-                    text: match backup {
-                        Some(b) => format!("Saved. The previous file is kept in {b}"),
-                        None => "Nothing needed to change.".to_owned(),
+                    text: match (changed, backup) {
+                        (false, _) => "Nothing needed to change.".to_owned(),
+                        (true, Some(b)) => format!("Saved. The previous file is kept in {b}"),
+                        (true, None) => "Saved.".to_owned(),
                     },
                     ok: true,
                 });
@@ -560,6 +565,20 @@ impl ShellApp {
             } else {
                 ui.label("These lines in your Claude Code configuration will change:");
             }
+            for review in &plan.reviews {
+                ui.add_space(4.0);
+                Frame::new()
+                    .stroke(egui::Stroke::new(1.0, pal.warn))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&review.title).strong().color(pal.warn));
+                        for line in &review.lines {
+                            ui.add(egui::Label::new(line).wrap());
+                        }
+                    });
+            }
             for file in &plan.files {
                 if file.lines.is_empty() {
                     continue;
@@ -602,7 +621,14 @@ impl ShellApp {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!plan.nothing_to_do && !applying, egui::Button::new("Apply"))
+                    .add_enabled(
+                        !plan.nothing_to_do && !applying,
+                        egui::Button::new(if plan.reviews.is_empty() {
+                            "Apply"
+                        } else {
+                            "Approve"
+                        }),
+                    )
                     .clicked()
                 {
                     apply = true;
@@ -755,6 +781,25 @@ impl ShellApp {
                         }
                         kv("Shadowed", if s.shadowed { "yes" } else { "no" }.to_owned());
                     });
+                if s.scope == Scope::Project
+                    && s.approval.is_some_and(|a| a != Approval::Approved)
+                    && self.core.is_some()
+                {
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            self.plan.is_none(),
+                            egui::Button::new("Review and approve…"),
+                        )
+                        .on_hover_text(
+                            "See everything this server would run, then let Claude Code run it",
+                        )
+                        .clicked()
+                    {
+                        self.outcome = None;
+                        self.send(Command::Prepare(vec![Change::Approve { id: s.id() }]));
+                    }
+                }
             }
             DetailTab::Status => {
                 egui::Grid::new("status")
@@ -1861,6 +1906,7 @@ mod tests {
             }],
             warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
             nothing_to_do,
+            reviews: Vec::new(),
         }
     }
 
@@ -2008,6 +2054,7 @@ mod tests {
             .events
             .send(Event::Applied {
                 plan: 7,
+                changed: true,
                 backup: Some("/data/backups/claude.json.1.bak".to_owned()),
             })
             .unwrap();
@@ -2059,6 +2106,7 @@ mod tests {
             .events
             .send(Event::Applied {
                 plan: 7,
+                changed: true,
                 backup: Some("b".to_owned()),
             })
             .unwrap();
@@ -2088,5 +2136,103 @@ mod tests {
             sent.iter().all(|c| !matches!(c, Command::Prepare(_))),
             "a second plan cannot start: {sent:?}"
         );
+    }
+
+    // ---- approving a project server
+
+    fn project_row(name: &str, approval: Option<klefki_core::api::Approval>) -> ServerRow {
+        let mut row = live_row(name, Scope::Project, Some("C:/Repos/WebApp"));
+        row.approval = approval;
+        row
+    }
+
+    fn open_general(h: &mut Harness<'static, ShellApp>, name: &str) {
+        h.get_by_label(name).click();
+        h.run();
+    }
+
+    #[test]
+    fn a_pending_or_rejected_project_server_offers_review_and_approve() {
+        use klefki_core::api::Approval::{Pending, Rejected};
+        for approval in [Pending, Rejected] {
+            let (mut h, engine) = live_harness();
+            let row = project_row("docs", Some(approval));
+            engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+            h.run();
+            open_general(&mut h, "docs");
+            h.get_by_label_contains("Review and approve").click();
+            h.run();
+            assert_eq!(
+                drain(&engine),
+                vec![Command::Prepare(vec![Change::Approve { id: row.id() }])]
+            );
+        }
+    }
+
+    #[test]
+    fn approved_servers_and_other_scopes_have_no_approve_button() {
+        let (mut h, engine) = live_harness();
+        let approved = project_row("done", Some(klefki_core::api::Approval::Approved));
+        let user = live_row("mine", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![approved, user]))
+            .unwrap();
+        h.run();
+        for name in ["done", "mine"] {
+            open_general(&mut h, name);
+            assert!(
+                h.query_by_label_contains("Review and approve").is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_approval_dialog_shows_what_will_run_before_anything_is_saved() {
+        let (mut h, engine) = live_harness();
+        let row = project_row("docs", Some(klefki_core::api::Approval::Pending));
+        engine.events.send(snapshot_of(vec![row])).unwrap();
+        let mut plan = plan_view(
+            3,
+            &["  enabledMcpjsonServers", "+ docs"],
+            &["Only approve it if you trust the repository."],
+            false,
+        );
+        plan.reviews = vec![klefki_core::api::Review {
+            title: "docs would be allowed to run:".to_owned(),
+            lines: vec![
+                "Command: node".to_owned(),
+                "Argument 1: server.js".to_owned(),
+                "Environment: NODE_OPTIONS=--require ./hook.js".to_owned(),
+            ],
+        }];
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label_contains("docs would be allowed to run");
+        h.get_by_label("Command: node");
+        h.get_by_label("Argument 1: server.js");
+        h.get_by_label_contains("NODE_OPTIONS=--require ./hook.js");
+        h.get_by_label_contains("trust the repository");
+        assert!(drain(&engine).is_empty());
+        // The button says what it does, and sends the plan.
+        h.get_by_label("Approve").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(3)]);
+    }
+
+    #[test]
+    fn a_saved_approval_without_a_backup_just_says_saved() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("Saved.");
     }
 }
