@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 pub use crate::config::ConfigPaths;
-pub use crate::engine::{Command, Core, Detached, Event};
+pub use crate::engine::{Command, Core, Detached, Diagnosis, Event, Hint};
 pub use crate::model::{NameError, ServerName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

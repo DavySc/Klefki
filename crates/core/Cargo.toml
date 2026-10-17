@@ -10,7 +10,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 directories = "6"
 url = "2"
+regex = "1"
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 sha2 = "0.10"

@@ -1,5 +1,5 @@
 //! Locating and reading Claude Code's configuration. Read-only for now.
-mod fsx;
+pub(crate) mod fsx;
 pub(crate) mod inventory;
 
 use std::path::PathBuf;

@@ -411,4 +411,84 @@ mod tests {
         assert_eq!(out.exit_code, Some(2));
         assert!(out.stderr.contains("no rule matches"));
     }
+
+    #[test]
+    fn a_wildcard_argument_matches_any_single_value_but_not_a_missing_one() {
+        let f = fixture(
+            r#"{"rules":[{"args":["mcp","get","*","extra"],"exit_code":0}]}"#,
+            &[],
+        );
+        assert_eq!(
+            f.run(&["mcp", "get", "anything-at-all", "extra"], &[], SECS, 100)
+                .unwrap()
+                .exit_code,
+            Some(0)
+        );
+        // Too few arguments: the wildcard stands for exactly one.
+        assert_eq!(
+            f.run(&["mcp", "get"], &[], SECS, 100).unwrap().exit_code,
+            Some(2)
+        );
+        // The wrong fixed argument after the wildcard.
+        assert_eq!(
+            f.run(&["mcp", "get", "x", "other"], &[], SECS, 100)
+                .unwrap()
+                .exit_code,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn the_debug_file_the_client_would_write_is_written_where_asked() {
+        let f = fixture(
+            r#"{"rules":[{"args":["--debug","mcp","--debug-file","*","mcp","get","s"],
+                          "debug_file_from":"debug.txt","stdout_file":"out.txt"}]}"#,
+            &[
+                ("debug.txt", b"line one\nline two\n"),
+                ("out.txt", b"Status: ok\n"),
+            ],
+        );
+        let target = f.dir.path().join("written-by-the-cli.log");
+        let target_str = target.to_string_lossy().into_owned();
+        let out = f
+            .run(
+                &[
+                    "--debug",
+                    "mcp",
+                    "--debug-file",
+                    &target_str,
+                    "mcp",
+                    "get",
+                    "s",
+                ],
+                &[],
+                SECS,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout, "Status: ok\n");
+        assert_eq!(std::fs::read(&target).unwrap(), b"line one\nline two\n");
+    }
+
+    #[test]
+    fn existing_exact_rules_still_work_next_to_wildcards() {
+        let f = fixture(
+            r#"{"rules":[{"args":["mcp","get","a"],"exit_code":3},
+                        {"args":["mcp","get","*"],"exit_code":4}]}"#,
+            &[],
+        );
+        assert_eq!(
+            f.run(&["mcp", "get", "a"], &[], SECS, 10)
+                .unwrap()
+                .exit_code,
+            Some(3)
+        );
+        assert_eq!(
+            f.run(&["mcp", "get", "b"], &[], SECS, 10)
+                .unwrap()
+                .exit_code,
+            Some(4)
+        );
+    }
 }

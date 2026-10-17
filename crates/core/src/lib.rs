@@ -2,6 +2,7 @@
 pub mod api;
 mod cli;
 mod config;
+mod diagnose;
 mod engine;
 mod fixtures;
 mod model;

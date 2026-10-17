@@ -5,7 +5,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Command, Core, Event, Scope, ServerId, ServerRow, Snapshot, Status, TransportKind,
+    Approval, Command, Core, Diagnosis, Event, Scope, ServerId, ServerRow, Snapshot, Status,
+    TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -66,6 +67,8 @@ pub struct ShellApp {
     core: Option<Core>,
     /// Live results from the engine, which take precedence over the snapshot's hints.
     live: HashMap<ServerId, (Status, Option<String>)>,
+    /// The latest explanation per server, from the Diagnose action.
+    diagnoses: HashMap<ServerId, Diagnosis>,
     cli_version: Option<String>,
     cli_problem: Option<String>,
     pub page: Page,
@@ -80,6 +83,7 @@ impl ShellApp {
         Self {
             core: None,
             live: HashMap::new(),
+            diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
             snapshot,
@@ -142,10 +146,16 @@ impl ShellApp {
                     snapshot.servers.iter().map(ServerRow::id).collect();
                 self.live
                     .retain(|id, (status, _)| *status != Status::Checking && known.contains(id));
+                self.diagnoses.retain(|id, _| known.contains(id));
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
                 self.snapshot = snapshot;
+            }
+            Event::Diagnosis { id, diagnosis } => {
+                if self.snapshot.servers.iter().any(|r| r.id() == id) {
+                    self.diagnoses.insert(id, diagnosis);
+                }
             }
             Event::CliVersion(version) => self.cli_version = version,
             Event::CliProblem(problem) => self.cli_problem = Some(problem),
@@ -557,11 +567,26 @@ impl ShellApp {
                     );
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
+                ui.horizontal(|ui| {
                 if ui
                     .add_enabled(can_check, egui::Button::new("Check now"))
+                    .on_hover_text("Check the status again")
                     .clicked()
                 {
                     self.send(Command::Check(s.id()));
+                }
+                if ui
+                    .add_enabled(can_check, egui::Button::new("Diagnose"))
+                    .on_hover_text(
+                        "Run the check again with the client's own debug output and explain what went wrong",
+                    )
+                    .clicked()
+                {
+                    self.send(Command::Diagnose(s.id()));
+                }
+                });
+                if let Some(d) = self.diagnoses.get(&s.id()) {
+                    diagnosis_panel(ui, &s, d);
                 }
             }
             _ => {
@@ -594,6 +619,101 @@ fn flat_items(ui: &mut Ui) {
         &mut w.open,
     ] {
         state.bg_stroke = egui::Stroke::NONE;
+    }
+}
+
+/// Plain text a user can paste into a support request. The engine already sanitised and redacted it.
+fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
+    use std::fmt::Write;
+    let mut out = String::from("klefki diagnostic report\n");
+    let place = match &row.project {
+        Some(project) => format!("{}, {project}", row.scope.label()),
+        None => row.scope.label().to_owned(),
+    };
+    let _ = writeln!(out, "server: {} ({place})", row.name);
+    let _ = writeln!(out, "transport: {}", row.transport.label());
+    let _ = match &d.detail {
+        Some(detail) => writeln!(out, "status: {}: {detail}", d.status.label()),
+        None => writeln!(out, "status: {}", d.status.label()),
+    };
+    if let Some(note) = &d.note {
+        let _ = writeln!(out, "note: {note}");
+    }
+    if !d.hints.is_empty() {
+        out.push_str("possible causes:\n");
+        for hint in &d.hints {
+            let _ = writeln!(out, "  - {}: {}", hint.title, hint.advice);
+        }
+    }
+    if !d.server_said.is_empty() {
+        out.push_str("the server said:\n");
+        for line in &d.server_said {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    if !d.client_log.is_empty() {
+        out.push_str("client log:\n");
+        for line in &d.client_log {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    out
+}
+
+/// What the client's debug output said, in the order a person needs it: the likely cause, what the server
+/// printed itself, and the raw log behind a collapsed header.
+fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
+    let pal = theme::palette(ui.ctx());
+    ui.add_space(10.0);
+    ui.separator();
+    if let Some(note) = &d.note {
+        ui.label(RichText::new(note).color(pal.warn));
+    }
+    if !d.hints.is_empty() {
+        ui.label(
+            RichText::new("What probably went wrong")
+                .family(theme::bold_family())
+                .size(16.0),
+        );
+        for hint in &d.hints {
+            ui.label(
+                RichText::new(&hint.title)
+                    .family(theme::bold_family())
+                    .color(pal.primary),
+            );
+            ui.label(RichText::new(&hint.advice).color(pal.text_muted));
+            ui.add_space(4.0);
+        }
+    }
+    if !d.server_said.is_empty() {
+        ui.label(
+            RichText::new("The server said")
+                .family(theme::bold_family())
+                .size(16.0),
+        );
+        for line in &d.server_said {
+            ui.label(RichText::new(line).monospace());
+        }
+        ui.add_space(4.0);
+    }
+    if !d.client_log.is_empty() {
+        egui::CollapsingHeader::new("Client log")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::both().max_height(220.0).show(ui, |ui| {
+                    for line in &d.client_log {
+                        ui.add(egui::Label::new(RichText::new(line).monospace().small()).extend());
+                    }
+                });
+            });
+    }
+    ui.add_space(6.0);
+    if ui
+        .button("Copy report")
+        .on_hover_text("Copy this explanation as plain text. Secrets are already removed.")
+        .clicked()
+    {
+        ui.ctx().copy_text(diagnosis_report(row, d));
     }
 }
 
@@ -1253,5 +1373,205 @@ mod tests {
         h.run();
         h.get_by_label("Pending approval");
         assert!(h.query_by_label_contains("of 17 projects").is_none());
+    }
+
+    // ---- Diagnose: the explanation the engine builds is shown, and asked for, from the Status tab ----
+
+    fn diagnosis(
+        status: Status,
+        hints: &[(&str, &str)],
+        said: &[&str],
+        log: &[&str],
+        note: Option<&str>,
+    ) -> Diagnosis {
+        Diagnosis {
+            status,
+            detail: Some("CONNECTION_CLOSED: Connection closed".to_owned()),
+            hints: hints
+                .iter()
+                .map(|(t, a)| klefki_core::api::Hint {
+                    title: (*t).to_owned(),
+                    advice: (*a).to_owned(),
+                })
+                .collect(),
+            server_said: said.iter().map(|l| (*l).to_owned()).collect(),
+            client_log: log.iter().map(|l| (*l).to_owned()).collect(),
+            note: note.map(str::to_owned),
+        }
+    }
+
+    fn open_status_tab(h: &mut Harness<'static, ShellApp>, row_name: &str) {
+        use egui::accesskit::Role;
+        h.get_by_label(row_name).click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+    }
+
+    #[test]
+    fn a_diagnosis_is_shown_in_the_status_tab() {
+        let (mut h, engine) = live_harness();
+        let row = live_row("bad-stdio", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine
+            .events
+            .send(klefki_core::api::Event::Diagnosis {
+                id: row.id(),
+                diagnosis: diagnosis(
+                    Status::Failed,
+                    &[("The command was not found", "Claude could not start the server because the program is not on the PATH it uses.")],
+                    &["'xyz' is not recognized as an internal or external command,", "operable program or batch file."],
+                    &["[ERROR] MCP server \"bad-stdio\" Connection failed (CONNECTION_CLOSED)"],
+                    Some("the client wrote no debug output"),
+                ),
+            })
+            .unwrap();
+        h.run();
+        open_status_tab(&mut h, "bad-stdio");
+        h.get_by_label("The command was not found");
+        h.get_by_label_contains("not on the PATH it uses");
+        h.get_by_label("The server said");
+        h.get_by_label("'xyz' is not recognized as an internal or external command,");
+        h.get_by_label("operable program or batch file.");
+        h.get_by_label_contains("the client wrote no debug output");
+    }
+
+    #[test]
+    fn the_client_log_is_collapsed_until_opened() {
+        let (mut h, engine) = live_harness();
+        let row = live_row("bad-stdio", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine
+            .events
+            .send(klefki_core::api::Event::Diagnosis {
+                id: row.id(),
+                diagnosis: diagnosis(
+                    Status::Failed,
+                    &[],
+                    &[],
+                    &["LOGLINE-ONE", "LOGLINE-TWO"],
+                    None,
+                ),
+            })
+            .unwrap();
+        h.run();
+        open_status_tab(&mut h, "bad-stdio");
+        assert!(
+            h.query_by_label_contains("LOGLINE-ONE").is_none(),
+            "collapsed by default"
+        );
+        h.get_by_label_contains("Client log").click();
+        h.run();
+        h.get_by_label_contains("LOGLINE-ONE");
+        h.get_by_label_contains("LOGLINE-TWO");
+    }
+
+    #[test]
+    fn diagnose_asks_the_engine_and_waits_while_a_check_runs() {
+        use egui_kittest::kittest::NodeT;
+        let (mut h, engine) = live_harness();
+        let row = live_row("bad-stdio", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        h.run();
+        open_status_tab(&mut h, "bad-stdio");
+        h.get_by_label("Diagnose").click();
+        h.run();
+        assert_eq!(
+            engine.commands.try_recv().unwrap(),
+            klefki_core::api::Command::Diagnose(row.id())
+        );
+        assert!(engine.commands.try_recv().is_err(), "exactly one command");
+        // While a check or diagnosis is running, asking again would only queue a duplicate.
+        engine
+            .events
+            .send(status_event(&row, Status::Checking, None))
+            .unwrap();
+        h.run();
+        assert!(h.get_by_label("Diagnose").accesskit_node().is_disabled());
+        assert!(h.get_by_label("Check now").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn a_diagnosis_for_a_row_that_is_gone_is_dropped() {
+        let (mut h, engine) = live_harness();
+        let gone = live_row("gone", Scope::User, None);
+        let stays = live_row("stays", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![stays.clone()]))
+            .unwrap();
+        engine
+            .events
+            .send(klefki_core::api::Event::Diagnosis {
+                id: gone.id(),
+                diagnosis: diagnosis(Status::Failed, &[], &["NEVER-SHOWN"], &[], None),
+            })
+            .unwrap();
+        h.run();
+        open_status_tab(&mut h, "stays");
+        assert!(h.query_by_label_contains("NEVER-SHOWN").is_none());
+        assert!(h.query_by_label("The server said").is_none());
+    }
+
+    #[test]
+    fn a_new_snapshot_forgets_diagnoses_of_rows_that_disappeared() {
+        let (mut h, engine) = live_harness();
+        let a = live_row("a", Scope::User, None);
+        let b = live_row("b", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        engine
+            .events
+            .send(klefki_core::api::Event::Diagnosis {
+                id: b.id(),
+                diagnosis: diagnosis(Status::Failed, &[], &["B-SAID-THIS"], &[], None),
+            })
+            .unwrap();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        h.run();
+        open_status_tab(&mut h, "b");
+        assert!(
+            h.query_by_label_contains("B-SAID-THIS").is_none(),
+            "an old answer is not shown for a new row"
+        );
+    }
+
+    #[test]
+    fn the_report_to_copy_is_complete_plain_and_free_of_markup() {
+        let mut row = live_row("bad-stdio", Scope::Project, Some("C:/Repos/WebApp"));
+        row.transport = klefki_core::api::TransportKind::Stdio;
+        let d = diagnosis(
+            Status::Failed,
+            &[(
+                "The command was not found",
+                "Install it or use its full path.",
+            )],
+            &["xyz is not recognized"],
+            &["[ERROR] MCP server \"bad-stdio\" Connection failed"],
+            Some("a note"),
+        );
+        let text = diagnosis_report(&row, &d);
+        for needle in [
+            "bad-stdio",
+            "Project",
+            "C:/Repos/WebApp",
+            "Failed",
+            "CONNECTION_CLOSED: Connection closed",
+            "The command was not found",
+            "Install it or use its full path.",
+            "xyz is not recognized",
+            "Connection failed",
+            "a note",
+        ] {
+            assert!(text.contains(needle), "{needle:?} missing from:\n{text}");
+        }
+        assert!(!text.contains('\u{1b}') && !text.contains("\r"), "{text:?}");
+        assert!(text.ends_with('\n'));
     }
 }

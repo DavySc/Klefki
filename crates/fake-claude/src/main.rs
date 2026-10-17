@@ -16,7 +16,7 @@ struct Scenario {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct Rule {
-    /// The rule applies when the real arguments start with these.
+    /// The rule applies when the real arguments start with these. `"*"` matches any single argument.
     args: Vec<String>,
     stdout_file: Option<String>,
     stderr_file: Option<String>,
@@ -28,6 +28,18 @@ struct Rule {
     flood_bytes: usize,
     /// Write our process id here, so a test can check the child really died.
     write_pid_to: Option<String>,
+    /// When the real arguments contain `--debug-file <path>`, copy this scenario file to `<path>`, as the real
+    /// CLI writes its debug log there.
+    debug_file_from: Option<String>,
+}
+
+/// The real arguments must start with the rule's; a `"*"` stands for exactly one argument, whatever it is.
+fn matches(rule: &[String], argv: &[String]) -> bool {
+    argv.len() >= rule.len()
+        && rule
+            .iter()
+            .zip(argv)
+            .all(|(want, got)| want == "*" || want == got)
 }
 
 fn now_ms() -> u128 {
@@ -87,16 +99,18 @@ fn main() {
         });
 
     log("start", &argv);
-    let Some(rule) = scenario
-        .rules
-        .iter()
-        .find(|r| argv.len() >= r.args.len() && argv[..r.args.len()] == r.args[..])
-    else {
+    let Some(rule) = scenario.rules.iter().find(|r| matches(&r.args, &argv)) else {
         eprintln!("fake-claude: no rule matches {argv:?}");
         log("end", &argv);
         std::process::exit(2);
     };
 
+    if let Some(source) = &rule.debug_file_from
+        && let Some(at) = argv.iter().position(|a| a == "--debug-file")
+        && let Some(target) = argv.get(at + 1)
+    {
+        let _ = std::fs::write(target, read_relative(&base, source));
+    }
     if let Some(p) = &rule.write_pid_to {
         let _ = std::fs::write(p, std::process::id().to_string());
     }

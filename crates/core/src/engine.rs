@@ -3,13 +3,16 @@
 use crate::api::{Scope, ServerId, ServerRow, Snapshot, Status};
 use crate::cli::locate;
 use crate::cli::parse;
-use crate::cli::runner::{self, RunSpec};
+use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::ConfigPaths;
+use crate::config::fsx;
 use crate::config::inventory;
+use crate::diagnose::report;
 use crate::model::ServerName;
 use crate::sanitize::{clip, sanitize};
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -24,6 +27,30 @@ pub enum Command {
     /// Check one server now. This is the only way a project (`.mcp.json`) server is checked, because checking
     /// it runs the repository's command.
     Check(ServerId),
+    /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
+    /// this runs a project server's command, so it only happens on request.
+    Diagnose(ServerId),
+}
+
+/// One plain-language explanation of a common failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hint {
+    pub title: String,
+    pub advice: String,
+}
+
+/// What the client's debug output says about one server, made safe to show: sanitised, with secrets redacted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnosis {
+    pub status: Status,
+    pub detail: Option<String>,
+    pub hints: Vec<Hint>,
+    /// What the server process itself printed on stderr.
+    pub server_said: Vec<String>,
+    /// The client's log lines about this server.
+    pub client_log: Vec<String>,
+    /// Set when diagnosing itself ran into trouble (could not start, timed out, no debug output).
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +63,10 @@ pub enum Event {
         id: ServerId,
         status: Status,
         detail: Option<String>,
+    },
+    Diagnosis {
+        id: ServerId,
+        diagnosis: Diagnosis,
     },
 }
 
@@ -87,6 +118,7 @@ pub(crate) struct EngineConfig {
 }
 
 const MAX_CHECK_OUTPUT: usize = 64 * 1024;
+const MAX_DEBUG_FILE: u64 = 1024 * 1024;
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DETAIL_CHARS: usize = 200;
 
@@ -118,12 +150,19 @@ impl Emitter {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JobKind {
+    Check,
+    Diagnose,
+}
+
 struct Job {
     generation: u64,
     id: ServerId,
     /// Already validated; it is passed to the CLI as its own argument.
     name: ServerName,
     cwd: PathBuf,
+    kind: JobKind,
     /// Tell the UI the check is running (only for rows that have nothing better to show meanwhile).
     announce: bool,
 }
@@ -163,7 +202,8 @@ fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitt
     while let Ok(command) = commands.recv() {
         match command {
             Command::Refresh { live_all } => refresh(&shared, &mut snapshot, live_all),
-            Command::Check(id) => check_now(&shared, &snapshot, &id),
+            Command::Check(id) => enqueue_now(&shared, &snapshot, &id, JobKind::Check),
+            Command::Diagnose(id) => enqueue_now(&shared, &snapshot, &id, JobKind::Diagnose),
         }
     }
     // The UI is gone: let the workers finish what they are doing and stop.
@@ -217,7 +257,13 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
             && row.enabled
             && (live_all || row.status == Status::Unknown);
         if wanted
-            && let Some(job) = build_job(shared, row, generation, row.status == Status::Unknown)
+            && let Some(job) = build_job(
+                shared,
+                row,
+                generation,
+                JobKind::Check,
+                row.status == Status::Unknown,
+            )
         {
             jobs.push(job);
         }
@@ -228,25 +274,45 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
     shared.wake_workers.notify_all();
 }
 
-fn check_now(shared: &Shared, snapshot: &Snapshot, id: &ServerId) {
+/// A check or diagnosis the user asked for: ahead of the background checks.
+fn enqueue_now(shared: &Shared, snapshot: &Snapshot, id: &ServerId, kind: JobKind) {
     let Some(row) = snapshot.servers.iter().find(|r| r.id() == *id) else {
         return;
     };
     let generation = shared.generation.load(Ordering::SeqCst);
-    if let Some(job) = build_job(shared, row, generation, true) {
+    if let Some(job) = build_job(shared, row, generation, kind, true) {
         lock(&shared.queue).jobs.push_front(job);
         shared.wake_workers.notify_one();
     }
 }
 
-/// Turns a row into a job, or reports why it cannot be checked. A name that is not safe never reaches a spawn.
-fn build_job(shared: &Shared, row: &ServerRow, generation: u64, announce: bool) -> Option<Job> {
+/// Turns a row into a job, or reports why it cannot be run. A name that is not safe never reaches a spawn.
+fn build_job(
+    shared: &Shared,
+    row: &ServerRow,
+    generation: u64,
+    kind: JobKind,
+    announce: bool,
+) -> Option<Job> {
     let refuse = |why: String| {
-        shared.emitter.status(
-            row.id(),
-            Status::Unknown,
-            Some(format!("not checked: {why}")),
-        );
+        match kind {
+            JobKind::Check => shared.emitter.status(
+                row.id(),
+                Status::Unknown,
+                Some(format!("not checked: {why}")),
+            ),
+            JobKind::Diagnose => shared.emitter.emit(Event::Diagnosis {
+                id: row.id(),
+                diagnosis: Diagnosis {
+                    status: Status::Unknown,
+                    detail: None,
+                    hints: Vec::new(),
+                    server_said: Vec::new(),
+                    client_log: Vec::new(),
+                    note: Some(format!("not diagnosed: {why}")),
+                },
+            }),
+        }
         None
     };
     let name = match ServerName::parse(&row.name) {
@@ -275,6 +341,7 @@ fn build_job(shared: &Shared, row: &ServerRow, generation: u64, announce: bool) 
         id: row.id(),
         name,
         cwd,
+        kind,
         announce,
     })
 }
@@ -305,10 +372,28 @@ fn worker(shared: &Shared) {
                 .emitter
                 .status(job.id.clone(), Status::Checking, None);
         }
-        let (status, detail) = execute(shared, &job);
-        // A refresh may have replaced the world while this ran; its answer would be about a stale row.
-        if current() {
-            shared.emitter.status(job.id.clone(), status, detail);
+        match job.kind {
+            JobKind::Check => {
+                let (status, detail) = execute(shared, &job);
+                // A refresh may have replaced the world while this ran; its answer would be about a stale row.
+                if current() {
+                    shared.emitter.status(job.id.clone(), status, detail);
+                }
+            }
+            JobKind::Diagnose => {
+                let diagnosis = run_diagnose(shared, &job);
+                if current() {
+                    shared.emitter.status(
+                        job.id.clone(),
+                        diagnosis.status,
+                        diagnosis.detail.clone(),
+                    );
+                    shared.emitter.emit(Event::Diagnosis {
+                        id: job.id.clone(),
+                        diagnosis,
+                    });
+                }
+            }
         }
     }
 }
@@ -337,13 +422,16 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
         .then(|| clip(token, 32))
 }
 
-fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
-    let program = shared
+fn claude_program(shared: &Shared) -> Option<PathBuf> {
+    shared
         .claude
         .read()
         .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let Some(program) = program else {
+        .clone()
+}
+
+fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
+    let Some(program) = claude_program(shared) else {
         return (
             Status::Unknown,
             Some("the claude CLI is not available".to_owned()),
@@ -358,6 +446,11 @@ fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
         timeout,
         max_output: MAX_CHECK_OUTPUT,
     });
+    interpret(result, timeout)
+}
+
+/// What a finished `claude mcp get` means: a status, and a reason when there is no verdict.
+fn interpret(result: io::Result<RunOutput>, timeout: Duration) -> (Status, Option<String>) {
     match result {
         Err(e) => (
             Status::Unknown,
@@ -394,6 +487,98 @@ fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
                 (checked.status, checked.detail)
             }
         }
+    }
+}
+
+/// Runs the check again with the client's own debug output and turns that into a safe, readable diagnosis.
+/// The debug file lives in a private temporary folder that is removed when this function returns.
+fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
+    let nothing = |note: String| Diagnosis {
+        status: Status::Unknown,
+        detail: None,
+        hints: Vec::new(),
+        server_said: Vec::new(),
+        client_log: Vec::new(),
+        note: Some(note),
+    };
+    let Some(program) = claude_program(shared) else {
+        return nothing("the claude CLI is not available".to_owned());
+    };
+    let dir = match tempfile::Builder::new()
+        .prefix("klefki-diagnose-")
+        .tempdir()
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            return nothing(format!(
+                "could not create a private temporary folder: {}",
+                sanitize(&e.to_string())
+            ));
+        }
+    };
+    let file = dir.path().join("debug.log");
+    let Some(file_arg) = file.to_str() else {
+        return nothing("the temporary path is not valid text".to_owned());
+    };
+    let timeout = shared.config.check_timeout;
+    let result = runner::run(&RunSpec {
+        program: &program,
+        args: &[
+            "--debug",
+            "mcp",
+            "--debug-file",
+            file_arg,
+            "mcp",
+            "get",
+            job.name.as_str(),
+        ],
+        cwd: Some(&job.cwd),
+        env: &cli_env(shared),
+        timeout,
+        max_output: MAX_CHECK_OUTPUT,
+    });
+    let stderr = result
+        .as_ref()
+        .ok()
+        .map(|o| o.stderr.clone())
+        .unwrap_or_default();
+    let timed_out = matches!(&result, Ok(o) if o.timed_out);
+    let (status, detail) = interpret(result, timeout);
+
+    let (debug_text, read_note) = match fsx::read_limited(&file, MAX_DEBUG_FILE) {
+        Ok(Some(text)) => (text, None),
+        Ok(None) => (
+            String::new(),
+            Some("the client wrote no debug output".to_owned()),
+        ),
+        Err(e) => (
+            String::new(),
+            Some(format!(
+                "could not read the debug output: {}",
+                sanitize(&e.to_string())
+            )),
+        ),
+    };
+    let note = if timed_out { detail.clone() } else { read_note };
+    let report = report::build(
+        &debug_text,
+        job.name.as_str(),
+        &format!("{}\n{}", detail.as_deref().unwrap_or(""), stderr),
+    );
+    Diagnosis {
+        status,
+        detail,
+        hints: report
+            .hints
+            .iter()
+            .map(|kind| Hint {
+                title: kind.title().to_owned(),
+                advice: kind.advice().to_owned(),
+            })
+            .collect(),
+        server_said: report.server_said,
+        client_log: report.client_log,
+        note,
     }
 }
 
@@ -799,5 +984,223 @@ mod tests {
         });
         collect(&core, |e| !e.is_empty());
         assert!(woken.load(Ordering::SeqCst) >= 1);
+    }
+
+    // ---- Diagnose: the client's own debug output, made safe ----
+
+    const DEBUG_STDIO: &[u8] = include_bytes!("../../../fixtures/debug/failed-stdio.log");
+
+    fn diagnosis_of(events: &[Event], name: &str) -> Option<Diagnosis> {
+        events.iter().rev().find_map(|e| match e {
+            Event::Diagnosis { id, diagnosis } if id.name == name => Some(diagnosis.clone()),
+            _ => None,
+        })
+    }
+
+    fn diagnose_env(extra_rules: &str, files: &[(&str, &[u8])], servers: serde_json::Value) -> Env {
+        let scenario = format!(r#"{{"rules":[{{"args":["--version"]}}{extra_rules}]}}"#,);
+        Env::new(
+            &serde_json::json!({ "mcpServers": servers }),
+            &scenario,
+            files,
+        )
+    }
+
+    fn diagnose_args() -> &'static str {
+        r#""args":["--debug","mcp","--debug-file","*","mcp","get","bad-stdio"]"#
+    }
+
+    #[test]
+    fn diagnose_explains_a_failing_stdio_server() {
+        let rule = format!(
+            r#",{{{},"debug_file_from":"dbg.log","stdout_file":"failed.txt"}}"#,
+            diagnose_args()
+        );
+        let env = diagnose_env(
+            &rule,
+            &[("dbg.log", DEBUG_STDIO), ("failed.txt", FAILED)],
+            serde_json::json!({"bad-stdio": {"command": "definitely-not-a-real-command-xyz"}}),
+        );
+        let mut config = env.config();
+        // Keep the startup check out of the way: the server already has a status.
+        config.max_checks = 3;
+        let core = start_with(config, || {});
+        let events = collect(&core, |e| final_status(e, "bad-stdio").is_some());
+        let row = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Snapshot(s) => s.servers.first().map(|r| r.id()),
+                _ => None,
+            })
+            .unwrap();
+        core.send(Command::Diagnose(row));
+        let events = collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
+        let d = diagnosis_of(&events, "bad-stdio").unwrap();
+        assert_eq!(d.status, Status::Failed);
+        assert_eq!(d.note, None);
+        assert_eq!(d.hints.len(), 1, "{:?}", d.hints);
+        assert_eq!(d.hints[0].title, "The command was not found");
+        assert_eq!(
+            d.server_said,
+            vec![
+                "'definitely-not-a-real-command-xyz' is not recognized as an internal or external command,",
+                "operable program or batch file.",
+            ]
+        );
+        assert!(d.client_log.iter().any(|l| l.contains("CONNECTION_CLOSED")));
+        assert!(
+            d.client_log.iter().all(|l| l.contains("bad-stdio")),
+            "no start-up noise"
+        );
+    }
+
+    #[test]
+    fn diagnose_cleans_up_its_private_temp_file() {
+        let rule = format!(
+            r#",{{{},"debug_file_from":"dbg.log","stdout_file":"failed.txt"}}"#,
+            diagnose_args()
+        );
+        let env = diagnose_env(
+            &rule,
+            &[("dbg.log", DEBUG_STDIO), ("failed.txt", FAILED)],
+            serde_json::json!({"bad-stdio": {"command": "x"}}),
+        );
+        let core = env.start();
+        let events = collect(&core, |e| final_status(e, "bad-stdio").is_some());
+        let id = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Snapshot(s) => s.servers.first().map(|r| r.id()),
+                _ => None,
+            })
+            .unwrap();
+        core.send(Command::Diagnose(id));
+        collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
+        let log = std::fs::read_to_string(&env.log).unwrap();
+        let debug_path = log
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find_map(|l| {
+                let argv = l["argv"].as_array()?.clone();
+                let at = argv.iter().position(|a| a == "--debug-file")?;
+                argv.get(at + 1)?.as_str().map(PathBuf::from)
+            })
+            .expect("the CLI was asked to write a debug file");
+        assert!(!debug_path.exists(), "the debug file is deleted");
+        assert!(
+            !debug_path.parent().unwrap().exists(),
+            "and so is its private folder"
+        );
+        assert_ne!(
+            debug_path.parent().unwrap(),
+            env.dir.path(),
+            "it never wrote into our own folders"
+        );
+    }
+
+    #[test]
+    fn diagnose_never_lets_a_secret_through() {
+        let hostile = b"2026-10-17T20:00:00.000Z [DEBUG] MCP server \"bad-stdio\": HTTP transport options: {\"headers\":{\"Authorization\":\"Bearer ENGINESECRET1\"}}\n\
+2026-10-17T20:00:01.000Z [ERROR] \"MCP server \\\"bad-stdio\\\" Server stderr: API_KEY=ENGINESECRET2 broke\"\n";
+        let rule = format!(
+            r#",{{{},"debug_file_from":"dbg.log","stdout_file":"failed.txt"}}"#,
+            diagnose_args()
+        );
+        let env = diagnose_env(
+            &rule,
+            &[("dbg.log", hostile), ("failed.txt", FAILED)],
+            serde_json::json!({"bad-stdio": {"command": "x"}}),
+        );
+        let core = env.start();
+        let events = collect(&core, |e| final_status(e, "bad-stdio").is_some());
+        let id = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Snapshot(s) => s.servers.first().map(|r| r.id()),
+                _ => None,
+            })
+            .unwrap();
+        core.send(Command::Diagnose(id));
+        let events = collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
+        let dump = format!("{:?}", diagnosis_of(&events, "bad-stdio").unwrap());
+        assert!(!dump.contains("ENGINESECRET"), "{dump}");
+    }
+
+    #[test]
+    fn diagnose_refuses_a_name_that_is_not_safe_without_running_anything() {
+        let env = diagnose_env("", &[], serde_json::json!({"a&b": {"command": "x"}}));
+        let core = env.start();
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        let Event::Snapshot(snap) = &events[0] else {
+            panic!()
+        };
+        core.send(Command::Diagnose(snap.servers[0].id()));
+        let events = collect(&core, |e| diagnosis_of(e, "a&b").is_some());
+        let d = diagnosis_of(&events, "a&b").unwrap();
+        assert_eq!(d.status, Status::Unknown);
+        assert!(d.note.unwrap().contains("not diagnosed"));
+        assert!(d.hints.is_empty() && d.client_log.is_empty());
+        let log = std::fs::read_to_string(&env.log).unwrap_or_default();
+        assert!(!log.contains("--debug"), "nothing was spawned for it");
+    }
+
+    #[test]
+    fn diagnose_survives_a_hung_client_and_a_missing_debug_file() {
+        let rule = r#",{"args":["--debug","mcp","--debug-file","*","mcp","get","slow"],"hang":true},
+                {"args":["--debug","mcp","--debug-file","*","mcp","get","quiet"],"stdout_file":"failed.txt"}"#;
+        let env = diagnose_env(
+            rule,
+            &[("failed.txt", FAILED)],
+            serde_json::json!({"slow": {"command": "x"}, "quiet": {"command": "x"}}),
+        );
+        let mut config = env.config();
+        config.check_timeout = Duration::from_secs(3);
+        let core = start_with(config, || {});
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        let Event::Snapshot(snap) = &events[0] else {
+            panic!()
+        };
+        for r in &snap.servers {
+            core.send(Command::Diagnose(r.id()));
+        }
+        let events = collect(&core, |e| {
+            diagnosis_of(e, "slow").is_some() && diagnosis_of(e, "quiet").is_some()
+        });
+        let slow = diagnosis_of(&events, "slow").unwrap();
+        assert_eq!(slow.status, Status::Unknown);
+        assert!(slow.note.unwrap().contains("timed out"));
+        let quiet = diagnosis_of(&events, "quiet").unwrap();
+        assert_eq!(
+            quiet.status,
+            Status::Failed,
+            "the normal output is still read"
+        );
+        assert!(quiet.note.unwrap().contains("no debug output"));
+        assert!(quiet.client_log.is_empty());
+    }
+
+    #[test]
+    fn diagnose_also_updates_the_servers_status() {
+        let rule = format!(
+            r#",{{{},"debug_file_from":"dbg.log","stdout_file":"failed.txt"}}"#,
+            diagnose_args()
+        );
+        let env = diagnose_env(
+            &rule,
+            &[("dbg.log", DEBUG_STDIO), ("failed.txt", FAILED)],
+            serde_json::json!({"bad-stdio": {"command": "x"}}),
+        );
+        let core = env.start();
+        let events = collect(&core, |e| final_status(e, "bad-stdio").is_some());
+        let id = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Snapshot(s) => s.servers.first().map(|r| r.id()),
+                _ => None,
+            })
+            .unwrap();
+        core.send(Command::Diagnose(id));
+        let events = collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
+        assert_eq!(final_status(&events, "bad-stdio"), Some(Status::Failed));
     }
 }

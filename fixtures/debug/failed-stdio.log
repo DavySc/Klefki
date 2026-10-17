@@ -1,0 +1,33 @@
+2026-10-17T21:04:04.539Z [DEBUG] MDM settings load completed in 59ms
+2026-10-17T21:04:04.547Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\cfg\settings.json
+2026-10-17T21:04:04.549Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-10-17T21:04:04.559Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.json
+2026-10-17T21:04:04.561Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.local.json
+2026-10-17T21:04:04.562Z [DEBUG] CA certs: Config fallback - globalEnv keys: , settingsEnv keys: none
+2026-10-17T21:04:04.566Z [DEBUG] [init] configureGlobalMTLS starting
+2026-10-17T21:04:04.566Z [DEBUG] [init] configureGlobalMTLS complete
+2026-10-17T21:04:04.566Z [DEBUG] [init] configureGlobalAgents starting
+2026-10-17T21:04:04.566Z [DEBUG] CA certs: stores=bundled,system, extraCertsPath=undefined
+2026-10-17T21:04:04.567Z [DEBUG] CA certs: Loaded 121 bundled root certificates
+2026-10-17T21:04:04.610Z [DEBUG] CA certs: Dropped 15 expired certificate(s) from system store
+2026-10-17T21:04:04.610Z [DEBUG] CA certs: Loaded 105 system CA certificates
+2026-10-17T21:04:04.610Z [DEBUG] mTLS: Creating HTTPS agent with custom certificates
+2026-10-17T21:04:04.610Z [DEBUG] [init] configureGlobalAgents complete
+2026-10-17T21:04:04.612Z [DEBUG] Using bash path: "C:\Program Files\Git\bin\bash.exe"
+2026-10-17T21:04:04.613Z [DEBUG] Git remote URL: null
+2026-10-17T21:04:04.613Z [DEBUG] No git remote URL found
+2026-10-17T21:04:04.615Z [DEBUG] Error log sink initialized
+2026-10-17T21:04:04.663Z [DEBUG] [claudeai-mcp] Disabled: API-key auth precedence active
+2026-10-17T21:04:04.669Z [DEBUG] installed_plugins.json doesn't exist, returning empty V2 object
+2026-10-17T21:04:04.671Z [DEBUG] Found 0 plugins (0 enabled, 0 disabled)
+2026-10-17T21:04:04.674Z [DEBUG] mcp runtime arm: v2 (source: default)
+2026-10-17T21:04:04.701Z [DEBUG] MCP server "bad-stdio": Starting connection with timeout of 30000ms
+2026-10-17T21:04:04.853Z [DEBUG] MCP server "bad-stdio": version negotiation probe closed the stdio server (rmcp-class pre-init hard close); respawning pinned legacy
+2026-10-17T21:04:04.854Z [DEBUG] "MCP server \"bad-stdio\": stderr of the stdio server before restarting it: 'definitely-not-a-real-command-xyz' is not recognized as an internal or external command,\r\noperable program or batch file."
+2026-10-17T21:04:04.943Z [ERROR] "MCP server \"bad-stdio\" Server stderr: 'definitely-not-a-real-command-xyz' is not recognized as an internal or external command,\r\noperable program or batch file."
+2026-10-17T21:04:04.946Z [DEBUG] MCP server "bad-stdio": Connection failed after 246ms (CONNECTION_CLOSED): Connection closed
+2026-10-17T21:04:04.946Z [ERROR] MCP server "bad-stdio" Connection failed (CONNECTION_CLOSED): Connection closed
+2026-10-17T21:04:04.954Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-10-17T21:04:04.954Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\cfg\settings.json
+2026-10-17T21:04:04.955Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.json
+2026-10-17T21:04:04.955Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.local.json

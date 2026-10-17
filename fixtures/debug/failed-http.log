@@ -1,0 +1,43 @@
+2026-10-17T21:04:05.505Z [DEBUG] MDM settings load completed in 7ms
+2026-10-17T21:04:05.510Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\cfg\settings.json
+2026-10-17T21:04:05.511Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-10-17T21:04:05.515Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.json
+2026-10-17T21:04:05.516Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.local.json
+2026-10-17T21:04:05.517Z [DEBUG] CA certs: Config fallback - globalEnv keys: , settingsEnv keys: none
+2026-10-17T21:04:05.519Z [DEBUG] [init] configureGlobalMTLS starting
+2026-10-17T21:04:05.519Z [DEBUG] [init] configureGlobalMTLS complete
+2026-10-17T21:04:05.519Z [DEBUG] [init] configureGlobalAgents starting
+2026-10-17T21:04:05.519Z [DEBUG] CA certs: stores=bundled,system, extraCertsPath=undefined
+2026-10-17T21:04:05.519Z [DEBUG] CA certs: Loaded 121 bundled root certificates
+2026-10-17T21:04:05.539Z [DEBUG] CA certs: Dropped 15 expired certificate(s) from system store
+2026-10-17T21:04:05.540Z [DEBUG] CA certs: Loaded 105 system CA certificates
+2026-10-17T21:04:05.540Z [DEBUG] mTLS: Creating HTTPS agent with custom certificates
+2026-10-17T21:04:05.540Z [DEBUG] [init] configureGlobalAgents complete
+2026-10-17T21:04:05.541Z [DEBUG] Using bash path: "C:\Program Files\Git\bin\bash.exe"
+2026-10-17T21:04:05.542Z [DEBUG] Git remote URL: null
+2026-10-17T21:04:05.542Z [DEBUG] No git remote URL found
+2026-10-17T21:04:05.544Z [DEBUG] Error log sink initialized
+2026-10-17T21:04:05.580Z [DEBUG] [claudeai-mcp] Disabled: API-key auth precedence active
+2026-10-17T21:04:05.586Z [DEBUG] installed_plugins.json doesn't exist, returning empty V2 object
+2026-10-17T21:04:05.587Z [DEBUG] Found 0 plugins (0 enabled, 0 disabled)
+2026-10-17T21:04:05.589Z [DEBUG] mcp runtime arm: v2 (source: default)
+2026-10-17T21:04:05.605Z [DEBUG] MCP server "remote-down": Initializing HTTP transport to http://127.0.0.1:9/mcp
+2026-10-17T21:04:05.605Z [DEBUG] MCP server "remote-down": Node version: v26.3.0, Platform: win32
+2026-10-17T21:04:05.605Z [DEBUG] MCP server "remote-down": Environment: {"NODE_OPTIONS":"not set","UV_THREADPOOL_SIZE":"default","HTTP_PROXY":"not set","HTTPS_PROXY":"not set","NO_PROXY":"not set"}
+2026-10-17T21:04:05.606Z [DEBUG] MCP server "remote-down": HTTP transport options: {"url":"http://127.0.0.1:9/mcp","headers":{"User-Agent":"claude-code/2.1.302 (sdk-cli)","Accept-Encoding":"identity"},"hasAuthProvider":true,"timeoutMs":60000}
+2026-10-17T21:04:05.606Z [DEBUG] MCP server "remote-down": HTTP transport created successfully
+2026-10-17T21:04:05.607Z [DEBUG] MCP server "remote-down": Starting connection with timeout of 30000ms
+2026-10-17T21:04:05.607Z [DEBUG] MCP server "remote-down": Testing basic HTTP connectivity to http://127.0.0.1:9/mcp
+2026-10-17T21:04:05.607Z [DEBUG] MCP server "remote-down": Parsed URL: host=127.0.0.1, port=9, protocol=http:
+2026-10-17T21:04:05.607Z [DEBUG] MCP server "remote-down": Using loopback address: 127.0.0.1
+2026-10-17T21:04:05.608Z [DEBUG] MCP server "remote-down": No token data found
+2026-10-17T21:04:05.611Z [DEBUG] MCP server "remote-down": version negotiation probe failed on the http transport; reconnecting pinned legacy
+2026-10-17T21:04:05.618Z [DEBUG] MCP server "remote-down": No token data found
+2026-10-17T21:04:05.620Z [DEBUG] MCP server "remote-down": HTTP Connection failed after 17ms: ECONNREFUSED: Unable to connect. Is the computer able to access the url? (code: ECONNREFUSED, errno: none)
+2026-10-17T21:04:05.620Z [ERROR] MCP server "remote-down" TypeError: ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+2026-10-17T21:04:05.623Z [DEBUG] MCP server "remote-down": Connection failed after 17ms (ECONNREFUSED): ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+2026-10-17T21:04:05.623Z [ERROR] MCP server "remote-down" Connection failed (ECONNREFUSED): ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+2026-10-17T21:04:05.631Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Program Files\ClaudeCode\managed-settings.json
+2026-10-17T21:04:05.631Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\cfg\settings.json
+2026-10-17T21:04:05.632Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.json
+2026-10-17T21:04:05.632Z [DEBUG] Broken symlink or missing file encountered for settings.json at path: C:\Users\someone\AppData\Local\Temp\throwaway\.claude\settings.local.json
