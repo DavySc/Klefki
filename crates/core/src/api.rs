@@ -167,6 +167,8 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
             cli_env: Vec::new(),
             max_checks: 3,
             check_timeout: std::time::Duration::from_secs(30),
+            watch_interval: Some(std::time::Duration::from_secs(1)),
+            watch_settle: std::time::Duration::from_millis(300),
         },
         wake,
     )

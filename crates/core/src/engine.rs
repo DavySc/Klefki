@@ -12,6 +12,7 @@ use crate::diagnose::report;
 use crate::model::ServerName;
 use crate::ops;
 use crate::sanitize::{clip, sanitize};
+use crate::watch::{self, Watch};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -183,6 +184,10 @@ pub(crate) struct EngineConfig {
     pub cli_env: Vec<(String, OsString)>,
     pub max_checks: usize,
     pub check_timeout: Duration,
+    /// How often to look for changes made to the configuration from outside; `None` turns watching off.
+    pub watch_interval: Option<Duration>,
+    /// How long changed files must hold still before they are read again.
+    pub watch_settle: Duration,
 }
 
 const MAX_CHECK_OUTPUT: usize = 64 * 1024;
@@ -191,14 +196,39 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DETAIL_CHARS: usize = 200;
 
 pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + 'static) -> Core {
-    let (tx, cmd_rx) = mpsc::channel();
+    let (tx, cmd_rx) = mpsc::channel::<Command>();
     let (ev_tx, rx) = mpsc::channel();
     let emitter = Emitter {
         tx: ev_tx,
         wake: Arc::new(wake),
     };
-    std::thread::spawn(move || engine_main(config, cmd_rx, emitter));
+    // The engine listens to the UI and to the file watcher. The UI's commands are passed on, and when the UI goes
+    // away the engine is told to stop (the watcher keeps a sender of its own, so the channel alone would not close).
+    let (input_tx, input_rx) = mpsc::channel();
+    let ui = input_tx.clone();
+    std::thread::Builder::new()
+        .name("klefki-commands".into())
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            for command in cmd_rx {
+                if ui.send(Input::Ui(command)).is_err() {
+                    return;
+                }
+            }
+            let _ = ui.send(Input::Closed);
+        })
+        .expect("start the command relay");
+    std::thread::spawn(move || engine_main(config, input_rx, input_tx, emitter));
     Core { tx, rx }
+}
+
+/// What the engine thread reacts to.
+enum Input {
+    Ui(Command),
+    /// The watcher saw the configuration change on disk.
+    FilesChanged,
+    /// The UI is gone.
+    Closed,
 }
 
 #[derive(Clone)]
@@ -251,6 +281,8 @@ struct Shared {
     /// large Node program), so it is only asked again when the file changes.
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     emitter: Emitter,
+    /// For threads that need the engine thread to do something (read the files again).
+    input: Sender<Input>,
 }
 
 /// Identifies one build of the CLI on disk: its path, size and modification time.
@@ -272,7 +304,12 @@ impl ProgramStamp {
     }
 }
 
-fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitter) {
+fn engine_main(
+    config: EngineConfig,
+    inputs: Receiver<Input>,
+    input_tx: Sender<Input>,
+    emitter: Emitter,
+) {
     let workers = config.max_checks.max(1);
     let shared = Arc::new(Shared {
         config,
@@ -282,25 +319,42 @@ fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitt
         claude: RwLock::new(None),
         version: Mutex::new(None),
         emitter,
+        input: input_tx.clone(),
     });
     for _ in 0..workers {
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || worker(&shared));
     }
 
-    let mut snapshot = Arc::new(Snapshot::default());
+    let watch = shared.config.watch_interval.map(|interval| {
+        Watch::start(interval, shared.config.watch_settle, move || {
+            let _ = input_tx.send(Input::FilesChanged);
+        })
+    });
+    let mut state = State {
+        snapshot: Arc::new(Snapshot::default()),
+        watch,
+    };
     let mut plans = Plans::default();
-    refresh(&shared, &mut snapshot, false);
-    while let Ok(command) = commands.recv() {
+    refresh(&shared, &mut state, false);
+    while let Ok(input) = inputs.recv() {
+        let command = match input {
+            Input::Ui(command) => command,
+            Input::FilesChanged => {
+                reload_after_change(&shared, &mut state);
+                continue;
+            }
+            Input::Closed => break,
+        };
         match command {
             Command::Prepare(changes) => prepare(&shared, &mut plans, &changes),
-            Command::Apply(id) => apply(&shared, &mut plans, &mut snapshot, id),
+            Command::Apply(id) => apply(&shared, &mut plans, &mut state, id),
             Command::Discard(id) => {
                 plans.stored.remove(&id);
             }
-            Command::Refresh { live_all } => refresh(&shared, &mut snapshot, live_all),
-            Command::Check(id) => enqueue_now(&shared, &snapshot, &id, JobKind::Check),
-            Command::Diagnose(id) => enqueue_now(&shared, &snapshot, &id, JobKind::Diagnose),
+            Command::Refresh { live_all } => refresh(&shared, &mut state, live_all),
+            Command::Check(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Check),
+            Command::Diagnose(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Diagnose),
         }
     }
     // The UI is gone: let the workers finish what they are doing and stop.
@@ -394,7 +448,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
     }
 }
 
-fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u64) {
+fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     let fail = |error: String| {
         shared.emitter.emit(Event::ApplyFailed { plan: id, error });
     };
@@ -430,7 +484,7 @@ fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u
                         " Already saved: {}. The rest was not changed.",
                         done.join(", ")
                     ));
-                    reload_after_change(shared, snapshot);
+                    reload_after_change(shared, state);
                 }
                 return fail(message);
             }
@@ -438,10 +492,10 @@ fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u
     }
     let changed = !written.is_empty();
     if changed {
-        reload_after_change(shared, snapshot);
+        reload_after_change(shared, state);
         // Claude Code can write without our lock; look again shortly, off the engine thread.
         let emitter = shared.emitter.clone();
-        let paths = shared.config.paths.clone();
+        let input = shared.input.clone();
         std::thread::spawn(move || {
             let mut reapplied = false;
             for (plan, store) in &written {
@@ -456,9 +510,8 @@ fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u
                 }
             }
             if reapplied {
-                if let Some(paths) = paths {
-                    emitter.emit(Event::Snapshot(Arc::new(inventory::load(&paths))));
-                }
+                // The engine thread reads the files again, as for any change on disk.
+                let _ = input.send(Input::FilesChanged);
                 emitter.emit(Event::Reapplied { plan: id });
             }
         });
@@ -482,20 +535,48 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
+/// The engine thread's view: the current snapshot, and the watcher that tells when it is out of date.
+struct State {
+    snapshot: Arc<Snapshot>,
+    watch: Option<Watch>,
+}
+
+impl State {
+    /// Reads the configuration again and returns the snapshot it replaces. The watcher's baseline is taken just
+    /// before reading, so a change made meanwhile is noticed afterwards instead of being lost.
+    fn reload(&mut self, shared: &Shared) -> Arc<Snapshot> {
+        let next = match &shared.config.paths {
+            Some(paths) => {
+                if let Some(watch) = &self.watch {
+                    watch.rebase(watch::watched_files(paths, &self.snapshot));
+                }
+                let next = inventory::load(paths);
+                if let Some(watch) = &self.watch {
+                    // Projects that just appeared start being watched from now.
+                    watch.extend(watch::watched_files(paths, &next));
+                }
+                next
+            }
+            None => Snapshot {
+                warnings: vec![
+                    "Could not determine where Claude Code keeps its configuration.".to_owned(),
+                ],
+                ..Snapshot::default()
+            },
+        };
+        let before = std::mem::replace(&mut self.snapshot, Arc::new(next));
+        shared
+            .emitter
+            .emit(Event::Snapshot(Arc::clone(&self.snapshot)));
+        before
+    }
+}
+
+fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
     let generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
     lock(&shared.queue).jobs.clear();
-
-    *snapshot = match &shared.config.paths {
-        Some(paths) => Arc::new(inventory::load(paths)),
-        None => Arc::new(Snapshot {
-            warnings: vec![
-                "Could not determine where Claude Code keeps its configuration.".to_owned(),
-            ],
-            ..Snapshot::default()
-        }),
-    };
-    shared.emitter.emit(Event::Snapshot(Arc::clone(snapshot)));
+    state.reload(shared);
+    let snapshot = &state.snapshot;
 
     let cli = locate::locate(&locate::Search {
         explicit: shared.config.claude.as_deref(),
@@ -541,15 +622,15 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
     shared.wake_workers.notify_all();
 }
 
-/// After klefki itself changed the configuration: show the new state, and check only servers the change switched
-/// on. A full refresh would look for the CLI again, ask its version, drop the checks still running and start them
-/// over, each one a process start that the change did not call for.
-fn reload_after_change(shared: &Shared, snapshot: &mut Arc<Snapshot>) {
-    let Some(paths) = &shared.config.paths else {
+/// After the configuration changed (by klefki, or on disk from outside): show the new state, and check only servers
+/// the change switched on. A full refresh would look for the CLI again, ask its version, drop the checks still
+/// running and start them over, each one a process start that the change did not call for.
+fn reload_after_change(shared: &Shared, state: &mut State) {
+    if shared.config.paths.is_none() {
         return;
-    };
-    let before = std::mem::replace(snapshot, Arc::new(inventory::load(paths)));
-    shared.emitter.emit(Event::Snapshot(Arc::clone(snapshot)));
+    }
+    let before = state.reload(shared);
+    let snapshot = &state.snapshot;
     let generation = shared.generation.load(Ordering::SeqCst);
     let jobs: Vec<Job> = snapshot
         .servers
@@ -943,6 +1024,8 @@ mod tests {
                 verify_delay: Duration::from_millis(50),
                 max_checks: 3,
                 check_timeout: Duration::from_secs(10),
+                watch_interval: Some(Duration::from_millis(40)),
+                watch_settle: Duration::from_millis(120),
             }
         }
 
@@ -2383,5 +2466,89 @@ mod tests {
         assert_eq!(env.runs(&["mcp", "get", "loc"]), 1);
         assert_eq!(env.runs(&["mcp", "get", "gw"]), 1);
         assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    // ---- the file watcher
+
+    fn snapshots(events: &[Event]) -> Vec<&Snapshot> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Snapshot(s) => Some(&**s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_server_added_from_outside_appears_without_a_refresh() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        let mut changed = two_projects("end");
+        changed["mcpServers"]["added"] =
+            serde_json::json!({"type": "http", "url": "https://x.example/mcp"});
+        write_config(&env, &changed);
+        collect(&core, |e| {
+            snapshots(e)
+                .iter()
+                .any(|s| s.servers.iter().any(|r| r.name == "added"))
+        });
+    }
+
+    #[test]
+    fn a_new_mcp_json_in_a_known_project_appears_without_a_refresh() {
+        let env = quiet_env(&serde_json::json!({}));
+        let repo = env.dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let key = repo.to_string_lossy().replace('\\', "/");
+        write_config(&env, &serde_json::json!({"projects": {key: {}}}));
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        std::fs::write(repo.join(".mcp.json"), MCP_JSON).unwrap();
+        collect(&core, |e| {
+            snapshots(e).iter().any(|s| {
+                s.servers
+                    .iter()
+                    .any(|r| r.name == "ps" && r.scope == Scope::Project)
+            })
+        });
+    }
+
+    #[test]
+    fn klefki_s_own_save_is_read_once_not_again_by_the_watcher() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        let mut events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        // Several watch intervals and the settle time pass.
+        std::thread::sleep(Duration::from_millis(600));
+        while let Some(e) = core.try_recv() {
+            events.push(e);
+        }
+        assert_eq!(snapshots(&events).len(), 1, "one reload after the save");
+    }
+
+    #[test]
+    fn nothing_is_read_again_while_nothing_changes() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        std::thread::sleep(Duration::from_millis(600));
+        let mut later = Vec::new();
+        while let Some(e) = core.try_recv() {
+            later.push(e);
+        }
+        assert!(snapshots(&later).is_empty(), "{later:#?}");
     }
 }
