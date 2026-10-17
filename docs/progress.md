@@ -1,7 +1,7 @@
 # Progress
 
 ## Current slice
-`docstore`, the enable/disable write path, `deny.toml` + cargo-deny (2026-10-17). Done except the open items under "Docstore and enable/disable". Next: decide the three `cargo deny` advisories, then run the real window on a machine with a display.
+`docstore`, the enable/disable write path, `deny.toml` + cargo-deny (2026-10-17). Done except the open items under "Docstore and enable/disable". Next: run the real window on a machine with a display.
 
 Earlier slice: Live status checks (CLI locate/runner/parse, status engine, UI wiring), see "Live status" below.
 
@@ -15,8 +15,8 @@ Previous slice: Read-only inventory of the real Claude Code config, restyle (Cat
 - UI: Enable and Disable toolbar buttons → Review dialog with the exact lines, warnings, Apply / Cancel (Esc or a click outside cancels), then a banner with the result.
 - Reproducers first where a bug existed; for new code the tests passed on first run, so I proved they bite by breaking the code on purpose and watching them fail: no backup, no changed-file check, no lock, first spelling only (docstore); user scope only first project (engine); no double-apply guard, toggle inverted, no discard on cancel (UI). One guard (`plan.is_none()` on the toolbar) cannot be told apart by a test because the modal already blocks the click.
 - `deny.toml` (protected file, created at the owner's request; please review) and `cargo-deny 0.20.2` installed. Licences allowed: MIT, Apache-2.0 (+LLVM), BSD-2/3, ISC, Zlib, MPL-2.0, Unicode-3.0, OFL-1.1, Ubuntu-font-1.0 (egui's default fonts), BSL-1.0. Workspace crates have no licence field, so `[licenses.private] ignore = true` is set; the owner should pick a licence instead.
-- **Open: `cargo deny check` fails (advisories).** RUSTSEC-2026-0370 and two siblings: `zvariant`, `zvariant_derive`, `zbus_names` are "unmaintained", pulled in only on Linux through eframe → egui-winit → accesskit_winit → accesskit_unix → atspi. No upgrade exists. Not ignored, because the rules forbid ignore lists. Options for the owner: accept via `[advisories] ignore`, set `unmaintained = "workspace"` (only direct dependencies count), or wait for egui to move.
-- Checks: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo test --workspace` 166 core + 64 app passed; `cargo deny check`: bans, licenses, sources ok, advisories FAILED (above).
+- **Resolved 2026-10-17: owner set `unmaintained = "workspace"` in `deny.toml`; `cargo deny check` now exits 0 (advisories, bans, licenses, sources ok). Original finding:** RUSTSEC-2026-0370 and two siblings: `zvariant`, `zvariant_derive`, `zbus_names` are "unmaintained", pulled in only on Linux through eframe → egui-winit → accesskit_winit → accesskit_unix → atspi. No upgrade exists. Not ignored, because the rules forbid ignore lists. Options for the owner: accept via `[advisories] ignore`, set `unmaintained = "workspace"` (only direct dependencies count), or wait for egui to move.
+- Checks: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo test --workspace` 166 core + 64 app passed; `cargo deny check` exit 0 after the owner's `unmaintained = "workspace"` change (it hides unmaintained transitive crates, so the zvariant family is no longer reported).
 - Not verified: the real window (this machine lacks `libxkbcommon-x11`, so `cargo run -p klefki` panics at startup), a write next to a live Claude Code session, behaviour on Windows/macOS, whether a running Claude session notices a toggle without restart, and "Claude Code is running" detection (only a generic restart warning is shown).
 - Duplicate keys in `~/.claude.json` are not detected on write (the last one wins when parsed); `.mcp.json` duplicates still are.
 

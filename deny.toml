@@ -5,6 +5,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Only unmaintained crates the workspace depends on directly count. The zvariant family comes in through
+# egui's Linux accessibility stack and has no replacement yet (owner decision, 2026-10-17).
+unmaintained = "workspace"
 
 [licenses]
 version = 2
