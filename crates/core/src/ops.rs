@@ -64,16 +64,12 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
 }
 
 fn find<'a>(id: &ServerId, snapshot: &'a Snapshot) -> Result<&'a ServerRow, String> {
-    snapshot
-        .servers
-        .iter()
-        .find(|r| r.id() == *id)
-        .ok_or_else(|| {
-            format!(
-                "{} is no longer in the configuration. Refresh and try again.",
-                sanitize(&id.name)
-            )
-        })
+    snapshot.servers.iter().find(|r| r.is(id)).ok_or_else(|| {
+        format!(
+            "{} is no longer in the configuration. Refresh and try again.",
+            sanitize(&id.name)
+        )
+    })
 }
 
 fn set_enabled(

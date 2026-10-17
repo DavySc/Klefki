@@ -247,7 +247,29 @@ struct Shared {
     wake_workers: Condvar,
     generation: AtomicU64,
     claude: RwLock<Option<PathBuf>>,
+    /// The CLI's version, for the program file it was read from. Asking costs a process start (Claude Code is a
+    /// large Node program), so it is only asked again when the file changes.
+    version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     emitter: Emitter,
+}
+
+/// Identifies one build of the CLI on disk: its path, size and modification time.
+#[derive(Clone, PartialEq, Eq)]
+struct ProgramStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ProgramStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_owned(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
 }
 
 fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitter) {
@@ -258,6 +280,7 @@ fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitt
         wake_workers: Condvar::new(),
         generation: AtomicU64::new(0),
         claude: RwLock::new(None),
+        version: Mutex::new(None),
         emitter,
     });
     for _ in 0..workers {
@@ -308,8 +331,16 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         let paths = shared.config.paths.as_ref().ok_or_else(|| {
             "Could not determine where Claude Code keeps its configuration.".to_owned()
         })?;
-        // Always against the files as they are now, not the snapshot the user last saw.
-        let fresh = inventory::load(paths);
+        // Always against the files as they are now, not the snapshot the user last saw. `.claude.json` is read once
+        // for both the inventory and the plan.
+        let read = fsx::read_limited_bom(&paths.claude_json, inventory::MAX_CLAUDE_JSON);
+        let fresh = inventory::load_text(
+            paths,
+            match &read {
+                Ok(text) => Ok(text.as_ref().map(|(t, _)| t.as_str())),
+                Err(e) => Err(e.to_string()),
+            },
+        );
         let resolved = ops::resolve(changes, &fresh)?;
         let mut parts = Vec::new();
         for (project, ops) in resolved.settings {
@@ -323,7 +354,11 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         if !resolved.claude.is_empty() {
             let mut store = Docstore::new(paths.claude_json.clone(), backup_dir(shared)?);
             store.verify_delay = shared.config.verify_delay;
-            let plan = store.prepare(resolved.claude).map_err(|e| e.to_string())?;
+            let plan = match read {
+                Ok(Some((text, bom))) => store.prepare_text(text, bom, resolved.claude),
+                _ => store.prepare(resolved.claude),
+            }
+            .map_err(|e| e.to_string())?;
             parts.push((plan, store));
         }
         for (_, store) in &mut parts {
@@ -395,7 +430,7 @@ fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u
                         " Already saved: {}. The rest was not changed.",
                         done.join(", ")
                     ));
-                    refresh(shared, snapshot, false);
+                    reload_after_change(shared, snapshot);
                 }
                 return fail(message);
             }
@@ -403,7 +438,7 @@ fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u
     }
     let changed = !written.is_empty();
     if changed {
-        refresh(shared, snapshot, false);
+        reload_after_change(shared, snapshot);
         // Claude Code can write without our lock; look again shortly, off the engine thread.
         let emitter = shared.emitter.clone();
         let paths = shared.config.paths.clone();
@@ -480,7 +515,7 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
     *shared.claude.write().unwrap_or_else(|e| e.into_inner()) = Some(program.clone());
     shared
         .emitter
-        .emit(Event::CliVersion(cli_version(shared, &program)));
+        .emit(Event::CliVersion(cached_cli_version(shared, &program)));
 
     let mut jobs = Vec::new();
     for row in &snapshot.servers {
@@ -506,9 +541,44 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
     shared.wake_workers.notify_all();
 }
 
+/// After klefki itself changed the configuration: show the new state, and check only servers the change switched
+/// on. A full refresh would look for the CLI again, ask its version, drop the checks still running and start them
+/// over, each one a process start that the change did not call for.
+fn reload_after_change(shared: &Shared, snapshot: &mut Arc<Snapshot>) {
+    let Some(paths) = &shared.config.paths else {
+        return;
+    };
+    let before = std::mem::replace(snapshot, Arc::new(inventory::load(paths)));
+    shared.emitter.emit(Event::Snapshot(Arc::clone(snapshot)));
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let jobs: Vec<Job> = snapshot
+        .servers
+        .iter()
+        .filter(|row| {
+            row.scope != Scope::Project
+                && row.enabled
+                && row.status == Status::Unknown
+                && !before
+                    .servers
+                    .iter()
+                    .any(|old| old.enabled && same_row(old, row))
+        })
+        .filter_map(|row| build_job(shared, row, generation, JobKind::Check, true))
+        .collect();
+    if !jobs.is_empty() {
+        lock(&shared.queue).jobs.extend(jobs);
+        shared.wake_workers.notify_all();
+    }
+}
+
+/// The same server in two snapshots, compared without building ids.
+fn same_row(a: &ServerRow, b: &ServerRow) -> bool {
+    a.scope == b.scope && a.name == b.name && a.project == b.project
+}
+
 /// A check or diagnosis the user asked for: ahead of the background checks.
 fn enqueue_now(shared: &Shared, snapshot: &Snapshot, id: &ServerId, kind: JobKind) {
-    let Some(row) = snapshot.servers.iter().find(|r| r.id() == *id) else {
+    let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) else {
         return;
     };
     let generation = shared.generation.load(Ordering::SeqCst);
@@ -637,6 +707,20 @@ fn cli_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_os_str()))
         .collect()
+}
+
+fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
+    let stamp = ProgramStamp::of(program);
+    if let (Some(stamp), Some((known, version))) = (&stamp, &*lock(&shared.version))
+        && stamp == known
+    {
+        return version.clone();
+    }
+    let version = cli_version(shared, program);
+    if let Some(stamp) = stamp {
+        *lock(&shared.version) = Some((stamp, version.clone()));
+    }
+    version
 }
 
 fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
@@ -2177,5 +2261,127 @@ mod tests {
             config_json(&env)["projects"][&key]["disabledMcpjsonServers"],
             serde_json::json!(["ps"])
         );
+    }
+
+    // ---- not spawning what is not needed
+
+    impl Env {
+        /// How many times the fake CLI was started with these leading arguments.
+        fn runs(&self, leading: &[&str]) -> usize {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|l| l["event"] == "start")
+                .filter(|l| {
+                    let argv = l["argv"].as_array().unwrap();
+                    argv.len() >= leading.len()
+                        && leading.iter().zip(argv).all(|(want, got)| got == want)
+                })
+                .count()
+        }
+    }
+
+    const CHECKABLE: &str = r#"{"rules":[
+        {"args":["--version"],"stdout_file":"version.txt"},
+        {"args":["mcp","get"],"stdout_file":"connected.txt"}]}"#;
+
+    fn checkable_env(claude_json: &serde_json::Value) -> Env {
+        Env::new(
+            claude_json,
+            CHECKABLE,
+            &[
+                ("version.txt", b"2.1.302 (Claude Code)\n"),
+                ("connected.txt", CONNECTED),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_cli_version_is_asked_once_not_on_every_refresh() {
+        let env = checkable_env(&two_projects("end"));
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::CliVersion(Some(_))))
+                && final_status(e, "gw").is_some()
+        });
+        for _ in 0..3 {
+            core.send(Command::Refresh { live_all: false });
+            collect(&core, |e| {
+                e.iter().any(|x| matches!(x, Event::CliVersion(Some(_))))
+            });
+        }
+        assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    /// `gw` (user) and `loc` (local, in a project folder that exists), both checkable. Returns the project key.
+    fn checkable_with_project(loc_off: bool) -> (Env, String) {
+        let env = checkable_env(&serde_json::json!({}));
+        let project = env.dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let key = project.to_string_lossy().replace('\\', "/");
+        let disabled: Vec<&str> = if loc_off { vec!["loc"] } else { vec![] };
+        write_config(
+            &env,
+            &serde_json::json!({
+                "mcpServers": {"gw": {"type": "stdio", "command": "node"}},
+                "projects": {key.clone(): {
+                    "mcpServers": {"loc": {"type": "stdio", "command": "x"}},
+                    "disabledMcpServers": disabled
+                }}
+            }),
+        );
+        let key = inventory::normalise_project(&key);
+        (env, key)
+    }
+
+    #[test]
+    fn saving_a_change_neither_re_checks_servers_nor_asks_the_version_again() {
+        let (env, key) = checkable_with_project(false);
+        let core = env.start();
+        collect(&core, |e| {
+            final_status(e, "gw") == Some(Status::Connected)
+                && final_status(e, "loc") == Some(Status::Connected)
+        });
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", &key),
+                enabled: false,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        // Give a stray check time to start, if one were queued.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(env.runs(&["mcp", "get", "gw"]), 1, "gw did not change");
+        assert_eq!(env.runs(&["mcp", "get", "loc"]), 1, "loc was switched off");
+        assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    #[test]
+    fn a_server_switched_on_by_a_change_is_checked() {
+        let (env, key) = checkable_with_project(true);
+        let core = env.start();
+        collect(&core, |e| final_status(e, "gw") == Some(Status::Connected));
+        assert_eq!(
+            env.runs(&["mcp", "get", "loc"]),
+            0,
+            "off servers are not checked"
+        );
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", &key),
+                enabled: true,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| final_status(e, "loc") == Some(Status::Connected));
+        assert_eq!(env.runs(&["mcp", "get", "loc"]), 1);
+        assert_eq!(env.runs(&["mcp", "get", "gw"]), 1);
+        assert_eq!(env.runs(&["--version"]), 1);
     }
 }

@@ -72,8 +72,11 @@ pub struct ShellApp {
     snapshot: Arc<Snapshot>,
     /// The engine. `None` for demo data and tests that feed the UI directly.
     core: Option<Core>,
-    /// Live results from the engine, which take precedence over the snapshot's hints.
-    live: HashMap<ServerId, (Status, Option<String>)>,
+    /// Live results from the engine, which take precedence over the snapshot's hints. One slot per row of the
+    /// snapshot, by position, so drawing a row looks its status up without building a key.
+    live: Vec<Option<(Status, Option<String>)>>,
+    /// The grid's rows for the current snapshot and search, built when either changes rather than every frame.
+    grid_cache: Option<(String, Arc<[GridRow]>)>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
     cli_version: Option<String>,
@@ -95,7 +98,8 @@ impl ShellApp {
     pub fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
         Self {
             core: None,
-            live: HashMap::new(),
+            live: vec![None; snapshot.servers.len()],
+            grid_cache: None,
             diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
@@ -144,32 +148,42 @@ impl ShellApp {
     fn apply_event(&mut self, event: Event) {
         match event {
             Event::Snapshot(snapshot) => {
-                // Selection is by position, so carry it over by identity.
-                let selected_ids: Vec<ServerId> = self
-                    .selected
-                    .iter()
-                    .filter_map(|&i| self.snapshot.servers.get(i).map(ServerRow::id))
-                    .collect();
-                self.selected = snapshot
+                // Rows are kept by position; carry selection, live results and diagnoses over by identity.
+                let new_index: HashMap<(Scope, Option<&str>, &str), usize> = snapshot
                     .servers
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| selected_ids.contains(&r.id()))
-                    .map(|(i, _)| i)
+                    .map(|(i, r)| ((r.scope, r.project.as_deref(), r.name.as_str()), i))
                     .collect();
-                // A check that was running is cut off by a refresh, and rows may have disappeared.
-                let known: BTreeSet<ServerId> =
-                    snapshot.servers.iter().map(ServerRow::id).collect();
-                self.live
-                    .retain(|id, (status, _)| *status != Status::Checking && known.contains(id));
-                self.diagnoses.retain(|id, _| known.contains(id));
+                let moved = |old: usize| {
+                    let r = &self.snapshot.servers[old];
+                    new_index
+                        .get(&(r.scope, r.project.as_deref(), r.name.as_str()))
+                        .copied()
+                };
+                let selected = self.selected.iter().filter_map(|&i| moved(i)).collect();
+                let mut live = vec![None; snapshot.servers.len()];
+                for (old, result) in self.live.iter_mut().enumerate() {
+                    // A check that was running is cut off by a refresh.
+                    if let (Some(new), Some(r)) = (moved(old), result.take())
+                        && r.0 != Status::Checking
+                    {
+                        live[new] = Some(r);
+                    }
+                }
+                self.diagnoses.retain(|id, _| {
+                    new_index.contains_key(&(id.scope, id.project.as_deref(), id.name.as_str()))
+                });
+                self.selected = selected;
+                self.live = live;
+                self.grid_cache = None;
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
                 self.snapshot = snapshot;
             }
             Event::Diagnosis { id, diagnosis } => {
-                if self.snapshot.servers.iter().any(|r| r.id() == id) {
+                if self.snapshot.servers.iter().any(|r| r.is(&id)) {
                     self.diagnoses.insert(id, diagnosis);
                 }
             }
@@ -221,18 +235,18 @@ impl ShellApp {
             Event::CliVersion(version) => self.cli_version = version,
             Event::CliProblem(problem) => self.cli_problem = Some(problem),
             Event::Status { id, status, detail } => {
-                if self.snapshot.servers.iter().any(|r| r.id() == id) {
-                    self.live.insert(id, (status, detail));
+                if let Some(i) = self.snapshot.servers.iter().position(|r| r.is(&id)) {
+                    self.live[i] = Some((status, detail));
                 }
             }
         }
     }
 
-    /// What to show for a row: the engine's latest answer, else what Claude's own cache said.
-    fn effective<'a>(&'a self, row: &'a ServerRow) -> (Status, Option<&'a str>) {
-        match self.live.get(&row.id()) {
+    /// What to show for row `i`: the engine's latest answer, else what Claude's own cache said.
+    fn effective(&self, i: usize) -> (Status, Option<&str>) {
+        match self.live.get(i).and_then(Option::as_ref) {
             Some((status, detail)) => (*status, detail.as_deref()),
-            None => (row.status, None),
+            None => (self.snapshot.servers[i].status, None),
         }
     }
 
@@ -250,30 +264,39 @@ impl ShellApp {
                         .is_some_and(|p| p.to_lowercase().contains(&q))
             })
             .collect();
-        idx.sort_by(|&a, &b| {
-            let (a, b) = (&self.snapshot.servers[a], &self.snapshot.servers[b]);
-            (a.scope, &a.project, a.name.to_lowercase()).cmp(&(
-                b.scope,
-                &b.project,
-                b.name.to_lowercase(),
-            ))
+        // Each name is lower-cased once, not once per comparison.
+        idx.sort_by_cached_key(|&i| {
+            let s = &self.snapshot.servers[i];
+            (s.scope, s.project.as_deref(), s.name.to_lowercase())
         });
         idx
     }
 
     fn grid_rows(&self) -> Vec<GridRow> {
         let mut rows = Vec::new();
-        let mut last: Option<(Scope, Option<String>)> = None;
+        let mut last: Option<(Scope, Option<&str>)> = None;
         for i in self.visible() {
             let s = &self.snapshot.servers[i];
-            let key = (s.scope, s.project.clone());
-            if last.as_ref() != Some(&key) {
+            let key = (s.scope, s.project.as_deref());
+            if last != Some(key) {
                 rows.push(GridRow::Group(group_title(s)));
                 last = Some(key);
             }
             rows.push(GridRow::Server(i));
         }
         rows
+    }
+
+    /// The grid's rows, rebuilt only when the snapshot or the search changed.
+    fn cached_grid_rows(&mut self) -> Arc<[GridRow]> {
+        match &self.grid_cache {
+            Some((search, rows)) if *search == self.search => Arc::clone(rows),
+            _ => {
+                let rows: Arc<[GridRow]> = self.grid_rows().into();
+                self.grid_cache = Some((self.search.clone(), Arc::clone(&rows)));
+                rows
+            }
+        }
     }
 
     fn show(&mut self, ui: &mut Ui) {
@@ -654,7 +677,7 @@ impl ShellApp {
 
     fn grid(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        let rows = self.grid_rows();
+        let rows = self.cached_grid_rows();
         let ctrl = ui.input(|i| i.modifiers.command);
         let project_count = self.snapshot.project_count;
         let mut clicked = None;
@@ -694,7 +717,7 @@ impl ShellApp {
                         row.col(|ui| {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
-                        let (status, detail) = self.effective(s);
+                        let (status, detail) = self.effective(*i);
                         row.col(|ui| status_cell(ui, s, status, detail));
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
@@ -736,9 +759,12 @@ impl ShellApp {
             ui.label(RichText::new(msg).color(pal.text_muted));
             return;
         };
-        let s = self.snapshot.servers[i].clone();
+        // A second handle to the snapshot (a reference count), so the row can be read while `self` is borrowed
+        // mutably below, without copying its strings every frame.
+        let snapshot = Arc::clone(&self.snapshot);
+        let s = &snapshot.servers[i];
         let (status, detail) = {
-            let (status, detail) = self.effective(&s);
+            let (status, detail) = self.effective(i);
             (status, detail.map(str::to_owned))
         };
         ui.label(RichText::new(&s.name).heading());
@@ -843,7 +869,7 @@ impl ShellApp {
                 }
                 });
                 if let Some(d) = self.diagnoses.get(&s.id()) {
-                    diagnosis_panel(ui, &s, d);
+                    diagnosis_panel(ui, s, d);
                 }
             }
             _ => {
@@ -2234,5 +2260,69 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label("Saved.");
+    }
+
+    #[test]
+    fn live_results_and_selection_follow_their_rows_when_a_snapshot_reorders_them() {
+        let (mut h, engine) = live_harness();
+        let a = live_row("alpha", Scope::User, None);
+        let b = live_row("beta", Scope::User, None);
+        let c = live_row("gamma", Scope::Local, Some("C:/Repos/WebApp"));
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        engine
+            .events
+            .send(status_event(&b, Status::Failed, Some("beta broke")))
+            .unwrap();
+        h.run();
+        h.get_by_label("beta").click();
+        h.run();
+        // Same rows, another order, one more in front.
+        engine
+            .events
+            .send(snapshot_of(vec![c, b.clone(), a.clone()]))
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().selected.len(), 1);
+        let selected = *h.state().selected.iter().next().unwrap();
+        assert_eq!(h.state().snapshot.servers[selected].name, "beta");
+        assert_eq!(h.state().effective(selected).0, Status::Failed);
+        let alpha = h
+            .state()
+            .snapshot
+            .servers
+            .iter()
+            .position(|r| r.name == "alpha")
+            .unwrap();
+        assert_eq!(h.state().effective(alpha).0, Status::Unknown);
+        h.get_by_label_contains(Status::Failed.label());
+    }
+
+    #[test]
+    fn the_grid_follows_a_new_snapshot_and_a_new_search() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(snapshot_of(vec![live_row("alpha", Scope::User, None)]))
+            .unwrap();
+        h.run();
+        h.get_by_label("alpha");
+        engine
+            .events
+            .send(snapshot_of(vec![
+                live_row("alpha", Scope::User, None),
+                live_row("omega", Scope::User, None),
+            ]))
+            .unwrap();
+        h.run();
+        h.get_by_label("omega");
+        h.state_mut().search = "alp".to_owned();
+        h.run();
+        assert!(h.query_by_label("omega").is_none());
+        h.state_mut().search.clear();
+        h.run();
+        h.get_by_label("omega");
     }
 }

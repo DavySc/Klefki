@@ -161,11 +161,37 @@ impl Docstore {
 
     /// Reads the file and works out what `ops` would change. Writes nothing.
     pub(crate) fn prepare(&self, ops: Vec<Op>) -> Result<Plan, StoreError> {
-        let current = self.read()?;
-        let (_, changes) = self.edit(&current, &ops)?;
+        self.prepare_current(self.read()?, ops)
+    }
+
+    /// [`prepare`](Self::prepare) for a file the caller has just read itself (text without the byte-order mark,
+    /// and whether there was one), so it is not read twice.
+    pub(crate) fn prepare_text(
+        &self,
+        text: String,
+        bom: bool,
+        ops: Vec<Op>,
+    ) -> Result<Plan, StoreError> {
+        self.prepare_current(
+            Current {
+                text,
+                bom,
+                missing: false,
+            },
+            ops,
+        )
+    }
+
+    fn prepare_current(&self, current: Current, ops: Vec<Op>) -> Result<Plan, StoreError> {
+        let (hash, edited) = alongside(
+            current.text.len() >= PARALLEL_FROM,
+            || current.hash(),
+            || self.edit(&current, &ops),
+        );
+        let (_, changes) = edited?;
         Ok(Plan {
             ops,
-            base_hash: current.hash(),
+            base_hash: hash,
             changes,
         })
     }
@@ -226,21 +252,25 @@ impl Docstore {
 
     /// Waits `verify_delay`, then makes sure the change is still there. Claude may write without our lock, from a
     /// copy it read before ours; if so the ops are applied again (up to three times). Says whether it had to.
+    /// Looking needs no lock (every writer replaces the file whole), so in the usual case, the change intact, Claude
+    /// is never kept waiting; the lock is taken only to write.
     pub(crate) fn verify(&self, plan: &Plan) -> Result<bool, StoreError> {
         let mut reapplied = false;
         for round in 0..MAX_VERIFY_ROUNDS {
             std::thread::sleep(self.verify_delay);
-            let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
-            let current = self.read()?;
-            let (text, _) = self.edit(&current, &plan.ops)?;
-            if text.is_none() {
+            if self.edit(&self.read()?, &plan.ops)?.0.is_none() {
                 return Ok(reapplied);
             }
             if round + 1 == MAX_VERIFY_ROUNDS {
                 break;
             }
-            self.write(&current, text.as_ref())?;
-            reapplied = true;
+            let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
+            let current = self.read()?;
+            let (edits, _) = self.edit(&current, &plan.ops)?;
+            if edits.is_some() {
+                self.write(&current, edits.as_ref())?;
+                reapplied = true;
+            }
         }
         Err(StoreError::Lost)
     }
@@ -552,13 +582,48 @@ const REJECTED: &str = "disabledMcpjsonServers";
 /// the projects, however many ops (switching a user server touches every project). Returns the new text, or `None`
 /// when nothing changes, and the plan's lines.
 fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<String>), StoreError> {
-    let invalid = |why: String| StoreError::Invalid(why);
-    serde_json::from_str::<serde::de::IgnoredAny>(text).map_err(|e| {
-        invalid(format!(
+    // Checking the whole text and finding the lists are independent passes over it: on a large file they run side
+    // by side. A broken file is reported as such even when the scan also failed.
+    let (valid, edited) = alongside(
+        text.len() >= PARALLEL_FROM,
+        || serde_json::from_str::<serde::de::IgnoredAny>(text),
+        || edit_valid_claude_json(text, ops),
+    );
+    valid.map_err(|e| {
+        StoreError::Invalid(format!(
             "the configuration is not valid JSON ({}); nothing was changed",
             sanitize(&e.to_string())
         ))
     })?;
+    edited
+}
+
+/// Below this size a second thread costs more than it saves.
+const PARALLEL_FROM: usize = 1 << 20;
+
+/// Runs `a` and `b`, on two threads when `parallel`.
+fn alongside<A: Send, B>(
+    parallel: bool,
+    a: impl FnOnce() -> A + Send,
+    b: impl FnOnce() -> B,
+) -> (A, B) {
+    if !parallel {
+        return (a(), b());
+    }
+    std::thread::scope(|scope| {
+        let a = scope.spawn(a);
+        let b = b();
+        // `a` only parses or hashes; a panic there is a bug worth surfacing as one.
+        (a.join().unwrap_or_else(|p| std::panic::resume_unwind(p)), b)
+    })
+}
+
+/// [`edit_claude_json`] for text already known to be valid JSON (or being checked alongside).
+fn edit_valid_claude_json(
+    text: &str,
+    ops: &[Op],
+) -> Result<(Option<Splices>, Vec<String>), StoreError> {
+    let invalid = |why: String| StoreError::Invalid(why);
     let b = text.as_bytes();
     let start = jsonspan::skip_ws(b, 0);
     if b.get(start) != Some(&b'{') {
@@ -578,11 +643,16 @@ fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<Stri
             Op::Approve { .. } => return Err(wrong_file()),
         }
     }
-    let root = jsonspan::object_at(text, start).map_err(invalid)?;
+    // One pass: the root, `projects`, and only the entries the ops are about.
+    let root = jsonspan::object_with(text, start, &mut |level, key| match level {
+        0 => key == "projects",
+        1 => targets.contains(&normalise_project(key)),
+        _ => false,
+    })
+    .map_err(invalid)?;
     let projects = single(&root, "projects", "the configuration")?
-        .filter(|m| b[m.value.start] == b'{')
+        .and_then(|m| m.object.as_ref())
         .ok_or_else(|| invalid("the configuration has no projects".to_owned()))?;
-    let projects = jsonspan::object_at(text, projects.value.start).map_err(invalid)?;
     let keys: Vec<String> = projects
         .members
         .iter()
@@ -616,13 +686,12 @@ fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<Stri
         if here.is_empty() {
             continue;
         }
-        if b[member.value.start] != b'{' {
+        let Some(entry) = &member.object else {
             return Err(invalid(format!(
                 "the entry for {} is not an object",
                 sanitize(&member.key)
             )));
-        }
-        let entry = jsonspan::object_at(text, member.value.start).map_err(invalid)?;
+        };
         let shown_key = sanitize(&member.key.replace('"', "\\\""));
         for list in [DISABLED, REJECTED] {
             let list_ops: Vec<&&Op> = here
@@ -638,7 +707,7 @@ fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<Stri
                 continue;
             }
             let existing = single(
-                &entry,
+                entry,
                 list,
                 &format!("the entry for {}", sanitize(&member.key)),
             )?;
@@ -704,7 +773,7 @@ fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<Stri
                     let indent = jsonspan::line_indent(text, m.key_start);
                     (m.value.clone(), render_list(&items, indent, nl)?)
                 }
-                None => add_member(text, member, &entry, list, &items, nl)?,
+                None => add_member(text, member, entry, list, &items, nl)?,
             });
         }
     }
@@ -2002,5 +2071,68 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn verify_reads_without_the_lock_when_the_change_is_intact() {
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        // Claude is busy saving: an intact change needs nothing from it, so verify must not wait or fail.
+        std::fs::create_dir(f.lock()).unwrap();
+        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert!(f.lock().is_dir(), "someone else's lock is left alone");
+    }
+
+    #[test]
+    fn verify_still_takes_the_lock_to_put_a_change_back() {
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let before = pretty(&sample());
+        std::fs::write(&f.store.path, &before).unwrap();
+        std::fs::create_dir(f.lock()).unwrap();
+        assert_eq!(f.store.verify(&plan), Err(StoreError::Locked));
+        assert_eq!(f.text(), before, "nothing written without the lock");
+    }
+
+    #[test]
+    fn large_files_take_the_two_thread_path_with_the_same_results() {
+        let history: Vec<Value> = (0..4000)
+            .map(|i| json!({"display": format!("{i} {}", "x".repeat(300))}))
+            .collect();
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["history"] = Value::Array(history);
+        let text = pretty(&doc);
+        assert!(text.len() >= PARALLEL_FROM, "{} bytes", text.len());
+        let f = Fixture::new(&text);
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        assert_eq!(
+            plan.base_hash,
+            format!("{:x}", Sha256::digest(text.as_bytes()))
+        );
+        f.store.apply(&plan).unwrap();
+        doc["projects"]["C:/work/app"]["disabledMcpServers"] = json!(["old", "gateway"]);
+        assert_eq!(f.text(), pretty(&doc));
+        // Broken at the very end: found by the check running alongside the scan.
+        let broken = format!("{}]", pretty(&doc));
+        std::fs::write(&f.store.path, &broken).unwrap();
+        let err = f
+            .store
+            .prepare(vec![disable("C:/work/app", "x")])
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Invalid(m) if m.contains("not valid JSON")),
+            "{err:?}"
+        );
     }
 }

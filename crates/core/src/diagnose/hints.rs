@@ -118,7 +118,7 @@ impl HintKind {
     }
 }
 
-use regex::Regex;
+use regex::RegexSet;
 use std::sync::LazyLock;
 
 /// In order of how specific the cause is; the first few that match are shown.
@@ -178,20 +178,18 @@ const PATTERNS: &[(HintKind, &str)] = &[
     (HintKind::ExitedImmediately, r"CONNECTION_CLOSED"),
 ];
 
-static COMPILED: LazyLock<Vec<(HintKind, Regex)>> = LazyLock::new(|| {
-    PATTERNS
-        .iter()
-        .map(|(kind, pattern)| (*kind, Regex::new(pattern).expect("valid hint pattern")))
-        .collect()
+/// All patterns in one automaton: the text is read once, not once per pattern.
+static COMPILED: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new(PATTERNS.iter().map(|(_, pattern)| pattern)).expect("valid hint patterns")
 });
 
 const MAX_HINTS: usize = 4;
 
 pub(crate) fn hints_for(text: &str) -> Vec<HintKind> {
     let matched: Vec<HintKind> = COMPILED
+        .matches(text)
         .iter()
-        .filter(|(_, re)| re.is_match(text))
-        .map(|(kind, _)| *kind)
+        .map(|i| PATTERNS[i].0)
         .collect();
     let has = |k: HintKind| matched.contains(&k);
 

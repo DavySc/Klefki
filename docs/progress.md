@@ -9,6 +9,33 @@ Earlier slice: M1 day-1 spikes done and recorded (below). Next: fix the inventor
 
 Previous slice: Read-only inventory of the real Claude Code config, restyle (Catppuccin Mocha, JetBrains Mono, bigger controls), and a light theme (Latte-based) with a System option.
 
+## Performance pass 2 (2026-10-17)
+Measured with a throwaway release benchmark (median of 5-9 runs, counting allocator; not committed, saved outside the repo). Synthetic configs, Linux, local disk.
+
+| | 61 MB before | 61 MB after | 7 MB before | 7 MB after |
+|---|---|---|---|---|
+| `docstore` prepare | 144 ms | 86-94 ms | 11.8 ms | 7.0 ms |
+| verify, lock held | 87 ms (whole check) | 0 ms (check reads without the lock) | 7.1 ms | 0 ms |
+| apply, lock held (all projects) | 384 ms | 182-352 ms (write-back noise; see below) | 21.5 ms | 18.3 ms |
+| peak heap reading the file | 67.1 MB | 60.8 MB (= file size) | 8.4 MB | 8.4 MB |
+| sanitize 1 MB | 6.3 ms | 0.10 ms | | |
+| hints over 1 MB | 5.8 ms | 3.5 ms | | |
+| Diagnose report, 1 MB log | 21.9 ms | 16.3 ms | | |
+
+Apply under the lock at 61 MB now splits into read 46 ms, edit 22 ms, write 18 ms (up to 210 ms when the kernel throttles repeated 60 MB writes), fsync 55-61 ms, link + rename + rotation under 0.3 ms. What is left is the file system.
+
+UI (kittest, release, one `step` with no painting): frame time 0.28 / 0.46 / 2.95 ms for 30 / 300 / 3000 rows before, 0.26 / 0.26 / 0.45 ms after; allocations per frame 1500 / 6896 / 82515 before, 1116 / 1236 / 1236 after (the rest is egui's own). A status event: 52 / 502 / 5002 allocations before, none of klefki's own after.
+
+- Engine: the CLI version is asked once per CLI build (path, size, modification time), not on every refresh: each ask was a Node process start. After klefki saves a change it reloads the snapshot only; it no longer looks for the CLI again, asks its version, drops running checks and re-checks every unknown server. Servers the change switched on are checked. Three tests, which failed on the old behaviour (counted from fake-claude's log).
+- `docstore`: one pass over the file for root, projects and the targeted entries (`jsonspan::object_with`); on files of 1 MiB or more the JSON check runs on a second thread alongside the scan, and the hash in `prepare` alongside the edit. `verify` reads without the lock and only takes it to write (two tests: no wait while Claude holds the lock; still no write without it). The engine reads `.claude.json` once for both the inventory and the plan.
+- `fsx`: the read buffer is sized from the metadata, so peak heap equals the file size.
+- `sanitize`: plain runs (printable ASCII, tab, newline) are copied whole, tested 16 bytes at a time in a form the compiler vectorises; checked against the previous implementation on 20,000 generated strings.
+- `hints`: one `RegexSet` pass instead of 16 regex passes.
+- `inventory`: shadowed check without an O(n²) scan with an allocation per comparison; names lower-cased once for the casing check.
+- UI: grid rows are cached per snapshot and search; live statuses are stored by row position, so drawing a row needs no key; status and diagnosis events compare ids in place (`ServerRow::is`); the detail panel no longer clones the selected row each frame. Two new tests (results and selection follow reordered rows; the grid follows a new snapshot and search); removing the cache invalidation fails 25 tests.
+- Considered and not done: streaming the inventory parse (peak heap 62 MB to 0.8 MB, but 2.5 times slower: 161 vs 63 ms); memory-mapping the file (unsafe, and a truncating writer would crash the app); a faster non-cryptographic hash (SHA-256 already runs at about 1.3 GB/s and is off the critical path); prefiltering the redaction rules (a later rule could match text an earlier one produced; not worth the risk on a security path); dropping egui's default fonts (they are the fallback for emoji and symbols).
+- Checks: fmt 0; clippy workspace 0 and `-p klefki` 0; `cargo test --workspace` 212 core + 70 app passed, three runs in a row; `cargo deny check` 0.
+
 ## Lock time and lighter reads (2026-10-17)
 Measured on synthetic configs (release build, Linux, local disk; throwaway benchmark, not committed). "Lock held" is `apply` only.
 

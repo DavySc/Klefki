@@ -132,6 +132,11 @@ impl ServerRow {
             name: self.name.clone(),
         }
     }
+
+    /// Whether this row is the server `id` names. Compares in place, without building an id.
+    pub fn is(&self, id: &ServerId) -> bool {
+        self.scope == id.scope && self.name == id.name && self.project == id.project
+    }
 }
 
 #[derive(Debug, Clone, Default)]

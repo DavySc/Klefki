@@ -10,6 +10,8 @@ pub(crate) struct Member {
     /// Where the key's opening quote is.
     pub key_start: usize,
     pub value: Range<usize>,
+    /// The value's own members, when the caller asked to look inside it (see [`object_with`]).
+    pub object: Option<Object>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +31,28 @@ pub(crate) fn skip_ws(b: &[u8], mut i: usize) -> usize {
 }
 
 /// The members of the object whose `{` is at `open`, in file order (duplicates included).
+#[cfg(test)]
 pub(crate) fn object_at(text: &str, open: usize) -> Result<Object, String> {
+    object_with(text, open, &mut |_, _| false)
+}
+
+/// Like [`object_at`], and also reads the members of nested objects for which `descend(level, key)` says so
+/// (`level` 0 for this object's members). Each byte is scanned once, however deep the caller looks: a nested object
+/// is read in place of being skipped.
+pub(crate) fn object_with(
+    text: &str,
+    open: usize,
+    descend: &mut dyn FnMut(usize, &str) -> bool,
+) -> Result<Object, String> {
+    object_level(text, open, 0, descend)
+}
+
+fn object_level(
+    text: &str,
+    open: usize,
+    level: usize,
+    descend: &mut dyn FnMut(usize, &str) -> bool,
+) -> Result<Object, String> {
     let b = text.as_bytes();
     if b.get(open) != Some(&b'{') {
         return Err("expected an object".to_owned());
@@ -55,11 +78,17 @@ pub(crate) fn object_at(text: &str, open: usize) -> Result<Object, String> {
             return Err("expected ':'".to_owned());
         }
         let start = skip_ws(b, colon + 1);
-        let end = value_end(b, start)?;
+        let (end, object) = if b.get(start) == Some(&b'{') && descend(level, &key) {
+            let inner = object_level(text, start, level + 1, descend)?;
+            (inner.close + 1, Some(inner))
+        } else {
+            (value_end(b, start)?, None)
+        };
         members.push(Member {
             key,
             key_start: i,
             value: start..end,
+            object,
         });
         i = skip_ws(b, end);
         match b.get(i) {
@@ -195,6 +224,31 @@ mod tests {
         ] {
             assert!(object_at(text, 0).is_err(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn nested_objects_are_read_only_where_asked() {
+        let text = r#"{"skip": {"a": {"b": 1}}, "into": {"x": {"y": [1]}, "z": 2}}"#;
+        let mut asked = Vec::new();
+        let o = object_with(text, 0, &mut |level, key| {
+            asked.push((level, key.to_owned()));
+            key == "into" || key == "x"
+        })
+        .unwrap();
+        assert_eq!(o.members[0].object, None);
+        let into = o.members[1].object.as_ref().unwrap();
+        assert_eq!(into.members[0].key, "x");
+        let x = into.members[0].object.as_ref().unwrap();
+        assert_eq!(&text[x.members[0].value.clone()], "[1]");
+        assert_eq!(
+            &text[o.members[1].value.clone()],
+            r#"{"x": {"y": [1]}, "z": 2}"#
+        );
+        // Only object values are offered, each once, with their depth.
+        assert_eq!(
+            asked,
+            [(0, "skip".into()), (0, "into".into()), (1, "x".into())]
+        );
     }
 
     #[test]

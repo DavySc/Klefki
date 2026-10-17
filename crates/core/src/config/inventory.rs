@@ -17,8 +17,18 @@ const MAX_MCP_SERVERS: usize = 500;
 const MAX_TEXT_CHARS: usize = 512;
 
 pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
+    let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON).map_err(|e| e.to_string());
+    load_text(
+        paths,
+        text.as_ref().map(Option::as_deref).map_err(String::clone),
+    )
+}
+
+/// [`load`] with `.claude.json` already read (`Ok(None)`: it does not exist), so a caller that needs the text too
+/// reads the file once.
+pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>) -> Snapshot {
     let mut snap = Snapshot::default();
-    let root = match read_claude_json(&paths.claude_json) {
+    let root = match text.and_then(|t| t.map(parse_claude_json).transpose()) {
         Ok(Some(v)) => v,
         Ok(None) => {
             snap.warnings.push(format!(
@@ -75,6 +85,8 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
     for (key, project) in &projects {
         let disabled = &disabled_by_project[key];
         let mut seen_local = BTreeSet::new();
+        // This project's local rows are the ones pushed from here on in this iteration.
+        let local_start = snap.servers.len();
         for value in &project.values {
             let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
                 continue;
@@ -127,11 +139,9 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
                         hint,
                     );
                     r.approval = Some(approval);
-                    r.shadowed = snap.servers.iter().any(|o| {
-                        o.scope == Scope::Local
-                            && o.name == r.name
-                            && o.project.as_deref().map(normalise_project).as_deref() == Some(key)
-                    });
+                    r.shadowed = snap.servers[local_start..]
+                        .iter()
+                        .any(|o| o.scope == Scope::Local && o.name == r.name);
                     snap.servers.push(r);
                 }
             }
@@ -255,14 +265,13 @@ fn mark_casing_collisions(rows: &mut [ServerRow]) {
         set.extend(&user);
         sets.push(set);
     }
+    // Each name is lower-cased once; user rows take part in every project's set.
+    let lower: Vec<String> = rows.iter().map(|r| r.name.to_lowercase()).collect();
     let mut flagged = BTreeSet::new();
     for set in &sets {
-        let mut by_lower: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        let mut by_lower: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
         for &i in set {
-            by_lower
-                .entry(rows[i].name.to_lowercase())
-                .or_default()
-                .push(i);
+            by_lower.entry(lower[i].as_str()).or_default().push(i);
         }
         for group in by_lower.values() {
             let spellings: BTreeSet<&str> = group.iter().map(|&i| rows[i].name.as_str()).collect();
@@ -511,18 +520,22 @@ const ENTRY_KEYS: &[&str] = &[
     "enableAllProjectMcpServers",
 ];
 
-/// Reads `.claude.json` keeping only what the inventory uses: `mcpServers`, and in `projects` the entries' server
+/// Parses `.claude.json` keeping only what the inventory uses: `mcpServers`, and in `projects` the entries' server
 /// lists. Everything else (chat history, caches, tips) is checked as JSON but skipped while parsing, not built into a
 /// tree, which matters for files of tens of megabytes. A root that is not an object comes back as `Null`.
+#[cfg(test)]
 fn read_claude_json(path: &Path) -> Result<Option<Value>, String> {
-    let Some(text) = fsx::read_limited(path, MAX_CLAUDE_JSON).map_err(|e| e.to_string())? else {
-        return Ok(None);
-    };
-    let mut de = serde_json::Deserializer::from_str(&text);
-    let value = serde::de::DeserializeSeed::deserialize(Level::Root, &mut de)
+    fsx::read_limited(path, MAX_CLAUDE_JSON)
+        .map_err(|e| e.to_string())?
+        .map(|text| parse_claude_json(&text))
+        .transpose()
+}
+
+fn parse_claude_json(text: &str) -> Result<Value, String> {
+    let mut de = serde_json::Deserializer::from_str(text);
+    serde::de::DeserializeSeed::deserialize(Level::Root, &mut de)
         .and_then(|v| de.end().map(|()| v))
-        .map_err(|e| format!("invalid JSON ({e})"))?;
-    Ok(Some(value))
+        .map_err(|e| format!("invalid JSON ({e})"))
 }
 
 /// Where in `.claude.json` a value sits, which decides what of it is kept.

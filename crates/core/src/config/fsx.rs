@@ -38,7 +38,9 @@ pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option
             "file is larger than the {max_bytes} byte limit"
         )));
     }
-    let mut buf = Vec::new();
+    // Sized from the metadata (plus one byte, to notice a file that grew meanwhile), so a large file is read
+    // into one allocation rather than a series of growing ones.
+    let mut buf = Vec::with_capacity(meta.len() as usize + 1);
     File::open(path)?
         .take(max_bytes + 1)
         .read_to_end(&mut buf)?;
