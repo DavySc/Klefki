@@ -5,7 +5,7 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Command, Core, Event, Scope, ServerId, ServerRow, Snapshot, Status, TransportKind,
+    Approval, Command, Core, Event, Scope, ServerId, ServerRow, Snapshot, Status, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -413,6 +413,7 @@ impl ShellApp {
         let pal = theme::palette(ui.ctx());
         let rows = self.grid_rows();
         let ctrl = ui.input(|i| i.modifiers.command);
+        let project_count = self.snapshot.project_count;
         let mut clicked = None;
         TableBuilder::new(ui)
             .striped(true)
@@ -446,7 +447,7 @@ impl ShellApp {
                     GridRow::Server(i) => {
                         let s = &self.snapshot.servers[*i];
                         row.set_selected(self.selected.contains(i));
-                        row.col(|ui| name_cell(ui, s));
+                        row.col(|ui| name_cell(ui, s, project_count));
                         row.col(|ui| {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
@@ -517,7 +518,20 @@ impl ShellApp {
                         kv("Project", s.project.clone().unwrap_or_else(|| "-".into()));
                         kv("Type", s.transport.label().to_owned());
                         kv("Target", s.target.clone());
-                        kv("Enabled", if s.enabled { "yes" } else { "no" }.to_owned());
+                        let enabled = if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
+                            format!(
+                                "disabled in {} of {} projects",
+                                s.disabled_in, self.snapshot.project_count
+                            )
+                        } else if s.enabled {
+                            "yes".to_owned()
+                        } else {
+                            "no".to_owned()
+                        };
+                        kv("Enabled", enabled);
+                        if let Some(approval) = s.approval {
+                            kv("Approval", approval.label().to_owned());
+                        }
                         kv("Shadowed", if s.shadowed { "yes" } else { "no" }.to_owned());
                     });
             }
@@ -598,7 +612,7 @@ fn group_title(s: &ServerRow) -> String {
     }
 }
 
-fn name_cell(ui: &mut Ui, s: &ServerRow) {
+fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     let pal = theme::palette(ui.ctx());
     let color = if s.enabled { pal.text } else { pal.disabled };
     ui.add(egui::Label::new(RichText::new(&s.name).color(color)).truncate());
@@ -615,12 +629,29 @@ fn name_cell(ui: &mut Ui, s: &ServerRow) {
             badge(ui, text, fill);
         }
     }
+    // The toggle is per project: a user server can be off in some and on in others.
+    if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
+        badge(
+            ui,
+            &format!("off in {}/{}", s.disabled_in, project_count),
+            pal.warn,
+        );
+    }
+    if s.approval == Some(Approval::Rejected) {
+        badge(ui, "rejected", pal.danger);
+    }
 }
 
 fn status_cell(ui: &mut Ui, s: &ServerRow, status: Status, detail: Option<&str>) {
     let pal = theme::palette(ui.ctx());
     if !s.enabled {
         ui.label(RichText::new("Disabled").color(pal.disabled));
+        return;
+    }
+    if s.approval == Some(Approval::Rejected) {
+        ui.label(
+            RichText::new(format!("\u{25CF} {}", Approval::Rejected.label())).color(pal.danger),
+        );
         return;
     }
     let color = match status {
@@ -777,6 +808,8 @@ mod tests {
             target: format!("https://{name}.example.com/mcp"),
             status: Status::Connected,
             enabled: true,
+            disabled_in: 0,
+            approval: None,
             shadowed: false,
             casing_collision: false,
         };
@@ -896,6 +929,8 @@ mod tests {
             target: "npx something".to_owned(),
             status: Status::Unknown,
             enabled: true,
+            disabled_in: 0,
+            approval: None,
             shadowed: false,
             casing_collision: false,
         }
@@ -1137,5 +1172,86 @@ mod tests {
         h.run();
         h.get_by_label_contains("Disabled");
         assert!(h.query_by_label_contains("Connected").is_none());
+    }
+
+    // ---- the toggle is per project; project servers have an approval ----
+
+    fn snapshot_with_projects(count: usize, rows: Vec<ServerRow>) -> klefki_core::api::Event {
+        klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+            servers: rows,
+            project_count: count,
+            ..Snapshot::default()
+        }))
+    }
+
+    #[test]
+    fn a_user_server_off_in_some_projects_says_how_many() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.disabled_in = 3;
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label("gateway");
+        h.get_by_label("off in 3/17");
+        assert!(
+            h.query_by_label_contains("Disabled").is_none(),
+            "still on in 14 projects"
+        );
+    }
+
+    #[test]
+    fn a_user_server_off_everywhere_reads_disabled_without_the_partial_badge() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.disabled_in = 17;
+        row.enabled = false;
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Disabled");
+        assert!(h.query_by_label_contains("off in").is_none());
+    }
+
+    #[test]
+    fn a_rejected_project_server_says_rejected_and_pending_is_a_status() {
+        let (mut h, engine) = live_harness();
+        let mut rejected = live_row("no-thanks", Scope::Project, Some("C:/Repos/WebApp"));
+        rejected.approval = Some(klefki_core::api::Approval::Rejected);
+        let mut pending = live_row("waiting", Scope::Project, Some("C:/Repos/WebApp"));
+        pending.approval = Some(klefki_core::api::Approval::Pending);
+        pending.status = Status::PendingApproval;
+        engine
+            .events
+            .send(snapshot_with_projects(1, vec![rejected, pending]))
+            .unwrap();
+        h.run();
+        h.get_by_label("\u{25CF} Rejected");
+        h.get_by_label("\u{25CF} Pending approval");
+    }
+
+    #[test]
+    fn the_detail_panel_explains_the_toggle_and_the_approval() {
+        let (mut h, engine) = live_harness();
+        let mut user = live_row("gateway", Scope::User, None);
+        user.disabled_in = 3;
+        let mut project = live_row("docs", Scope::Project, Some("C:/Repos/WebApp"));
+        project.approval = Some(klefki_core::api::Approval::Pending);
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![user, project]))
+            .unwrap();
+        h.run();
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("disabled in 3 of 17 projects");
+        h.get_by_label("docs").click();
+        h.run();
+        h.get_by_label("Pending approval");
+        assert!(h.query_by_label_contains("of 17 projects").is_none());
     }
 }

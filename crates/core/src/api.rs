@@ -74,6 +74,25 @@ impl Status {
     }
 }
 
+/// Whether the user has approved a project (`.mcp.json`) server. Separate from the on/off toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Approved,
+    /// Claude has not asked yet, or the user has not answered; it does not run the server.
+    Pending,
+    Rejected,
+}
+
+impl Approval {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approved => "Approved",
+            Self::Pending => "Pending approval",
+            Self::Rejected => "Rejected",
+        }
+    }
+}
+
 /// Identifies a row across snapshots, so live results can be matched back to it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerId {
@@ -92,7 +111,13 @@ pub struct ServerRow {
     /// URL for remote servers, the command line for stdio.
     pub target: String,
     pub status: Status,
+    /// The on/off toggle (`/mcp disable`). Per project in Claude Code; a user server is only `false` here when
+    /// it is off in every known project (see `disabled_in`).
     pub enabled: bool,
+    /// User servers only: in how many known projects the toggle is off (out of `Snapshot::project_count`).
+    pub disabled_in: usize,
+    /// Project (`.mcp.json`) servers only.
+    pub approval: Option<Approval>,
     pub shadowed: bool,
     pub casing_collision: bool,
 }
@@ -110,6 +135,8 @@ impl ServerRow {
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub cli_version: Option<String>,
+    /// Projects Claude knows about (one per directory, spellings merged).
+    pub project_count: usize,
     pub servers: Vec<ServerRow>,
     /// Problems found while reading the configuration. Already sanitised.
     pub warnings: Vec<String>,

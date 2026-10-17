@@ -1,7 +1,7 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::{ConfigPaths, fsx};
-use crate::api::{Scope, ServerRow, Snapshot, Status, TransportKind};
+use crate::api::{Approval, Scope, ServerRow, Snapshot, Status, TransportKind};
 use crate::sanitize::{self, sanitize};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -45,22 +45,34 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
 
     let hints = Hints::load(paths, &mut snap.warnings);
 
+    let projects = merged_projects(root);
+    snap.project_count = projects.len();
+    // The on/off toggle is a list of names in each project's entry (decision 002).
+    let disabled_by_project: BTreeMap<&String, BTreeSet<String>> = projects
+        .iter()
+        .map(|(key, project)| {
+            let names = string_set(project.values.iter().map(|v| v.get("disabledMcpServers")));
+            (key, names)
+        })
+        .collect();
+
     if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
         for (name, entry) in servers {
             let status = hints.status_of(name);
-            snap.servers
-                .push(row(name, entry, Scope::User, None, true, status));
+            let mut r = row(name, entry, Scope::User, None, true, status);
+            r.disabled_in = disabled_by_project
+                .values()
+                .filter(|d| d.contains(name))
+                .count();
+            // A user server is one row, but the toggle is per project: it only counts as off when it is off
+            // everywhere Claude knows about.
+            r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
+            snap.servers.push(r);
         }
     }
 
-    for (key, project) in merged_projects(root) {
-        let disabled_local = string_set(project.values.iter().map(|v| v.get("disabledMcpServers")));
-        let disabled_project = string_set(
-            project
-                .values
-                .iter()
-                .map(|v| v.get("disabledMcpjsonServers")),
-        );
+    for (key, project) in &projects {
+        let disabled = &disabled_by_project[key];
         let mut seen_local = BTreeSet::new();
         for value in &project.values {
             let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
@@ -68,13 +80,12 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
-                    let enabled = !disabled_local.contains(name);
                     snap.servers.push(row(
                         name,
                         entry,
                         Scope::Local,
                         Some(&project.display),
-                        enabled,
+                        !disabled.contains(name),
                         Status::Unknown,
                     ));
                 }
@@ -98,20 +109,27 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
                         sanitize(&name)
                     ));
                 }
+                let approvals = ApprovalLists::load(project, &mut snap.warnings);
                 for (name, entry) in servers {
-                    let enabled = !disabled_project.contains(&name);
+                    let approval = approvals.of(&name);
+                    let hint = if approval == Approval::Pending {
+                        Status::PendingApproval
+                    } else {
+                        Status::Unknown
+                    };
                     let mut r = row(
                         &name,
                         &entry,
                         Scope::Project,
                         Some(&project.display),
-                        enabled,
-                        Status::Unknown,
+                        !disabled.contains(&name),
+                        hint,
                     );
+                    r.approval = Some(approval);
                     r.shadowed = snap.servers.iter().any(|o| {
                         o.scope == Scope::Local
                             && o.name == r.name
-                            && o.project.as_deref().map(normalise_project).as_deref() == Some(&key)
+                            && o.project.as_deref().map(normalise_project).as_deref() == Some(key)
                     });
                     snap.servers.push(r);
                 }
@@ -145,6 +163,8 @@ fn row(
         target,
         status,
         enabled,
+        disabled_in: 0,
+        approval: None,
         shadowed: false,
         casing_collision: false,
     }
@@ -360,6 +380,58 @@ impl<'de> Deserialize<'de> for Pairs {
             }
         }
         d.deserialize_map(V)
+    }
+}
+
+// ---------------------------------------------------------------- approval
+
+/// Who has said yes or no to a project server. Claude keeps this in the project entry of `.claude.json` and,
+/// in current versions, in the project's own `.claude/settings.local.json`; both are read (decision 002).
+struct ApprovalLists {
+    enabled: BTreeSet<String>,
+    rejected: BTreeSet<String>,
+    all: bool,
+}
+
+impl ApprovalLists {
+    fn load(project: &Project<'_>, warnings: &mut Vec<String>) -> Self {
+        let mut lists = Self {
+            enabled: BTreeSet::new(),
+            rejected: BTreeSet::new(),
+            all: false,
+        };
+        for value in &project.values {
+            lists.absorb(value);
+        }
+        let path = Path::new(&project.raw)
+            .join(".claude")
+            .join("settings.local.json");
+        match read_json(&path, MAX_MCP_JSON) {
+            Ok(Some(value)) => lists.absorb(&value),
+            Ok(None) => {}
+            Err(e) => warnings.push(format!("Ignored {}: {e}", display_path(&path))),
+        }
+        lists
+    }
+
+    fn absorb(&mut self, source: &Value) {
+        self.enabled.extend(string_set(std::iter::once(
+            source.get("enabledMcpjsonServers"),
+        )));
+        self.rejected.extend(string_set(std::iter::once(
+            source.get("disabledMcpjsonServers"),
+        )));
+        self.all |= source.get("enableAllProjectMcpServers") == Some(&Value::Bool(true));
+    }
+
+    fn of(&self, name: &str) -> Approval {
+        if self.rejected.contains(name) {
+            Approval::Rejected
+        } else if self.all || self.enabled.contains(name) {
+            Approval::Approved
+        } else {
+            Approval::Pending
+        }
     }
 }
 
@@ -584,28 +656,25 @@ mod tests {
     }
 
     #[test]
-    fn project_servers_come_from_mcp_json_and_can_be_shadowed_or_disabled() {
+    fn project_servers_come_from_mcp_json_and_can_be_shadowed() {
         let e = Env::new();
         let p = e.project("app");
         std::fs::write(
             p.join(".mcp.json"),
             r#"{"mcpServers":{"shared":{"type":"http","url":"https://s.example.com"},
-                "docs":{"command":"node","args":["docs.js"]},
-                "off":{"type":"sse","url":"https://o.example.com"}}}"#,
+                "docs":{"command":"node","args":["docs.js"]}}}"#,
         )
         .unwrap();
         e.write(
             ".claude.json",
             &json!({"projects": {p.to_string_lossy(): {
-                "mcpServers": {"shared": {"type":"http","url":"https://mine.example.com"}},
-                "disabledMcpjsonServers": ["off"]
+                "mcpServers": {"shared": {"type":"http","url":"https://mine.example.com"}}
             }}}),
         );
         let s = e.load();
         assert!(find(&s, Scope::Project, "shared").shadowed);
         assert!(!find(&s, Scope::Local, "shared").shadowed);
         assert!(!find(&s, Scope::Project, "docs").shadowed);
-        assert!(!find(&s, Scope::Project, "off").enabled);
     }
 
     #[test]
@@ -819,5 +888,298 @@ mod tests {
         );
         let s = e.load();
         assert!(s.servers[0].target.chars().count() <= MAX_TEXT_CHARS + 1);
+    }
+
+    // ---- enabled / disabled and approval, per decision 002 ----
+
+    fn write_local_settings(project: &Path, v: &Value) {
+        let dir = project.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.local.json"), v.to_string()).unwrap();
+    }
+
+    fn project_with_mcp_json(e: &Env, name: &str, servers: &[&str]) -> PathBuf {
+        let p = e.project(name);
+        let entries: serde_json::Map<String, Value> = servers
+            .iter()
+            .map(|s| {
+                (
+                    (*s).to_owned(),
+                    json!({"type": "http", "url": "https://p.example.com"}),
+                )
+            })
+            .collect();
+        std::fs::write(
+            p.join(".mcp.json"),
+            json!({"mcpServers": entries}).to_string(),
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn the_toggle_is_disabledmcpservers_for_every_scope() {
+        let e = Env::new();
+        let p = project_with_mcp_json(&e, "app", &["proj-on", "proj-off"]);
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"user-srv": {"command": "u"}},
+                "projects": {p.to_string_lossy(): {
+                    "mcpServers": {"local-on": {"command": "a"}, "local-off": {"command": "b"}},
+                    "disabledMcpServers": ["local-off", "proj-off"],
+                    "enabledMcpjsonServers": ["proj-on", "proj-off"]
+                }}
+            }),
+        );
+        let s = e.load();
+        assert!(find(&s, Scope::Local, "local-on").enabled);
+        assert!(!find(&s, Scope::Local, "local-off").enabled);
+        assert!(find(&s, Scope::Project, "proj-on").enabled);
+        assert!(!find(&s, Scope::Project, "proj-off").enabled);
+        assert!(find(&s, Scope::User, "user-srv").enabled, "not in the list");
+    }
+
+    #[test]
+    fn rejecting_a_project_server_is_not_the_toggle() {
+        // `disabledMcpjsonServers` is the approval dialog's "no", not the /mcp on/off switch.
+        let e = Env::new();
+        let p = project_with_mcp_json(&e, "app", &["srv"]);
+        e.write(
+            ".claude.json",
+            &json!({"projects": {p.to_string_lossy(): {"disabledMcpjsonServers": ["srv"]}}}),
+        );
+        let s = e.load();
+        let r = find(&s, Scope::Project, "srv");
+        assert!(r.enabled, "the toggle is untouched");
+        assert_eq!(r.approval, Some(Approval::Rejected));
+    }
+
+    #[test]
+    fn a_user_server_is_disabled_per_project() {
+        let e = Env::new();
+        let a = e.project("a");
+        let b = e.project("b");
+        let c = e.project("c");
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}, "v": {"command": "y"}},
+                "projects": {
+                    a.to_string_lossy(): {"disabledMcpServers": ["u", "v"]},
+                    b.to_string_lossy(): {"disabledMcpServers": ["u"]},
+                    c.to_string_lossy(): {}
+                }
+            }),
+        );
+        let s = e.load();
+        assert_eq!(s.project_count, 3);
+        let u = find(&s, Scope::User, "u");
+        assert_eq!(u.disabled_in, 2);
+        assert!(u.enabled, "still on in one project");
+        assert_eq!(find(&s, Scope::User, "v").disabled_in, 1);
+    }
+
+    #[test]
+    fn a_user_server_off_in_every_known_project_counts_as_disabled() {
+        let e = Env::new();
+        let a = e.project("a");
+        let b = e.project("b");
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}},
+                "projects": {
+                    a.to_string_lossy(): {"disabledMcpServers": ["u"]},
+                    b.to_string_lossy(): {"disabledMcpServers": ["u"]}
+                }
+            }),
+        );
+        let s = e.load();
+        let u = find(&s, Scope::User, "u");
+        assert_eq!((u.disabled_in, s.project_count), (2, 2));
+        assert!(!u.enabled);
+    }
+
+    #[test]
+    fn with_no_known_projects_a_user_server_is_simply_enabled() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"mcpServers": {"u": {"command": "x"}}}),
+        );
+        let s = e.load();
+        assert_eq!(s.project_count, 0);
+        let u = find(&s, Scope::User, "u");
+        assert!(u.enabled);
+        assert_eq!(u.disabled_in, 0);
+    }
+
+    #[test]
+    fn one_project_under_two_spellings_counts_once() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}},
+                "projects": {
+                    "c:\\Users\\x": {"disabledMcpServers": ["u"]},
+                    "C:/Users/x/": {"disabledMcpServers": ["u"]}
+                }
+            }),
+        );
+        let s = e.load();
+        assert_eq!(s.project_count, 1);
+        assert_eq!(find(&s, Scope::User, "u").disabled_in, 1);
+    }
+
+    #[test]
+    fn junk_in_the_disabled_list_is_ignored() {
+        let e = Env::new();
+        let a = e.project("a");
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}},
+                "projects": {a.to_string_lossy(): {"disabledMcpServers": [1, null, {"x": 1}, "u"]}}
+            }),
+        );
+        assert_eq!(find(&e.load(), Scope::User, "u").disabled_in, 1);
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}},
+                "projects": {a.to_string_lossy(): {"disabledMcpServers": "u"}}
+            }),
+        );
+        assert_eq!(
+            find(&e.load(), Scope::User, "u").disabled_in,
+            0,
+            "not an array"
+        );
+    }
+
+    #[test]
+    fn approval_is_read_from_the_project_entry_and_from_settings_local_json() {
+        let e = Env::new();
+        let p = project_with_mcp_json(
+            &e,
+            "app",
+            &["in-entry", "in-local", "neither", "no-way", "both"],
+        );
+        e.write(
+            ".claude.json",
+            &json!({"projects": {p.to_string_lossy(): {
+                "enabledMcpjsonServers": ["in-entry", "both"]}}}),
+        );
+        write_local_settings(
+            &p,
+            &json!({"enabledMcpjsonServers": ["in-local"], "disabledMcpjsonServers": ["no-way", "both"]}),
+        );
+        let s = e.load();
+        let approval = |n: &str| find(&s, Scope::Project, n).approval;
+        assert_eq!(approval("in-entry"), Some(Approval::Approved));
+        assert_eq!(approval("in-local"), Some(Approval::Approved));
+        assert_eq!(approval("neither"), Some(Approval::Pending));
+        assert_eq!(approval("no-way"), Some(Approval::Rejected));
+        assert_eq!(
+            approval("both"),
+            Some(Approval::Rejected),
+            "a rejection beats an approval"
+        );
+    }
+
+    #[test]
+    fn approving_everything_covers_servers_not_listed() {
+        for place in ["entry", "local"] {
+            let e = Env::new();
+            let p = project_with_mcp_json(&e, "app", &["x", "y"]);
+            if place == "entry" {
+                e.write(
+                    ".claude.json",
+                    &json!({"projects": {p.to_string_lossy(): {"enableAllProjectMcpServers": true}}}),
+                );
+            } else {
+                e.write(
+                    ".claude.json",
+                    &json!({"projects": {p.to_string_lossy(): {}}}),
+                );
+                write_local_settings(&p, &json!({"enableAllProjectMcpServers": true}));
+            }
+            let s = e.load();
+            for n in ["x", "y"] {
+                assert_eq!(
+                    find(&s, Scope::Project, n).approval,
+                    Some(Approval::Approved),
+                    "{place} {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pending_project_server_says_so_and_other_scopes_have_no_approval() {
+        let e = Env::new();
+        let p = project_with_mcp_json(&e, "app", &["waiting"]);
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}},
+                "projects": {p.to_string_lossy(): {"mcpServers": {"l": {"command": "y"}}}}
+            }),
+        );
+        let s = e.load();
+        let w = find(&s, Scope::Project, "waiting");
+        assert_eq!(w.approval, Some(Approval::Pending));
+        assert_eq!(w.status, Status::PendingApproval);
+        assert_eq!(find(&s, Scope::User, "u").approval, None);
+        assert_eq!(find(&s, Scope::Local, "l").approval, None);
+    }
+
+    #[test]
+    fn a_broken_settings_local_json_is_ignored_with_a_warning() {
+        let e = Env::new();
+        let p = project_with_mcp_json(&e, "app", &["srv"]);
+        e.write(
+            ".claude.json",
+            &json!({"projects": {p.to_string_lossy(): {"enabledMcpjsonServers": ["srv"]}}}),
+        );
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        std::fs::write(p.join(".claude").join("settings.local.json"), "{ not json").unwrap();
+        let s = e.load();
+        assert_eq!(
+            find(&s, Scope::Project, "srv").approval,
+            Some(Approval::Approved)
+        );
+        assert!(
+            s.warnings.iter().any(|w| w.contains("settings.local.json")),
+            "{:?}",
+            s.warnings
+        );
+        // An oversized file is refused the same way.
+        std::fs::write(
+            p.join(".claude").join("settings.local.json"),
+            " ".repeat(MAX_MCP_JSON as usize + 1),
+        )
+        .unwrap();
+        let s = e.load();
+        assert_eq!(
+            find(&s, Scope::Project, "srv").approval,
+            Some(Approval::Approved)
+        );
+        assert!(s.warnings.iter().any(|w| w.contains("settings.local.json")));
+    }
+
+    #[test]
+    fn approval_is_not_read_from_a_project_path_we_refuse_to_open() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"projects": {"\\\\evil\\share\\proj": {"enabledMcpjsonServers": ["x"]}}}),
+        );
+        // Nothing to list (the .mcp.json is never opened) and nothing to crash on.
+        let s = e.load();
+        assert!(s.servers.is_empty());
+        assert_eq!(s.project_count, 1);
     }
 }
