@@ -1,0 +1,14 @@
+{
+  "cli_version": "2.1.0",
+  "servers": [
+    { "name": "gateway", "scope": "user", "transport": "http", "target": "https://gateway.example.com/mcp", "status": "connected", "enabled": true },
+    { "name": "issue-tracker", "scope": "user", "transport": "http", "target": "https://it.example.com/mcp", "status": "needs_auth", "enabled": true },
+    { "name": "azure-devops", "scope": "user", "transport": "stdio", "target": "npx -y @azure-devops/mcp contoso", "status": "connected", "enabled": true },
+    { "name": "legacy-events", "scope": "user", "transport": "sse", "target": "https://events.example.com/sse", "status": "failed", "enabled": false },
+    { "name": "gateway", "scope": "local", "project": "C:/Repos/Gateway", "transport": "http", "target": "https://gateway-dev.example.com/mcp", "status": "unknown", "enabled": true },
+    { "name": "Gateway", "scope": "local", "project": "C:/Repos/WebApp", "transport": "http", "target": "https://gateway.example.com/mcp", "status": "unknown", "enabled": true, "casing_collision": true },
+    { "name": "docs", "scope": "project", "project": "C:/Repos/WebApp", "transport": "stdio", "target": "node tools/docs-mcp.js", "status": "unknown", "enabled": true },
+    { "name": "gateway", "scope": "project", "project": "C:/Repos/Gateway", "transport": "http", "target": "https://shared.example.com/mcp", "status": "unknown", "enabled": true, "shadowed": true },
+    { "name": "broken", "scope": "project", "project": "C:/Repos/WebApp", "transport": "invalid", "target": "\u001b[31mmissing command\u001b[0m", "status": "unknown", "enabled": false }
+  ]
+}

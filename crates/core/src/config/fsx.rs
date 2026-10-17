@@ -1,0 +1,105 @@
+//! The single file-access layer. Reads are size-limited and refuse symlinks and secret stores.
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
+
+const DENIED_FILE_NAMES: &[&str] = &[".credentials.json"];
+
+/// Reads a UTF-8 text file of at most `max_bytes`. `Ok(None)` when the file does not exist.
+pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| DENIED_FILE_NAMES.contains(&n))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "reading credential files is not allowed",
+        ));
+    }
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::other("refusing to follow a symlink"));
+    }
+    if !meta.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    if meta.len() > max_bytes {
+        return Err(io::Error::other(format!(
+            "file is larger than the {max_bytes} byte limit"
+        )));
+    }
+    let mut buf = Vec::new();
+    File::open(path)?
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(io::Error::other(
+            "file grew past the size limit while reading",
+        ));
+    }
+    let text = String::from_utf8(buf).map_err(|_| io::Error::other("file is not valid UTF-8"))?;
+    Ok(Some(
+        text.strip_prefix('\u{feff}')
+            .map(str::to_owned)
+            .unwrap_or(text),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_limited(&dir.path().join("nope.json"), 10).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_within_limit_and_strips_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.json");
+        std::fs::write(&f, "\u{feff}{}").unwrap();
+        assert_eq!(read_limited(&f, 10).unwrap().as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.json");
+        std::fs::write(&f, "x".repeat(11)).unwrap();
+        assert!(read_limited(&f, 10).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("bin.json");
+        std::fs::write(&f, [0xff, 0xfe, 0xfd]).unwrap();
+        assert!(read_limited(&f, 10).is_err());
+        assert!(read_limited(dir.path(), 10).is_err());
+    }
+
+    #[test]
+    fn never_reads_the_credentials_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(".credentials.json");
+        std::fs::write(&f, "{}").unwrap();
+        let err = read_limited(&f, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // Also when it does not exist: the refusal must not depend on presence.
+        let missing = dir.path().join("sub").join(".credentials.json");
+        assert_eq!(
+            read_limited(&missing, 10).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+}

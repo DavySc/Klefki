@@ -1,0 +1,15 @@
+[package]
+name = "klefki-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+directories = "6"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

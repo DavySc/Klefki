@@ -35,7 +35,7 @@ klefki/
   crates/core/         all IO; no egui dependency; public surface = api.rs only
   crates/app/          egui binary; depends only on klefki_core::api
     clippy.toml        disallowed-methods: std::fs::*, process::Command::new, std::net::*, open::*  (boundary enforced in CI)
-  crates/cli/          optional headless `klefki` (list/status/export)
+  crates/cli/          optional headless `klefki-cli` (list/status/export)
   crates/fake-claude/  test stub of the claude CLI
   fixtures/            claude.json samples, malicious .mcp.json corpus, `mcp get` outputs with ANSI
   .github/workflows/   ci.yml (fmt, clippy -D warnings, test on win/mac/linux, cargo-deny), release.yml
@@ -109,12 +109,19 @@ klefki/
 - **Legacy `mcpServersDisabled`**: shown read-only, with a migrate action.
 - Verify the exact `disabledMcpServers` location with a real `/mcp` toggle on day 1 of M1.
 
-## App (`crates/app/src`): dark look
-- **`theme.rs`**: one `Palette` mapped to `egui::Visuals`, with 2 px rounding. Starting colours, all in one place for tuning:
-  - **Surfaces**: background `#16191D`, panels `#1E2227` / `#252A31`, alternate row `#20252B`, border `#313842`
-  - **Text**: `#E6E9ED`, muted `#9AA4AF`
-  - **Brand**: primary `#1D71B8`, hover/focus/nav indicator `#38A8E0`, selection `#1C52A1`
-  - **Status** (foreground / fill): success `#4CC27A` / `#1E7A3C`, warn `#F0A043` / `#B4650A`, danger `#EF5350` / `#C62828`, drift `#38A8E0`, disabled `#6B7580`
+## App (`crates/app/src`): Catppuccin Mocha / Latte with Klefki accents
+Changed from the original look at the owner's request. Dark (Mocha) is the default; a light (Latte) theme and a System option were added.
+- **`theme.rs`**: one `Palette` per theme (`DARK`, `LIGHT`) mapped to `egui::Visuals`, 6 px rounding. A top-bar dropdown offers System, Light and Dark; the choice is remembered through eframe's storage, and `--theme light|dark|system` overrides it for one run. All colours in one place:
+  - **Dark surfaces** (Mocha): field `#11111B`, chrome `#181825`, panel `#1E1E2E`, raised `#313244`, alternate row `#232334`, border `#45475A`, hover `#3B3D50`
+  - **Dark text**: `#CDD6F4`, muted `#A6ADC8`
+  - **Dark accents**: primary mauve `#CBA6F7` (the ring), key gold `#F9E2AF`, link `#89B4FA`, focus fairy pink `#F5C2E7`, selection `#403957`
+  - **Dark status**: success `#A6E3A1`, warn `#FAB387`, danger `#F38BA8`, disabled `#7F849C`, text on bright fills `#11111B`
+  - **Light surfaces** (Latte): field `#FFFFFF`, chrome `#E6E9EF`, panel `#EFF1F5`, raised `#FFFFFF`, alternate row `#E9ECF1`, border `#BCC0CC`, hover `#E0E4EB`
+  - **Light text**: `#4C4F69`, muted `#5C5F77`
+  - **Light accents**: deeper variants of the Mocha hues, because Latte's pastels fail contrast as text: primary `#7C2FE0`, key `#8A5A00`, link `#1A66A6`, focus `#CF3F9B`, selection `#E7DFFA`
+  - **Light status**: success `#26741A`, warn `#A83F05`, danger `#C40F35`, disabled `#8C8FA1`, text on bright fills `#FFFFFF`
+  - **Contrast rules (tested for both themes)**: text and accent inks at least 4.5:1 on every surface, focus and primary outlines at least 3:1, text on bright fills at least 4.5:1.
+  - **Type and size**: JetBrains Mono (OFL, embedded, regular + bold), body 15 px, buttons at least 40x34, table rows 36 px, nav rows 44 px.
 - **Layout (desktop-app style)**:
   - Left nav menu: Connections, Scope drift, Secrets, Settings, Activity log.
   - Top bar: title, CLI version, global search, refresh.
@@ -144,7 +151,7 @@ klefki/
    - UI: detail panel, search, enable/disable and bulk actions, delete, duplicate, edit (form, raw JSON, diff).
    - Keyring secrets, v1 meta compatibility, shortcuts.
 3. **M2**: add wizard (metadata, scope picker, free-port check), PTY login and re-authorize, move/copy, transactional upsert with rollback. Spike early: how `--no-browser` handles the callback port (paste-back input as fallback).
-4. **M3**: drift watcher and refresh scopes, export/import, legacy secret import, orphaned-secrets view, optional `klefki` CLI.
+4. **M3**: drift watcher and refresh scopes, export/import, legacy secret import, orphaned-secrets view, optional `klefki-cli` CLI.
 5. **M4**: cargo-packager in a GitHub Actions matrix:
    - Windows: msi, NSIS and portable exe, signed with Authenticode.
    - macOS: universal .app/.dmg, Developer ID + notarisation.
