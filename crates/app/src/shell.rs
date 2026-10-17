@@ -5,8 +5,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Command, Core, Diagnosis, Event, Scope, ServerId, ServerRow, Snapshot, Status,
-    TransportKind,
+    Approval, Change, Command, Core, Diagnosis, Event, PlanView, Scope, ServerId, ServerRow,
+    Snapshot, Status, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -56,6 +56,13 @@ impl DetailTab {
     ];
 }
 
+/// What happened to the last change, for the banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outcome {
+    text: String,
+    ok: bool,
+}
+
 enum GridRow {
     Group(String),
     Server(usize),
@@ -71,6 +78,12 @@ pub struct ShellApp {
     diagnoses: HashMap<ServerId, Diagnosis>,
     cli_version: Option<String>,
     cli_problem: Option<String>,
+    /// A change the engine has prepared and the user has not yet confirmed.
+    plan: Option<PlanView>,
+    /// Apply was pressed and the engine has not answered yet.
+    applying: bool,
+    /// The outcome of the last change, shown until dismissed.
+    outcome: Option<Outcome>,
     pub page: Page,
     pub search: String,
     pub selected: BTreeSet<usize>,
@@ -86,6 +99,9 @@ impl ShellApp {
             diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
+            plan: None,
+            applying: false,
+            outcome: None,
             snapshot,
             page: Page::Connections,
             search: String::new(),
@@ -156,6 +172,46 @@ impl ShellApp {
                 if self.snapshot.servers.iter().any(|r| r.id() == id) {
                     self.diagnoses.insert(id, diagnosis);
                 }
+            }
+            Event::PlanReady(plan) => {
+                self.applying = false;
+                self.plan = Some(plan);
+            }
+            Event::PlanFailed(why) => {
+                self.outcome = Some(Outcome {
+                    text: why,
+                    ok: false,
+                })
+            }
+            Event::Applied { plan, backup } => {
+                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+                    self.plan = None;
+                    self.applying = false;
+                }
+                self.outcome = Some(Outcome {
+                    text: match backup {
+                        Some(b) => format!("Saved. The previous file is kept in {b}"),
+                        None => "Nothing needed to change.".to_owned(),
+                    },
+                    ok: true,
+                });
+            }
+            Event::ApplyFailed { plan, error } => {
+                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+                    self.plan = None;
+                    self.applying = false;
+                }
+                self.outcome = Some(Outcome {
+                    text: error,
+                    ok: false,
+                });
+            }
+            Event::Reapplied { .. } => {
+                self.outcome = Some(Outcome {
+                    text: "Claude Code overwrote the change right after it was saved, so it was written again. Close running Claude Code sessions if this keeps happening."
+                        .to_owned(),
+                    ok: false,
+                });
             }
             Event::CliVersion(version) => self.cli_version = version,
             Event::CliProblem(problem) => self.cli_problem = Some(problem),
@@ -240,11 +296,14 @@ impl ShellApp {
                 .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(12)))
                 .show(ui, |ui| self.detail(ui));
         }
+        let ctx = ui.ctx().clone();
+        self.plan_dialog(&ctx);
         egui::CentralPanel::default()
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(14)))
             .show(ui, |ui| match self.page {
                 Page::Connections => {
                     self.warnings(ui);
+                    self.outcome_banner(ui);
                     self.toolbar(ui);
                     ui.add_space(6.0);
                     self.grid(ui);
@@ -405,18 +464,166 @@ impl ShellApp {
             (icon::EXPORT, "Export"),
             (icon::DOWNLOAD_SIMPLE, "Import"),
         ];
+        let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.plan.is_none();
         ui.horizontal(|ui| {
             for (glyph, tip) in ACTIONS {
-                // Operations arrive with M1; the toolbar is shown disabled so the layout can be judged.
+                let toggle = match glyph {
+                    g if g == icon::TOGGLE_RIGHT => Some(true),
+                    g if g == icon::TOGGLE_LEFT => Some(false),
+                    _ => None,
+                };
+                // The other operations arrive later in M1; they are shown disabled so the layout can be judged.
                 let button = egui::Button::new(RichText::new(glyph).size(20.0))
                     .min_size(egui::vec2(44.0, 38.0));
-                ui.add_enabled(false, button).on_disabled_hover_text(tip);
+                match toggle {
+                    Some(enabled) => {
+                        if ui
+                            .add_enabled(can_toggle, button)
+                            .on_hover_text(tip)
+                            .on_disabled_hover_text(format!("{tip}: select a server first"))
+                            .clicked()
+                        {
+                            self.prepare_toggle(enabled);
+                        }
+                    }
+                    None => {
+                        ui.add_enabled(false, button).on_disabled_hover_text(tip);
+                    }
+                }
             }
             ui.separator();
             ui.label(
                 RichText::new(format!("{} selected", self.selected.len())).color(pal.text_muted),
             );
         });
+    }
+
+    /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
+    fn prepare_toggle(&mut self, enabled: bool) {
+        let changes: Vec<Change> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .map(|row| Change::SetEnabled {
+                id: row.id(),
+                enabled,
+            })
+            .collect();
+        if !changes.is_empty() {
+            self.outcome = None;
+            self.send(Command::Prepare(changes));
+        }
+    }
+
+    /// The banner for the last change.
+    fn outcome_banner(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        let Some(outcome) = self.outcome.clone() else {
+            return;
+        };
+        let color = if outcome.ok { pal.success } else { pal.danger };
+        let mut dismiss = false;
+        Frame::new()
+            .stroke(egui::Stroke::new(1.0, color))
+            .corner_radius(6)
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&outcome.text).color(color));
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        if dismiss {
+            self.outcome = None;
+        }
+    }
+
+    /// The confirmation step: shows exactly what would change, then applies or drops it.
+    fn plan_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let Some(plan) = self.plan.clone() else {
+            return;
+        };
+        let applying = self.applying;
+        let mut apply = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("plan_dialog")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading("Review the change");
+            ui.add_space(6.0);
+            if plan.nothing_to_do {
+                ui.label("The configuration already looks like this. Nothing would be written.");
+            } else {
+                ui.label("These lines in your Claude Code configuration will change:");
+            }
+            for file in &plan.files {
+                if file.lines.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(&file.path).color(pal.text_muted));
+                Frame::new()
+                    .fill(pal.field)
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                for line in &file.lines {
+                                    let color = if line.starts_with("+ ") {
+                                        pal.success
+                                    } else if line.starts_with("- ") {
+                                        pal.danger
+                                    } else {
+                                        pal.text_muted
+                                    };
+                                    ui.add(
+                                        egui::Label::new(RichText::new(line).color(color)).wrap(),
+                                    );
+                                }
+                            });
+                    });
+            }
+            for warning in &plan.warnings {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} {warning}", icon::WARNING)).color(pal.warn),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(!plan.nothing_to_do && !applying, egui::Button::new("Apply"))
+                    .clicked()
+                {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if apply {
+            self.applying = true;
+            self.send(Command::Apply(plan.id));
+            // The dialog stays until the engine answers, so a second click cannot apply twice.
+        } else if cancel {
+            self.send(Command::Discard(plan.id));
+            self.plan = None;
+            self.applying = false;
+        }
     }
 
     fn grid(&mut self, ui: &mut Ui) {
@@ -1641,5 +1848,245 @@ mod tests {
             detail_left_edge(&h, "Scope")
         };
         assert_eq!(short, long, "a long target made the detail panel wider");
+    }
+
+    // ---- switching servers on and off
+
+    fn plan_view(id: u64, lines: &[&str], warnings: &[&str], nothing_to_do: bool) -> PlanView {
+        PlanView {
+            id,
+            files: vec![klefki_core::api::FileDiff {
+                path: ".claude.json".to_owned(),
+                lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+            }],
+            warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
+            nothing_to_do,
+        }
+    }
+
+    fn two_rows() -> (ServerRow, ServerRow) {
+        (
+            live_row("alpha", Scope::User, None),
+            live_row("beta", Scope::Local, Some("C:/Repos/WebApp")),
+        )
+    }
+
+    fn drain(engine: &klefki_core::api::Detached) -> Vec<Command> {
+        let mut out = Vec::new();
+        while let Ok(c) = engine.commands.try_recv() {
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn enable_and_disable_need_a_selection() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert!(drain(&engine).is_empty(), "nothing selected, nothing asked");
+    }
+
+    #[test]
+    fn disable_asks_the_engine_for_a_plan_for_each_selected_server() {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: a.id(),
+                enabled: false
+            }])]
+        );
+    }
+
+    #[test]
+    fn enable_asks_for_the_opposite() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::TOGGLE_RIGHT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: a.id(),
+                enabled: true
+            }])]
+        );
+    }
+
+    fn with_plan(
+        lines: &[&str],
+        warnings: &[&str],
+        nothing: bool,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, lines, warnings, nothing)))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    #[test]
+    fn the_plan_dialog_shows_exactly_what_will_change_and_nothing_is_sent_yet() {
+        let (_h, engine) = {
+            let (h, engine) = with_plan(
+                &["  projects[\"C:/x\"].disabledMcpServers", "+ alpha"],
+                &["A running Claude Code session may need a restart before it notices this."],
+                false,
+            );
+            h.get_by_label_contains("Review the change");
+            h.get_by_label_contains("disabledMcpServers");
+            h.get_by_label("+ alpha");
+            h.get_by_label_contains("may need a restart");
+            (h, engine)
+        };
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn apply_sends_the_plan_once_even_if_pressed_twice() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Apply").click();
+        h.run();
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(7)]);
+    }
+
+    #[test]
+    fn cancel_discards_the_plan_and_closes_the_dialog() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Discard(7)]);
+        assert!(h.query_by_label_contains("Review the change").is_none());
+    }
+
+    #[test]
+    fn escape_cancels_like_the_cancel_button() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Discard(7)]);
+        assert!(h.query_by_label_contains("Review the change").is_none());
+    }
+
+    #[test]
+    fn a_plan_that_changes_nothing_cannot_be_applied() {
+        let (mut h, engine) = with_plan(&[], &[], true);
+        h.get_by_label_contains("Nothing would be written");
+        h.get_by_label("Apply").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_saved_change_closes_the_dialog_and_says_where_the_backup_is() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                backup: Some("/data/backups/claude.json.1.bak".to_owned()),
+            })
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Review the change").is_none());
+        h.get_by_label_contains(
+            "Saved. The previous file is kept in /data/backups/claude.json.1.bak",
+        );
+    }
+
+    #[test]
+    fn a_failed_change_closes_the_dialog_and_shows_the_reason() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::ApplyFailed {
+                plan: 7,
+                error: "Claude Code is writing its configuration right now.".to_owned(),
+            })
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Review the change").is_none());
+        h.get_by_label_contains("Claude Code is writing its configuration");
+        h.get_by_label("Dismiss").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("writing its configuration")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_plan_that_could_not_be_made_shows_the_reason() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(Event::PlanFailed(
+                "ghost is no longer in the configuration.".to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("ghost is no longer");
+    }
+
+    #[test]
+    fn a_change_claude_overwrote_is_reported_after_the_dialog_is_gone() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                backup: Some("b".to_owned()),
+            })
+            .unwrap();
+        engine.events.send(Event::Reapplied { plan: 7 }).unwrap();
+        h.run();
+        h.get_by_label_contains("overwrote the change right after it was saved");
+    }
+
+    #[test]
+    fn the_toggle_buttons_do_not_start_a_second_plan_while_one_is_open() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(8, &["+ alpha"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        // A click outside the dialog closes it (and drops the plan); it never starts a second plan.
+        let sent = drain(&engine);
+        assert!(
+            sent.iter().all(|c| !matches!(c, Command::Prepare(_))),
+            "a second plan cannot start: {sent:?}"
+        );
     }
 }

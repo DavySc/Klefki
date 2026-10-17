@@ -12,6 +12,7 @@ directories = "6"
 url = "2"
 regex = "1"
 tempfile = "3"
+sha2 = "0.10"
 
 [dev-dependencies]
-sha2 = "0.10"
+filetime = "0.2"

@@ -1,6 +1,6 @@
 # Proposed protected files
 
-Status 2026-10-17: `crates/app/clippy.toml` and `crates/fake-claude/` were approved and created (see `fake-claude.md`). `deny.toml` and `fixtures/malicious/` are still pending.
+Status 2026-10-17: `crates/app/clippy.toml` and `crates/fake-claude/` were approved and created (see `fake-claude.md`). `deny.toml` was created at the owner's request on 2026-10-17 (needs review; see `docs/progress.md`). `fixtures/malicious/` is still pending.
 
 ## `crates/app/clippy.toml`
 Enforces "the UI performs no IO". Disallowed paths are checked by `cargo clippy -p klefki -- -D warnings`.

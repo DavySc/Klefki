@@ -1,11 +1,24 @@
 # Progress
 
 ## Current slice
-Live status checks (CLI locate/runner/parse, status engine, UI wiring). Done, see "Live status" below. Next: fix the inventory's enabled/disabled semantics (decision 002), then `docstore`.
+`docstore`, the enable/disable write path, `deny.toml` + cargo-deny (2026-10-17). Done except the open items under "Docstore and enable/disable". Next: decide the three `cargo deny` advisories, then run the real window on a machine with a display.
+
+Earlier slice: Live status checks (CLI locate/runner/parse, status engine, UI wiring), see "Live status" below.
 
 Earlier slice: M1 day-1 spikes done and recorded (below). Next: fix the inventory's enabled/disabled semantics, then `docstore`.
 
 Previous slice: Read-only inventory of the real Claude Code config, restyle (Catppuccin Mocha, JetBrains Mono, bigger controls), and a light theme (Latte-based) with a System option.
+
+## Docstore and enable/disable (2026-10-17)
+- `config/docstore.rs`: Prepare (`prepare`, writes nothing) → plan (only list names, never server settings) → `apply`: take Claude's `<claude.json>.lock` directory (stale after 10 s, waits up to 3 s, aborts rather than write unlocked), re-read, re-apply the ops to the fresh copy, refuse if the file changed in a way that alters what the user saw, back up the old bytes (private, last 20, own folder), write a temp file in the same folder, fsync, rename. `verify` (1 s later) re-applies up to 3 times if Claude overwrote it without the lock. Keeps key order, unknown keys, floats, BOM, CRLF and a final newline if the file had them; default is Claude's own style. Refuses symlinks, wrong shapes, unknown projects (never creates a project entry; that part of Claude's behaviour is unverified).
+- `ops.rs` + engine: `Command::Prepare(Vec<Change>)` / `Apply(id)` / `Discard(id)`, events `PlanReady`, `PlanFailed`, `Applied`, `ApplyFailed`, `Reapplied`. A user server is switched in every known project (with the "projects first opened later are not covered" warning); local and project servers in their own project. Project servers: only `disabledMcpServers` in `~/.claude.json`; the repository is never touched, and enabling an unapproved one warns that it is still not approved. Approval writes (`settings.local.json`) are not built.
+- UI: Enable and Disable toolbar buttons → Review dialog with the exact lines, warnings, Apply / Cancel (Esc or a click outside cancels), then a banner with the result.
+- Reproducers first where a bug existed; for new code the tests passed on first run, so I proved they bite by breaking the code on purpose and watching them fail: no backup, no changed-file check, no lock, first spelling only (docstore); user scope only first project (engine); no double-apply guard, toggle inverted, no discard on cancel (UI). One guard (`plan.is_none()` on the toolbar) cannot be told apart by a test because the modal already blocks the click.
+- `deny.toml` (protected file, created at the owner's request; please review) and `cargo-deny 0.20.2` installed. Licences allowed: MIT, Apache-2.0 (+LLVM), BSD-2/3, ISC, Zlib, MPL-2.0, Unicode-3.0, OFL-1.1, Ubuntu-font-1.0 (egui's default fonts), BSL-1.0. Workspace crates have no licence field, so `[licenses.private] ignore = true` is set; the owner should pick a licence instead.
+- **Open: `cargo deny check` fails (advisories).** RUSTSEC-2026-0370 and two siblings: `zvariant`, `zvariant_derive`, `zbus_names` are "unmaintained", pulled in only on Linux through eframe → egui-winit → accesskit_winit → accesskit_unix → atspi. No upgrade exists. Not ignored, because the rules forbid ignore lists. Options for the owner: accept via `[advisories] ignore`, set `unmaintained = "workspace"` (only direct dependencies count), or wait for egui to move.
+- Checks: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo test --workspace` 166 core + 64 app passed; `cargo deny check`: bans, licenses, sources ok, advisories FAILED (above).
+- Not verified: the real window (this machine lacks `libxkbcommon-x11`, so `cargo run -p klefki` panics at startup), a write next to a live Claude Code session, behaviour on Windows/macOS, whether a running Claude session notices a toggle without restart, and "Claude Code is running" detection (only a generic restart warning is shown).
+- Duplicate keys in `~/.claude.json` are not detected on write (the last one wins when parsed); `.mcp.json` duplicates still are.
 
 ## Engine test failure on Linux (2026-10-17)
 `engine::tests::at_most_three_checks_run_at_once` failed 3 of 3 runs on Linux: `fake-claude` wrote each log line with several `write` calls, so parallel runs tore each other's lines. Not a flake. Reproducer first: `cli::runner::tests::concurrent_stub_runs_never_interleave_log_lines` (128 parallel runs) failed, then passed after the approved stub change (one `write_all` per line, `docs/proposals/fake-claude-atomic-log.md`). Evidence: `cargo test -p klefki-core --lib` 126 passed, 5 runs in a row; `cargo test --workspace` 126 core + 51 app passed; clippy and fmt exit 0. The earlier "176 passed" count is now 177 on Linux. `cargo deny` still not run.
@@ -85,11 +98,10 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.
 - A refresh that arrives while checks run drops their answers by generation; this is covered by reading the code and by the UI test for cut-off checks, not by an engine test with a real race.
 - Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server in the home folder could shadow it. Not seen in practice.
-- `cargo deny` still not run (`deny.toml` and `cargo-deny` pending).
+- `cargo deny` runs now; advisories fail (see Docstore section).
 - Theme persistence goes through eframe's storage (written by the framework to the app data folder); the app crate itself still has no fs calls. Not tested across a real restart, and flagged for review against the no-IO invariant.
 - System theme follows the OS setting; only checked that it is selectable, not against a real OS theme change.
 - Hover colours were only seen on one row in each theme.
-- Enabled/disabled in the grid is wrong for user and project rows (see Spikes); fix is the next slice.
 - Status is only Claude's cached hint, not a live `claude mcp get` check.
 - The CLI version in the top bar is not detected yet (hidden unless known).
 - CI untested on macOS/Linux. Spike findings are for Claude Code 2.1.302 on Windows only; a live interactive session was not tested for outside-edit survival.

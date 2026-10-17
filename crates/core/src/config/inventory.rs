@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 
-const MAX_CLAUDE_JSON: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_CLAUDE_JSON: u64 = 64 * 1024 * 1024;
 const MAX_CACHE_JSON: u64 = 4 * 1024 * 1024;
 const MAX_MCP_JSON: u64 = 1024 * 1024;
 const MAX_MCP_SERVERS: usize = 500;
@@ -47,6 +47,7 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
 
     let projects = merged_projects(root);
     snap.project_count = projects.len();
+    snap.projects = projects.keys().cloned().collect();
     // The on/off toggle is a list of names in each project's entry (decision 002).
     let disabled_by_project: BTreeMap<&String, BTreeSet<String>> = projects
         .iter()
