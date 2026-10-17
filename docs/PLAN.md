@@ -149,6 +149,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
    - Core: fsx, docstore, inventory (all transports and scopes), casing, hints, CLI locate/runner/parse, live status, watcher.
    - UI: detail panel, search, enable/disable and bulk actions, delete, duplicate, edit (form, raw JSON, diff).
    - Keyring secrets, v1 meta compatibility, shortcuts.
+   - **Diagnose** (decision 004): on request, rerun a server's check with the client's own debug output (`claude --debug mcp --debug-file`), then show redacted, sanitised excerpts, what the server printed itself, and plain-language hints for common failures. Includes a "restart needed" notice in the apply dialog.
 3. **M2**: add wizard (metadata, scope picker, free-port check), PTY login and re-authorize, move/copy, transactional upsert with rollback. Spike early: how `--no-browser` handles the callback port (paste-back input as fallback).
 4. **M3**: drift watcher and refresh scopes, export/import, legacy secret import, orphaned-secrets view, optional `klefki-cli` CLI.
 5. **M4**: cargo-packager in a GitHub Actions matrix:
@@ -167,6 +168,10 @@ Ideas from an outside brainstorm, compared with this plan and checked on a real 
    - text is sanitised like all untrusted output, and tokens, `Authorization` values and environment values are redacted by default (the logs can contain full JSON-RPC traffic), with an explicit "copy sanitised" action.
 3. **Paste-to-add.** Accept an `{"mcpServers": {...}}` block or a `claude mcp add ...` command. Parse it ourselves (never run the pasted text), show the exact resolved command and require confirmation before anything is spawned, and write through `add-json` like every other add. Normalise the `/c` that Git Bash turns into `C:/` when it appears in a pasted `cmd /c` command.
 4. **Scope visibility hint for the VS Code extension** ("this server is project-scoped; the extension may not see it"). Only after an experiment confirms the extension really behaves that way: it is installed on the owner's machine (2.1.301) but the claim is unverified.
+
+5. **Network probe for HTTP servers** (decision 004): DNS, TLS (including a TLS-inspecting proxy) and the HTTP status of the URL, on the planned `net/` module, to explain what Claude reports as a bare `ECONNREFUSED` or `Needs authentication`.
+6. **Relative-path lint** for user-scope stdio servers: the working directory a client uses is not your project folder, and a check run from the home folder can pass where a real session fails.
+7. **Copy the MCP Inspector command** for a server (never run it automatically: `npx` downloads code, and the Inspector keeps OAuth tokens and `env:` values in its own store, so no secrets are passed).
 
 Not planned, with the reasons recorded in decision 003: `cmd /c` validation (a plain `npx` entry works with the current native Claude Code), and cleanup of old MCP logs (a current install shows 14 MB in 659 files, so the reported runaway growth did not reproduce, and deleting files needs its own safety design).
 

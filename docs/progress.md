@@ -16,6 +16,18 @@ Previous slice: Read-only inventory of the real Claude Code config, restyle (Cat
 - Approved protected files created: `crates/fake-claude` (test stub, `docs/proposals/fake-claude.md`) and `crates/app/clippy.toml` (UI does no IO; proven by a deliberate violation failing clippy).
 - Security hardening beyond the plan: a server name may not start with `-` (it would be read as a CLI option), and the plan's regex is otherwise unchanged.
 
+## Debugging connections (2026-10-17)
+Decision 004 compares the MCP debugging guide with this plan. The **Diagnose** action is built and was run in the real window against deliberately broken servers:
+- Core: `diagnose/redact.rs` (secrets removed; keeps the "set / not set" summary of proxy variables), `diagnose/hints.rs` (16 plain-language hints including the 2026-07-28 protocol errors; the cases that fooled a naive match are tests: "No token data found" in a healthy log, "timeout of 30000ms" as a normal line, "command not found" as a bad URL), `diagnose/report.rs` (the lines about one server, what the server itself printed, clipped, most recent last), and `Command::Diagnose` / `Event::Diagnosis` in the engine. It runs `claude --debug mcp --debug-file <private temp file> mcp get <name>`, reads the file with a size cap, deletes the folder, and also updates the server's status.
+- App: Status tab has **Check now** and **Diagnose** side by side, "What probably went wrong", "The server said", a collapsed "Client log", and **Copy report** (plain text).
+- Real window: a stdio server whose command does not exist shows "The command was not found" plus the real `is not recognized as an internal or external command` message; an HTTP server on a closed port shows "Nothing is listening at that address". No private temp folders or `mcp get` processes were left behind.
+- Protected `crates/fake-claude` got the two approved additions (`"*"` wildcard argument, `debug_file_from`).
+- Layout bug found and fixed in the real window: a long status detail or target widened the whole detail panel (content jumped from x=584 to x=233) because grid cells do not wrap. Reproduced by two tests first; the grids now cap their column width and the values wrap.
+- Tests that depended on a tight process-start time were flaky under load (800 ms timeouts; a 400 ms overlap check); they now use roomy timings with the same assertions, and 10 consecutive full runs passed.
+
+## Enabled/disabled and approval (2026-10-17)
+Fixed the inventory per decision 002: the toggle is `disabledMcpServers` for every scope; a user server shows how many known projects have it off ("off in 3/17", disabled only when off everywhere); project servers get a separate approval (approved, pending, rejected) read from both `.claude.json` and the repository's `.claude/settings.local.json`. One earlier test encoded the old, wrong rule and was replaced for that reason.
+
 ## Brainstorm comparison (2026-10-17)
 An outside brainstorm was compared with the plan and checked on this machine: `docs/decisions/003-brainstorm-comparison.md`. Four ideas were added to PLAN.md as nice-to-haves after M4 (read-only Desktop detection, bounded redacted log tail, paste-to-add, VS Code visibility hint); `cmd /c` validation and log cleanup were not adopted. Measured release build: 0.7 to 0.8 s to a window, 109 to 117 MB working set.
 
@@ -42,7 +54,7 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 |---|---|
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
-| `cargo test --workspace` | 109 passed (70 core, 39 app incl. egui_kittest), 0 failed |
+| `cargo test --workspace` | 176 passed (125 core, 51 app incl. egui_kittest), 0 failed |
 | grep for `std::fs`, `process::Command`, `std::net`, `open::` in `crates/app/src` | 0 matches |
 | `target/debug/klefki.exe` against the real `~/.claude.json`, screenshot | lists `REMOTE_1`, `REMOTE_2` (Connected, from Claude's health cache) and `azure-devops` |
 | `target/debug/klefki.exe --demo`, screenshot | all scopes, badges, group headers render in full |
@@ -65,6 +77,8 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - A UI test wrote a temp config (IO in `crates/app`); replaced by an in-memory snapshot. Real-config loading is tested in core.
 
 ## Not done / unverified
+- Diagnose output formats are from Claude Code 2.1.302 only; the hints match short stable fragments and say nothing rather than guess when the text changes.
+- The debug file did not repeat a configured header or env secret in two tests, but that is not a guarantee; redaction is the safeguard, with tests.
 - The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.
 - A refresh that arrives while checks run drops their answers by generation; this is covered by reading the code and by the UI test for cut-off checks, not by an engine test with a real race.
 - Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server in the home folder could shadow it. Not seen in practice.

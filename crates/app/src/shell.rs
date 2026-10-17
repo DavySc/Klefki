@@ -486,6 +486,9 @@ impl ShellApp {
 
     fn detail(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
+        // Long values must wrap inside the panel; without a cap a grid cell grows to fit its text, and the whole
+        // panel grows with it.
+        let col_width = (ui.available_width() - 110.0).max(100.0);
         let Some(&i) = self
             .selected
             .iter()
@@ -518,10 +521,11 @@ impl ShellApp {
                 egui::Grid::new("general")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
+                    .max_col_width(col_width)
                     .show(ui, |ui| {
                         let mut kv = |k: &str, v: String| {
                             ui.label(RichText::new(k).color(pal.text_muted));
-                            ui.label(v);
+                            ui.add(egui::Label::new(v).wrap());
                             ui.end_row();
                         };
                         kv("Scope", s.scope.label().to_owned());
@@ -549,12 +553,13 @@ impl ShellApp {
                 egui::Grid::new("status")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
+                    .max_col_width(col_width)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Status").color(pal.text_muted));
                         ui.label(status.label());
                         ui.end_row();
                         ui.label(RichText::new("Detail").color(pal.text_muted));
-                        ui.label(detail.as_deref().unwrap_or("-"));
+                        ui.add(egui::Label::new(detail.as_deref().unwrap_or("-")).wrap());
                         ui.end_row();
                     });
                 ui.add_space(8.0);
@@ -1573,5 +1578,68 @@ mod tests {
         }
         assert!(!text.contains('\u{1b}') && !text.contains("\r"), "{text:?}");
         assert!(text.ends_with('\n'));
+    }
+
+    // ---- long text must wrap inside the detail panel, never resize it ----
+
+    /// Where the detail panel's contents start. If the panel grows, this moves left.
+    fn detail_left_edge(h: &Harness<'static, ShellApp>, label: &str) -> f32 {
+        h.get_by_label(label).rect().min.x
+    }
+
+    #[test]
+    fn a_very_long_status_detail_wraps_instead_of_widening_the_panel() {
+        let (mut h, engine) = live_harness();
+        let row = live_row("bad-stdio", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine
+            .events
+            .send(status_event(&row, Status::Failed, Some("short")))
+            .unwrap();
+        h.run();
+        open_status_tab(&mut h, "bad-stdio");
+        let before = detail_left_edge(&h, "Check now");
+
+        let long =
+            "ECONNREFUSED: Unable to connect. Is the computer able to access the url? ".repeat(8);
+        engine
+            .events
+            .send(status_event(&row, Status::Failed, Some(&long)))
+            .unwrap();
+        h.run();
+        let after = detail_left_edge(&h, "Check now");
+        assert_eq!(
+            before, after,
+            "the detail panel changed width because of a long detail"
+        );
+    }
+
+    #[test]
+    fn a_very_long_target_wraps_instead_of_widening_the_panel() {
+        let short = {
+            let (mut h, engine) = live_harness();
+            engine
+                .events
+                .send(snapshot_of(vec![live_row("srv", Scope::User, None)]))
+                .unwrap();
+            h.run();
+            h.get_by_label("srv").click();
+            h.run();
+            detail_left_edge(&h, "Scope")
+        };
+        let long = {
+            let (mut h, engine) = live_harness();
+            let mut row = live_row("srv", Scope::User, None);
+            row.target = format!(
+                "https://example.com/{}",
+                "very-long-path-segment/".repeat(20)
+            );
+            engine.events.send(snapshot_of(vec![row])).unwrap();
+            h.run();
+            h.get_by_label("srv").click();
+            h.run();
+            detail_left_edge(&h, "Scope")
+        };
+        assert_eq!(short, long, "a long target made the detail panel wider");
     }
 }

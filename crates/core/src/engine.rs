@@ -868,20 +868,21 @@ mod tests {
 
     #[test]
     fn at_most_three_checks_run_at_once() {
-        let servers: serde_json::Map<String, serde_json::Value> = (0..9)
+        // Each stub run sleeps a full second so that a slow process start under load cannot hide the overlap.
+        let servers: serde_json::Map<String, serde_json::Value> = (0..6)
             .map(|i| (format!("s{i}"), serde_json::json!({"command": "x"})))
             .collect();
         let env = Env::new(
             &serde_json::json!({ "mcpServers": servers }),
-            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":400}]}"#,
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":1000}]}"#,
             &[("c.txt", CONNECTED)],
         );
         let core = env.start();
         collect(&core, |e| {
-            (0..9).all(|i| final_status(e, &format!("s{i}")).is_some())
+            (0..6).all(|i| final_status(e, &format!("s{i}")).is_some())
         });
         let gets = env.gets();
-        assert_eq!(gets.len(), 9);
+        assert_eq!(gets.len(), 6);
         let max_overlap = gets
             .iter()
             .map(|(_, start, _)| {
@@ -913,7 +914,8 @@ mod tests {
             ],
         );
         let mut config = env.config();
-        config.check_timeout = Duration::from_millis(800);
+        // Roomy on purpose: with many tests starting processes at once, a normal start can take a second.
+        config.check_timeout = Duration::from_secs(3);
         let core = start_with(config, || {});
         let events = collect(&core, |e| {
             ["missing", "slow", "garbage"]

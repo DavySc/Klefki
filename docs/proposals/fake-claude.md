@@ -26,3 +26,10 @@ Live status checks (this slice) spawn `claude mcp get <name>`. The plan's verifi
 - `crates/app/clippy.toml` (architecture check): see `protected-files.md`.
 - `deny.toml`: needs `cargo-deny` installed and a licence decision.
 - `fixtures/malicious/`: not needed yet, the hostile-input cases are covered by inline tests.
+
+## Addendum 2026-10-17: support for the Diagnose action (decision 004)
+`claude --debug mcp --debug-file <path> mcp get <name>` writes a debug file at a path klefki picks at run time (a fresh private temp directory), so a scenario cannot name it in advance. Two small, backward-compatible additions to `crates/fake-claude/src/main.rs`:
+1. An entry `"*"` in a rule's `args` matches any single argument (today a rule matches only an exact argv prefix).
+2. A rule field `debug_file_from: "<file>"`: when the real arguments contain `--debug-file <path>`, copy that scenario file's bytes to `<path>` before answering, which is what the real CLI does.
+
+Existing scenarios and tests are unaffected. The log gains nothing new.
