@@ -35,7 +35,7 @@ fn is_plain(b: u8) -> bool {
 /// them, which the compiler turns into vector instructions.
 fn plain_run(bytes: &[u8]) -> usize {
     let mut n = 0;
-    for block in bytes.chunks_exact(16) {
+    for block in bytes.as_chunks::<16>().0 {
         if !block.iter().fold(true, |all, &b| all & is_plain(b)) {
             break;
         }

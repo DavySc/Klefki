@@ -247,6 +247,9 @@ mod tests {
             serde_json::to_string(&pid_file.display().to_string()).unwrap()
         );
         let f = fixture(&json, &[]);
+        // The first use builds fake-claude with cargo, which can take seconds on a cold CI runner (11 s seen on
+        // Windows); that must not count against the timeout being measured.
+        fake_claude();
         let started = Instant::now();
         let out = f
             .run(
@@ -278,6 +281,8 @@ mod tests {
     #[test]
     fn flooding_output_is_capped_without_blocking_the_child() {
         let f = fixture(r#"{"rules":[{"args":[],"flood_bytes":5000000}]}"#, &[]);
+        // Build fake-claude before the clock starts (see `a_timeout_kills_the_child`).
+        fake_claude();
         let started = Instant::now();
         let out = f.run(&["x"], &[], SECS, 10_000).unwrap();
         assert!(out.truncated);
