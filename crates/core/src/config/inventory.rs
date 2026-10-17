@@ -18,7 +18,7 @@ const MAX_TEXT_CHARS: usize = 512;
 
 pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
     let mut snap = Snapshot::default();
-    let root = match read_json(&paths.claude_json, MAX_CLAUDE_JSON) {
+    let root = match read_claude_json(&paths.claude_json) {
         Ok(Some(v)) => v,
         Ok(None) => {
             snap.warnings.push(format!(
@@ -497,6 +497,99 @@ impl Hints {
             Some(_) => Status::Failed,
             None => Status::Unknown,
         }
+    }
+}
+
+// ---------------------------------------------------------------- reading .claude.json
+
+/// The keys the inventory reads, at the top of `.claude.json` and in each project entry.
+const ENTRY_KEYS: &[&str] = &[
+    "mcpServers",
+    "disabledMcpServers",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+    "enableAllProjectMcpServers",
+];
+
+/// Reads `.claude.json` keeping only what the inventory uses: `mcpServers`, and in `projects` the entries' server
+/// lists. Everything else (chat history, caches, tips) is checked as JSON but skipped while parsing, not built into a
+/// tree, which matters for files of tens of megabytes. A root that is not an object comes back as `Null`.
+fn read_claude_json(path: &Path) -> Result<Option<Value>, String> {
+    let Some(text) = fsx::read_limited(path, MAX_CLAUDE_JSON).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let mut de = serde_json::Deserializer::from_str(&text);
+    let value = serde::de::DeserializeSeed::deserialize(Level::Root, &mut de)
+        .and_then(|v| de.end().map(|()| v))
+        .map_err(|e| format!("invalid JSON ({e})"))?;
+    Ok(Some(value))
+}
+
+/// Where in `.claude.json` a value sits, which decides what of it is kept.
+#[derive(Clone, Copy)]
+enum Level {
+    Root,
+    Projects,
+    Entry,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for Level {
+    type Value = Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Level {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("JSON")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let kept = match (self, key.as_str()) {
+                (Level::Root, "mcpServers") => Some(map.next_value::<Value>()?),
+                (Level::Root, "projects") => Some(map.next_value_seed(Level::Projects)?),
+                (Level::Projects, _) => Some(map.next_value_seed(Level::Entry)?),
+                (Level::Entry, k) if ENTRY_KEYS.contains(&k) => Some(map.next_value::<Value>()?),
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    None
+                }
+            };
+            if let Some(value) = kept {
+                // Like a full parse: a later duplicate replaces the earlier value.
+                out.insert(key, value);
+            }
+        }
+        Ok(Value::Object(out))
+    }
+
+    // Anything that is not an object is skipped; the inventory treats `Null` as "not an object".
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(Value::Null)
+    }
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
     }
 }
 
@@ -1197,5 +1290,59 @@ mod tests {
         let s = e.load();
         assert!(s.servers.is_empty());
         assert_eq!(s.project_count, 1);
+    }
+
+    #[test]
+    fn reading_claude_json_keeps_only_what_the_inventory_uses() {
+        let env = Env::new();
+        env.write_raw(
+            ".claude.json",
+            r#"{"numStartups": 9, "cachedChangelog": "long", "mcpServers": {"a": {"command": "x", "extra": [1]}},
+                "projects": {
+                  "/p": {"history": [{"display": "hi"}], "mcpServers": {"l": {"command": "y"}},
+                         "disabledMcpServers": ["a"], "enabledMcpjsonServers": ["e"], "disabledMcpjsonServers": [],
+                         "enableAllProjectMcpServers": true, "allowedTools": ["Bash"]},
+                  "/odd": 5,
+                  "/p": {"disabledMcpServers": ["later"]}
+                },
+                "tail": {"projects": {"/x": {}}}}"#,
+        );
+        let v = read_claude_json(&env.dir.path().join(".claude.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "mcpServers": {"a": {"command": "x", "extra": [1]}},
+                "projects": {"/p": {"disabledMcpServers": ["later"]}, "/odd": null}
+            })
+        );
+        let keys: Vec<_> = v["projects"].as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            ["/p", "/odd"],
+            "file order, as a full parse would give"
+        );
+        // Only the last /p survives, as before; its earlier fields are not merged in.
+        assert!(v["projects"]["/p"].get("history").is_none());
+    }
+
+    #[test]
+    fn reading_claude_json_still_rejects_broken_json_and_reports_non_objects() {
+        let env = Env::new();
+        for (text, ok) in [
+            ("[1, 2]", true),
+            ("5", true),
+            ("{\"a\": [1, }", false),
+            ("{} trailing", false),
+            ("{\"projects\": {\"/p\": {\"history\": [}}}", false),
+        ] {
+            env.write_raw(".claude.json", text);
+            let got = read_claude_json(&env.dir.path().join(".claude.json"));
+            assert_eq!(got.is_ok(), ok, "{text}");
+            if ok {
+                assert_eq!(got.unwrap(), Some(Value::Null));
+            }
+        }
     }
 }

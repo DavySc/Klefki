@@ -9,6 +9,24 @@ Earlier slice: M1 day-1 spikes done and recorded (below). Next: fix the inventor
 
 Previous slice: Read-only inventory of the real Claude Code config, restyle (Catppuccin Mocha, JetBrains Mono, bigger controls), and a light theme (Latte-based) with a System option.
 
+## Lock time and lighter reads (2026-10-17)
+Measured on synthetic configs (release build, Linux, local disk; throwaway benchmark, not committed). "Lock held" is `apply` only.
+
+| | 7 MB before | 7 MB after | 61 MB before | 61 MB after |
+|---|---|---|---|---|
+| `docstore` apply, lock held | ~95 ms (est.: prepare+apply minus prepare) | 16-24 ms | ~790-820 ms (est.) | 340-420 ms |
+| `docstore` prepare | 21 ms | 13 ms | 255-307 ms | 160 ms |
+| `inventory::load` | 16 ms | 6 ms | 167 ms | 71 ms |
+
+- `.claude.json` is now edited in place: `config/jsonspan.rs` (new) finds the byte ranges of the project entries and their lists, and only the changed lists are rewritten or inserted, indented like their surroundings (or on one line where the file is on one line), with the file's own newline. Everything else stays byte for byte, including formatting serde would have changed (`1.0`, `\u00e9`, numbers beyond u64, four-space indents). One pass over the projects however many ops ("switch everywhere"). The whole text is still checked as valid JSON first. New: a project key or a list that appears twice is refused instead of silently dropping one copy.
+- String scanning uses `memchr` (vector instructions where the CPU has them): the projects scan went from 118 ms to 28-34 ms at 61 MB. New direct dependency `memchr` (already in the tree through `regex`; `cargo deny` ok).
+- Backups are a hard link to the old file (no copy, any size), made private after the rename; a copy of the text read is the fallback when linking fails. The copy fallback is not exercised by a test (needs a second file system).
+- The new file is written from the original text and the replacements, piece by piece, so no second full copy is built in memory; no more full-text clones for the hash or the backup.
+- `inventory`: `.claude.json` is read through a pruning deserializer that keeps only `mcpServers` and, per project, the five keys the inventory uses; history and caches are validated but skipped.
+- Tests first: byte preservation, one-line entries, duplicate project / list refusal and the hard-link backup failed before the change. A differential test (400 generated files × op sequences, pretty and compact) checks the in-place edit against the previous Value-based edit (kept in the tests as the oracle; its one difference, creating an empty list when enabling, is noted there). Deliberate breaks (indent, rejection clearing, pretty rendering) each made tests fail.
+- **Test fixture changed, for review:** `style_is_kept_or_defaults_to_claudes` used a file of CRLF lines ending in a bare LF and asserted every newline came out CRLF; the old full rewrite normalised it. In-place edits keep that bare LF, so the fixture now ends in CRLF (same assertions), and a new test pins the mixed case (kept as is).
+- Checks: fmt 0; clippy workspace 0; `cargo test --workspace` 204 core + 68 app passed; `cargo deny check` 0.
+
 ## Approval writes (2026-10-17)
 - `Change::Approve { id }` for a project (`.mcp.json`) server. The plan lists everything the server would run, in full: command, every argument, environment names **and values**, or the address and any `headersHelper` command (header values are not shown). It refuses, with a reason, what cannot be shown whole and exactly: control or bidi characters (a newline too), a value over 2000 characters, an address with a login, an unknown `type`, wrong-typed fields.
 - Writes `enabledMcpjsonServers` (and removes the name from `disabledMcpjsonServers`) in `<project>/.claude/settings.local.json`, creating the file and the `.claude` folder when missing, through `docstore` (`Kind::ProjectSettings`: same lock, backup under its own name, atomic replace; a linked `.claude` folder or file is refused). If the server was rejected in the project entry of `~/.claude.json`, that rejection is cleared too, shown as a second file in the diff. Nothing else in the repository is touched (tested: only `.claude/settings.local.json`, no lock left).

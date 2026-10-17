@@ -2,6 +2,7 @@
 pub(crate) mod docstore;
 pub(crate) mod fsx;
 pub(crate) mod inventory;
+pub(crate) mod jsonspan;
 
 use std::path::PathBuf;
 

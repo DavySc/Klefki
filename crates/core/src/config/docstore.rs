@@ -6,8 +6,8 @@
 //! atomically. Key order, unknown keys and untouched values survive because the ops patch the parsed document.
 //! Claude may still write without the lock (it gives up waiting after about 1.5 s), so `verify` re-reads a moment
 //! later and re-applies if our change is gone.
-use super::fsx;
 use super::inventory::{MAX_CLAUDE_JSON, normalise_project};
+use super::{fsx, jsonspan};
 use crate::sanitize::sanitize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 const LOCK_STALE: Duration = Duration::from_secs(10);
 const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
 const MAX_VERIFY_ROUNDS: usize = 3;
+const BOM: &str = "\u{feff}";
 
 /// One edit to the document. Idempotent: applying it twice changes nothing the second time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,8 +162,7 @@ impl Docstore {
     /// Reads the file and works out what `ops` would change. Writes nothing.
     pub(crate) fn prepare(&self, ops: Vec<Op>) -> Result<Plan, StoreError> {
         let current = self.read()?;
-        let mut doc = current.parse()?;
-        let changes = self.patch(&mut doc, &ops)?;
+        let (_, changes) = self.edit(&current, &ops)?;
         Ok(Plan {
             ops,
             base_hash: current.hash(),
@@ -170,35 +170,39 @@ impl Docstore {
         })
     }
 
-    /// Applies `ops` to `doc` and reports what changed. Ops meant for the other kind of file are refused.
-    fn patch(&self, doc: &mut Value, ops: &[Op]) -> Result<Vec<FileChange>, StoreError> {
-        let mut lines = Vec::new();
-        for op in ops {
-            match (self.kind, op) {
-                (
-                    Kind::ClaudeJson,
-                    Op::SetDisabled {
-                        project,
-                        name,
-                        disabled,
-                    },
-                ) => set_disabled(doc, project, name, *disabled, &mut lines)?,
-                (Kind::ClaudeJson, Op::ClearRejection { project, name }) => {
-                    clear_rejection(doc, project, name, &mut lines)?
+    /// Applies `ops` to the file's text. Returns the replacements to make in it, or `None` when nothing changes,
+    /// and what changed. Ops meant for the other kind of file are refused.
+    fn edit(
+        &self,
+        current: &Current,
+        ops: &[Op],
+    ) -> Result<(Option<Splices>, Vec<FileChange>), StoreError> {
+        let (text, lines) = match self.kind {
+            // Possibly tens of megabytes: only the bytes of the changed lists are replaced.
+            Kind::ClaudeJson => edit_claude_json(&current.text, ops)?,
+            // A small file: parse, change, write it out whole.
+            Kind::ProjectSettings => {
+                let mut doc = current.parse()?;
+                let mut lines = Vec::new();
+                for op in ops {
+                    match op {
+                        Op::Approve { name } => approve(&mut doc, name, &mut lines)?,
+                        _ => return Err(wrong_file()),
+                    }
                 }
-                (Kind::ProjectSettings, Op::Approve { name }) => approve(doc, name, &mut lines)?,
-                _ => {
-                    return Err(StoreError::Invalid(
-                        "that change does not belong in this file".to_owned(),
-                    ));
-                }
+                let text = if lines.is_empty() {
+                    None
+                } else {
+                    Some(vec![(0..current.text.len(), current.render(&doc)?)])
+                };
+                (text, lines)
             }
-        }
+        };
         let path = match self.kind {
             Kind::ClaudeJson => ".claude.json".to_owned(),
             Kind::ProjectSettings => sanitize(&self.path.display().to_string()),
         };
-        Ok(vec![FileChange { path, lines }])
+        Ok((text, vec![FileChange { path, lines }]))
     }
 
     /// Writes the plan's change. The file is re-read under the lock and the ops are applied to that fresh copy; if
@@ -213,12 +217,11 @@ impl Docstore {
         }
         let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
         let current = self.read()?;
-        let mut doc = current.parse()?;
-        let changes = self.patch(&mut doc, &plan.ops)?;
-        if current.hash() != plan.base_hash && changes != plan.changes {
+        let (text, changes) = self.edit(&current, &plan.ops)?;
+        if changes != plan.changes && current.hash() != plan.base_hash {
             return Err(StoreError::Changed);
         }
-        self.write(&current, &doc, &changes)
+        self.write(&current, text.as_ref())
     }
 
     /// Waits `verify_delay`, then makes sure the change is still there. Claude may write without our lock, from a
@@ -229,15 +232,14 @@ impl Docstore {
             std::thread::sleep(self.verify_delay);
             let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
             let current = self.read()?;
-            let mut doc = current.parse()?;
-            let changes = self.patch(&mut doc, &plan.ops)?;
-            if changes.iter().all(|c| c.lines.is_empty()) {
+            let (text, _) = self.edit(&current, &plan.ops)?;
+            if text.is_none() {
                 return Ok(reapplied);
             }
             if round + 1 == MAX_VERIFY_ROUNDS {
                 break;
             }
-            self.write(&current, &doc, &changes)?;
+            self.write(&current, text.as_ref())?;
             reapplied = true;
         }
         Err(StoreError::Lost)
@@ -269,42 +271,55 @@ impl Docstore {
         }
     }
 
-    fn write(
-        &self,
-        current: &Current,
-        doc: &Value,
-        changes: &[FileChange],
-    ) -> Result<Applied, StoreError> {
-        if changes.iter().all(|c| c.lines.is_empty()) {
+    /// Replaces the file with its text after `edits` (plus the byte-order mark it had), written piece by piece so a
+    /// large file is not copied in memory first. `None` writes nothing.
+    fn write(&self, current: &Current, edits: Option<&Splices>) -> Result<Applied, StoreError> {
+        let Some(edits) = edits else {
             return Ok(Applied {
                 wrote: false,
                 backup: None,
             });
-        }
+        };
         let dir = self.path.parent().ok_or_else(|| {
             StoreError::Invalid("the configuration file has no parent folder".to_owned())
         })?;
         if self.kind == Kind::ProjectSettings {
             ensure_plain_dir(dir)?;
         }
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".claude.json.tmp.")
+            .tempfile_in(dir)?;
+        if current.bom {
+            tmp.write_all(BOM.as_bytes())?;
+        }
+        let mut at = 0;
+        for (range, with) in edits {
+            tmp.write_all(&current.text.as_bytes()[at..range.start])?;
+            tmp.write_all(with.as_bytes())?;
+            at = range.end;
+        }
+        tmp.write_all(&current.text.as_bytes()[at..])?;
+        tmp.as_file().sync_all()?;
         let backup = if current.missing {
             None
         } else {
             Some(self.backup(current)?)
         };
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".claude.json.tmp.")
-            .tempfile_in(dir)?;
-        tmp.write_all(current.render(doc)?.as_bytes())?;
-        tmp.as_file().sync_all()?;
         tmp.persist(&self.path).map_err(|e| e.error)?;
+        if let Some(backup) = &backup {
+            // A hard link shares the old file's permissions until now; it is the only name of that file left.
+            make_private(backup);
+        }
+        self.rotate_backups();
         Ok(Applied {
             wrote: true,
             backup,
         })
     }
 
-    /// Saves the bytes about to be replaced, readable by the owner only, and drops the oldest beyond the limit.
+    /// Keeps the bytes about to be replaced. A hard link to the current file costs nothing, whatever its size: the
+    /// rename that follows leaves the old file to the link alone. Where a link is not possible (another drive, a
+    /// file system without links) the text that was read is copied instead.
     fn backup(&self, current: &Current) -> Result<PathBuf, StoreError> {
         create_private_dir(&self.backup_dir)?;
         let ms = SystemTime::now()
@@ -312,20 +327,27 @@ impl Docstore {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let mut n = 0u32;
-        let (path, mut file) = loop {
+        loop {
             let path = self
                 .backup_dir
                 .join(format!("{}.{ms:016}-{n}.bak", self.backup_label()));
-            match create_private_file(&path) {
-                Ok(f) => break (path, f),
+            match std::fs::hard_link(&self.path, &path) {
+                Ok(()) => return Ok(path),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
-                Err(e) => return Err(e.into()),
+                Err(_) => match create_private_file(&path) {
+                    Ok(mut file) => {
+                        if current.bom {
+                            file.write_all(BOM.as_bytes())?;
+                        }
+                        file.write_all(current.text.as_bytes())?;
+                        file.sync_all()?;
+                        return Ok(path);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+                    Err(e) => return Err(e.into()),
+                },
             }
-        };
-        file.write_all(current.raw().as_bytes())?;
-        file.sync_all()?;
-        self.rotate_backups();
-        Ok(path)
+        }
     }
 
     /// Backups of different files must not push each other out of the rotation.
@@ -375,6 +397,19 @@ fn ensure_plain_dir(dir: &Path) -> Result<(), StoreError> {
         Err(e) => Err(e.into()),
     }
 }
+
+fn wrong_file() -> StoreError {
+    StoreError::Invalid("that change does not belong in this file".to_owned())
+}
+
+#[cfg(unix)]
+fn make_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) {}
 
 #[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
@@ -432,21 +467,18 @@ impl Current {
         Ok(value)
     }
 
-    /// The exact bytes on disk, as text.
-    fn raw(&self) -> String {
-        if self.bom {
-            format!("\u{feff}{}", self.text)
-        } else {
-            self.text.clone()
-        }
-    }
-
+    /// Hash of the exact bytes on disk.
     fn hash(&self) -> String {
-        format!("{:x}", Sha256::digest(self.raw().as_bytes()))
+        let mut hasher = Sha256::new();
+        if self.bom {
+            hasher.update(BOM.as_bytes());
+        }
+        hasher.update(self.text.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
-    /// Claude writes 2-space JSON with LF and no trailing newline; a file that has a BOM, CRLF or a final newline
-    /// keeps them.
+    /// Claude writes 2-space JSON with LF and no trailing newline; a file that has CRLF or a final newline keeps
+    /// them (and a byte-order mark, which `write` adds back).
     fn render(&self, doc: &Value) -> Result<String, StoreError> {
         let mut out = serde_json::to_string_pretty(doc)
             .map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))?;
@@ -455,9 +487,6 @@ impl Current {
         }
         if self.text.contains("\r\n") {
             out = out.replace('\n', "\r\n");
-        }
-        if self.bom {
-            out.insert(0, '\u{feff}');
         }
         Ok(out)
     }
@@ -512,107 +541,251 @@ fn is_stale(dir: &Path) -> bool {
         .is_some_and(|age| age > LOCK_STALE)
 }
 
-fn set_disabled(
-    doc: &mut Value,
-    project: &str,
-    name: &str,
-    disabled: bool,
-    lines: &mut Vec<String>,
-) -> Result<(), StoreError> {
-    let wanted = normalise_project(project);
-    let projects = doc
-        .get_mut("projects")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| StoreError::Invalid("the configuration has no projects".to_owned()))?;
-    let mut found = false;
-    for (key, entry) in projects.iter_mut() {
-        if normalise_project(key) != wanted {
+/// Replacements in a file's text: each range (in file order, not overlapping) becomes the string.
+type Splices = Vec<(std::ops::Range<usize>, String)>;
+
+/// The lists a [`Op`] on `.claude.json` changes, inside a project entry.
+const DISABLED: &str = "disabledMcpServers";
+const REJECTED: &str = "disabledMcpjsonServers";
+
+/// Applies `ops` to the text of `.claude.json` by replacing only the bytes of the lists they change. One pass over
+/// the projects, however many ops (switching a user server touches every project). Returns the new text, or `None`
+/// when nothing changes, and the plan's lines.
+fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<String>), StoreError> {
+    let invalid = |why: String| StoreError::Invalid(why);
+    serde_json::from_str::<serde::de::IgnoredAny>(text).map_err(|e| {
+        invalid(format!(
+            "the configuration is not valid JSON ({}); nothing was changed",
+            sanitize(&e.to_string())
+        ))
+    })?;
+    let b = text.as_bytes();
+    let start = jsonspan::skip_ws(b, 0);
+    if b.get(start) != Some(&b'{') {
+        return Err(invalid(
+            "the configuration is not a JSON object; nothing was changed".to_owned(),
+        ));
+    }
+    if ops.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    let mut targets = Vec::with_capacity(ops.len());
+    for op in ops {
+        match op {
+            Op::SetDisabled { project, .. } | Op::ClearRejection { project, .. } => {
+                targets.push(normalise_project(project))
+            }
+            Op::Approve { .. } => return Err(wrong_file()),
+        }
+    }
+    let root = jsonspan::object_at(text, start).map_err(invalid)?;
+    let projects = single(&root, "projects", "the configuration")?
+        .filter(|m| b[m.value.start] == b'{')
+        .ok_or_else(|| invalid("the configuration has no projects".to_owned()))?;
+    let projects = jsonspan::object_at(text, projects.value.start).map_err(invalid)?;
+    let keys: Vec<String> = projects
+        .members
+        .iter()
+        .map(|m| normalise_project(&m.key))
+        .collect();
+    for (i, member) in projects.members.iter().enumerate() {
+        if projects.members[..i].iter().any(|m| m.key == member.key) {
+            return Err(invalid(format!(
+                "the project {} is listed twice; refusing to guess which one Claude Code uses",
+                sanitize(&member.key)
+            )));
+        }
+    }
+    if let Some(missing) = targets.iter().find(|t| !keys.contains(t)) {
+        return Err(invalid(format!(
+            "{} is not a project Claude Code knows about",
+            sanitize(missing)
+        )));
+    }
+
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines = Vec::new();
+    let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (member, key) in projects.members.iter().zip(&keys) {
+        let here: Vec<&Op> = ops
+            .iter()
+            .zip(&targets)
+            .filter(|(_, t)| *t == key)
+            .map(|(op, _)| op)
+            .collect();
+        if here.is_empty() {
             continue;
         }
-        found = true;
-        let entry = entry.as_object_mut().ok_or_else(|| {
-            StoreError::Invalid(format!("the entry for {} is not an object", sanitize(key)))
-        })?;
-        let list = entry
-            .entry("disabledMcpServers")
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let list = list.as_array_mut().ok_or_else(|| {
-            StoreError::Invalid(format!(
-                "disabledMcpServers of {} is not a list; refusing to change it",
-                sanitize(key)
-            ))
-        })?;
-        let is_name = |v: &Value| v.as_str() == Some(name);
-        let before = list.len();
-        let header = format!(
-            "  projects[\"{}\"].disabledMcpServers",
-            sanitize(&key.replace('"', "\\\""))
-        );
-        if disabled {
-            if !list.iter().any(is_name) {
-                list.push(Value::String(name.to_owned()));
-                lines.push(header);
-                lines.push(format!("+ {}", sanitize(name)));
+        if b[member.value.start] != b'{' {
+            return Err(invalid(format!(
+                "the entry for {} is not an object",
+                sanitize(&member.key)
+            )));
+        }
+        let entry = jsonspan::object_at(text, member.value.start).map_err(invalid)?;
+        let shown_key = sanitize(&member.key.replace('"', "\\\""));
+        for list in [DISABLED, REJECTED] {
+            let list_ops: Vec<&&Op> = here
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        (op, list),
+                        (Op::SetDisabled { .. }, DISABLED) | (Op::ClearRejection { .. }, REJECTED)
+                    )
+                })
+                .collect();
+            if list_ops.is_empty() {
+                continue;
             }
-        } else {
-            list.retain(|v| !is_name(v));
-            if list.len() != before {
-                lines.push(header);
-                lines.push(format!("- {}", sanitize(name)));
+            let existing = single(
+                &entry,
+                list,
+                &format!("the entry for {}", sanitize(&member.key)),
+            )?;
+            let mut items = match existing {
+                None => None,
+                Some(m) => match serde_json::from_str::<Value>(&text[m.value.clone()]) {
+                    Ok(Value::Array(items)) => Some(items),
+                    Ok(_) if list == DISABLED => {
+                        return Err(invalid(format!(
+                            "{list} of {} is not a list; refusing to change it",
+                            sanitize(&member.key)
+                        )));
+                    }
+                    // The reader ignores a rejection list of the wrong shape, so there is nothing to clear in it.
+                    Ok(_) => continue,
+                    Err(e) => return Err(invalid(sanitize(&e.to_string()))),
+                },
+            };
+            let header = format!("  projects[\"{shown_key}\"].{list}");
+            let mut changed = false;
+            for op in list_ops {
+                match op {
+                    Op::SetDisabled { name, disabled, .. } => {
+                        let is_name = |v: &Value| v.as_str() == Some(name.as_str());
+                        if *disabled {
+                            let list = items.get_or_insert_with(Vec::new);
+                            if !list.iter().any(is_name) {
+                                list.push(Value::String(name.clone()));
+                                lines.push(header.clone());
+                                lines.push(format!("+ {}", sanitize(name)));
+                                changed = true;
+                            }
+                        } else if let Some(list) = &mut items {
+                            let before = list.len();
+                            list.retain(|v| !is_name(v));
+                            if list.len() != before {
+                                lines.push(header.clone());
+                                lines.push(format!("- {}", sanitize(name)));
+                                changed = true;
+                            }
+                        }
+                    }
+                    Op::ClearRejection { name, .. } => {
+                        if let Some(list) = &mut items {
+                            let before = list.len();
+                            list.retain(|v| v.as_str() != Some(name.as_str()));
+                            if list.len() != before {
+                                lines.push(header.clone());
+                                lines.push(format!("- {}", sanitize(name)));
+                                changed = true;
+                            }
+                        }
+                    }
+                    Op::Approve { .. } => return Err(wrong_file()),
+                }
             }
+            if !changed {
+                continue;
+            }
+            let items = items.unwrap_or_default();
+            splices.push(match existing {
+                Some(m) => {
+                    let indent = jsonspan::line_indent(text, m.key_start);
+                    (m.value.clone(), render_list(&items, indent, nl)?)
+                }
+                None => add_member(text, member, &entry, list, &items, nl)?,
+            });
         }
     }
-    if found {
-        Ok(())
-    } else {
-        Err(StoreError::Invalid(format!(
-            "{} is not a project Claude Code knows about",
-            sanitize(&wanted)
-        )))
+    if splices.is_empty() {
+        return Ok((None, lines));
     }
+    // In file order; a stable sort keeps two insertions at the same place in the order they were made.
+    splices.sort_by_key(|(range, _)| range.start);
+    Ok((Some(splices), lines))
 }
 
-fn clear_rejection(
-    doc: &mut Value,
-    project: &str,
-    name: &str,
-    lines: &mut Vec<String>,
-) -> Result<(), StoreError> {
-    let wanted = normalise_project(project);
-    let projects = doc
-        .get_mut("projects")
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| StoreError::Invalid("the configuration has no projects".to_owned()))?;
-    let mut found = false;
-    for (key, entry) in projects.iter_mut() {
-        if normalise_project(key) != wanted {
-            continue;
-        }
-        found = true;
-        // A list of the wrong shape is ignored by the reader too, so there is nothing to clear in it.
-        let Some(list) = entry
-            .get_mut("disabledMcpjsonServers")
-            .and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        let before = list.len();
-        list.retain(|v| v.as_str() != Some(name));
-        if list.len() != before {
-            lines.push(format!(
-                "  projects[\"{}\"].disabledMcpjsonServers",
-                sanitize(&key.replace('"', "\\\""))
-            ));
-            lines.push(format!("- {}", sanitize(name)));
-        }
+/// The member called `key`, refusing a key that appears twice (a JSON reader would silently keep only one).
+fn single<'a>(
+    object: &'a jsonspan::Object,
+    key: &str,
+    owner: &str,
+) -> Result<Option<&'a jsonspan::Member>, StoreError> {
+    let mut found = object.members.iter().filter(|m| m.key == key);
+    let first = found.next();
+    if found.next().is_some() {
+        return Err(StoreError::Invalid(format!(
+            "{owner} has {key} twice; refusing to guess which one Claude Code uses"
+        )));
     }
-    if found {
-        Ok(())
-    } else {
-        Err(StoreError::Invalid(format!(
-            "{} is not a project Claude Code knows about",
-            sanitize(&wanted)
-        )))
+    Ok(first)
+}
+
+/// A list written the way the surrounding file is: one item per line, indented one step more than the line its
+/// key is on, or on one line when the key shares its line with other text.
+fn render_list(items: &[Value], indent: Option<&str>, nl: &str) -> Result<String, StoreError> {
+    let value = Value::Array(items.to_vec());
+    let out = match indent {
+        Some(indent) => {
+            serde_json::to_string_pretty(&value).map(|s| s.replace('\n', &format!("{nl}{indent}")))
+        }
+        None => serde_json::to_string(&value),
+    };
+    out.map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))
+}
+
+/// The splice that adds `"<list>": [...]` as the last member of `entry` (the value of the project `member`).
+fn add_member(
+    text: &str,
+    member: &jsonspan::Member,
+    entry: &jsonspan::Object,
+    list: &str,
+    items: &[Value],
+    nl: &str,
+) -> Result<(std::ops::Range<usize>, String), StoreError> {
+    let key = serde_json::to_string(list).map_err(|e| StoreError::Invalid(e.to_string()))?;
+    match entry.members.last() {
+        Some(last) => match jsonspan::line_indent(text, last.key_start) {
+            Some(indent) => Ok((
+                last.value.end..last.value.end,
+                format!(
+                    ",{nl}{indent}{key}: {}",
+                    render_list(items, Some(indent), nl)?
+                ),
+            )),
+            None => Ok((
+                last.value.end..last.value.end,
+                format!(",{key}:{}", render_list(items, None, nl)?),
+            )),
+        },
+        // An empty entry, `{}`: written out like Claude would, two spaces deeper than the project's key.
+        None => match jsonspan::line_indent(text, member.key_start) {
+            Some(outer) => {
+                let inner = format!("{outer}  ");
+                Ok((
+                    entry.open..entry.close + 1,
+                    format!(
+                        "{{{nl}{inner}{key}: {}{nl}{outer}}}",
+                        render_list(items, Some(&inner), nl)?
+                    ),
+                ))
+            }
+            None => Ok((
+                entry.open..entry.close + 1,
+                format!("{{{key}:{}}}", render_list(items, None, nl)?),
+            )),
+        },
     }
 }
 
@@ -659,6 +832,123 @@ fn approve(doc: &mut Value, name: &str, lines: &mut Vec<String>) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
+
+    // The Value-based edits this module used before it edited text in place; kept as an oracle for tests.
+    fn set_disabled(
+        doc: &mut Value,
+        project: &str,
+        name: &str,
+        disabled: bool,
+        lines: &mut Vec<String>,
+    ) -> Result<(), super::StoreError> {
+        let wanted = normalise_project(project);
+        let projects = doc
+            .get_mut("projects")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                super::StoreError::Invalid("the configuration has no projects".to_owned())
+            })?;
+        let mut found = false;
+        for (key, entry) in projects.iter_mut() {
+            if normalise_project(key) != wanted {
+                continue;
+            }
+            found = true;
+            let entry = entry.as_object_mut().ok_or_else(|| {
+                super::StoreError::Invalid(format!(
+                    "the entry for {} is not an object",
+                    sanitize(key)
+                ))
+            })?;
+            // (The original created an empty list when enabling; the in-place edit does not, and neither does this.)
+            if !disabled && !entry.contains_key("disabledMcpServers") {
+                continue;
+            }
+            let list = entry
+                .entry("disabledMcpServers")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let list = list.as_array_mut().ok_or_else(|| {
+                super::StoreError::Invalid(format!(
+                    "disabledMcpServers of {} is not a list; refusing to change it",
+                    sanitize(key)
+                ))
+            })?;
+            let is_name = |v: &Value| v.as_str() == Some(name);
+            let before = list.len();
+            let header = format!(
+                "  projects[\"{}\"].disabledMcpServers",
+                sanitize(&key.replace('"', "\\\""))
+            );
+            if disabled {
+                if !list.iter().any(is_name) {
+                    list.push(Value::String(name.to_owned()));
+                    lines.push(header);
+                    lines.push(format!("+ {}", sanitize(name)));
+                }
+            } else {
+                list.retain(|v| !is_name(v));
+                if list.len() != before {
+                    lines.push(header);
+                    lines.push(format!("- {}", sanitize(name)));
+                }
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(super::StoreError::Invalid(format!(
+                "{} is not a project Claude Code knows about",
+                sanitize(&wanted)
+            )))
+        }
+    }
+
+    fn clear_rejection(
+        doc: &mut Value,
+        project: &str,
+        name: &str,
+        lines: &mut Vec<String>,
+    ) -> Result<(), super::StoreError> {
+        let wanted = normalise_project(project);
+        let projects = doc
+            .get_mut("projects")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                super::StoreError::Invalid("the configuration has no projects".to_owned())
+            })?;
+        let mut found = false;
+        for (key, entry) in projects.iter_mut() {
+            if normalise_project(key) != wanted {
+                continue;
+            }
+            found = true;
+            // A list of the wrong shape is ignored by the reader too, so there is nothing to clear in it.
+            let Some(list) = entry
+                .get_mut("disabledMcpjsonServers")
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            let before = list.len();
+            list.retain(|v| v.as_str() != Some(name));
+            if list.len() != before {
+                lines.push(format!(
+                    "  projects[\"{}\"].disabledMcpjsonServers",
+                    sanitize(&key.replace('"', "\\\""))
+                ));
+                lines.push(format!("- {}", sanitize(name)));
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(super::StoreError::Invalid(format!(
+                "{} is not a project Claude Code knows about",
+                sanitize(&wanted)
+            )))
+        }
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1148,7 +1438,9 @@ mod tests {
         assert!(!f.text().ends_with('\n') && !f.text().contains('\r'));
         assert!(f.text().contains("\n  \"zeta\": 1.5"));
         // A file that had a BOM, CRLF and a final newline keeps them.
-        let original = format!("\u{feff}{}\n", pretty(&sample()).replace('\n', "\r\n"));
+        // (This input used to end in a bare LF after CRLF lines, which the old full rewrite normalised. Edits are
+        // now made in place, so a mixed file stays mixed; that case is covered by the test below.)
+        let original = format!("\u{feff}{}\r\n", pretty(&sample()).replace('\n', "\r\n"));
         let f = Fixture::new(&original);
         let plan = f
             .store
@@ -1160,6 +1452,17 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.ends_with("}\r\n") || text.ends_with("}\n"));
         assert_eq!(text.matches('\n').count(), text.matches("\r\n").count());
+    }
+
+    #[test]
+    fn mixed_line_endings_outside_the_change_are_left_as_they_are() {
+        let original = format!("{}\n", pretty(&sample()).replace('\n', "\r\n"));
+        let f = Fixture::new(&original);
+        let plan = f.store.prepare(vec![disable("C:/work/app", "g")]).unwrap();
+        f.store.apply(&plan).unwrap();
+        let text = f.text();
+        assert!(text.ends_with("}\n") && !text.ends_with("}\r\n"));
+        assert_eq!(text.matches('\n').count(), text.matches("\r\n").count() + 1);
     }
 
     #[test]
@@ -1474,5 +1777,230 @@ mod tests {
             f.store.prepare(vec![op]),
             Err(StoreError::Invalid(_))
         ));
+    }
+
+    // ---- editing in place: only the changed list's bytes differ
+
+    #[test]
+    fn bytes_outside_the_changed_list_are_kept_exactly() {
+        // Not the way serde or Claude would write it: four-space indents, escapes, a float with a trailing zero,
+        // a number too big for u64, and an entry spread over one line.
+        let text = "{\n    \"tipsHistory\": {\"a\": 1.0, \"b\": 1e2, \"big\": 123456789012345678901234567890},\n    \"name\": \"caf\\u00e9 \\/ x\",\n    \"projects\": {\n        \"/p\": {\n            \"allowedTools\": [ ],\n            \"disabledMcpServers\": [\"old\"]\n        },\n        \"/q\": {\"x\": 1}\n    }\n}";
+        let f = Fixture::new(text);
+        let plan = f.store.prepare(vec![disable("/p", "gw")]).unwrap();
+        f.store.apply(&plan).unwrap();
+        let after = f.text();
+        let start = text.find("[\"old\"]").unwrap();
+        assert_eq!(
+            &after[..start],
+            &text[..start],
+            "everything before the list"
+        );
+        let tail = &text[start + "[\"old\"]".len()..];
+        assert!(after.ends_with(tail), "everything after the list: {after}");
+        let list = &after[start..after.len() - tail.len()];
+        let parsed: Value = serde_json::from_str(list).unwrap();
+        assert_eq!(parsed, json!(["old", "gw"]));
+    }
+
+    #[test]
+    fn a_list_added_to_a_one_line_entry_keeps_the_rest_of_the_file_exactly() {
+        let text = "{\"projects\":{\"/q\":{\"x\":1.50},\"/r\":{}},\"z\":\"\\u00e9\"}";
+        let f = Fixture::new(text);
+        let plan = f
+            .store
+            .prepare(vec![disable("/q", "a"), disable("/r", "b")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        assert_eq!(
+            f.text(),
+            "{\"projects\":{\"/q\":{\"x\":1.50,\"disabledMcpServers\":[\"a\"]},\"/r\":{\"disabledMcpServers\":[\"b\"]}},\"z\":\"\\u00e9\"}"
+        );
+    }
+
+    #[test]
+    fn a_project_listed_twice_under_the_same_spelling_is_refused() {
+        // serde would keep only the last one and silently drop the other on write.
+        let text = "{\"projects\": {\"/p\": {\"a\": 1}, \"/p\": {\"b\": 2}}}";
+        let f = Fixture::new(text);
+        assert!(matches!(
+            f.store.prepare(vec![disable("/p", "x")]),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(f.text(), text);
+    }
+
+    #[test]
+    fn a_list_present_twice_in_one_entry_is_refused() {
+        let text = "{\"projects\": {\"/p\": {\"disabledMcpServers\": [], \"disabledMcpServers\": [\"y\"]}}}";
+        let f = Fixture::new(text);
+        assert!(matches!(
+            f.store.prepare(vec![disable("/p", "x")]),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn crlf_files_get_crlf_in_the_new_lines_too() {
+        let text = pretty(&json!({"projects": {"/p": {"a": 1}, "/e": {}}})).replace('\n', "\r\n");
+        let f = Fixture::new(&text);
+        let plan = f
+            .store
+            .prepare(vec![disable("/p", "x"), disable("/e", "y")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let after = f.text();
+        assert_eq!(
+            after.matches('\n').count(),
+            after.matches("\r\n").count(),
+            "{after:?}"
+        );
+        let expected = pretty(&json!({"projects": {
+            "/p": {"a": 1, "disabledMcpServers": ["x"]},
+            "/e": {"disabledMcpServers": ["y"]}
+        }}))
+        .replace('\n', "\r\n");
+        assert_eq!(after, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_is_the_old_file_itself_not_a_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let f = Fixture::new(&pretty(&sample()));
+        let old_inode = std::fs::metadata(&f.store.path).unwrap().ino();
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        let backup = f.store.apply(&plan).unwrap().backup.unwrap();
+        assert_eq!(std::fs::metadata(&backup).unwrap().ino(), old_inode);
+        assert_ne!(std::fs::metadata(&f.store.path).unwrap().ino(), old_inode);
+    }
+
+    /// Same results as the Value-based edits, over many generated files and op sequences: the same document, the
+    /// same plan lines, and for files written the way Claude writes them, the same bytes.
+    #[test]
+    fn in_place_edits_match_the_parsed_edits() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let names = ["a", "b", "gw", "x y", "\u{e9}"];
+        let spellings = ["C:/w/p", "c:\\w\\p", "C:/w/p/", "/q", "/r"];
+        for round in 0..400 {
+            let mut projects = serde_json::Map::new();
+            for key in spellings {
+                if next(4) == 0 {
+                    continue;
+                }
+                let mut entry = serde_json::Map::new();
+                if next(2) == 0 {
+                    entry.insert("allowedTools".into(), json!(["Bash"]));
+                }
+                for list in ["disabledMcpServers", "disabledMcpjsonServers"] {
+                    match next(4) {
+                        0 => {}
+                        1 => {
+                            entry.insert(list.into(), json!([]));
+                        }
+                        _ => {
+                            let items: Vec<Value> = (0..next(4))
+                                .map(|_| match next(6) {
+                                    0 => json!(7),
+                                    1 => Value::Null,
+                                    _ => json!(names[next(names.len() as u64) as usize]),
+                                })
+                                .collect();
+                            entry.insert(list.into(), Value::Array(items));
+                        }
+                    }
+                }
+                if next(3) == 0 {
+                    entry.insert("history".into(), json!([{"display": "x", "n": 1.5}]));
+                }
+                projects.insert(key.into(), Value::Object(entry));
+            }
+            if projects.is_empty() {
+                projects.insert("/q".into(), json!({}));
+            }
+            let doc = json!({"numStartups": 3, "projects": projects, "tail": [1, {"k": "v"}]});
+            let keys: Vec<String> = doc["projects"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            let ops: Vec<Op> = (0..1 + next(5))
+                .map(|_| {
+                    let project = keys[next(keys.len() as u64) as usize].clone();
+                    let name = names[next(names.len() as u64) as usize].to_owned();
+                    if next(3) == 0 {
+                        Op::ClearRejection { project, name }
+                    } else {
+                        Op::SetDisabled {
+                            project,
+                            name,
+                            disabled: next(2) == 0,
+                        }
+                    }
+                })
+                .collect();
+            for compact in [false, true] {
+                let text = if compact {
+                    serde_json::to_string(&doc).unwrap()
+                } else {
+                    pretty(&doc)
+                };
+                let mut expected = doc.clone();
+                let mut expected_lines = Vec::new();
+                let oracle: Result<(), super::StoreError> =
+                    ops.iter().try_for_each(|op| match op {
+                        Op::SetDisabled {
+                            project,
+                            name,
+                            disabled,
+                        } => set_disabled(
+                            &mut expected,
+                            project,
+                            name,
+                            *disabled,
+                            &mut expected_lines,
+                        ),
+                        Op::ClearRejection { project, name } => {
+                            clear_rejection(&mut expected, project, name, &mut expected_lines)
+                        }
+                        Op::Approve { .. } => unreachable!(),
+                    });
+                let got = edit_claude_json(&text, &ops);
+                match (oracle, got) {
+                    (Ok(()), Ok((splices, mut lines))) => {
+                        let mut new_text = text.clone();
+                        for (range, with) in splices.unwrap_or_default().iter().rev() {
+                            new_text.replace_range(range.clone(), with);
+                        }
+                        let parsed: Value = serde_json::from_str(&new_text).unwrap();
+                        assert_eq!(
+                            parsed, expected,
+                            "round {round}, compact {compact}, ops {ops:?}"
+                        );
+                        if !compact {
+                            assert_eq!(new_text, pretty(&expected), "round {round}: bytes");
+                        }
+                        let mut want = expected_lines.clone();
+                        want.sort();
+                        lines.sort();
+                        assert_eq!(lines, want, "round {round}: plan lines");
+                    }
+                    (Err(_), Err(_)) => {}
+                    (oracle, got) => {
+                        panic!("round {round}: oracle {oracle:?}, in place {got:?}, ops {ops:?}")
+                    }
+                }
+            }
+        }
     }
 }
