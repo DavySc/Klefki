@@ -1,0 +1,18 @@
+# The UI crate performs no IO (CLAUDE.md invariant). Everything goes through klefki_core::api.
+disallowed-methods = [
+  { path = "std::fs::read", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::read_to_string", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::read_dir", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::metadata", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::write", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::copy", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::rename", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::remove_file", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::create_dir_all", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::File::open", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::File::create", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::fs::OpenOptions::new", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::process::Command::new", reason = "UI spawns no processes; use klefki_core::api" },
+  { path = "std::net::TcpStream::connect", reason = "UI does no network IO; use klefki_core::api" },
+  { path = "std::net::UdpSocket::bind", reason = "UI does no network IO; use klefki_core::api" },
+]

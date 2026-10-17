@@ -4,8 +4,10 @@ use crate::theme::{self, Palette, ThemeChoice};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
-use klefki_core::api::{Scope, ServerRow, Snapshot, Status};
-use std::collections::BTreeSet;
+use klefki_core::api::{
+    Command, Core, Event, Scope, ServerId, ServerRow, Snapshot, Status, TransportKind,
+};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,12 @@ enum GridRow {
 
 pub struct ShellApp {
     snapshot: Arc<Snapshot>,
+    /// The engine. `None` for demo data and tests that feed the UI directly.
+    core: Option<Core>,
+    /// Live results from the engine, which take precedence over the snapshot's hints.
+    live: HashMap<ServerId, (Status, Option<String>)>,
+    cli_version: Option<String>,
+    cli_problem: Option<String>,
     pub page: Page,
     pub search: String,
     pub selected: BTreeSet<usize>,
@@ -70,12 +78,90 @@ pub struct ShellApp {
 impl ShellApp {
     pub fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
         Self {
+            core: None,
+            live: HashMap::new(),
+            cli_version: None,
+            cli_problem: None,
             snapshot,
             page: Page::Connections,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
             theme,
+        }
+    }
+
+    /// The app driven by the engine: the snapshot and every status arrive as events.
+    pub fn with_core(core: Core, theme: ThemeChoice) -> Self {
+        let mut app = Self::new(Arc::new(Snapshot::default()), theme);
+        app.core = Some(core);
+        app
+    }
+
+    fn send(&self, command: Command) {
+        if let Some(core) = &self.core {
+            core.send(command);
+        }
+    }
+
+    /// Re-reads the configuration and re-checks every server.
+    fn refresh(&self) {
+        self.send(Command::Refresh { live_all: true });
+    }
+
+    fn poll_core(&mut self) {
+        let mut events = Vec::new();
+        if let Some(core) = &self.core {
+            while let Some(event) = core.try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.apply_event(event);
+        }
+    }
+
+    fn apply_event(&mut self, event: Event) {
+        match event {
+            Event::Snapshot(snapshot) => {
+                // Selection is by position, so carry it over by identity.
+                let selected_ids: Vec<ServerId> = self
+                    .selected
+                    .iter()
+                    .filter_map(|&i| self.snapshot.servers.get(i).map(ServerRow::id))
+                    .collect();
+                self.selected = snapshot
+                    .servers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| selected_ids.contains(&r.id()))
+                    .map(|(i, _)| i)
+                    .collect();
+                // A check that was running is cut off by a refresh, and rows may have disappeared.
+                let known: BTreeSet<ServerId> =
+                    snapshot.servers.iter().map(ServerRow::id).collect();
+                self.live
+                    .retain(|id, (status, _)| *status != Status::Checking && known.contains(id));
+                if snapshot.cli_version.is_some() {
+                    self.cli_version = snapshot.cli_version.clone();
+                }
+                self.snapshot = snapshot;
+            }
+            Event::CliVersion(version) => self.cli_version = version,
+            Event::CliProblem(problem) => self.cli_problem = Some(problem),
+            Event::Status { id, status, detail } => {
+                if self.snapshot.servers.iter().any(|r| r.id() == id) {
+                    self.live.insert(id, (status, detail));
+                }
+            }
+        }
+    }
+
+    /// What to show for a row: the engine's latest answer, else what Claude's own cache said.
+    fn effective<'a>(&'a self, row: &'a ServerRow) -> (Status, Option<&'a str>) {
+        match self.live.get(&row.id()) {
+            Some((status, detail)) => (*status, detail.as_deref()),
+            None => (row.status, None),
         }
     }
 
@@ -120,6 +206,10 @@ impl ShellApp {
     }
 
     fn show(&mut self, ui: &mut Ui) {
+        self.poll_core();
+        if ui.input(|i| i.key_pressed(egui::Key::F5)) {
+            self.refresh();
+        }
         let pal = theme::palette(ui.ctx());
         egui::Panel::top("top_bar")
             .frame(bar_frame(pal))
@@ -174,9 +264,13 @@ impl ShellApp {
             );
             ui.label(RichText::new(self.page.title()).color(pal.text_muted));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let _ = ui
+                if ui
                     .button(icon::ARROWS_CLOCKWISE)
-                    .on_hover_text("Refresh (F5)");
+                    .on_hover_text("Refresh and re-check all (F5)")
+                    .clicked()
+                {
+                    self.refresh();
+                }
                 let mut changed = false;
                 egui::ComboBox::from_id_salt("theme")
                     .selected_text(format!("{} {}", self.theme.icon(), self.theme.label()))
@@ -198,7 +292,11 @@ impl ShellApp {
                         .hint_text(format!("{} Search", icon::MAGNIFYING_GLASS))
                         .desired_width(220.0),
                 );
-                if let Some(version) = self.snapshot.cli_version.as_deref() {
+                if let Some(version) = self
+                    .cli_version
+                    .as_deref()
+                    .or(self.snapshot.cli_version.as_deref())
+                {
                     ui.label(RichText::new(format!("Claude CLI {version}")).color(pal.text_muted));
                 }
             });
@@ -253,7 +351,13 @@ impl ShellApp {
     fn warnings(&self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
         const SHOWN: usize = 4;
-        let warnings = &self.snapshot.warnings;
+        let warnings: Vec<&str> = self
+            .snapshot
+            .warnings
+            .iter()
+            .map(String::as_str)
+            .chain(self.cli_problem.as_deref())
+            .collect();
         if warnings.is_empty() {
             return;
         }
@@ -346,7 +450,8 @@ impl ShellApp {
                         row.col(|ui| {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
-                        row.col(|ui| status_cell(ui, s));
+                        let (status, detail) = self.effective(s);
+                        row.col(|ui| status_cell(ui, s, status, detail));
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
                         });
@@ -385,6 +490,10 @@ impl ShellApp {
             return;
         };
         let s = self.snapshot.servers[i].clone();
+        let (status, detail) = {
+            let (status, detail) = self.effective(&s);
+            (status, detail.map(str::to_owned))
+        };
         ui.label(RichText::new(&s.name).heading());
         ui.horizontal(|ui| {
             flat_items(ui);
@@ -411,6 +520,35 @@ impl ShellApp {
                         kv("Enabled", if s.enabled { "yes" } else { "no" }.to_owned());
                         kv("Shadowed", if s.shadowed { "yes" } else { "no" }.to_owned());
                     });
+            }
+            DetailTab::Status => {
+                egui::Grid::new("status")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Status").color(pal.text_muted));
+                        ui.label(status.label());
+                        ui.end_row();
+                        ui.label(RichText::new("Detail").color(pal.text_muted));
+                        ui.label(detail.as_deref().unwrap_or("-"));
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                if s.scope == Scope::Project && s.transport == TransportKind::Stdio {
+                    ui.label(
+                        RichText::new(
+                            "Checking runs this server's command from its repository, so it only happens when you ask.",
+                        )
+                        .color(pal.warn),
+                    );
+                }
+                let can_check = self.core.is_some() && status != Status::Checking;
+                if ui
+                    .add_enabled(can_check, egui::Button::new("Check now"))
+                    .clicked()
+                {
+                    self.send(Command::Check(s.id()));
+                }
             }
             _ => {
                 ui.label(RichText::new("Available from M1.").color(pal.text_muted));
@@ -479,19 +617,23 @@ fn name_cell(ui: &mut Ui, s: &ServerRow) {
     }
 }
 
-fn status_cell(ui: &mut Ui, s: &ServerRow) {
+fn status_cell(ui: &mut Ui, s: &ServerRow, status: Status, detail: Option<&str>) {
     let pal = theme::palette(ui.ctx());
     if !s.enabled {
         ui.label(RichText::new("Disabled").color(pal.disabled));
         return;
     }
-    let color = match s.status {
+    let color = match status {
         Status::Connected => pal.success,
-        Status::NeedsAuth => pal.warn,
+        Status::Degraded | Status::NeedsAuth | Status::PendingApproval => pal.warn,
         Status::Failed => pal.danger,
-        Status::Unknown => pal.text_muted,
+        Status::Checking => pal.primary,
+        Status::NotConfigured | Status::Unknown => pal.text_muted,
     };
-    ui.label(RichText::new(format!("\u{25CF} {}", s.status.label())).color(color));
+    let response = ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color));
+    if let Some(detail) = detail {
+        response.on_hover_text(detail);
+    }
 }
 
 fn badge(ui: &mut Ui, text: &str, fill: Color32) {
@@ -741,5 +883,259 @@ mod tests {
             let after = h.get_by_label_contains(option).rect();
             assert_eq!(before, after, "option {option} moved or resized on hover");
         }
+    }
+
+    // ---- live status: the UI only reacts to events from the engine and sends commands back ----
+
+    fn live_row(name: &str, scope: Scope, project: Option<&str>) -> ServerRow {
+        ServerRow {
+            name: name.to_owned(),
+            scope,
+            project: project.map(str::to_owned),
+            transport: klefki_core::api::TransportKind::Stdio,
+            target: "npx something".to_owned(),
+            status: Status::Unknown,
+            enabled: true,
+            shadowed: false,
+            casing_collision: false,
+        }
+    }
+
+    fn snapshot_of(rows: Vec<ServerRow>) -> klefki_core::api::Event {
+        klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+            servers: rows,
+            ..Snapshot::default()
+        }))
+    }
+
+    fn live_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (core, engine) = klefki_core::api::Core::detached();
+        let h = Harness::builder()
+            .with_size(egui::vec2(1100.0, 900.0))
+            .build_eframe(move |cc| {
+                crate::theme::apply(&cc.egui_ctx, ThemeChoice::Dark);
+                ShellApp::with_core(core, ThemeChoice::Dark)
+            });
+        (h, engine)
+    }
+
+    fn status_event(
+        row: &ServerRow,
+        status: Status,
+        detail: Option<&str>,
+    ) -> klefki_core::api::Event {
+        klefki_core::api::Event::Status {
+            id: row.id(),
+            status,
+            detail: detail.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_snapshot_event_fills_the_grid_and_status_events_update_it_live() {
+        let (mut h, engine) = live_harness();
+        h.run();
+        let row = live_row("azure-devops", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        h.run();
+        h.get_by_label("azure-devops");
+        h.get_by_label_contains("Not checked");
+
+        engine
+            .events
+            .send(status_event(&row, Status::Checking, None))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Checking");
+        assert!(h.query_by_label_contains("Not checked").is_none());
+
+        engine
+            .events
+            .send(status_event(&row, Status::Connected, None))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Connected");
+        assert!(h.query_by_label_contains("Checking").is_none());
+    }
+
+    #[test]
+    fn every_status_has_its_own_readable_label() {
+        let (mut h, engine) = live_harness();
+        let statuses = [
+            Status::Connected,
+            Status::Degraded,
+            Status::NeedsAuth,
+            Status::Failed,
+            Status::PendingApproval,
+            Status::NotConfigured,
+            Status::Checking,
+            Status::Unknown,
+        ];
+        let labels: std::collections::BTreeSet<_> = statuses.iter().map(|s| s.label()).collect();
+        assert_eq!(
+            labels.len(),
+            statuses.len(),
+            "every status reads differently"
+        );
+        let rows: Vec<ServerRow> = (0..statuses.len())
+            .map(|i| live_row(&format!("srv{i}"), Scope::User, None))
+            .collect();
+        engine.events.send(snapshot_of(rows.clone())).unwrap();
+        for (row, status) in rows.iter().zip(statuses) {
+            engine.events.send(status_event(row, status, None)).unwrap();
+        }
+        h.run();
+        for status in statuses {
+            h.get_by_label(&format!("\u{25CF} {}", status.label()));
+        }
+    }
+
+    #[test]
+    fn a_new_snapshot_clears_checks_that_were_cut_off() {
+        let (mut h, engine) = live_harness();
+        let row = live_row("azure-devops", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine
+            .events
+            .send(status_event(&row, Status::Checking, None))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Checking");
+        // A refresh replaced the world; the running check's answer will be dropped by the engine.
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Checking").is_none());
+        h.get_by_label_contains("Not checked");
+    }
+
+    #[test]
+    fn results_for_rows_that_are_gone_do_not_linger_or_crash() {
+        let (mut h, engine) = live_harness();
+        let gone = live_row("gone", Scope::User, None);
+        let stays = live_row("stays", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![gone.clone(), stays.clone()]))
+            .unwrap();
+        engine
+            .events
+            .send(status_event(&gone, Status::Failed, Some("x")))
+            .unwrap();
+        engine
+            .events
+            .send(snapshot_of(vec![stays.clone()]))
+            .unwrap();
+        engine
+            .events
+            .send(status_event(&gone, Status::Failed, Some("late")))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label("gone").is_none());
+        h.get_by_label("stays");
+    }
+
+    #[test]
+    fn the_cli_version_and_problems_are_shown() {
+        let (mut h, engine) = live_harness();
+        h.run();
+        assert!(h.query_by_label_contains("Claude CLI").is_none());
+        engine
+            .events
+            .send(klefki_core::api::Event::CliVersion(Some(
+                "2.1.302".to_owned(),
+            )))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Claude CLI 2.1.302");
+        engine
+            .events
+            .send(klefki_core::api::Event::CliProblem(
+                "Live status is unavailable: nope.".to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Live status is unavailable");
+    }
+
+    #[test]
+    fn the_status_tab_shows_the_detail_and_check_now_asks_the_engine() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let row = live_row("docs", Scope::Project, Some("C:/Repos/WebApp"));
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine
+            .events
+            .send(status_event(
+                &row,
+                Status::Failed,
+                Some("CONNECTION_CLOSED: Connection closed"),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label("docs").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("CONNECTION_CLOSED: Connection closed");
+        // A project server's check runs the repository's own command, and the UI says so.
+        h.get_by_label_contains("runs this server's command");
+        h.get_by_label_contains("Check now").click();
+        h.run();
+        let sent = engine.commands.try_recv().expect("a command was sent");
+        assert_eq!(sent, klefki_core::api::Command::Check(row.id()));
+        assert!(engine.commands.try_recv().is_err(), "exactly one command");
+    }
+
+    #[test]
+    fn check_now_does_not_warn_about_commands_for_remote_servers() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.transport = klefki_core::api::TransportKind::Http;
+        engine.events.send(snapshot_of(vec![row])).unwrap();
+        h.run();
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("runs this server's command")
+                .is_none()
+        );
+        h.get_by_label_contains("Check now");
+    }
+
+    #[test]
+    fn the_refresh_button_and_f5_ask_for_a_full_recheck() {
+        let (mut h, engine) = live_harness();
+        h.run();
+        h.get_by_label(icon::ARROWS_CLOCKWISE).click();
+        h.run();
+        assert_eq!(
+            engine.commands.try_recv().unwrap(),
+            klefki_core::api::Command::Refresh { live_all: true }
+        );
+        h.key_press(egui::Key::F5);
+        h.run();
+        assert_eq!(
+            engine.commands.try_recv().unwrap(),
+            klefki_core::api::Command::Refresh { live_all: true }
+        );
+        assert!(engine.commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn disabled_rows_still_say_disabled_whatever_the_engine_reports() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("off", Scope::User, None);
+        row.enabled = false;
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine
+            .events
+            .send(status_event(&row, Status::Connected, None))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Disabled");
+        assert!(h.query_by_label_contains("Connected").is_none());
     }
 }

@@ -1,0 +1,5 @@
+gateway:
+  Scope: User config (available in all your projects)
+  Status: ✘ Connection error
+  Type: http
+  URL: https://gateway.example.com/mcp

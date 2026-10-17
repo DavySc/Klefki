@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 pub use crate::config::ConfigPaths;
+pub use crate::engine::{Command, Core, Detached, Event};
 pub use crate::model::{NameError, ServerName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -45,8 +46,16 @@ impl TransportKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Connected,
+    /// Connected, but listing the server's tools failed.
+    Degraded,
     NeedsAuth,
     Failed,
+    /// A project server the user has not approved yet. Claude does not run it.
+    PendingApproval,
+    NotConfigured,
+    /// A live check is running.
+    Checking,
+    /// Nothing is known: not cached by Claude and not checked yet.
     Unknown,
 }
 
@@ -54,11 +63,23 @@ impl Status {
     pub fn label(self) -> &'static str {
         match self {
             Self::Connected => "Connected",
+            Self::Degraded => "Connected, tools failed",
             Self::NeedsAuth => "Needs auth",
             Self::Failed => "Failed",
-            Self::Unknown => "Unknown",
+            Self::PendingApproval => "Pending approval",
+            Self::NotConfigured => "Not configured",
+            Self::Checking => "Checking…",
+            Self::Unknown => "Not checked",
         }
     }
+}
+
+/// Identifies a row across snapshots, so live results can be matched back to it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServerId {
+    pub scope: Scope,
+    pub project: Option<String>,
+    pub name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +97,16 @@ pub struct ServerRow {
     pub casing_collision: bool,
 }
 
+impl ServerRow {
+    pub fn id(&self) -> ServerId {
+        ServerId {
+            scope: self.scope,
+            project: self.project.clone(),
+            name: self.name.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub cli_version: Option<String>,
@@ -84,7 +115,25 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
 }
 
-/// Reads the real Claude Code configuration (read-only).
+/// Starts the engine against the real Claude Code configuration and the real CLI. It loads the snapshot, finds
+/// `claude`, and runs live status checks in the background. `wake` is called whenever events are waiting, so the
+/// UI can repaint.
+pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
+    crate::engine::start_with(
+        crate::engine::EngineConfig {
+            paths: ConfigPaths::discover(),
+            claude: None,
+            home: directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
+            path_var: std::env::var_os("PATH"),
+            cli_env: Vec::new(),
+            max_checks: 3,
+            check_timeout: std::time::Duration::from_secs(30),
+        },
+        wake,
+    )
+}
+
+/// Reads the real Claude Code configuration (read-only), once, without live checks.
 pub fn load_snapshot() -> Arc<Snapshot> {
     match ConfigPaths::discover() {
         Some(paths) => load_snapshot_from(&paths),

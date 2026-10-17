@@ -1,0 +1,9 @@
+azure-devops:
+  Scope: User config (available in all your projects)
+  Status: ✔ Connected
+  Type: stdio
+  Command: npx
+  Args: -y @azure-devops/mcp example-org
+  Environment:
+
+To remove this server, run: claude mcp remove azure-devops -s user

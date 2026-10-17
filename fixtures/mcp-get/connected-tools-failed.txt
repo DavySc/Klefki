@@ -1,0 +1,6 @@
+gateway:
+  Scope: User config (available in all your projects)
+  Status: ! Connected · tools fetch failed
+  Issue: tools/list timed out
+  Type: http
+  URL: https://gateway.example.com/mcp

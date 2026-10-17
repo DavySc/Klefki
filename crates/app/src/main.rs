@@ -17,18 +17,25 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             let choice = theme_flag().unwrap_or_else(|| theme::load_choice(cc.storage));
             theme::apply(&cc.egui_ctx, choice);
-            Ok(Box::new(ShellApp::new(snapshot(), choice)))
+            let app = if demo() {
+                ShellApp::new(klefki_core::api::fixture_snapshot(), choice)
+            } else {
+                // The engine loads the configuration and runs live status checks in the background; it wakes
+                // the UI when something new is ready.
+                let ctx = cc.egui_ctx.clone();
+                ShellApp::with_core(
+                    klefki_core::api::start(move || ctx.request_repaint()),
+                    choice,
+                )
+            };
+            Ok(Box::new(app))
         }),
     )
 }
 
-/// Real configuration by default; `--demo` shows the built-in sample data instead.
-fn snapshot() -> std::sync::Arc<klefki_core::api::Snapshot> {
-    if std::env::args().any(|a| a == "--demo") {
-        klefki_core::api::fixture_snapshot()
-    } else {
-        klefki_core::api::load_snapshot()
-    }
+/// `--demo` shows the built-in sample data instead of the real configuration.
+fn demo() -> bool {
+    std::env::args().any(|a| a == "--demo")
 }
 
 /// `--theme light|dark|system` overrides the remembered choice for this run.

@@ -1,0 +1,8 @@
+pending-proj:
+  Scope: Project config (shared via .mcp.json)
+  Status: ⏸ Pending approval (run `claude` to approve)
+  Type: stdio
+  Command: node
+  Args: server.js
+
+To remove this server, run: claude mcp remove pending-proj -s project

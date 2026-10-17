@@ -1,0 +1,12 @@
+[package]
+name = "fake-claude"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Test-only stand-in for the claude CLI. Never shipped."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

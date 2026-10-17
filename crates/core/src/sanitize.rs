@@ -13,6 +13,16 @@ pub(crate) fn sanitize(input: &str) -> String {
     out
 }
 
+/// Cuts `s` to at most `max` characters, marking the cut with an ellipsis.
+pub(crate) fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
 fn skip_escape(chars: &mut std::str::Chars<'_>) {
     match chars.next() {
         // CSI: parameters/intermediates, then a final byte 0x40..=0x7E.
@@ -69,6 +79,14 @@ mod tests {
     #[test]
     fn keeps_newline_tab_and_unicode() {
         assert_eq!(sanitize("a\tb\nc é 日本"), "a\tb\nc é 日本");
+    }
+
+    #[test]
+    fn clip_cuts_on_characters_not_bytes() {
+        assert_eq!(super::clip("abc", 3), "abc");
+        assert_eq!(super::clip("abcd", 3), "abc…");
+        assert_eq!(super::clip("日本語です", 2), "日本…");
+        assert_eq!(super::clip("", 0), "");
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub enum NameError {
     Empty,
     TooLong,
     BadChar(char),
+    /// A leading `-` would be read as an option by the Claude CLI.
+    LeadingDash,
     Reserved,
 }
 
@@ -27,6 +29,7 @@ impl fmt::Display for NameError {
             Self::Empty => write!(f, "name is empty"),
             Self::TooLong => write!(f, "name is longer than 64 characters"),
             Self::BadChar(c) => write!(f, "character {c:?} is not allowed (use A-Z a-z 0-9 _ -)"),
+            Self::LeadingDash => write!(f, "name must not start with a dash"),
             Self::Reserved => write!(f, "name is reserved"),
         }
     }
@@ -45,6 +48,9 @@ impl ServerName {
             .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
         {
             return Err(NameError::BadChar(c));
+        }
+        if s.starts_with('-') {
+            return Err(NameError::LeadingDash);
         }
         if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(s)) {
             return Err(NameError::Reserved);
@@ -85,6 +91,22 @@ mod tests {
                 matches!(ServerName::parse(n), Err(NameError::BadChar(_))),
                 "{n:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_names_the_cli_would_read_as_options() {
+        // Passed as `claude mcp get <name>`, a leading dash would be parsed as a flag.
+        for n in ["-h", "--help", "-", "--", "-x", "_-ok-", "-a"] {
+            let parsed = ServerName::parse(n);
+            if n.starts_with('-') {
+                assert_eq!(parsed, Err(NameError::LeadingDash), "{n:?}");
+            } else {
+                assert!(
+                    parsed.is_ok(),
+                    "{n:?} should be fine: a dash inside is allowed"
+                );
+            }
         }
     }
 

@@ -1,0 +1,1 @@
+No MCP server named "no-such-server". Configured servers: bad-stdio, remote-down (.mcp.json servers are awaiting approval — run `claude` in this directory to review them.)

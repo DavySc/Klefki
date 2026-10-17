@@ -2,7 +2,7 @@
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::{ConfigPaths, fsx};
 use crate::api::{Scope, ServerRow, Snapshot, Status, TransportKind};
-use crate::sanitize::sanitize;
+use crate::sanitize::{self, sanitize};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde_json::Value;
@@ -215,12 +215,7 @@ fn display_url(raw: &str, schemes: &[&str]) -> Result<String, &'static str> {
 }
 
 fn clip(s: &str) -> String {
-    if s.chars().count() <= MAX_TEXT_CHARS {
-        return s.to_owned();
-    }
-    let mut out: String = s.chars().take(MAX_TEXT_CHARS).collect();
-    out.push('…');
-    out
+    sanitize::clip(s, MAX_TEXT_CHARS)
 }
 
 fn mark_casing_collisions(rows: &mut [ServerRow]) {
