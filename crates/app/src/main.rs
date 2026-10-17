@@ -6,13 +6,13 @@ use shell::ShellApp;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("klefki")
+            .with_title("Klefki")
             .with_inner_size([1200.0, 720.0])
             .with_min_inner_size([800.0, 480.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "klefki",
+        "Klefki",
         options,
         Box::new(|cc| {
             let choice = theme_flag().unwrap_or_else(|| theme::load_choice(cc.storage));

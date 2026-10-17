@@ -354,7 +354,7 @@ impl ShellApp {
         ui.horizontal_centered(|ui| {
             ui.label(RichText::new(icon::KEY).size(22.0).color(pal.key));
             ui.label(
-                RichText::new("klefki")
+                RichText::new("Klefki")
                     .family(theme::bold_family())
                     .size(20.0)
                     .color(pal.primary),
@@ -908,7 +908,7 @@ fn flat_items(ui: &mut Ui) {
 /// Plain text a user can paste into a support request. The engine already sanitised and redacted it.
 fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
     use std::fmt::Write;
-    let mut out = String::from("klefki diagnostic report\n");
+    let mut out = String::from("Klefki diagnostic report\n");
     let place = match &row.project {
         Some(project) => format!("{}, {project}", row.scope.label()),
         None => row.scope.label().to_owned(),

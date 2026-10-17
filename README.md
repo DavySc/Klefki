@@ -1,4 +1,4 @@
-# klefki
+# Klefki
 
 A fast, native, cross-platform manager for the MCP servers configured in Claude Code. It replaces the earlier Electron-based MCP manager.
 
