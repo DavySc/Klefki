@@ -24,7 +24,7 @@ If a command can't run, report the work as **unverified**.
 - `crates/app` performs no IO: no fs, process, net or URL opening. Only `klefki_core::api`.
 - All writes go Prepare → diff → Apply, through `config/docstore.rs`: re-read, hash check, backup, atomic persist; key order and unknown keys preserved.
 - OAuth entries are written only via `claude mcp add-json --client-secret`. The secret is passed only in the `MCP_CLIENT_SECRET` env var, never in argv or logs.
-- Never create entries in `project` scope (`Target` is `User | Local` only). Project servers are toggled only through `.claude/settings.local.json`.
+- Never create entries in `project` scope (`Target` is `User | Local` only). Project servers are toggled through `disabledMcpServers` in the project entry of `~/.claude.json`, like every other server. The repository's `.claude/settings.local.json` is written only to approve a project server (`enabledMcpjsonServers`), after showing its full command.
 - Secrets live in the OS keyring, keyed by `ConnectionId`. No plaintext fallback. Never read `~/.claude/.credentials.json`.
 - Claude is spawned with no shell, no `.cmd` or `.bat`, and names matching `^[A-Za-z0-9_-]{1,64}$`. URLs opened are https only. TLS verification is always on.
 - `.mcp.json`, server metadata and CLI output are untrusted: size-limit, validate and sanitize them (ANSI, control and bidi characters).

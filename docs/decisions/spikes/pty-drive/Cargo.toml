@@ -1,0 +1,10 @@
+[package]
+name = "pty-drive"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
+
+[workspace]

@@ -3,3 +3,7 @@
 .idea/
 .vscode/
 *.swp
+
+# Throwaway spike tools build outside the workspace
+docs/decisions/spikes/*/target/
+docs/decisions/spikes/*/Cargo.lock

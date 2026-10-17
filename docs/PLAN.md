@@ -73,7 +73,7 @@ klefki/
   - Detects secret-looking header/env values: masks them and suggests `${VAR}`.
 - **`config/`**:
   - **`fsx.rs`**: the single file access layer, with an allowlist that blocks `~/.claude/.credentials.json`.
-  - **`docstore.rs`**: read, then hash, then patch ops. Before writing it re-reads, and if the file changed it re-applies the ops (up to 3 times). It keeps a rotating private backup (last 20), writes via tempfile + fsync + persist, refuses symlinks, and preserves order, unknown keys and floats. It also takes Claude Code's own lock if the M1 lock experiment shows one exists.
+  - **`docstore.rs`**: read, then hash, then patch ops. Before writing it re-reads, and if the file changed it re-applies the ops (up to 3 times). It keeps a rotating private backup (last 20), writes via tempfile + fsync + persist, refuses symlinks, and preserves order, unknown keys and floats. It takes Claude Code's own lock, a `<claude.json>.lock` directory (stale after 10 s), holds it under 1 s, aborts rather than writing unlocked, re-reads about 1 s after writing to catch an unlocked write by Claude, and serialises as 2-space JSON with LF and no trailing newline (`docs/decisions/001-claude-json-locking.md`).
   - **`claude_json.rs`, `settings.rs`**: honour `CLAUDE_CONFIG_DIR`.
   - **`mcp_json.rs`**: untrusted parser. Max 1 MiB and 500 servers, detects duplicate keys, never panics.
   - **`inventory.rs`**: merges all scopes, marks shadowed servers (local > project > user) and casing collisions.
@@ -102,12 +102,11 @@ klefki/
 - **`watch.rs`**: watches the config dir, `~/.claude/`, and each project's `.mcp.json` and `.claude/` with a 300 ms debounce, then rebuilds the inventory incrementally.
 - **`logging.rs`**: secret types print `***`; secrets are never logged.
 
-### Enable/disable semantics
-- **Local**: the native `projects[p].disabledMcpServers`.
-- **Project**: `<p>/.claude/settings.local.json` `disabledMcpjsonServers`. Warn if it isn't covered by `.gitignore`. Enabling a stdio server shows the full command first.
-- **User**: disable in all known projects, with a caveat that new projects aren't covered.
+### Enable/disable semantics (verified, `docs/decisions/002-disabled-servers.md`)
+- **All scopes**: toggle = membership of the name in `projects[<key>].disabledMcpServers` (append on disable, remove on enable, leave `[]`). Claude writes the key with `/` separators and an upper-case drive letter.
+- **User servers**: per project. "Disable everywhere" adds the name to every known project entry, with a caveat that projects first opened later are not covered.
+- **Project (`.mcp.json`) servers**: the toggle is the same list. Approval is separate: `enabledMcpjsonServers` / `disabledMcpjsonServers`, read from both the project entry and `<project>/.claude/settings.local.json`, written only to the latter. Warn if it isn't covered by `.gitignore`. Approving a stdio server shows the full command first.
 - **Legacy `mcpServersDisabled`**: shown read-only, with a migrate action.
-- Verify the exact `disabledMcpServers` location with a real `/mcp` toggle on day 1 of M1.
 
 ## App (`crates/app/src`): Catppuccin Mocha / Latte with Klefki accents
 Changed from the original look at the owner's request. Dark (Mocha) is the default; a light (Latte) theme and a System option were added.
@@ -158,6 +157,18 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
    - Linux: deb and AppImage, with checksums and minisign.
    - Build provenance attestation and an SBOM.
    - Auto-update only from an org-owned, signature-verified source.
+
+## Nice to have (after M4)
+Ideas from an outside brainstorm, compared with this plan and checked on a real machine in `docs/decisions/003-brainstorm-comparison.md`. None of them blocks M0 to M4, and they are in rough order of value.
+1. **Claude Desktop detection, read-only.** List the servers in `claude_desktop_config.json`. Check both locations: `%APPDATA%\Claude\` and the MSIX-virtualised `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\` (the MSIX one is the real one on the owner's machine). No editing and no health check of Desktop servers (there is no CLI to delegate to); show them with their log tail instead.
+2. **Bounded log tail for MCP servers.** Show the newest log for a server (Claude Code: `%LOCALAPPDATA%\claude-cli-nodejs\Cache\<project>\mcp-logs-<server>\`), reading from the end of the file in chunks. Acceptance criteria, written before the code:
+   - memory stays flat whatever the file size, proven by a test that runs the tail in a child process on a generated 1 GB file and checks peak working set grows by only a few MB, with the first lines visible quickly;
+   - a single huge line without a newline, a file that grows or rotates while read, and a file held open by its writer are all handled;
+   - text is sanitised like all untrusted output, and tokens, `Authorization` values and environment values are redacted by default (the logs can contain full JSON-RPC traffic), with an explicit "copy sanitised" action.
+3. **Paste-to-add.** Accept an `{"mcpServers": {...}}` block or a `claude mcp add ...` command. Parse it ourselves (never run the pasted text), show the exact resolved command and require confirmation before anything is spawned, and write through `add-json` like every other add. Normalise the `/c` that Git Bash turns into `C:/` when it appears in a pasted `cmd /c` command.
+4. **Scope visibility hint for the VS Code extension** ("this server is project-scoped; the extension may not see it"). Only after an experiment confirms the extension really behaves that way: it is installed on the owner's machine (2.1.301) but the claim is unverified.
+
+Not planned, with the reasons recorded in decision 003: `cmd /c` validation (a plain `npx` entry works with the current native Claude Code), and cleanup of old MCP logs (a current install shows 14 MB in 659 files, so the reported runaway growth did not reproduce, and deleting files needs its own safety design).
 
 ## Verification
 - **Unit tests**:
