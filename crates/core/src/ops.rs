@@ -1,0 +1,391 @@
+//! Turns what the user asked for into document edits. Needs the current inventory to know which projects exist.
+use crate::api::{Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot};
+use crate::config::docstore::Op;
+use crate::config::{fsx, inventory};
+use crate::sanitize::sanitize;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// A single shown value longer than this cannot be reviewed with care, so the approval is refused.
+const MAX_REVIEW_CHARS: usize = 2000;
+const MAX_GITIGNORE: u64 = 256 * 1024;
+
+/// What the changes come to.
+#[derive(Default)]
+pub(crate) struct Resolved {
+    /// Edits to `~/.claude.json`.
+    pub claude: Vec<Op>,
+    /// Edits to a project's `.claude/settings.local.json`, by project path.
+    pub settings: BTreeMap<String, Vec<Op>>,
+    pub warnings: Vec<String>,
+    pub reviews: Vec<Review>,
+    /// Definitions that were reviewed; they must be unchanged when the plan is applied.
+    pub guards: Vec<Guard>,
+}
+
+/// An approval is by name. If the repository edits the definition after the user looked at it, the approval
+/// would cover something that was never shown, so the plan checks the definition again before writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Guard {
+    pub project: String,
+    pub name: String,
+    digest: String,
+}
+
+impl Guard {
+    /// Is the server still defined exactly as it was when reviewed?
+    pub(crate) fn still_holds(&self) -> bool {
+        inventory::project_server(&self.project, &self.name)
+            .is_ok_and(|entry| digest(&entry) == self.digest)
+    }
+}
+
+fn digest(entry: &Value) -> String {
+    format!("{:x}", Sha256::digest(entry.to_string().as_bytes()))
+}
+
+pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolved, String> {
+    let mut out = Resolved::default();
+    for change in changes {
+        match change {
+            Change::SetEnabled { id, enabled } => set_enabled(id, *enabled, snapshot, &mut out)?,
+            Change::Approve { id } => approve(id, snapshot, &mut out)?,
+        }
+    }
+    if !out.claude.is_empty() {
+        out.warnings.push(
+            "A running Claude Code session may need a restart before it notices this.".to_owned(),
+        );
+    }
+    out.warnings.dedup();
+    Ok(out)
+}
+
+fn find<'a>(id: &ServerId, snapshot: &'a Snapshot) -> Result<&'a ServerRow, String> {
+    snapshot.servers.iter().find(|r| r.is(id)).ok_or_else(|| {
+        format!(
+            "{} is no longer in the configuration. Refresh and try again.",
+            sanitize(&id.name)
+        )
+    })
+}
+
+fn set_enabled(
+    id: &ServerId,
+    enabled: bool,
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let row = find(id, snapshot)?;
+    let shown = sanitize(&id.name);
+    let disabled = !enabled;
+    match row.scope {
+        Scope::Local | Scope::Project => {
+            let project = row
+                .project
+                .clone()
+                .ok_or_else(|| format!("{shown} has no project"))?;
+            out.claude.push(Op::SetDisabled {
+                project,
+                name: row.name.clone(),
+                disabled,
+            });
+            if enabled && row.scope == Scope::Project && row.approval != Some(Approval::Approved) {
+                out.warnings.push(format!(
+                    "{shown} is a project server that you have not approved in Claude Code. Turning it on does not approve it, so Claude will still not run it."
+                ));
+            }
+        }
+        Scope::User => {
+            if snapshot.projects.is_empty() {
+                return Err(format!(
+                    "Claude Code knows no projects yet, so there is nowhere to switch {shown} {}.",
+                    if enabled { "on" } else { "off" }
+                ));
+            }
+            for project in &snapshot.projects {
+                out.claude.push(Op::SetDisabled {
+                    project: project.clone(),
+                    name: row.name.clone(),
+                    disabled,
+                });
+            }
+            out.warnings.push(format!(
+                "{shown} is a user server, and Claude Code switches it per project. This changes the {} projects it knows today; a project it first opens later is not covered.",
+                snapshot.projects.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
+    let row = find(id, snapshot)?;
+    let shown = sanitize(&id.name);
+    if row.scope != Scope::Project {
+        return Err(format!(
+            "{shown} is not a project server, so it needs no approval."
+        ));
+    }
+    if row.approval == Some(Approval::Approved) {
+        return Ok(());
+    }
+    let project = row
+        .project
+        .clone()
+        .ok_or_else(|| format!("{shown} has no project"))?;
+    if !inventory::is_safe_project_path(&project) || !Path::new(&project).is_dir() {
+        return Err(format!(
+            "The project folder of {shown} was not found, so it cannot be approved."
+        ));
+    }
+    let entry = inventory::project_server(&project, &row.name)?;
+    let lines = describe(&entry).map_err(|why| {
+        format!("{shown} cannot be reviewed safely, so it is not approved: {why}.")
+    })?;
+
+    out.reviews.push(Review {
+        title: format!("{shown} would be allowed to run:"),
+        lines,
+    });
+    out.guards.push(Guard {
+        project: project.clone(),
+        name: row.name.clone(),
+        digest: digest(&entry),
+    });
+    out.warnings.push(format!(
+        "Claude Code will run {shown} from {} whenever you use that project. Only approve it if you trust the repository.",
+        sanitize(&project)
+    ));
+    if !ignored_by_git(Path::new(&project)) {
+        out.warnings.push(
+            "The approval goes into .claude/settings.local.json, which is not listed in this repository's .gitignore or .git/info/exclude, so it could be committed by accident (a global ignore file may still cover it).".to_owned(),
+        );
+    }
+    if row.approval == Some(Approval::Rejected) {
+        out.claude.push(Op::ClearRejection {
+            project: project.clone(),
+            name: row.name.clone(),
+        });
+    }
+    out.settings.entry(project).or_default().push(Op::Approve {
+        name: row.name.clone(),
+    });
+    Ok(())
+}
+
+/// Everything the server would run or connect to, one fact per line. Refuses what cannot be shown whole and
+/// exactly: unknown shapes, hidden characters, very long values.
+fn describe(entry: &Value) -> Result<Vec<String>, String> {
+    let object = entry.as_object().ok_or("the definition is not an object")?;
+    let text = |key: &str| -> Result<Option<&str>, String> {
+        match object.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s)),
+            Some(_) => Err(format!("{key} is not text")),
+        }
+    };
+    let kind = text("type")?.unwrap_or("stdio");
+    let mut lines = Vec::new();
+    match kind {
+        "stdio" => {
+            let command = text("command")?
+                .filter(|c| !c.is_empty())
+                .ok_or("it has no command")?;
+            lines.push(format!("Command: {}", shown(command)?));
+            match object.get("args") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(args)) => {
+                    for (i, arg) in args.iter().enumerate() {
+                        let arg = arg.as_str().ok_or("an argument is not text")?;
+                        lines.push(format!("Argument {}: {}", i + 1, shown(arg)?));
+                    }
+                }
+                Some(_) => return Err("args is not a list".to_owned()),
+            }
+            match object.get("env") {
+                None | Some(Value::Null) => {}
+                Some(Value::Object(env)) => {
+                    for (name, value) in env {
+                        let value = value.as_str().ok_or("an environment value is not text")?;
+                        lines.push(format!("Environment: {}={}", shown(name)?, shown(value)?));
+                    }
+                }
+                Some(_) => return Err("env is not an object".to_owned()),
+            }
+        }
+        "http" | "sse" | "ws" => {
+            let raw = text("url")?.ok_or("it has no address")?;
+            let url = url::Url::parse(raw).map_err(|_| "the address is not a valid URL")?;
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err("the address contains a login".to_owned());
+            }
+            lines.push(format!("Connects to: {}", shown(raw)?));
+        }
+        other => {
+            return Err(format!(
+                "its type {:?} is not one Claude Code understands",
+                sanitize(other)
+            ));
+        }
+    }
+    if kind != "stdio" {
+        match object.get("headers") {
+            None | Some(Value::Null) => {}
+            Some(Value::Object(headers)) => {
+                if !headers.is_empty() {
+                    let names: Result<Vec<_>, _> = headers.keys().map(|k| shown(k)).collect();
+                    lines.push(format!("Sends headers: {}", names?.join(", ")));
+                }
+            }
+            Some(_) => return Err("headers is not an object".to_owned()),
+        }
+        if let Some(helper) = text("headersHelper")? {
+            lines.push(format!("Runs this to get headers: {}", shown(helper)?));
+        }
+    }
+    Ok(lines)
+}
+
+/// A value exactly as it is, or an error when it cannot be shown that way.
+fn shown(value: &str) -> Result<String, String> {
+    if value.chars().count() > MAX_REVIEW_CHARS {
+        return Err(format!(
+            "a value is longer than {MAX_REVIEW_CHARS} characters"
+        ));
+    }
+    if sanitize(value) != value || value.chars().any(char::is_control) {
+        return Err("a value contains control or hidden characters".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+/// Is `.claude/settings.local.json` named by the repository's own ignore files? Only the common spellings are
+/// recognised; a global ignore file is not consulted, and the warning says so.
+fn ignored_by_git(project: &Path) -> bool {
+    const COVERING: [&str; 8] = [
+        ".claude/settings.local.json",
+        "settings.local.json",
+        ".claude/*.local.json",
+        "*.local.json",
+        ".claude/",
+        ".claude",
+        ".claude/*",
+        "**/settings.local.json",
+    ];
+    [
+        project.join(".gitignore"),
+        project.join(".git").join("info").join("exclude"),
+    ]
+    .iter()
+    .filter_map(|p| fsx::read_limited(p, MAX_GITIGNORE).ok().flatten())
+    .any(|text| {
+        text.lines()
+            .map(|l| l.trim().trim_start_matches('/'))
+            .any(|l| COVERING.contains(&l))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn d(v: Value) -> Result<Vec<String>, String> {
+        describe(&v)
+    }
+
+    #[test]
+    fn a_stdio_server_is_shown_command_arguments_and_environment_in_full() {
+        let lines = d(json!({
+            "command": "node",
+            "args": ["server.js", "--flag", "a b"],
+            "env": {"NODE_OPTIONS": "--require ./evil.js", "TOKEN": "${TOKEN}"}
+        }))
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "Command: node",
+                "Argument 1: server.js",
+                "Argument 2: --flag",
+                "Argument 3: a b",
+                "Environment: NODE_OPTIONS=--require ./evil.js",
+                "Environment: TOKEN=${TOKEN}",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_remote_server_shows_its_address_header_names_and_any_helper_command() {
+        let lines = d(json!({
+            "type": "http",
+            "url": "https://example.com/mcp?x=1",
+            "headers": {"Authorization": "Bearer abc"},
+            "headersHelper": "sh -c 'get-token'"
+        }))
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "Connects to: https://example.com/mcp?x=1",
+                "Sends headers: Authorization",
+                "Runs this to get headers: sh -c 'get-token'",
+            ]
+        );
+        assert!(
+            !lines.join("\n").contains("abc"),
+            "header values are not shown"
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_shown_whole_and_exactly_is_refused() {
+        for bad in [
+            json!("text"),
+            json!({}),
+            json!({"command": ""}),
+            json!({"command": 5}),
+            json!({"command": "node", "args": "x"}),
+            json!({"command": "node", "args": [1]}),
+            json!({"command": "node", "env": {"A": 1}}),
+            json!({"command": "no\u{1b}[2Kde"}),
+            json!({"command": "node", "args": ["a\u{202e}b"]}),
+            json!({"command": "node", "args": ["a\nb"]}),
+            json!({"command": "x".repeat(MAX_REVIEW_CHARS + 1)}),
+            json!({"type": "http", "url": "https://user:pw@example.com/"}),
+            json!({"type": "http", "url": "not a url"}),
+            json!({"type": "http"}),
+            json!({"type": "carrier-pigeon", "url": "https://example.com"}),
+        ] {
+            assert!(d(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_gitignore_check_recognises_the_usual_spellings_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!ignored_by_git(dir.path()));
+        for (file, text, expected) in [
+            (".gitignore", "target\n", false),
+            (".gitignore", "# .claude/settings.local.json\n", false),
+            (".gitignore", ".claude/settings.local.json\n", true),
+            (".gitignore", "/.claude/settings.local.json\n", true),
+            (".gitignore", "node_modules\n  *.local.json  \n", true),
+            (".gitignore", ".claude/settings.json\n", false),
+        ] {
+            std::fs::write(dir.path().join(file), text).unwrap();
+            assert_eq!(ignored_by_git(dir.path()), expected, "{text:?}");
+        }
+        std::fs::remove_file(dir.path().join(".gitignore")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git").join("info")).unwrap();
+        std::fs::write(
+            dir.path().join(".git").join("info").join("exclude"),
+            ".claude/\n",
+        )
+        .unwrap();
+        assert!(ignored_by_git(dir.path()));
+    }
+}

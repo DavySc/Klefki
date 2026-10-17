@@ -2,7 +2,9 @@
 use std::sync::Arc;
 
 pub use crate::config::ConfigPaths;
-pub use crate::engine::{Command, Core, Detached, Diagnosis, Event, Hint};
+pub use crate::engine::{
+    Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Hint, PlanView, Review,
+};
 pub use crate::model::{NameError, ServerName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -130,6 +132,11 @@ impl ServerRow {
             name: self.name.clone(),
         }
     }
+
+    /// Whether this row is the server `id` names. Compares in place, without building an id.
+    pub fn is(&self, id: &ServerId) -> bool {
+        self.scope == id.scope && self.name == id.name && self.project == id.project
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -137,6 +144,8 @@ pub struct Snapshot {
     pub cli_version: Option<String>,
     /// Projects Claude knows about (one per directory, spellings merged).
     pub project_count: usize,
+    /// The same projects as paths, in one normal spelling.
+    pub projects: Vec<String>,
     pub servers: Vec<ServerRow>,
     /// Problems found while reading the configuration. Already sanitised.
     pub warnings: Vec<String>,
@@ -151,6 +160,9 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
             paths: ConfigPaths::discover(),
             claude: None,
             home: directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
+            backup_dir: directories::ProjectDirs::from("dev", "klefki", "klefki")
+                .map(|d| d.data_dir().join("backups")),
+            verify_delay: std::time::Duration::from_secs(1),
             path_var: std::env::var_os("PATH"),
             cli_env: Vec::new(),
             max_checks: 3,

@@ -5,8 +5,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Command, Core, Diagnosis, Event, Scope, ServerId, ServerRow, Snapshot, Status,
-    TransportKind,
+    Approval, Change, Command, Core, Diagnosis, Event, PlanView, Scope, ServerId, ServerRow,
+    Snapshot, Status, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -56,6 +56,13 @@ impl DetailTab {
     ];
 }
 
+/// What happened to the last change, for the banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outcome {
+    text: String,
+    ok: bool,
+}
+
 enum GridRow {
     Group(String),
     Server(usize),
@@ -65,12 +72,21 @@ pub struct ShellApp {
     snapshot: Arc<Snapshot>,
     /// The engine. `None` for demo data and tests that feed the UI directly.
     core: Option<Core>,
-    /// Live results from the engine, which take precedence over the snapshot's hints.
-    live: HashMap<ServerId, (Status, Option<String>)>,
+    /// Live results from the engine, which take precedence over the snapshot's hints. One slot per row of the
+    /// snapshot, by position, so drawing a row looks its status up without building a key.
+    live: Vec<Option<(Status, Option<String>)>>,
+    /// The grid's rows for the current snapshot and search, built when either changes rather than every frame.
+    grid_cache: Option<(String, Arc<[GridRow]>)>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
     cli_version: Option<String>,
     cli_problem: Option<String>,
+    /// A change the engine has prepared and the user has not yet confirmed.
+    plan: Option<PlanView>,
+    /// Apply was pressed and the engine has not answered yet.
+    applying: bool,
+    /// The outcome of the last change, shown until dismissed.
+    outcome: Option<Outcome>,
     pub page: Page,
     pub search: String,
     pub selected: BTreeSet<usize>,
@@ -82,10 +98,14 @@ impl ShellApp {
     pub fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
         Self {
             core: None,
-            live: HashMap::new(),
+            live: vec![None; snapshot.servers.len()],
+            grid_cache: None,
             diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
+            plan: None,
+            applying: false,
+            outcome: None,
             snapshot,
             page: Page::Connections,
             search: String::new(),
@@ -128,50 +148,105 @@ impl ShellApp {
     fn apply_event(&mut self, event: Event) {
         match event {
             Event::Snapshot(snapshot) => {
-                // Selection is by position, so carry it over by identity.
-                let selected_ids: Vec<ServerId> = self
-                    .selected
-                    .iter()
-                    .filter_map(|&i| self.snapshot.servers.get(i).map(ServerRow::id))
-                    .collect();
-                self.selected = snapshot
+                // Rows are kept by position; carry selection, live results and diagnoses over by identity.
+                let new_index: HashMap<(Scope, Option<&str>, &str), usize> = snapshot
                     .servers
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| selected_ids.contains(&r.id()))
-                    .map(|(i, _)| i)
+                    .map(|(i, r)| ((r.scope, r.project.as_deref(), r.name.as_str()), i))
                     .collect();
-                // A check that was running is cut off by a refresh, and rows may have disappeared.
-                let known: BTreeSet<ServerId> =
-                    snapshot.servers.iter().map(ServerRow::id).collect();
-                self.live
-                    .retain(|id, (status, _)| *status != Status::Checking && known.contains(id));
-                self.diagnoses.retain(|id, _| known.contains(id));
+                let moved = |old: usize| {
+                    let r = &self.snapshot.servers[old];
+                    new_index
+                        .get(&(r.scope, r.project.as_deref(), r.name.as_str()))
+                        .copied()
+                };
+                let selected = self.selected.iter().filter_map(|&i| moved(i)).collect();
+                let mut live = vec![None; snapshot.servers.len()];
+                for (old, result) in self.live.iter_mut().enumerate() {
+                    // A check that was running is cut off by a refresh.
+                    if let (Some(new), Some(r)) = (moved(old), result.take())
+                        && r.0 != Status::Checking
+                    {
+                        live[new] = Some(r);
+                    }
+                }
+                self.diagnoses.retain(|id, _| {
+                    new_index.contains_key(&(id.scope, id.project.as_deref(), id.name.as_str()))
+                });
+                self.selected = selected;
+                self.live = live;
+                self.grid_cache = None;
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
                 self.snapshot = snapshot;
             }
             Event::Diagnosis { id, diagnosis } => {
-                if self.snapshot.servers.iter().any(|r| r.id() == id) {
+                if self.snapshot.servers.iter().any(|r| r.is(&id)) {
                     self.diagnoses.insert(id, diagnosis);
                 }
+            }
+            Event::PlanReady(plan) => {
+                self.applying = false;
+                self.plan = Some(plan);
+            }
+            Event::PlanFailed(why) => {
+                self.outcome = Some(Outcome {
+                    text: why,
+                    ok: false,
+                })
+            }
+            Event::Applied {
+                plan,
+                changed,
+                backup,
+            } => {
+                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+                    self.plan = None;
+                    self.applying = false;
+                }
+                self.outcome = Some(Outcome {
+                    text: match (changed, backup) {
+                        (false, _) => "Nothing needed to change.".to_owned(),
+                        (true, Some(b)) => format!("Saved. The previous file is kept in {b}"),
+                        (true, None) => "Saved.".to_owned(),
+                    },
+                    ok: true,
+                });
+            }
+            Event::ApplyFailed { plan, error } => {
+                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+                    self.plan = None;
+                    self.applying = false;
+                }
+                self.outcome = Some(Outcome {
+                    text: error,
+                    ok: false,
+                });
+            }
+            Event::Reapplied { .. } => {
+                self.outcome = Some(Outcome {
+                    text: "Claude Code overwrote the change right after it was saved, so it was written again. Close running Claude Code sessions if this keeps happening."
+                        .to_owned(),
+                    ok: false,
+                });
             }
             Event::CliVersion(version) => self.cli_version = version,
             Event::CliProblem(problem) => self.cli_problem = Some(problem),
             Event::Status { id, status, detail } => {
-                if self.snapshot.servers.iter().any(|r| r.id() == id) {
-                    self.live.insert(id, (status, detail));
+                if let Some(i) = self.snapshot.servers.iter().position(|r| r.is(&id)) {
+                    self.live[i] = Some((status, detail));
                 }
             }
         }
     }
 
-    /// What to show for a row: the engine's latest answer, else what Claude's own cache said.
-    fn effective<'a>(&'a self, row: &'a ServerRow) -> (Status, Option<&'a str>) {
-        match self.live.get(&row.id()) {
+    /// What to show for row `i`: the engine's latest answer, else what Claude's own cache said.
+    fn effective(&self, i: usize) -> (Status, Option<&str>) {
+        match self.live.get(i).and_then(Option::as_ref) {
             Some((status, detail)) => (*status, detail.as_deref()),
-            None => (row.status, None),
+            None => (self.snapshot.servers[i].status, None),
         }
     }
 
@@ -189,30 +264,39 @@ impl ShellApp {
                         .is_some_and(|p| p.to_lowercase().contains(&q))
             })
             .collect();
-        idx.sort_by(|&a, &b| {
-            let (a, b) = (&self.snapshot.servers[a], &self.snapshot.servers[b]);
-            (a.scope, &a.project, a.name.to_lowercase()).cmp(&(
-                b.scope,
-                &b.project,
-                b.name.to_lowercase(),
-            ))
+        // Each name is lower-cased once, not once per comparison.
+        idx.sort_by_cached_key(|&i| {
+            let s = &self.snapshot.servers[i];
+            (s.scope, s.project.as_deref(), s.name.to_lowercase())
         });
         idx
     }
 
     fn grid_rows(&self) -> Vec<GridRow> {
         let mut rows = Vec::new();
-        let mut last: Option<(Scope, Option<String>)> = None;
+        let mut last: Option<(Scope, Option<&str>)> = None;
         for i in self.visible() {
             let s = &self.snapshot.servers[i];
-            let key = (s.scope, s.project.clone());
-            if last.as_ref() != Some(&key) {
+            let key = (s.scope, s.project.as_deref());
+            if last != Some(key) {
                 rows.push(GridRow::Group(group_title(s)));
                 last = Some(key);
             }
             rows.push(GridRow::Server(i));
         }
         rows
+    }
+
+    /// The grid's rows, rebuilt only when the snapshot or the search changed.
+    fn cached_grid_rows(&mut self) -> Arc<[GridRow]> {
+        match &self.grid_cache {
+            Some((search, rows)) if *search == self.search => Arc::clone(rows),
+            _ => {
+                let rows: Arc<[GridRow]> = self.grid_rows().into();
+                self.grid_cache = Some((self.search.clone(), Arc::clone(&rows)));
+                rows
+            }
+        }
     }
 
     fn show(&mut self, ui: &mut Ui) {
@@ -240,11 +324,14 @@ impl ShellApp {
                 .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(12)))
                 .show(ui, |ui| self.detail(ui));
         }
+        let ctx = ui.ctx().clone();
+        self.plan_dialog(&ctx);
         egui::CentralPanel::default()
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(14)))
             .show(ui, |ui| match self.page {
                 Page::Connections => {
                     self.warnings(ui);
+                    self.outcome_banner(ui);
                     self.toolbar(ui);
                     ui.add_space(6.0);
                     self.grid(ui);
@@ -405,12 +492,32 @@ impl ShellApp {
             (icon::EXPORT, "Export"),
             (icon::DOWNLOAD_SIMPLE, "Import"),
         ];
+        let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.plan.is_none();
         ui.horizontal(|ui| {
             for (glyph, tip) in ACTIONS {
-                // Operations arrive with M1; the toolbar is shown disabled so the layout can be judged.
+                let toggle = match glyph {
+                    g if g == icon::TOGGLE_RIGHT => Some(true),
+                    g if g == icon::TOGGLE_LEFT => Some(false),
+                    _ => None,
+                };
+                // The other operations arrive later in M1; they are shown disabled so the layout can be judged.
                 let button = egui::Button::new(RichText::new(glyph).size(20.0))
                     .min_size(egui::vec2(44.0, 38.0));
-                ui.add_enabled(false, button).on_disabled_hover_text(tip);
+                match toggle {
+                    Some(enabled) => {
+                        if ui
+                            .add_enabled(can_toggle, button)
+                            .on_hover_text(tip)
+                            .on_disabled_hover_text(format!("{tip}: select a server first"))
+                            .clicked()
+                        {
+                            self.prepare_toggle(enabled);
+                        }
+                    }
+                    None => {
+                        ui.add_enabled(false, button).on_disabled_hover_text(tip);
+                    }
+                }
             }
             ui.separator();
             ui.label(
@@ -419,9 +526,158 @@ impl ShellApp {
         });
     }
 
+    /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
+    fn prepare_toggle(&mut self, enabled: bool) {
+        let changes: Vec<Change> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .map(|row| Change::SetEnabled {
+                id: row.id(),
+                enabled,
+            })
+            .collect();
+        if !changes.is_empty() {
+            self.outcome = None;
+            self.send(Command::Prepare(changes));
+        }
+    }
+
+    /// The banner for the last change.
+    fn outcome_banner(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        let Some(outcome) = self.outcome.clone() else {
+            return;
+        };
+        let color = if outcome.ok { pal.success } else { pal.danger };
+        let mut dismiss = false;
+        Frame::new()
+            .stroke(egui::Stroke::new(1.0, color))
+            .corner_radius(6)
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&outcome.text).color(color));
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        ui.add_space(6.0);
+        if dismiss {
+            self.outcome = None;
+        }
+    }
+
+    /// The confirmation step: shows exactly what would change, then applies or drops it.
+    fn plan_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let Some(plan) = self.plan.clone() else {
+            return;
+        };
+        let applying = self.applying;
+        let mut apply = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("plan_dialog")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading("Review the change");
+            ui.add_space(6.0);
+            if plan.nothing_to_do {
+                ui.label("The configuration already looks like this. Nothing would be written.");
+            } else {
+                ui.label("These lines in your Claude Code configuration will change:");
+            }
+            for review in &plan.reviews {
+                ui.add_space(4.0);
+                Frame::new()
+                    .stroke(egui::Stroke::new(1.0, pal.warn))
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&review.title).strong().color(pal.warn));
+                        for line in &review.lines {
+                            ui.add(egui::Label::new(line).wrap());
+                        }
+                    });
+            }
+            for file in &plan.files {
+                if file.lines.is_empty() {
+                    continue;
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new(&file.path).color(pal.text_muted));
+                Frame::new()
+                    .fill(pal.field)
+                    .corner_radius(6)
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                for line in &file.lines {
+                                    let color = if line.starts_with("+ ") {
+                                        pal.success
+                                    } else if line.starts_with("- ") {
+                                        pal.danger
+                                    } else {
+                                        pal.text_muted
+                                    };
+                                    ui.add(
+                                        egui::Label::new(RichText::new(line).color(color)).wrap(),
+                                    );
+                                }
+                            });
+                    });
+            }
+            for warning in &plan.warnings {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} {warning}", icon::WARNING)).color(pal.warn),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !plan.nothing_to_do && !applying,
+                        egui::Button::new(if plan.reviews.is_empty() {
+                            "Apply"
+                        } else {
+                            "Approve"
+                        }),
+                    )
+                    .clicked()
+                {
+                    apply = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if apply {
+            self.applying = true;
+            self.send(Command::Apply(plan.id));
+            // The dialog stays until the engine answers, so a second click cannot apply twice.
+        } else if cancel {
+            self.send(Command::Discard(plan.id));
+            self.plan = None;
+            self.applying = false;
+        }
+    }
+
     fn grid(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        let rows = self.grid_rows();
+        let rows = self.cached_grid_rows();
         let ctrl = ui.input(|i| i.modifiers.command);
         let project_count = self.snapshot.project_count;
         let mut clicked = None;
@@ -461,7 +717,7 @@ impl ShellApp {
                         row.col(|ui| {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
-                        let (status, detail) = self.effective(s);
+                        let (status, detail) = self.effective(*i);
                         row.col(|ui| status_cell(ui, s, status, detail));
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
@@ -503,9 +759,12 @@ impl ShellApp {
             ui.label(RichText::new(msg).color(pal.text_muted));
             return;
         };
-        let s = self.snapshot.servers[i].clone();
+        // A second handle to the snapshot (a reference count), so the row can be read while `self` is borrowed
+        // mutably below, without copying its strings every frame.
+        let snapshot = Arc::clone(&self.snapshot);
+        let s = &snapshot.servers[i];
         let (status, detail) = {
-            let (status, detail) = self.effective(&s);
+            let (status, detail) = self.effective(i);
             (status, detail.map(str::to_owned))
         };
         ui.label(RichText::new(&s.name).heading());
@@ -548,6 +807,25 @@ impl ShellApp {
                         }
                         kv("Shadowed", if s.shadowed { "yes" } else { "no" }.to_owned());
                     });
+                if s.scope == Scope::Project
+                    && s.approval.is_some_and(|a| a != Approval::Approved)
+                    && self.core.is_some()
+                {
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            self.plan.is_none(),
+                            egui::Button::new("Review and approve…"),
+                        )
+                        .on_hover_text(
+                            "See everything this server would run, then let Claude Code run it",
+                        )
+                        .clicked()
+                    {
+                        self.outcome = None;
+                        self.send(Command::Prepare(vec![Change::Approve { id: s.id() }]));
+                    }
+                }
             }
             DetailTab::Status => {
                 egui::Grid::new("status")
@@ -591,7 +869,7 @@ impl ShellApp {
                 }
                 });
                 if let Some(d) = self.diagnoses.get(&s.id()) {
-                    diagnosis_panel(ui, &s, d);
+                    diagnosis_panel(ui, s, d);
                 }
             }
             _ => {
@@ -1641,5 +1919,410 @@ mod tests {
             detail_left_edge(&h, "Scope")
         };
         assert_eq!(short, long, "a long target made the detail panel wider");
+    }
+
+    // ---- switching servers on and off
+
+    fn plan_view(id: u64, lines: &[&str], warnings: &[&str], nothing_to_do: bool) -> PlanView {
+        PlanView {
+            id,
+            files: vec![klefki_core::api::FileDiff {
+                path: ".claude.json".to_owned(),
+                lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+            }],
+            warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
+            nothing_to_do,
+            reviews: Vec::new(),
+        }
+    }
+
+    fn two_rows() -> (ServerRow, ServerRow) {
+        (
+            live_row("alpha", Scope::User, None),
+            live_row("beta", Scope::Local, Some("C:/Repos/WebApp")),
+        )
+    }
+
+    fn drain(engine: &klefki_core::api::Detached) -> Vec<Command> {
+        let mut out = Vec::new();
+        while let Ok(c) = engine.commands.try_recv() {
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn enable_and_disable_need_a_selection() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert!(drain(&engine).is_empty(), "nothing selected, nothing asked");
+    }
+
+    #[test]
+    fn disable_asks_the_engine_for_a_plan_for_each_selected_server() {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: a.id(),
+                enabled: false
+            }])]
+        );
+    }
+
+    #[test]
+    fn enable_asks_for_the_opposite() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::TOGGLE_RIGHT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: a.id(),
+                enabled: true
+            }])]
+        );
+    }
+
+    fn with_plan(
+        lines: &[&str],
+        warnings: &[&str],
+        nothing: bool,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, lines, warnings, nothing)))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    #[test]
+    fn the_plan_dialog_shows_exactly_what_will_change_and_nothing_is_sent_yet() {
+        let (_h, engine) = {
+            let (h, engine) = with_plan(
+                &["  projects[\"C:/x\"].disabledMcpServers", "+ alpha"],
+                &["A running Claude Code session may need a restart before it notices this."],
+                false,
+            );
+            h.get_by_label_contains("Review the change");
+            h.get_by_label_contains("disabledMcpServers");
+            h.get_by_label("+ alpha");
+            h.get_by_label_contains("may need a restart");
+            (h, engine)
+        };
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn apply_sends_the_plan_once_even_if_pressed_twice() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Apply").click();
+        h.run();
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(7)]);
+    }
+
+    #[test]
+    fn cancel_discards_the_plan_and_closes_the_dialog() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Discard(7)]);
+        assert!(h.query_by_label_contains("Review the change").is_none());
+    }
+
+    #[test]
+    fn escape_cancels_like_the_cancel_button() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Discard(7)]);
+        assert!(h.query_by_label_contains("Review the change").is_none());
+    }
+
+    #[test]
+    fn a_plan_that_changes_nothing_cannot_be_applied() {
+        let (mut h, engine) = with_plan(&[], &[], true);
+        h.get_by_label_contains("Nothing would be written");
+        h.get_by_label("Apply").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_saved_change_closes_the_dialog_and_says_where_the_backup_is() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: Some("/data/backups/claude.json.1.bak".to_owned()),
+            })
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Review the change").is_none());
+        h.get_by_label_contains(
+            "Saved. The previous file is kept in /data/backups/claude.json.1.bak",
+        );
+    }
+
+    #[test]
+    fn a_failed_change_closes_the_dialog_and_shows_the_reason() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::ApplyFailed {
+                plan: 7,
+                error: "Claude Code is writing its configuration right now.".to_owned(),
+            })
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Review the change").is_none());
+        h.get_by_label_contains("Claude Code is writing its configuration");
+        h.get_by_label("Dismiss").click();
+        h.run();
+        assert!(
+            h.query_by_label_contains("writing its configuration")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_plan_that_could_not_be_made_shows_the_reason() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(Event::PlanFailed(
+                "ghost is no longer in the configuration.".to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("ghost is no longer");
+    }
+
+    #[test]
+    fn a_change_claude_overwrote_is_reported_after_the_dialog_is_gone() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: Some("b".to_owned()),
+            })
+            .unwrap();
+        engine.events.send(Event::Reapplied { plan: 7 }).unwrap();
+        h.run();
+        h.get_by_label_contains("overwrote the change right after it was saved");
+    }
+
+    #[test]
+    fn the_toggle_buttons_do_not_start_a_second_plan_while_one_is_open() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(8, &["+ alpha"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        // A click outside the dialog closes it (and drops the plan); it never starts a second plan.
+        let sent = drain(&engine);
+        assert!(
+            sent.iter().all(|c| !matches!(c, Command::Prepare(_))),
+            "a second plan cannot start: {sent:?}"
+        );
+    }
+
+    // ---- approving a project server
+
+    fn project_row(name: &str, approval: Option<klefki_core::api::Approval>) -> ServerRow {
+        let mut row = live_row(name, Scope::Project, Some("C:/Repos/WebApp"));
+        row.approval = approval;
+        row
+    }
+
+    fn open_general(h: &mut Harness<'static, ShellApp>, name: &str) {
+        h.get_by_label(name).click();
+        h.run();
+    }
+
+    #[test]
+    fn a_pending_or_rejected_project_server_offers_review_and_approve() {
+        use klefki_core::api::Approval::{Pending, Rejected};
+        for approval in [Pending, Rejected] {
+            let (mut h, engine) = live_harness();
+            let row = project_row("docs", Some(approval));
+            engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+            h.run();
+            open_general(&mut h, "docs");
+            h.get_by_label_contains("Review and approve").click();
+            h.run();
+            assert_eq!(
+                drain(&engine),
+                vec![Command::Prepare(vec![Change::Approve { id: row.id() }])]
+            );
+        }
+    }
+
+    #[test]
+    fn approved_servers_and_other_scopes_have_no_approve_button() {
+        let (mut h, engine) = live_harness();
+        let approved = project_row("done", Some(klefki_core::api::Approval::Approved));
+        let user = live_row("mine", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![approved, user]))
+            .unwrap();
+        h.run();
+        for name in ["done", "mine"] {
+            open_general(&mut h, name);
+            assert!(
+                h.query_by_label_contains("Review and approve").is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_approval_dialog_shows_what_will_run_before_anything_is_saved() {
+        let (mut h, engine) = live_harness();
+        let row = project_row("docs", Some(klefki_core::api::Approval::Pending));
+        engine.events.send(snapshot_of(vec![row])).unwrap();
+        let mut plan = plan_view(
+            3,
+            &["  enabledMcpjsonServers", "+ docs"],
+            &["Only approve it if you trust the repository."],
+            false,
+        );
+        plan.reviews = vec![klefki_core::api::Review {
+            title: "docs would be allowed to run:".to_owned(),
+            lines: vec![
+                "Command: node".to_owned(),
+                "Argument 1: server.js".to_owned(),
+                "Environment: NODE_OPTIONS=--require ./hook.js".to_owned(),
+            ],
+        }];
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label_contains("docs would be allowed to run");
+        h.get_by_label("Command: node");
+        h.get_by_label("Argument 1: server.js");
+        h.get_by_label_contains("NODE_OPTIONS=--require ./hook.js");
+        h.get_by_label_contains("trust the repository");
+        assert!(drain(&engine).is_empty());
+        // The button says what it does, and sends the plan.
+        h.get_by_label("Approve").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(3)]);
+    }
+
+    #[test]
+    fn a_saved_approval_without_a_backup_just_says_saved() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("Saved.");
+    }
+
+    #[test]
+    fn live_results_and_selection_follow_their_rows_when_a_snapshot_reorders_them() {
+        let (mut h, engine) = live_harness();
+        let a = live_row("alpha", Scope::User, None);
+        let b = live_row("beta", Scope::User, None);
+        let c = live_row("gamma", Scope::Local, Some("C:/Repos/WebApp"));
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        engine
+            .events
+            .send(status_event(&b, Status::Failed, Some("beta broke")))
+            .unwrap();
+        h.run();
+        h.get_by_label("beta").click();
+        h.run();
+        // Same rows, another order, one more in front.
+        engine
+            .events
+            .send(snapshot_of(vec![c, b.clone(), a.clone()]))
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().selected.len(), 1);
+        let selected = *h.state().selected.iter().next().unwrap();
+        assert_eq!(h.state().snapshot.servers[selected].name, "beta");
+        assert_eq!(h.state().effective(selected).0, Status::Failed);
+        let alpha = h
+            .state()
+            .snapshot
+            .servers
+            .iter()
+            .position(|r| r.name == "alpha")
+            .unwrap();
+        assert_eq!(h.state().effective(alpha).0, Status::Unknown);
+        h.get_by_label_contains(Status::Failed.label());
+    }
+
+    #[test]
+    fn the_grid_follows_a_new_snapshot_and_a_new_search() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(snapshot_of(vec![live_row("alpha", Scope::User, None)]))
+            .unwrap();
+        h.run();
+        h.get_by_label("alpha");
+        engine
+            .events
+            .send(snapshot_of(vec![
+                live_row("alpha", Scope::User, None),
+                live_row("omega", Scope::User, None),
+            ]))
+            .unwrap();
+        h.run();
+        h.get_by_label("omega");
+        h.state_mut().search = "alp".to_owned();
+        h.run();
+        assert!(h.query_by_label("omega").is_none());
+        h.state_mut().search.clear();
+        h.run();
+        h.get_by_label("omega");
     }
 }

@@ -6,4 +6,5 @@ mod diagnose;
 mod engine;
 mod fixtures;
 mod model;
+mod ops;
 mod sanitize;

@@ -1,11 +1,82 @@
 # Progress
 
 ## Current slice
-Live status checks (CLI locate/runner/parse, status engine, UI wiring). Done, see "Live status" below. Next: fix the inventory's enabled/disabled semantics (decision 002), then `docstore`.
+`docstore`, the enable/disable write path, `deny.toml` + cargo-deny (2026-10-17). Done except the open items under "Docstore and enable/disable". Next: run the real window on a machine with a display.
+
+Earlier slice: Live status checks (CLI locate/runner/parse, status engine, UI wiring), see "Live status" below.
 
 Earlier slice: M1 day-1 spikes done and recorded (below). Next: fix the inventory's enabled/disabled semantics, then `docstore`.
 
 Previous slice: Read-only inventory of the real Claude Code config, restyle (Catppuccin Mocha, JetBrains Mono, bigger controls), and a light theme (Latte-based) with a System option.
+
+## Performance pass 2 (2026-10-17)
+Measured with a throwaway release benchmark (median of 5-9 runs, counting allocator; not committed, saved outside the repo). Synthetic configs, Linux, local disk.
+
+| | 61 MB before | 61 MB after | 7 MB before | 7 MB after |
+|---|---|---|---|---|
+| `docstore` prepare | 144 ms | 86-94 ms | 11.8 ms | 7.0 ms |
+| verify, lock held | 87 ms (whole check) | 0 ms (check reads without the lock) | 7.1 ms | 0 ms |
+| apply, lock held (all projects) | 384 ms | 182-352 ms (write-back noise; see below) | 21.5 ms | 18.3 ms |
+| peak heap reading the file | 67.1 MB | 60.8 MB (= file size) | 8.4 MB | 8.4 MB |
+| sanitize 1 MB | 6.3 ms | 0.10 ms | | |
+| hints over 1 MB | 5.8 ms | 3.5 ms | | |
+| Diagnose report, 1 MB log | 21.9 ms | 16.3 ms | | |
+
+Apply under the lock at 61 MB now splits into read 46 ms, edit 22 ms, write 18 ms (up to 210 ms when the kernel throttles repeated 60 MB writes), fsync 55-61 ms, link + rename + rotation under 0.3 ms. What is left is the file system.
+
+UI (kittest, release, one `step` with no painting): frame time 0.28 / 0.46 / 2.95 ms for 30 / 300 / 3000 rows before, 0.26 / 0.26 / 0.45 ms after; allocations per frame 1500 / 6896 / 82515 before, 1116 / 1236 / 1236 after (the rest is egui's own). A status event: 52 / 502 / 5002 allocations before, none of klefki's own after.
+
+- Engine: the CLI version is asked once per CLI build (path, size, modification time), not on every refresh: each ask was a Node process start. After klefki saves a change it reloads the snapshot only; it no longer looks for the CLI again, asks its version, drops running checks and re-checks every unknown server. Servers the change switched on are checked. Three tests, which failed on the old behaviour (counted from fake-claude's log).
+- `docstore`: one pass over the file for root, projects and the targeted entries (`jsonspan::object_with`); on files of 1 MiB or more the JSON check runs on a second thread alongside the scan, and the hash in `prepare` alongside the edit. `verify` reads without the lock and only takes it to write (two tests: no wait while Claude holds the lock; still no write without it). The engine reads `.claude.json` once for both the inventory and the plan.
+- `fsx`: the read buffer is sized from the metadata, so peak heap equals the file size.
+- `sanitize`: plain runs (printable ASCII, tab, newline) are copied whole, tested 16 bytes at a time in a form the compiler vectorises; checked against the previous implementation on 20,000 generated strings.
+- `hints`: one `RegexSet` pass instead of 16 regex passes.
+- `inventory`: shadowed check without an O(n²) scan with an allocation per comparison; names lower-cased once for the casing check.
+- UI: grid rows are cached per snapshot and search; live statuses are stored by row position, so drawing a row needs no key; status and diagnosis events compare ids in place (`ServerRow::is`); the detail panel no longer clones the selected row each frame. Two new tests (results and selection follow reordered rows; the grid follows a new snapshot and search); removing the cache invalidation fails 25 tests.
+- Considered and not done: streaming the inventory parse (peak heap 62 MB to 0.8 MB, but 2.5 times slower: 161 vs 63 ms); memory-mapping the file (unsafe, and a truncating writer would crash the app); a faster non-cryptographic hash (SHA-256 already runs at about 1.3 GB/s and is off the critical path); prefiltering the redaction rules (a later rule could match text an earlier one produced; not worth the risk on a security path); dropping egui's default fonts (they are the fallback for emoji and symbols).
+- Checks: fmt 0; clippy workspace 0 and `-p klefki` 0; `cargo test --workspace` 212 core + 70 app passed, three runs in a row; `cargo deny check` 0.
+
+## Lock time and lighter reads (2026-10-17)
+Measured on synthetic configs (release build, Linux, local disk; throwaway benchmark, not committed). "Lock held" is `apply` only.
+
+| | 7 MB before | 7 MB after | 61 MB before | 61 MB after |
+|---|---|---|---|---|
+| `docstore` apply, lock held | ~95 ms (est.: prepare+apply minus prepare) | 16-24 ms | ~790-820 ms (est.) | 340-420 ms |
+| `docstore` prepare | 21 ms | 13 ms | 255-307 ms | 160 ms |
+| `inventory::load` | 16 ms | 6 ms | 167 ms | 71 ms |
+
+- `.claude.json` is now edited in place: `config/jsonspan.rs` (new) finds the byte ranges of the project entries and their lists, and only the changed lists are rewritten or inserted, indented like their surroundings (or on one line where the file is on one line), with the file's own newline. Everything else stays byte for byte, including formatting serde would have changed (`1.0`, `\u00e9`, numbers beyond u64, four-space indents). One pass over the projects however many ops ("switch everywhere"). The whole text is still checked as valid JSON first. New: a project key or a list that appears twice is refused instead of silently dropping one copy.
+- String scanning uses `memchr` (vector instructions where the CPU has them): the projects scan went from 118 ms to 28-34 ms at 61 MB. New direct dependency `memchr` (already in the tree through `regex`; `cargo deny` ok).
+- Backups are a hard link to the old file (no copy, any size), made private after the rename; a copy of the text read is the fallback when linking fails. The copy fallback is not exercised by a test (needs a second file system).
+- The new file is written from the original text and the replacements, piece by piece, so no second full copy is built in memory; no more full-text clones for the hash or the backup.
+- `inventory`: `.claude.json` is read through a pruning deserializer that keeps only `mcpServers` and, per project, the five keys the inventory uses; history and caches are validated but skipped.
+- Tests first: byte preservation, one-line entries, duplicate project / list refusal and the hard-link backup failed before the change. A differential test (400 generated files × op sequences, pretty and compact) checks the in-place edit against the previous Value-based edit (kept in the tests as the oracle; its one difference, creating an empty list when enabling, is noted there). Deliberate breaks (indent, rejection clearing, pretty rendering) each made tests fail.
+- **Test fixture changed, for review:** `style_is_kept_or_defaults_to_claudes` used a file of CRLF lines ending in a bare LF and asserted every newline came out CRLF; the old full rewrite normalised it. In-place edits keep that bare LF, so the fixture now ends in CRLF (same assertions), and a new test pins the mixed case (kept as is).
+- Checks: fmt 0; clippy workspace 0; `cargo test --workspace` 204 core + 68 app passed; `cargo deny check` 0.
+
+## Approval writes (2026-10-17)
+- `Change::Approve { id }` for a project (`.mcp.json`) server. The plan lists everything the server would run, in full: command, every argument, environment names **and values**, or the address and any `headersHelper` command (header values are not shown). It refuses, with a reason, what cannot be shown whole and exactly: control or bidi characters (a newline too), a value over 2000 characters, an address with a login, an unknown `type`, wrong-typed fields.
+- Writes `enabledMcpjsonServers` (and removes the name from `disabledMcpjsonServers`) in `<project>/.claude/settings.local.json`, creating the file and the `.claude` folder when missing, through `docstore` (`Kind::ProjectSettings`: same lock, backup under its own name, atomic replace; a linked `.claude` folder or file is refused). If the server was rejected in the project entry of `~/.claude.json`, that rejection is cleared too, shown as a second file in the diff. Nothing else in the repository is touched (tested: only `.claude/settings.local.json`, no lock left).
+- The definition is checked again at Apply (digest of the `.mcp.json` entry). If the repository edited it after the review, nothing is saved. This is a small window closed, not eliminated: the check and the write are not one atomic step.
+- Several files in one plan are written one after the other, settings first and `~/.claude.json` last. If a later one fails, the message names what was already saved.
+- Warnings: trust the repository; `.claude/settings.local.json` not named in `.gitignore` / `.git/info/exclude` (only common spellings are recognised, global ignore files are not read, and the warning says so).
+- UI: **Review and approve…** in the General tab for pending and rejected project servers; the dialog shows the "would be allowed to run" box before the diff, and the button reads **Approve**.
+- Checks: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0 (and `-p klefki` 0); `cargo test --workspace` 189 core + 68 app passed; `cargo deny check` 0. Broken on purpose, each made tests fail: no re-check of the definition, no clearing of a rejection, no review box, approve button for approved servers.
+- Not verified: the exact file Claude Code writes for approval beyond decision 002's one observed file (key names `enabledMcpjsonServers` / `disabledMcpjsonServers` come from there and from Claude's schema); that Claude Code then actually runs the server; Windows paths; the real window; a new file gets a final newline and 2-space JSON, which is a guess for this file. Revoking or rejecting from klefki is not built (the plan only allows writing to approve).
+
+## Docstore and enable/disable (2026-10-17)
+- `config/docstore.rs`: Prepare (`prepare`, writes nothing) → plan (only list names, never server settings) → `apply`: take Claude's `<claude.json>.lock` directory (stale after 10 s, waits up to 3 s, aborts rather than write unlocked), re-read, re-apply the ops to the fresh copy, refuse if the file changed in a way that alters what the user saw, back up the old bytes (private, last 20, own folder), write a temp file in the same folder, fsync, rename. `verify` (1 s later) re-applies up to 3 times if Claude overwrote it without the lock. Keeps key order, unknown keys, floats, BOM, CRLF and a final newline if the file had them; default is Claude's own style. Refuses symlinks, wrong shapes, unknown projects (never creates a project entry; that part of Claude's behaviour is unverified).
+- `ops.rs` + engine: `Command::Prepare(Vec<Change>)` / `Apply(id)` / `Discard(id)`, events `PlanReady`, `PlanFailed`, `Applied`, `ApplyFailed`, `Reapplied`. A user server is switched in every known project (with the "projects first opened later are not covered" warning); local and project servers in their own project. Project servers: only `disabledMcpServers` in `~/.claude.json`; the repository is never touched, and enabling an unapproved one warns that it is still not approved. Approval writes (`settings.local.json`) are not built.
+- UI: Enable and Disable toolbar buttons → Review dialog with the exact lines, warnings, Apply / Cancel (Esc or a click outside cancels), then a banner with the result.
+- Reproducers first where a bug existed; for new code the tests passed on first run, so I proved they bite by breaking the code on purpose and watching them fail: no backup, no changed-file check, no lock, first spelling only (docstore); user scope only first project (engine); no double-apply guard, toggle inverted, no discard on cancel (UI). One guard (`plan.is_none()` on the toolbar) cannot be told apart by a test because the modal already blocks the click.
+- `deny.toml` (protected file, created at the owner's request; please review) and `cargo-deny 0.20.2` installed. Licences allowed: MIT, Apache-2.0 (+LLVM), BSD-2/3, ISC, Zlib, MPL-2.0, Unicode-3.0, OFL-1.1, Ubuntu-font-1.0 (egui's default fonts), BSL-1.0. Workspace crates have no licence field, so `[licenses.private] ignore = true` is set; the owner should pick a licence instead.
+- **Resolved 2026-10-17: owner set `unmaintained = "workspace"` in `deny.toml`; `cargo deny check` now exits 0 (advisories, bans, licenses, sources ok). Original finding:** RUSTSEC-2026-0370 and two siblings: `zvariant`, `zvariant_derive`, `zbus_names` are "unmaintained", pulled in only on Linux through eframe → egui-winit → accesskit_winit → accesskit_unix → atspi. No upgrade exists. Not ignored, because the rules forbid ignore lists. Options for the owner: accept via `[advisories] ignore`, set `unmaintained = "workspace"` (only direct dependencies count), or wait for egui to move.
+- Checks: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo test --workspace` 166 core + 64 app passed; `cargo deny check` exit 0 after the owner's `unmaintained = "workspace"` change (it hides unmaintained transitive crates, so the zvariant family is no longer reported).
+- Not verified: the real window (this machine lacks `libxkbcommon-x11`, so `cargo run -p klefki` panics at startup), a write next to a live Claude Code session, behaviour on Windows/macOS, whether a running Claude session notices a toggle without restart, and "Claude Code is running" detection (only a generic restart warning is shown).
+- Duplicate keys in `~/.claude.json` are not detected on write (the last one wins when parsed); `.mcp.json` duplicates still are.
+
+## Engine test failure on Linux (2026-10-17)
+`engine::tests::at_most_three_checks_run_at_once` failed 3 of 3 runs on Linux: `fake-claude` wrote each log line with several `write` calls, so parallel runs tore each other's lines. Not a flake. Reproducer first: `cli::runner::tests::concurrent_stub_runs_never_interleave_log_lines` (128 parallel runs) failed, then passed after the approved stub change (one `write_all` per line, `docs/proposals/fake-claude-atomic-log.md`). Evidence: `cargo test -p klefki-core --lib` 126 passed, 5 runs in a row; `cargo test --workspace` 126 core + 51 app passed; clippy and fmt exit 0. The earlier "176 passed" count is now 177 on Linux. `cargo deny` still not run.
 
 ## Live status (2026-10-17)
 - Cause of the original "Unknown" on `azure-devops`: Claude's health cache only holds remote servers, so a stdio server has no hint. Claude itself reports it Connected (`claude mcp get`, about 7 s).
@@ -82,11 +153,10 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.
 - A refresh that arrives while checks run drops their answers by generation; this is covered by reading the code and by the UI test for cut-off checks, not by an engine test with a real race.
 - Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server in the home folder could shadow it. Not seen in practice.
-- `cargo deny` still not run (`deny.toml` and `cargo-deny` pending).
+- `cargo deny` runs now; advisories fail (see Docstore section).
 - Theme persistence goes through eframe's storage (written by the framework to the app data folder); the app crate itself still has no fs calls. Not tested across a real restart, and flagged for review against the no-IO invariant.
 - System theme follows the OS setting; only checked that it is selectable, not against a real OS theme change.
 - Hover colours were only seen on one row in each theme.
-- Enabled/disabled in the grid is wrong for user and project rows (see Spikes); fix is the next slice.
 - Status is only Claude's cached hint, not a live `claude mcp get` check.
 - The CLI version in the top bar is not detected yet (hidden unless known).
 - CI untested on macOS/Linux. Spike findings are for Claude Code 2.1.302 on Windows only; a live interactive session was not tested for outside-edit survival.

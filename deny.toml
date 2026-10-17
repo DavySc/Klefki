@@ -1,0 +1,42 @@
+# Protected file: changes need human review (see CLAUDE.md). Created at the owner's request on 2026-10-17.
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Only unmaintained crates the workspace depends on directly count. The zvariant family comes in through
+# egui's Linux accessibility stack and has no replacement yet (owner decision, 2026-10-17).
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "OFL-1.1",
+  "Ubuntu-font-1.0",
+  "BSL-1.0",
+]
+confidence-threshold = 0.8
+
+# The workspace crates are `publish = false` and carry no licence field yet; the owner picks one.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

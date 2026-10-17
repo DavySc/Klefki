@@ -247,6 +247,9 @@ mod tests {
             serde_json::to_string(&pid_file.display().to_string()).unwrap()
         );
         let f = fixture(&json, &[]);
+        // The first use builds fake-claude with cargo, which can take seconds on a cold CI runner (11 s seen on
+        // Windows); that must not count against the timeout being measured.
+        fake_claude();
         let started = Instant::now();
         let out = f
             .run(
@@ -278,6 +281,8 @@ mod tests {
     #[test]
     fn flooding_output_is_capped_without_blocking_the_child() {
         let f = fixture(r#"{"rules":[{"args":[],"flood_bytes":5000000}]}"#, &[]);
+        // Build fake-claude before the clock starts (see `a_timeout_kills_the_child`).
+        fake_claude();
         let started = Instant::now();
         let out = f.run(&["x"], &[], SECS, 10_000).unwrap();
         assert!(out.truncated);
@@ -490,5 +495,39 @@ mod tests {
                 .exit_code,
             Some(4)
         );
+    }
+
+    #[test]
+    fn concurrent_stub_runs_never_interleave_log_lines() {
+        // Regression: the stub wrote each log line with several `write` calls, so parallel runs tore lines apart.
+        let dir = tempfile::tempdir().unwrap();
+        let scenario = write_scenario(dir.path(), r#"{"rules":[{"args":["mcp","get"]}]}"#, &[]);
+        let log = dir.path().join("log.jsonl");
+        let long = "x".repeat(2000);
+        let mut children = Vec::new();
+        for round in 0..8 {
+            for i in 0..16 {
+                children.push(
+                    Command::new(fake_claude())
+                        .args(["mcp", "get", &format!("s{round}-{i}-{long}")])
+                        .env("FAKE_CLAUDE_SCENARIO", &scenario)
+                        .env("FAKE_CLAUDE_LOG", &log)
+                        .current_dir(dir.path())
+                        .stdout(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                );
+            }
+        }
+        for mut c in children {
+            c.wait().unwrap();
+        }
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 8 * 16 * 2, "one start and one end per run");
+        for l in lines {
+            serde_json::from_str::<serde_json::Value>(l)
+                .unwrap_or_else(|e| panic!("torn log line: {e}"));
+        }
     }
 }

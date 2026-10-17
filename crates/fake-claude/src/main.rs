@@ -64,12 +64,15 @@ fn log(event: &str, argv: &[String]) {
         "no_color_set": std::env::var_os("NO_COLOR").is_some(),
         "ms": now_ms() as u64,
     });
+    // One `write` call for the whole line: parallel runs append to the same file and must not tear each other's lines.
+    let mut buf = line.to_string();
+    buf.push('\n');
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(buf.as_bytes());
     }
 }
 

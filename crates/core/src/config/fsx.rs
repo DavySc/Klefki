@@ -7,6 +7,11 @@ const DENIED_FILE_NAMES: &[&str] = &[".credentials.json"];
 
 /// Reads a UTF-8 text file of at most `max_bytes`. `Ok(None)` when the file does not exist.
 pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
+    Ok(read_limited_bom(path, max_bytes)?.map(|(text, _)| text))
+}
+
+/// Like [`read_limited`], and also says whether the file started with a byte-order mark, so a writer can keep it.
+pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option<(String, bool)>> {
     if path
         .file_name()
         .and_then(|n| n.to_str())
@@ -33,7 +38,9 @@ pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<Str
             "file is larger than the {max_bytes} byte limit"
         )));
     }
-    let mut buf = Vec::new();
+    // Sized from the metadata (plus one byte, to notice a file that grew meanwhile), so a large file is read
+    // into one allocation rather than a series of growing ones.
+    let mut buf = Vec::with_capacity(meta.len() as usize + 1);
     File::open(path)?
         .take(max_bytes + 1)
         .read_to_end(&mut buf)?;
@@ -43,11 +50,10 @@ pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<Str
         ));
     }
     let text = String::from_utf8(buf).map_err(|_| io::Error::other("file is not valid UTF-8"))?;
-    Ok(Some(
-        text.strip_prefix('\u{feff}')
-            .map(str::to_owned)
-            .unwrap_or(text),
-    ))
+    Ok(Some(match text.strip_prefix('\u{feff}') {
+        Some(rest) => (rest.to_owned(), true),
+        None => (text, false),
+    }))
 }
 
 #[cfg(test)]

