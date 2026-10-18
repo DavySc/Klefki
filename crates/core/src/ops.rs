@@ -164,6 +164,24 @@ pub(crate) fn folder_name(path: &str) -> String {
     }
 }
 
+/// A server as the files spell it: its project key and name before they were cleaned and cut for display. Every op
+/// is written with these, so a name with a hidden character, or a long one, changes that server and no other.
+struct OnDisk {
+    project: Option<String>,
+    name: String,
+}
+
+fn on_disk(row: &ServerRow) -> Result<OnDisk, String> {
+    let (_, project, name) = crate::model::ConnectionId::parse(row.connection.as_str())
+        .ok_or_else(|| {
+            format!(
+                "{} cannot be identified in the configuration",
+                sanitize(&row.name)
+            )
+        })?;
+    Ok(OnDisk { project, name })
+}
+
 fn find<'a>(id: &ServerId, snapshot: &'a Snapshot) -> Result<&'a ServerRow, String> {
     snapshot.servers.iter().find(|r| r.is(id)).ok_or_else(|| {
         format!(
@@ -180,17 +198,17 @@ fn set_enabled(
     out: &mut Resolved,
 ) -> Result<(), String> {
     let row = find(id, snapshot)?;
+    let disk = on_disk(row)?;
     let shown = sanitize(&id.name);
     let disabled = !enabled;
     match row.scope {
         Scope::Local | Scope::Project => {
-            let project = row
+            let project = disk
                 .project
-                .clone()
                 .ok_or_else(|| format!("{shown} has no project"))?;
             out.claude.push(Op::SetDisabled {
                 project,
-                name: row.name.clone(),
+                name: disk.name.clone(),
                 disabled,
             });
             if enabled && row.scope == Scope::Project && row.approval != Some(Approval::Approved) {
@@ -209,7 +227,7 @@ fn set_enabled(
             for project in &snapshot.projects {
                 out.claude.push(Op::SetDisabled {
                     project: project.clone(),
-                    name: row.name.clone(),
+                    name: disk.name.clone(),
                     disabled,
                 });
             }
@@ -222,17 +240,19 @@ fn set_enabled(
     Ok(())
 }
 
-/// Where a user or local server lives, for an op; project servers are refused (the repository's file).
-fn own_server(id: &ServerId, snapshot: &Snapshot, what: &str) -> Result<Option<String>, String> {
+/// Where a user or local server lives, for an op, as the file spells it; project servers are refused (the
+/// repository's file).
+fn own_server(id: &ServerId, snapshot: &Snapshot, what: &str) -> Result<OnDisk, String> {
     let row = find(id, snapshot)?;
     let shown = sanitize(&id.name);
+    let disk = on_disk(row)?;
     match row.scope {
-        Scope::User => Ok(None),
-        Scope::Local => row
-            .project
-            .clone()
-            .map(Some)
-            .ok_or_else(|| format!("{shown} has no project")),
+        Scope::User => Ok(OnDisk {
+            project: None,
+            ..disk
+        }),
+        Scope::Local if disk.project.is_some() => Ok(disk),
+        Scope::Local => Err(format!("{shown} has no project")),
         Scope::Project => Err(format!(
             "{shown} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here."
         )),
@@ -240,10 +260,10 @@ fn own_server(id: &ServerId, snapshot: &Snapshot, what: &str) -> Result<Option<S
 }
 
 fn delete(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
-    let project = own_server(id, snapshot, "delete from")?;
+    let disk = own_server(id, snapshot, "delete from")?;
     out.claude.push(Op::RemoveServer {
-        project,
-        name: id.name.clone(),
+        project: disk.project,
+        name: disk.name,
     });
     out.warnings.push(
         "Deleting removes the definition only. A sign-in Claude Code keeps for this server is not removed."
@@ -258,7 +278,7 @@ fn replace(
     snapshot: &Snapshot,
     out: &mut Resolved,
 ) -> Result<(), String> {
-    let project = own_server(id, snapshot, "edit")?;
+    let disk = own_server(id, snapshot, "edit")?;
     if json.len() > entry::MAX_ENTRY_BYTES {
         return Err(format!(
             "The definition is longer than {} KiB.",
@@ -274,8 +294,8 @@ fn replace(
     // Checked again after hidden values are put back; this catches mistakes before anything is read.
     entry::validate(&value).map_err(|why| format!("The definition is not usable: {why}."))?;
     out.claude.push(Op::ReplaceServer {
-        project,
-        name: id.name.clone(),
+        project: disk.project,
+        name: disk.name,
         entry: value,
     });
     Ok(())
@@ -290,10 +310,11 @@ fn duplicate(
 ) -> Result<(), String> {
     let row = find(id, snapshot)?;
     let shown = sanitize(&id.name);
+    let disk = on_disk(row)?;
     let from = match row.scope {
         Scope::User => None,
         Scope::Local => Some(
-            row.project
+            disk.project
                 .clone()
                 .ok_or_else(|| format!("{shown} has no project"))?,
         ),
@@ -381,7 +402,7 @@ fn duplicate(
         }
         out.claude.push(Op::CopyServer {
             from: from.clone(),
-            name: row.name.clone(),
+            name: disk.name.clone(),
             to,
             new_name: name.to_owned(),
         });
@@ -404,16 +425,14 @@ fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(),
     if row.approval == Some(Approval::Approved) {
         return Ok(());
     }
-    let project = row
-        .project
-        .clone()
-        .ok_or_else(|| format!("{shown} has no project"))?;
+    let OnDisk { project, name } = on_disk(row)?;
+    let project = project.ok_or_else(|| format!("{shown} has no project"))?;
     if !inventory::is_safe_project_path(&project) || !Path::new(&project).is_dir() {
         return Err(format!(
             "The project folder of {shown} was not found, so it cannot be approved."
         ));
     }
-    let entry = inventory::project_server(&project, &row.name)?;
+    let entry = inventory::project_server(&project, &name)?;
     let lines = describe(&entry).map_err(|why| {
         format!("{shown} cannot be reviewed safely, so it is not approved: {why}.")
     })?;
@@ -424,7 +443,7 @@ fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(),
     });
     out.guards.push(Guard {
         project: project.clone(),
-        name: row.name.clone(),
+        name: name.clone(),
         digest: digest(&entry),
     });
     out.warnings.push(format!(
@@ -439,12 +458,13 @@ fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(),
     if row.approval == Some(Approval::Rejected) {
         out.claude.push(Op::ClearRejection {
             project: project.clone(),
-            name: row.name.clone(),
+            name: name.clone(),
         });
     }
-    out.settings.entry(project).or_default().push(Op::Approve {
-        name: row.name.clone(),
-    });
+    out.settings
+        .entry(project)
+        .or_default()
+        .push(Op::Approve { name });
     Ok(())
 }
 
