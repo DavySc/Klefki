@@ -28,9 +28,12 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Reload the configuration. With `live_all`, also re-check every checkable server, not just the ones whose
-    /// status Claude does not already know.
+    /// Reload the configuration and check, in the background, the servers with no status of their own: unknown, or
+    /// only last known from Claude's cache. With `live_all` (the user asked: F5), check every checkable server, up
+    /// to `max_checks` at once; background checks run one at a time, as each is a large Node process.
     Refresh { live_all: bool },
+    /// The servers the user can see now. Background checks of these go first.
+    Visible(Vec<crate::model::ConnectionId>),
     /// Check one server now. This is the only way a project (`.mcp.json`) server is checked, because checking
     /// it runs the repository's command.
     Check(ServerId),
@@ -396,13 +399,51 @@ struct Job {
     kind: JobKind,
     /// Tell the UI the check is running (only for rows that have nothing better to show meanwhile).
     announce: bool,
+    /// Nobody asked for it: it runs only while no other background job does.
+    background: bool,
 }
 
 #[derive(Default)]
 struct Queue {
     jobs: VecDeque<Job>,
+    /// Background jobs running now; at most [`BACKGROUND_CHECKS`].
+    background_running: usize,
+    /// The servers on screen, from [`Command::Visible`]: their background jobs go first.
+    visible: std::collections::HashSet<crate::model::ConnectionId>,
     shutdown: bool,
 }
+
+impl Queue {
+    /// The next job a worker may take: the first that is not background, or the first background one when there is
+    /// room for it.
+    fn take(&mut self) -> Option<Job> {
+        let room = self.background_running < BACKGROUND_CHECKS;
+        let at = self.jobs.iter().position(|j| room || !j.background)?;
+        let job = self.jobs.remove(at)?;
+        if job.background {
+            self.background_running += 1;
+        }
+        Some(job)
+    }
+
+    /// Background jobs in order: on screen first, then those with nothing to show yet, then the rest; otherwise in
+    /// the order they came. Jobs the user asked for keep their place.
+    fn order(&mut self) {
+        let visible = &self.visible;
+        let rank = |j: &Job| {
+            if !j.background {
+                0
+            } else {
+                1 + u8::from(!visible.contains(&j.id.connection)) * 2 + u8::from(!j.announce)
+            }
+        };
+        self.jobs.make_contiguous().sort_by_key(rank);
+    }
+}
+
+/// Background checks running at once. Each is a `claude` process, a Node program of about 190 MB: three at once took
+/// klefki from 123 MB to about 700 MB at startup. One keeps it near 300 MB.
+const BACKGROUND_CHECKS: usize = 1;
 
 struct Shared {
     config: EngineConfig,
@@ -476,9 +517,7 @@ fn engine_main(
         watch,
     };
     let mut plans = Plans::default();
-    // Claude's caches can be days old: at startup every server is checked, those with nothing to show first. A row
-    // Claude knows keeps its last-known status until its own answer comes.
-    refresh(&shared, &mut state, true);
+    refresh(&shared, &mut state, false);
     while let Ok(input) = inputs.recv() {
         let command = match input {
             Input::Ui(command) => command,
@@ -495,6 +534,11 @@ fn engine_main(
                 plans.stored.remove(&id);
             }
             Command::Refresh { live_all } => refresh(&shared, &mut state, live_all),
+            Command::Visible(rows) => {
+                let mut queue = lock(&shared.queue);
+                queue.visible = rows.into_iter().collect();
+                queue.order();
+            }
             Command::Check(id) => enqueue_now(&shared, &state, &id, JobKind::Check),
             Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose),
             Command::Inspect(id) => inspect(&shared, &state, id),
@@ -916,11 +960,9 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
     let keys = &state.keys;
     for row in &snapshot.servers {
         // Project servers run the repository's own command: only on an explicit request.
-        let wanted = row.scope != Scope::Project
-            && row.enabled
-            && (live_all || row.status == Status::Unknown);
+        let wanted = row.scope != Scope::Project && row.enabled && (live_all || needs_check(row));
         if wanted
-            && let Some(job) = build_job(
+            && let Some(mut job) = build_job(
                 shared,
                 row,
                 keys.get(&row.connection),
@@ -929,12 +971,14 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
                 row.status == Status::Unknown,
             )
         {
+            job.background = !live_all;
             jobs.push(job);
         }
     }
-    // Servers with nothing to show yet go first.
-    jobs.sort_by_key(|j| !j.announce);
-    lock(&shared.queue).jobs.extend(jobs);
+    let mut queue = lock(&shared.queue);
+    queue.jobs.extend(jobs);
+    queue.order();
+    drop(queue);
     shared.wake_workers.notify_all();
 }
 
@@ -954,7 +998,7 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
         .filter(|row| {
             row.scope != Scope::Project
                 && row.enabled
-                && row.status == Status::Unknown
+                && needs_check(row)
                 && !before
                     .servers
                     .iter()
@@ -967,14 +1011,27 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
                 state.keys.get(&row.connection),
                 generation,
                 JobKind::Check,
-                true,
+                row.status == Status::Unknown,
             )
+            .map(|job| Job {
+                background: true,
+                ..job
+            })
         })
         .collect();
     if !jobs.is_empty() {
-        lock(&shared.queue).jobs.extend(jobs);
+        let mut queue = lock(&shared.queue);
+        queue.jobs.extend(jobs);
+        queue.order();
+        drop(queue);
         shared.wake_workers.notify_all();
     }
+}
+
+/// A row whose status klefki has not established: unknown, or only last known from Claude's cache (which can be any
+/// age). A fresh needs-auth entry from Claude is not checked again until the user asks.
+fn needs_check(row: &ServerRow) -> bool {
+    row.status == Status::Unknown || row.status_cached
 }
 
 /// The same server in two snapshots: by connection, as the file spells it, not by the shown name.
@@ -1007,6 +1064,8 @@ fn build_job(
 ) -> Option<Job> {
     let refuse = |why: String| {
         match kind {
+            // A row showing a last-known status keeps it: "not checked" would hide what little is known.
+            JobKind::Check if !announce => {}
             JobKind::Check => shared.emitter.status(
                 row.id(),
                 Status::Unknown,
@@ -1057,6 +1116,7 @@ fn build_job(
         cwd,
         kind,
         announce,
+        background: false,
     })
 }
 
@@ -1068,7 +1128,7 @@ fn worker(shared: &Shared) {
                 if queue.shutdown {
                     return;
                 }
-                if let Some(job) = queue.jobs.pop_front() {
+                if let Some(job) = queue.take() {
                     break job;
                 }
                 queue = shared
@@ -1077,36 +1137,43 @@ fn worker(shared: &Shared) {
                     .unwrap_or_else(|e| e.into_inner());
             }
         };
-        let current = || shared.generation.load(Ordering::SeqCst) == job.generation;
-        if !current() {
-            continue;
+        run(shared, &job);
+        if job.background {
+            lock(&shared.queue).background_running -= 1;
+            // A worker may be waiting for room to run the next one.
+            shared.wake_workers.notify_all();
         }
-        if job.announce {
-            shared
-                .emitter
-                .status(job.id.clone(), Status::Checking, None);
-        }
-        match job.kind {
-            JobKind::Check => {
-                let (status, detail) = execute(shared, &job);
-                // A refresh may have replaced the world while this ran; its answer would be about a stale row.
-                if current() {
-                    shared.emitter.status(job.id.clone(), status, detail);
-                }
+    }
+}
+
+fn run(shared: &Shared, job: &Job) {
+    let current = || shared.generation.load(Ordering::SeqCst) == job.generation;
+    if !current() {
+        return;
+    }
+    if job.announce {
+        shared
+            .emitter
+            .status(job.id.clone(), Status::Checking, None);
+    }
+    match job.kind {
+        JobKind::Check => {
+            let (status, detail) = execute(shared, job);
+            // A refresh may have replaced the world while this ran; its answer would be about a stale row.
+            if current() {
+                shared.emitter.status(job.id.clone(), status, detail);
             }
-            JobKind::Diagnose => {
-                let diagnosis = run_diagnose(shared, &job);
-                if current() {
-                    shared.emitter.status(
-                        job.id.clone(),
-                        diagnosis.status,
-                        diagnosis.detail.clone(),
-                    );
-                    shared.emitter.emit(Event::Diagnosis {
-                        id: job.id.clone(),
-                        diagnosis,
-                    });
-                }
+        }
+        JobKind::Diagnose => {
+            let diagnosis = run_diagnose(shared, job);
+            if current() {
+                shared
+                    .emitter
+                    .status(job.id.clone(), diagnosis.status, diagnosis.detail.clone());
+                shared.emitter.emit(Event::Diagnosis {
+                    id: job.id.clone(),
+                    diagnosis,
+                });
             }
         }
     }
@@ -1589,6 +1656,208 @@ mod tests {
         );
     }
 
+    /// Claude's needs-auth cache, written now for `names`, as Claude Code writes it.
+    fn recently_needing_auth(env: &Env, names: &[String]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let entries: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|n| (n.clone(), serde_json::json!({"timestamp": now})))
+            .collect();
+        std::fs::write(
+            env.dir.path().join("cfg").join("mcp-needs-auth-cache.json"),
+            serde_json::Value::Object(entries).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_server_claude_checked_recently_is_left_alone_until_f5() {
+        // Restores the half of the test this slice replaced: F5 checks a server the caches know.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "recent": http("https://a.example.com"),
+                "fresh": {"type": "stdio", "command": "x"}}}),
+            r#"{"rules":[{"args":["mcp","get"],"stdout_file":"c.txt"},{"args":["--version"]}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["recent".to_owned()]);
+        let core = env.start();
+        let events = collect(&core, |e| final_status(e, "fresh").is_some());
+        assert!(matches!(&events[0], Event::Snapshot(s)
+                if s.servers.iter().any(|r| r.name == "recent" && r.status == Status::NeedsAuth && !r.status_cached)));
+        let names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(
+            names,
+            ["fresh"],
+            "Claude found it needs sign-in minutes ago"
+        );
+
+        core.send(Command::Refresh { live_all: true });
+        let events = collect(&core, |e| final_status(e, "recent").is_some());
+        assert_eq!(final_status(&events, "recent"), Some(Status::Connected));
+        let mut names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        names.sort();
+        assert_eq!(names, ["fresh", "fresh", "recent"], "F5 checks every one");
+    }
+
+    fn max_overlap(gets: &[(String, u64, u64)]) -> usize {
+        gets.iter()
+            .map(|(_, start, _)| {
+                gets.iter()
+                    .filter(|(_, s, e)| s <= start && start < e)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn checks_nobody_asked_for_run_one_at_a_time() {
+        // Each is a large Node process: three at once took klefki from 123 MB to about 700 MB at startup.
+        let servers: serde_json::Map<String, serde_json::Value> = (0..4)
+            .map(|i| (format!("s{i}"), serde_json::json!({"command": "x"})))
+            .collect();
+        let env = Env::new(
+            &serde_json::json!({ "mcpServers": servers }),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":300}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = env.start();
+        collect(&core, |e| {
+            (0..4).all(|i| final_status(e, &format!("s{i}")).is_some())
+        });
+        let gets = env.gets();
+        assert_eq!(gets.len(), 4);
+        assert_eq!(max_overlap(&gets), 1, "{gets:?}");
+    }
+
+    #[test]
+    fn a_check_the_user_asks_for_does_not_wait_for_the_background_ones() {
+        let servers: serde_json::Map<String, serde_json::Value> = (0..3)
+            .map(|i| (format!("s{i}"), serde_json::json!({"command": "x"})))
+            .chain([("mine".to_owned(), serde_json::json!({"command": "x"}))])
+            .collect();
+        let env = Env::new(
+            &serde_json::json!({ "mcpServers": servers }),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":800}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["mine".to_owned()]);
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| {
+                matches!(
+                    x,
+                    Event::Status {
+                        status: Status::Checking,
+                        ..
+                    }
+                )
+            })
+        });
+        core.send(Command::Check(user_id("mine")));
+        collect(&core, |e| final_status(e, "mine").is_some());
+        let gets = env.gets();
+        let done = |n: &str| gets.iter().filter(|g| g.0 == n).count();
+        assert_eq!(done("mine"), 1);
+        assert!(
+            (0..3).filter(|i| done(&format!("s{i}")) == 1).count() < 3,
+            "it ran beside the background checks, not after them: {gets:?}"
+        );
+    }
+
+    #[test]
+    fn background_checks_of_servers_on_screen_go_first() {
+        let servers: serde_json::Map<String, serde_json::Value> = (0..5)
+            .map(|i| (format!("s{i}"), serde_json::json!({"command": "x"})))
+            .collect();
+        let env = Env::new(
+            &serde_json::json!({ "mcpServers": servers }),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":300}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = env.start();
+        core.send(Command::Visible(vec![
+            crate::model::ConnectionId::new(Scope::User, None, "s4"),
+            crate::model::ConnectionId::new(Scope::User, None, "s3"),
+        ]));
+        collect(&core, |e| {
+            (0..5).all(|i| final_status(e, &format!("s{i}")).is_some())
+        });
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        // One may already have started before the list arrived.
+        let at = |n: &str| order.iter().position(|o| o == n).unwrap();
+        assert!(at("s3") <= 2 && at("s4") <= 2, "{order:?}");
+        assert!(
+            at("s3") < at("s4"),
+            "on screen in their own order: {order:?}"
+        );
+    }
+
+    #[test]
+    fn a_known_server_switched_on_from_outside_is_checked() {
+        // Cross-review of this slice: only unknown servers were checked after a change.
+        let config = |off: bool| {
+            serde_json::json!({
+                "mcpServers": {"known": http("https://a.example.com")},
+                "projects": {"/p": {"disabledMcpServers": if off { vec!["known"] } else { vec![] }}}
+            })
+        };
+        let env = Env::new(
+            &config(true),
+            r#"{"rules":[{"args":["mcp","get"],"stdout_file":"f.txt"},{"args":["--version"]}]}"#,
+            &[("f.txt", FAILED)],
+        );
+        std::fs::write(
+            env.dir.path().join("cfg").join("mcp-health-cache.json"),
+            r#"{"version":1,"servers":{"known":{"status":"healthy"}}}"#,
+        )
+        .unwrap();
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        assert!(env.gets().is_empty(), "it is off");
+        write_config(&env, &config(false));
+        let events = collect(&core, |e| final_status(e, "known").is_some());
+        assert_eq!(final_status(&events, "known"), Some(Status::Failed));
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, Event::Status { id, status: Status::Checking, .. }
+                if id.name == "known")
+            ),
+            "its last-known status stays while it is checked"
+        );
+    }
+
+    #[test]
+    fn a_known_server_that_cannot_be_checked_keeps_its_last_known_status() {
+        // Cross-review: a refused check sent "not checked" over the cache's status. A variant: the unknown one still
+        // says why it is not checked.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "a&b": http("https://a.example.com"),
+                "c&d": http("https://c.example.com"),
+                "ok": http("https://b.example.com")}}),
+            r#"{"rules":[{"args":["mcp","get"],"stdout_file":"c.txt"},{"args":["--version"]}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        std::fs::write(
+            env.dir.path().join("cfg").join("mcp-health-cache.json"),
+            r#"{"version":1,"servers":{"a&b":{"status":"healthy"}}}"#,
+        )
+        .unwrap();
+        let core = env.start();
+        let events = collect(&core, |e| {
+            final_status(e, "ok").is_some() && final_status(e, "c&d").is_some()
+        });
+        assert_eq!(status_of(&events, "a&b"), None, "{events:?}");
+        let (status, detail) = status_of(&events, "c&d").unwrap();
+        assert_eq!(status, Status::Unknown);
+        assert!(detail.unwrap().contains("not checked"));
+    }
+
     #[test]
     fn project_servers_are_only_checked_on_request_and_run_in_their_folder() {
         let env = Env::new(
@@ -1676,7 +1945,13 @@ mod tests {
             r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":1000}]}"#,
             &[("c.txt", CONNECTED)],
         );
+        // Claude checked them all just now, so startup checks none; the pool is used when the user asks (F5).
+        // (This test used to count the startup checks, which now run one at a time.)
+        recently_needing_auth(&env, &(0..6).map(|i| format!("s{i}")).collect::<Vec<_>>());
         let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        assert!(env.gets().is_empty(), "nothing is checked at startup");
+        core.send(Command::Refresh { live_all: true });
         collect(&core, |e| {
             (0..6).all(|i| final_status(e, &format!("s{i}")).is_some())
         });
