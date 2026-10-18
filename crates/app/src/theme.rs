@@ -24,6 +24,8 @@ pub struct Palette {
     pub panel_raised: Color32,
     pub row_alt: Color32,
     pub border: Color32,
+    /// Panel edges and separators: softer than control outlines, so structure shows without clutter.
+    pub divider: Color32,
     /// Fill of a hovered control.
     pub hover: Color32,
     pub text: Color32,
@@ -52,6 +54,7 @@ pub const DARK: Palette = Palette {
     panel_raised: hex(0x313244),
     row_alt: hex(0x232334),
     border: hex(0x45475A),
+    divider: hex(0x2B2B3D),
     hover: hex(0x3B3D50),
     text: hex(0xCDD6F4),
     text_muted: hex(0xA6ADC8),
@@ -76,6 +79,7 @@ pub const LIGHT: Palette = Palette {
     panel_raised: hex(0xFFFFFF),
     row_alt: hex(0xE9ECF1),
     border: hex(0xBCC0CC),
+    divider: hex(0xDADEE6),
     hover: hex(0xE0E4EB),
     text: hex(0x4C4F69),
     text_muted: hex(0x5C5F77),
@@ -91,12 +95,128 @@ pub const LIGHT: Palette = Palette {
     on_bright: hex(0xFFFFFF),
 };
 
-/// The palette for the theme egui is currently showing.
-pub fn palette(ctx: &egui::Context) -> &'static Palette {
-    match ctx.theme() {
-        egui::Theme::Dark => &DARK,
-        egui::Theme::Light => &LIGHT,
+/// Warm gray, dark: less saturated than Mocha's blue-violet, warm without going muddy. Same accents.
+pub const WARM_DARK: Palette = Palette {
+    field: hex(0x131211),
+    chrome: hex(0x181716),
+    panel: hex(0x1D1C1A),
+    panel_raised: hex(0x2A2826),
+    row_alt: hex(0x22201F),
+    border: hex(0x45423E),
+    divider: hex(0x2C2A27),
+    hover: hex(0x353230),
+    text: hex(0xE7E4DF),
+    text_muted: hex(0xACA69F),
+    primary: hex(0xCBA6F7),
+    link: hex(0x8DB4F0),
+    focus: hex(0xF0BCDF),
+    key: hex(0xEBD2A0),
+    selection: hex(0x3E3747),
+    success: hex(0xA6DCA0),
+    warn: hex(0xF2B084),
+    danger: hex(0xF08CA6),
+    disabled: hex(0x827D77),
+    on_bright: hex(0x131211),
+};
+
+/// Warm gray, light.
+pub const WARM_LIGHT: Palette = Palette {
+    field: hex(0xFFFFFF),
+    chrome: hex(0xEFEDEA),
+    panel: hex(0xF7F6F3),
+    panel_raised: hex(0xFFFFFF),
+    row_alt: hex(0xF0EEEB),
+    border: hex(0xC9C5BF),
+    divider: hex(0xE3E0DB),
+    hover: hex(0xE9E6E1),
+    text: hex(0x2F2C28),
+    text_muted: hex(0x5E5A54),
+    primary: hex(0x7C2FE0),
+    link: hex(0x1A66A6),
+    focus: hex(0xCF3F9B),
+    key: hex(0x8A5A00),
+    selection: hex(0xEBE3F8),
+    success: hex(0x26741A),
+    warn: hex(0xA83F05),
+    danger: hex(0xC40F35),
+    disabled: hex(0x8E8A84),
+    on_bright: hex(0xFFFFFF),
+};
+
+/// The family of greys: Catppuccin's cool blue-violet (the default), or a warmer, calmer grey.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tone {
+    #[default]
+    Cool,
+    Warm,
+}
+
+impl Tone {
+    pub const ALL: [Self; 2] = [Self::Cool, Self::Warm];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cool => "cool",
+            Self::Warm => "warm",
+        }
     }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cool => "Cool (Catppuccin)",
+            Self::Warm => "Warm gray",
+        }
+    }
+
+    fn palettes(self) -> (&'static Palette, &'static Palette) {
+        match self {
+            Self::Cool => (&DARK, &LIGHT),
+            Self::Warm => (&WARM_DARK, &WARM_LIGHT),
+        }
+    }
+}
+
+fn tone_id() -> egui::Id {
+    egui::Id::new("klefki-tone")
+}
+
+/// The tone in use.
+pub fn tone(ctx: &egui::Context) -> Tone {
+    ctx.data(|d| d.get_temp(tone_id())).unwrap_or_default()
+}
+
+/// The palette for the theme and tone egui is currently showing.
+pub fn palette(ctx: &egui::Context) -> &'static Palette {
+    let (dark, light) = tone(ctx).palettes();
+    match ctx.theme() {
+        egui::Theme::Dark => dark,
+        egui::Theme::Light => light,
+    }
+}
+
+/// Switches the greys of both themes.
+pub fn set_tone(ctx: &egui::Context, tone: Tone) {
+    ctx.data_mut(|d| d.insert_temp(tone_id(), tone));
+    let (dark, light) = tone.palettes();
+    ctx.set_visuals_of(egui::Theme::Dark, visuals(dark, true));
+    ctx.set_visuals_of(egui::Theme::Light, visuals(light, false));
+}
+
+const TONE_KEY: &str = "tone";
+
+pub fn load_tone(storage: Option<&dyn eframe::Storage>) -> Tone {
+    storage
+        .and_then(|s| s.get_string(TONE_KEY))
+        .and_then(|v| Tone::parse(&v))
+        .unwrap_or_default()
+}
+
+pub fn save_tone(storage: &mut dyn eframe::Storage, tone: Tone) {
+    storage.set_string(TONE_KEY, tone.as_str().to_owned());
 }
 
 /// What the user picked. `System` follows the operating system.
@@ -211,7 +331,8 @@ pub fn visuals(p: &Palette, dark: bool) -> Visuals {
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.panel;
     w.noninteractive.weak_bg_fill = p.panel;
-    w.noninteractive.bg_stroke = Stroke::new(1.0, p.border);
+    // Panel edges and separators use the soft divider; controls keep their clearer outline.
+    w.noninteractive.bg_stroke = Stroke::new(1.0, p.divider);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
     w.inactive.bg_fill = p.panel_raised;
     w.inactive.weak_bg_fill = p.panel_raised;
@@ -347,8 +468,13 @@ pub(crate) mod tests {
         assert_eq!(hex(0xCBA6F7), Color32::from_rgb(0xCB, 0xA6, 0xF7));
     }
 
-    fn both() -> [(&'static str, &'static Palette, bool); 2] {
-        [("dark", &DARK, true), ("light", &LIGHT, false)]
+    fn both() -> [(&'static str, &'static Palette, bool); 4] {
+        [
+            ("dark", &DARK, true),
+            ("light", &LIGHT, false),
+            ("warm dark", &WARM_DARK, true),
+            ("warm light", &WARM_LIGHT, false),
+        ]
     }
 
     #[test]
@@ -532,5 +658,49 @@ pub(crate) mod tests {
                 .iter()
                 .any(|n| n == "phosphor")
         );
+    }
+
+    #[test]
+    fn warm_greys_are_warm_and_less_saturated_than_catppuccin() {
+        // Warm: red at least as strong as blue. Calmer: a smaller spread between channels.
+        let spread = |c: Color32| c.r().max(c.g()).max(c.b()) - c.r().min(c.g()).min(c.b());
+        for (warm, cool) in [(&WARM_DARK, &DARK), (&WARM_LIGHT, &LIGHT)] {
+            for (w, c) in [
+                (warm.panel, cool.panel),
+                (warm.chrome, cool.chrome),
+                (warm.text, cool.text),
+            ] {
+                assert!(w.r() >= w.b(), "{w:?} is not warm");
+                assert!(spread(w) <= spread(c), "{w:?} is not calmer than {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dividers_are_softer_than_outlines_but_still_there() {
+        for (name, p, _) in both() {
+            let soft = contrast(p.divider, p.panel);
+            let outline = contrast(p.border, p.panel);
+            assert!(soft < outline, "{name}: divider {soft} vs border {outline}");
+            assert!(soft > 1.05, "{name}: divider invisible ({soft})");
+        }
+    }
+
+    #[test]
+    fn the_tone_switches_both_themes_and_is_remembered() {
+        let ctx = egui::Context::default();
+        apply(&ctx, ThemeChoice::Dark);
+        assert_eq!(tone(&ctx), Tone::Cool);
+        assert_eq!(palette(&ctx).panel, DARK.panel);
+        set_tone(&ctx, Tone::Warm);
+        assert_eq!(palette(&ctx).panel, WARM_DARK.panel);
+        set_choice(&ctx, ThemeChoice::Light);
+        assert_eq!(palette(&ctx).panel, WARM_LIGHT.panel);
+        let mut st = MemoryStorage::default();
+        assert_eq!(load_tone(Some(&st)), Tone::Cool);
+        save_tone(&mut st, Tone::Warm);
+        assert_eq!(load_tone(Some(&st)), Tone::Warm);
+        eframe::Storage::set_string(&mut st, "tone", "sepia".to_owned());
+        assert_eq!(load_tone(Some(&st)), Tone::Cool);
     }
 }

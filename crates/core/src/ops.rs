@@ -20,6 +20,14 @@ pub(crate) struct Resolved {
     /// Edits to a project's `.claude/settings.local.json`, by project path.
     pub settings: BTreeMap<String, Vec<Op>>,
     pub warnings: Vec<String>,
+    /// Good to know, not a reason to hesitate (shown more quietly than warnings).
+    pub notes: Vec<String>,
+    /// One plain sentence per change, for the top of the review ("Turn off github in 3 projects").
+    pub summary: Vec<String>,
+    /// What the confirm button says: the verb all changes share, else "Apply".
+    pub action: String,
+    /// Something is removed (a delete), so the confirm button is shown as dangerous.
+    pub destructive: bool,
     pub reviews: Vec<Review>,
     /// Definitions that were reviewed; they must be unchanged when the plan is applied.
     pub guards: Vec<Guard>,
@@ -48,7 +56,20 @@ fn digest(entry: &Value) -> String {
 
 pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolved, String> {
     let mut out = Resolved::default();
+    let mut verbs: Vec<&str> = Vec::new();
     for change in changes {
+        let verb = match change {
+            Change::SetEnabled { enabled: true, .. } => "Turn on",
+            Change::SetEnabled { enabled: false, .. } => "Turn off",
+            Change::Approve { .. } => "Approve",
+            Change::Delete { .. } => "Delete",
+            Change::Replace { .. } => "Save",
+        };
+        if !verbs.contains(&verb) {
+            verbs.push(verb);
+        }
+        out.destructive |= matches!(change, Change::Delete { .. });
+        out.summary.push(summarise(change, snapshot));
         match change {
             Change::SetEnabled { id, enabled } => set_enabled(id, *enabled, snapshot, &mut out)?,
             Change::Approve { id } => approve(id, snapshot, &mut out)?,
@@ -56,13 +77,58 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
             Change::Replace { id, json } => replace(id, json, snapshot, &mut out)?,
         }
     }
+    out.action = match verbs.as_slice() {
+        [one] => (*one).to_owned(),
+        _ => "Apply".to_owned(),
+    };
     if !out.claude.is_empty() {
-        out.warnings.push(
+        out.notes.push(
             "A running Claude Code session may need a restart before it notices this.".to_owned(),
         );
     }
     out.warnings.dedup();
     Ok(out)
+}
+
+/// One plain sentence for a change, naming the server and where it applies.
+fn summarise(change: &Change, snapshot: &Snapshot) -> String {
+    let (id, verb) = match change {
+        Change::SetEnabled { id, enabled } => (id, if *enabled { "Turn on" } else { "Turn off" }),
+        Change::Approve { id } => (id, "Approve"),
+        Change::Delete { id } => (id, "Delete"),
+        Change::Replace { id, .. } => (id, "Save changes to"),
+    };
+    let name = sanitize(&id.name);
+    let place = match (id.scope, id.project.as_deref()) {
+        (Scope::User, _) => match change {
+            Change::SetEnabled { .. } => {
+                format!(" in {}", count(snapshot.projects.len(), "project"))
+            }
+            _ => " (user server)".to_owned(),
+        },
+        (_, Some(project)) => format!(" in {}", sanitize(&folder_name(project))),
+        (_, None) => String::new(),
+    };
+    format!("{verb} {name}{place}")
+}
+
+/// `1 project`, `3 projects`.
+pub(crate) fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// The last part of a project path: `C:/work/app` -> `app`.
+pub(crate) fn folder_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rsplit(['/', '\\']).next() {
+        Some(last) if !last.is_empty() => last.to_owned(),
+        // The root itself.
+        _ => path.to_owned(),
+    }
 }
 
 fn find<'a>(id: &ServerId, snapshot: &'a Snapshot) -> Result<&'a ServerRow, String> {
@@ -115,8 +181,8 @@ fn set_enabled(
                 });
             }
             out.warnings.push(format!(
-                "{shown} is a user server, and Claude Code switches it per project. This changes the {} projects it knows today; a project it first opens later is not covered.",
-                snapshot.projects.len()
+                "{shown} is a user server, and Claude Code switches it per project. This changes the {} it knows today; a project it first opens later is not covered.",
+                count(snapshot.projects.len(), "project")
             ));
         }
     }
@@ -448,5 +514,25 @@ mod tests {
         )
         .unwrap();
         assert!(ignored_by_git(dir.path()));
+    }
+
+    #[test]
+    fn counts_read_naturally() {
+        assert_eq!(count(1, "project"), "1 project");
+        assert_eq!(count(0, "project"), "0 projects");
+        assert_eq!(count(3, "project"), "3 projects");
+    }
+
+    #[test]
+    fn folder_names_come_from_any_spelling() {
+        for (path, want) in [
+            ("C:/work/app", "app"),
+            ("c:\\work\\app\\", "app"),
+            ("/home/u/repo/", "repo"),
+            ("/", "/"),
+            ("C:/", "C:"),
+        ] {
+            assert_eq!(folder_name(path), want, "{path}");
+        }
     }
 }

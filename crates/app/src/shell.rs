@@ -1,6 +1,7 @@
 //! The desktop-style shell: left nav, top bar, icon toolbar, grid and detail panel.
 //! Pure UI over an immutable `Snapshot`; no IO.
-use crate::theme::{self, Palette, ThemeChoice};
+use crate::command::{self, CommandPalette, Entry, shortcut};
+use crate::theme::{self, Palette, ThemeChoice, Tone};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
@@ -35,6 +36,34 @@ impl Page {
             .find(|(p, ..)| *p == self)
             .map_or("", |(.., t)| t)
     }
+
+    fn glyph(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find(|(p, ..)| *p == self)
+            .map_or("", |(_, g, _)| g)
+    }
+
+    /// Pages that are not built yet say what they will do, so the menu is a map rather than a dead end.
+    fn ready(self) -> bool {
+        matches!(self, Page::Connections | Page::Settings)
+    }
+
+    fn promise(self) -> &'static str {
+        match self {
+            Page::Connections => "",
+            Page::ScopeDrift => {
+                "Coming soon: servers whose definitions differ between scopes, side by side."
+            }
+            Page::Secrets => {
+                "Coming soon: the secrets Klefki keeps in your system keychain, and any that nothing uses any more."
+            }
+            Page::Settings => {
+                "Coming soon: where to find the Claude CLI, and how often to check servers."
+            }
+            Page::ActivityLog => "Coming soon: every change Klefki made, with its backup.",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +77,12 @@ pub enum DetailTab {
 
 impl DetailTab {
     const ALL: [(DetailTab, &'static str); 5] = [
+        // Short names keep the tabs on one line in a panel of a third of the window.
         (DetailTab::General, "General"),
-        (DetailTab::Auth, "Auth"),
-        (DetailTab::HeadersEnv, "Headers/Env"),
-        (DetailTab::RawJson, "Raw JSON"),
         (DetailTab::Status, "Status"),
+        (DetailTab::RawJson, "JSON"),
+        (DetailTab::HeadersEnv, "Env"),
+        (DetailTab::Auth, "Auth"),
     ];
 }
 
@@ -76,15 +106,30 @@ enum EditorState {
 }
 
 /// What happened to the last change, for the banner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct Outcome {
     text: String,
     ok: bool,
+    /// When it was first shown (egui time, seconds). A success fades after a few seconds; a problem stays.
+    shown_at: Option<f64>,
 }
 
+/// How long a success message stays.
+const SUCCESS_SECONDS: f64 = 4.0;
+
 enum GridRow {
-    Group(String),
+    Group(Group),
     Server(usize),
+}
+
+/// A group header: the scope and, for a project, its folder name up front and the rest of the path muted.
+struct Group {
+    title: String,
+    /// The folder the project is in, shown quietly after the title.
+    location: Option<String>,
+    /// The whole label, as one line: what assistive technology reads and what the tooltip shows.
+    full: String,
+    count: usize,
 }
 
 pub struct ShellApp {
@@ -106,6 +151,8 @@ pub struct ShellApp {
     applying: bool,
     /// The definition being viewed or edited in the Raw JSON tab.
     editor: Option<Editor>,
+    /// Ctrl+K / ⌘K.
+    command: CommandPalette,
     /// The outcome of the last change, shown until dismissed.
     outcome: Option<Outcome>,
     pub page: Page,
@@ -113,6 +160,7 @@ pub struct ShellApp {
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
     pub theme: ThemeChoice,
+    pub tone: Tone,
 }
 
 impl ShellApp {
@@ -127,6 +175,7 @@ impl ShellApp {
             plan: None,
             applying: false,
             editor: None,
+            command: CommandPalette::default(),
             outcome: None,
             snapshot,
             page: Page::Connections,
@@ -134,6 +183,7 @@ impl ShellApp {
             selected: BTreeSet::new(),
             tab: DetailTab::General,
             theme,
+            tone: Tone::default(),
         }
     }
 
@@ -208,6 +258,7 @@ impl ShellApp {
                     self.editor = None;
                 }
                 self.grid_cache = None;
+                self.command.invalidate();
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
@@ -226,6 +277,7 @@ impl ShellApp {
                 self.outcome = Some(Outcome {
                     text: why,
                     ok: false,
+                    shown_at: None,
                 })
             }
             Event::Applied {
@@ -248,6 +300,7 @@ impl ShellApp {
                         (true, None) => "Saved.".to_owned(),
                     },
                     ok: true,
+                    shown_at: None,
                 });
             }
             Event::ApplyFailed { plan, error } => {
@@ -258,6 +311,7 @@ impl ShellApp {
                 self.outcome = Some(Outcome {
                     text: error,
                     ok: false,
+                    shown_at: None,
                 });
             }
             Event::Reapplied { .. } => {
@@ -265,6 +319,7 @@ impl ShellApp {
                     text: "Claude Code overwrote the change right after it was saved, so it was written again. Close running Claude Code sessions if this keeps happening."
                         .to_owned(),
                     ok: false,
+                    shown_at: None,
                 });
             }
             Event::Entry { id, json, editable } => {
@@ -329,8 +384,15 @@ impl ShellApp {
             let s = &self.snapshot.servers[i];
             let key = (s.scope, s.project.as_deref());
             if last != Some(key) {
-                rows.push(GridRow::Group(group_title(s)));
+                rows.push(GridRow::Group(group_of(s)));
                 last = Some(key);
+            }
+            if let Some(GridRow::Group(g)) = rows
+                .iter_mut()
+                .rev()
+                .find(|r| matches!(r, GridRow::Group(_)))
+            {
+                g.count += 1;
             }
             rows.push(GridRow::Server(i));
         }
@@ -354,8 +416,32 @@ impl ShellApp {
         if ui.input(|i| i.key_pressed(egui::Key::F5)) {
             self.refresh();
         }
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) && self.plan.is_none()
+        {
+            if self.command.is_open() {
+                self.command.close();
+            } else {
+                self.command.open();
+            }
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            ctx.memory_mut(|m| m.request_focus(search_id()));
+        }
+        let idle =
+            !ctx.egui_wants_keyboard_input() && self.plan.is_none() && !self.command.is_open();
+        // Up and down walk the list, like any list.
+        if idle && self.page == Page::Connections {
+            let step = ctx.input(|i| {
+                i.key_pressed(egui::Key::ArrowDown) as i32
+                    - i.key_pressed(egui::Key::ArrowUp) as i32
+            });
+            if step != 0 {
+                self.move_selection(step);
+            }
+        }
         // Del and Ctrl+E act on the selection, unless a text field has the keyboard (Del edits text there).
-        if !ui.ctx().egui_wants_keyboard_input() && self.plan.is_none() && self.core.is_some() {
+        if idle && self.core.is_some() {
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.prepare_delete();
             }
@@ -380,31 +466,49 @@ impl ShellApp {
             .show(ui, |ui| self.nav(ui));
         if self.page == Page::Connections {
             egui::Panel::right("detail")
-                .default_size(340.0)
-                .min_size(260.0)
+                .default_size(360.0)
+                .min_size(280.0)
+                .max_size(460.0)
                 .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(12)))
                 .show(ui, |ui| self.detail(ui));
         }
-        let ctx = ui.ctx().clone();
         self.plan_dialog(&ctx);
+        self.outcome_toast(&ctx);
+        let mut command = std::mem::take(&mut self.command);
+        let chosen = command.show(&ctx, || self.commands());
+        self.command = command;
+        if let Some(action) = chosen {
+            self.run(&ctx, action);
+        }
         egui::CentralPanel::default()
             .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(14)))
             .show(ui, |ui| match self.page {
                 Page::Connections => {
                     self.warnings(ui);
-                    self.outcome_banner(ui);
                     self.toolbar(ui);
                     ui.add_space(6.0);
                     self.grid(ui);
                 }
+                Page::Settings => self.settings(ui),
                 other => {
-                    ui.add_space(24.0);
+                    ui.add_space(48.0);
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(other.title()).heading());
                         ui.label(
-                            RichText::new("Not built yet (see docs/PLAN.md).")
+                            RichText::new(other.glyph())
+                                .size(32.0)
                                 .color(pal.text_muted),
                         );
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(other.title()).heading());
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(other.promise()).color(pal.text_muted))
+                                .wrap(),
+                        );
+                        ui.add_space(12.0);
+                        if ui.button("Back to connections").clicked() {
+                            self.page = Page::Connections;
+                        }
                     });
                 }
             });
@@ -413,11 +517,11 @@ impl ShellApp {
     fn top_bar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
         ui.horizontal_centered(|ui| {
-            ui.label(RichText::new(icon::KEY).size(22.0).color(pal.key));
+            ui.label(RichText::new(icon::KEY).size(17.0).color(pal.key));
             ui.label(
                 RichText::new("Klefki")
                     .family(theme::bold_family())
-                    .size(20.0)
+                    .size(18.0)
                     .color(pal.primary),
             );
             ui.label(RichText::new(self.page.title()).color(pal.text_muted));
@@ -445,9 +549,24 @@ impl ShellApp {
                 if changed {
                     theme::set_choice(ui.ctx(), self.theme);
                 }
+                if ui
+                    .button(
+                        RichText::new(format!("{} {}", icon::COMMAND, shortcut("K")))
+                            .color(pal.text_muted),
+                    )
+                    .on_hover_text("Commands: everything Klefki can do, by name")
+                    .clicked()
+                {
+                    self.command.open();
+                }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text(format!("{} Search", icon::MAGNIFYING_GLASS))
+                        .id(search_id())
+                        .hint_text(format!(
+                            "{} Filter  {}",
+                            icon::MAGNIFYING_GLASS,
+                            shortcut("F")
+                        ))
                         .desired_width(220.0),
                 );
                 if let Some(version) = self
@@ -470,35 +589,44 @@ impl ShellApp {
             resp.widget_info(|| {
                 egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, title)
             });
+            // The menu orients; it should not compete with the list. Inactive items are dim, icons small and
+            // all one colour, and the active item is a quiet rounded fill rather than a coloured bar.
+            let pill = rect.shrink2(egui::vec2(8.0, 3.0));
             if active {
-                ui.painter().rect_filled(rect, 0.0, pal.panel);
-                let bar = egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height()));
-                ui.painter().rect_filled(bar, 0.0, pal.primary);
+                ui.painter().rect_filled(pill, 6.0, pal.hover);
             } else if resp.hovered() {
-                ui.painter().rect_filled(rect, 0.0, pal.row_alt);
+                ui.painter().rect_filled(pill, 6.0, pal.row_alt);
             }
-            let color = if active { pal.text } else { pal.text_muted };
-            let glyph_color = if page == Page::Secrets {
-                pal.key
-            } else if active {
-                pal.primary
+            let color = if active {
+                pal.text
+            } else if page.ready() {
+                pal.text_muted
             } else {
-                color
+                pal.disabled
             };
             ui.painter().text(
-                rect.left_center() + egui::vec2(18.0, 0.0),
+                rect.left_center() + egui::vec2(22.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 glyph,
-                egui::FontId::proportional(20.0),
-                glyph_color,
-            );
-            ui.painter().text(
-                rect.left_center() + egui::vec2(52.0, 0.0),
-                egui::Align2::LEFT_CENTER,
-                title,
                 egui::FontId::proportional(16.0),
                 color,
             );
+            let label = ui.painter().text(
+                rect.left_center() + egui::vec2(48.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                title,
+                egui::FontId::proportional(15.0),
+                color,
+            );
+            if !page.ready() {
+                ui.painter().text(
+                    egui::pos2(label.max.x + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    "soon",
+                    egui::FontId::proportional(12.0),
+                    pal.disabled,
+                );
+            }
             if resp.clicked() {
                 self.page = page;
             }
@@ -540,33 +668,26 @@ impl ShellApp {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        const ACTIONS: [(&str, &str); 11] = [
-            (icon::PLUS, "Add (Ctrl+N)"),
+        // Only what works today: a button that can never be pressed is noise (Add, Duplicate, Move, Re-authorize,
+        // Export and Import arrive with M2 and M3).
+        const ACTIONS: [(&str, &str); 4] = [
             (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
-            (icon::COPY, "Duplicate (Ctrl+D)"),
-            (icon::SWAP, "Move / copy"),
-            (icon::TOGGLE_RIGHT, "Enable"),
-            (icon::TOGGLE_LEFT, "Disable"),
+            (icon::TOGGLE_RIGHT, "Turn on"),
+            (icon::TOGGLE_LEFT, "Turn off"),
             (icon::TRASH, "Delete (Del)"),
-            (icon::SIGN_IN, "Re-authorize"),
-            (icon::GIT_DIFF, "Refresh scopes"),
-            (icon::EXPORT, "Export"),
-            (icon::DOWNLOAD_SIMPLE, "Import"),
         ];
         let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.plan.is_none();
         let can_edit = self.core.is_some() && self.selected.len() == 1;
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
             for (glyph, tip) in ACTIONS {
-                // Operations not built yet are shown disabled so the layout can be judged.
-                let button = egui::Button::new(RichText::new(glyph).size(20.0))
+                let button = egui::Button::new(RichText::new(glyph).size(16.0))
                     .min_size(egui::vec2(44.0, 38.0));
                 let (enabled, needs) = match glyph {
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
                     }
-                    g if g == icon::PENCIL_SIMPLE => (can_edit, "select one server"),
-                    _ => (false, "not built yet"),
+                    _ => (can_edit, "select one server"),
                 };
                 let clicked = ui
                     .add_enabled(enabled, button)
@@ -582,11 +703,270 @@ impl ShellApp {
                     }
                 }
             }
-            ui.separator();
-            ui.label(
-                RichText::new(format!("{} selected", self.selected.len())).color(pal.text_muted),
-            );
+            if !self.selected.is_empty() {
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("{} selected", self.selected.len()))
+                        .color(pal.text_muted),
+                );
+            }
         });
+    }
+
+    /// Everything the command palette offers right now: actions on the selection first, then the rest.
+    fn commands(&self) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let selected: Vec<&ServerRow> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .collect();
+        let names = selected
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let live = self.core.is_some();
+        let mut add = |icon: &'static str,
+                       title: String,
+                       subtitle: String,
+                       key: Option<String>,
+                       action: command::Action| {
+            out.push(Entry {
+                icon,
+                title,
+                subtitle,
+                shortcut: key,
+                action,
+            });
+        };
+        if live && !selected.is_empty() {
+            let what = if selected.len() == 1 {
+                names.clone()
+            } else {
+                format!("{} servers", selected.len())
+            };
+            add(
+                icon::TOGGLE_RIGHT,
+                format!("Turn on {what}"),
+                String::new(),
+                None,
+                command::Action::TurnOn,
+            );
+            add(
+                icon::TOGGLE_LEFT,
+                format!("Turn off {what}"),
+                String::new(),
+                None,
+                command::Action::TurnOff,
+            );
+            if selected.len() == 1 {
+                let s = selected[0];
+                add(
+                    icon::PENCIL_SIMPLE,
+                    format!("Edit {}", s.name),
+                    "JSON".into(),
+                    Some(shortcut("E")),
+                    command::Action::Edit,
+                );
+                add(
+                    icon::PULSE,
+                    format!("Check {} now", s.name),
+                    String::new(),
+                    None,
+                    command::Action::Check,
+                );
+                add(
+                    icon::STETHOSCOPE,
+                    format!("Diagnose {}", s.name),
+                    "Explain what goes wrong".into(),
+                    None,
+                    command::Action::Diagnose,
+                );
+                if s.scope == Scope::Project && s.approval.is_some_and(|a| a != Approval::Approved)
+                {
+                    add(
+                        icon::SHIELD_CHECK,
+                        format!("Review and approve {}", s.name),
+                        String::new(),
+                        None,
+                        command::Action::Approve,
+                    );
+                }
+            }
+            add(
+                icon::TRASH,
+                format!("Delete {what}"),
+                String::new(),
+                Some("Del".into()),
+                command::Action::Delete,
+            );
+        }
+        if live {
+            add(
+                icon::ARROWS_CLOCKWISE,
+                "Refresh".into(),
+                "Read the configuration and check every server".into(),
+                Some("F5".into()),
+                command::Action::Refresh,
+            );
+        }
+        add(
+            icon::MAGNIFYING_GLASS,
+            "Filter servers".into(),
+            String::new(),
+            Some(shortcut("F")),
+            command::Action::Search,
+        );
+        for choice in ThemeChoice::ALL {
+            add(
+                choice.icon(),
+                format!("Theme: {}", choice.label()),
+                String::new(),
+                None,
+                command::Action::Theme(choice),
+            );
+        }
+        for tone in Tone::ALL {
+            add(
+                icon::PALETTE,
+                format!("Greys: {}", tone.label()),
+                String::new(),
+                None,
+                command::Action::Tone(tone),
+            );
+        }
+        add(
+            icon::GEAR,
+            "Settings".into(),
+            "Appearance".into(),
+            None,
+            command::Action::Settings,
+        );
+        for i in self.visible() {
+            let s = &self.snapshot.servers[i];
+            add(
+                icon::ARROW_RIGHT,
+                format!("Go to {}", s.name),
+                group_of(s).full,
+                None,
+                command::Action::Select(i),
+            );
+        }
+        out
+    }
+
+    fn run(&mut self, ctx: &egui::Context, action: command::Action) {
+        use command::Action as A;
+        match action {
+            A::Select(i) => {
+                self.selected.clear();
+                self.selected.insert(i);
+                self.page = Page::Connections;
+            }
+            A::TurnOn => self.prepare_toggle(true),
+            A::TurnOff => self.prepare_toggle(false),
+            A::Delete => self.prepare_delete(),
+            A::Edit => self.tab = DetailTab::RawJson,
+            A::Check | A::Diagnose | A::Approve => {
+                if let Some(s) = self.single_selected() {
+                    let id = s.id();
+                    match action {
+                        A::Check => self.send(Command::Check(id)),
+                        A::Diagnose => {
+                            self.tab = DetailTab::Status;
+                            self.send(Command::Diagnose(id));
+                        }
+                        _ => {
+                            self.outcome = None;
+                            self.send(Command::Prepare(vec![Change::Approve { id }]));
+                        }
+                    }
+                }
+            }
+            A::Refresh => self.refresh(),
+            A::Search => ctx.memory_mut(|m| m.request_focus(search_id())),
+            A::Theme(choice) => {
+                self.theme = choice;
+                theme::set_choice(ctx, choice);
+            }
+            A::Tone(tone) => {
+                self.tone = tone;
+                theme::set_tone(ctx, tone);
+            }
+            A::Settings => self.page = Page::Settings,
+        }
+    }
+
+    fn single_selected(&self) -> Option<&ServerRow> {
+        let mut it = self.selected.iter();
+        match (it.next(), it.next()) {
+            (Some(&i), None) => self.snapshot.servers.get(i),
+            _ => None,
+        }
+    }
+
+    /// Settings. For now, how Klefki looks: light or dark, and which family of greys.
+    fn settings(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        ui.add_space(8.0);
+        ui.label(RichText::new("Settings").heading());
+        ui.add_space(16.0);
+        ui.label(RichText::new("Appearance").strong());
+        ui.add_space(6.0);
+        egui::Grid::new("appearance")
+            .num_columns(2)
+            .spacing([24.0, 14.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Theme").color(pal.text_muted));
+                ui.horizontal(|ui| {
+                    for choice in ThemeChoice::ALL {
+                        let text = format!("{} {}", choice.icon(), choice.label());
+                        if ui.selectable_value(&mut self.theme, choice, text).changed() {
+                            theme::set_choice(ui.ctx(), choice);
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label(RichText::new("Greys").color(pal.text_muted));
+                ui.horizontal(|ui| {
+                    for tone in Tone::ALL {
+                        if ui
+                            .selectable_value(&mut self.tone, tone, tone.label())
+                            .changed()
+                        {
+                            theme::set_tone(ui.ctx(), tone);
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Both keep every text at a contrast of at least 4.5:1.")
+                .small()
+                .color(pal.text_muted),
+        );
+    }
+
+    /// Moves the selection `step` rows through the list as shown, starting at the top when nothing is selected.
+    fn move_selection(&mut self, step: i32) {
+        let order = self.visible();
+        if order.is_empty() {
+            return;
+        }
+        let at = self
+            .selected
+            .iter()
+            .next()
+            .and_then(|i| order.iter().position(|o| o == i));
+        let next = match at {
+            None if step > 0 => 0,
+            None => order.len() - 1,
+            Some(p) => (p as i32 + step).clamp(0, order.len() as i32 - 1) as usize,
+        };
+        self.selected.clear();
+        self.selected.insert(order[next]);
     }
 
     /// Asks the engine what deleting the selected servers would change. Nothing is written yet.
@@ -621,27 +1001,61 @@ impl ShellApp {
     }
 
     /// The banner for the last change.
-    fn outcome_banner(&mut self, ui: &mut Ui) {
-        let pal = theme::palette(ui.ctx());
-        let Some(outcome) = self.outcome.clone() else {
+    /// The outcome of the last change, as a small card in the bottom-right corner: it does not push the list
+    /// around, a success fades after a few seconds, and a problem stays until dismissed.
+    fn outcome_toast(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let now = ctx.input(|i| i.time);
+        let Some(outcome) = self.outcome.as_mut() else {
             return;
         };
-        let color = if outcome.ok { pal.success } else { pal.danger };
+        let shown_at = *outcome.shown_at.get_or_insert(now);
+        if outcome.ok {
+            let left = SUCCESS_SECONDS - (now - shown_at);
+            if left <= 0.0 {
+                self.outcome = None;
+                return;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+        }
+        let outcome = outcome.clone();
+        let (color, glyph) = if outcome.ok {
+            (pal.success, icon::CHECK_CIRCLE)
+        } else {
+            (pal.danger, icon::WARNING_CIRCLE)
+        };
         let mut dismiss = false;
-        Frame::new()
-            .stroke(egui::Stroke::new(1.0, color))
-            .corner_radius(6)
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(&outcome.text).color(color));
-                    if ui.button("Dismiss").clicked() {
-                        dismiss = true;
-                    }
-                });
+        egui::Area::new(egui::Id::new("outcome"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(pal.panel_raised)
+                    .stroke(egui::Stroke::new(1.0, color))
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(12))
+                    .shadow(egui::Shadow {
+                        offset: [0, 4],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(80),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_max_width(420.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(glyph).size(16.0).color(color));
+                            ui.add(
+                                egui::Label::new(RichText::new(&outcome.text).color(pal.text))
+                                    .wrap(),
+                            );
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                            if ui.small_button("Dismiss").clicked() {
+                                dismiss = true;
+                            }
+                        });
+                    });
             });
-        ui.add_space(6.0);
         if dismiss {
             self.outcome = None;
         }
@@ -657,56 +1071,32 @@ impl ShellApp {
         let mut apply = false;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("plan_dialog")).show(ctx, |ui| {
-            ui.set_width(520.0);
-            ui.heading("Review the change");
-            ui.add_space(6.0);
+            ui.set_width(540.0);
+            // What happens, in words, first; the exact lines follow for those who want them.
+            if plan.summary.is_empty() {
+                ui.heading("Review the change");
+            } else {
+                ui.label(RichText::new("Review the change").color(pal.text_muted));
+                for line in &plan.summary {
+                    ui.add(egui::Label::new(RichText::new(line).heading()).wrap());
+                }
+            }
+            ui.add_space(8.0);
             if plan.nothing_to_do {
                 ui.label("The configuration already looks like this. Nothing would be written.");
-            } else {
-                ui.label("These lines in your Claude Code configuration will change:");
             }
             for review in &plan.reviews {
                 ui.add_space(4.0);
                 Frame::new()
                     .stroke(egui::Stroke::new(1.0, pal.warn))
-                    .corner_radius(6)
-                    .inner_margin(Margin::same(8))
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(&review.title).strong().color(pal.warn));
                         for line in &review.lines {
-                            ui.add(egui::Label::new(line).wrap());
+                            ui.add(egui::Label::new(RichText::new(line).monospace()).wrap());
                         }
-                    });
-            }
-            for file in &plan.files {
-                if file.lines.is_empty() {
-                    continue;
-                }
-                ui.add_space(4.0);
-                ui.label(RichText::new(&file.path).color(pal.text_muted));
-                Frame::new()
-                    .fill(pal.field)
-                    .corner_radius(6)
-                    .inner_margin(Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        egui::ScrollArea::vertical()
-                            .max_height(260.0)
-                            .show(ui, |ui| {
-                                for line in &file.lines {
-                                    let color = if line.starts_with("+ ") {
-                                        pal.success
-                                    } else if line.starts_with("- ") {
-                                        pal.danger
-                                    } else {
-                                        pal.text_muted
-                                    };
-                                    ui.add(
-                                        egui::Label::new(RichText::new(line).color(color)).wrap(),
-                                    );
-                                }
-                            });
                     });
             }
             for warning in &plan.warnings {
@@ -718,23 +1108,96 @@ impl ShellApp {
                     .wrap(),
                 );
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !plan.nothing_to_do && !applying,
-                        egui::Button::new(if plan.reviews.is_empty() {
-                            "Apply"
-                        } else {
-                            "Approve"
-                        }),
+            for file in &plan.files {
+                if file.lines.is_empty() {
+                    continue;
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("Changes in {}", file.path))
+                        .small()
+                        .color(pal.text_muted),
+                );
+                Frame::new()
+                    .fill(pal.field)
+                    .corner_radius(8)
+                    .inner_margin(Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for line in &file.lines {
+                                    let color = if line.starts_with("+ ") {
+                                        pal.success
+                                    } else if line.starts_with("- ") {
+                                        pal.danger
+                                    } else {
+                                        pal.text_muted
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(line).monospace().color(color),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                    });
+            }
+            for note in &plan.notes {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} {note}", icon::INFO))
+                            .small()
+                            .color(pal.text_muted),
                     )
+                    .wrap(),
+                );
+            }
+            ui.add_space(12.0);
+            let label = if !plan.action.is_empty() {
+                plan.action.as_str()
+            } else if plan.reviews.is_empty() {
+                "Apply"
+            } else {
+                "Approve"
+            };
+            ui.horizontal(|ui| {
+                let fill = if plan.destructive {
+                    pal.danger
+                } else {
+                    pal.primary
+                };
+                let confirm = egui::Button::new(RichText::new(label).strong().color(pal.on_bright))
+                    .fill(fill)
+                    .min_size(egui::vec2(96.0, 34.0));
+                let enabled = !plan.nothing_to_do && !applying;
+                if ui
+                    .add_enabled(enabled, confirm)
+                    .on_hover_text("Enter")
                     .clicked()
                 {
                     apply = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui
+                    .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
+                    .on_hover_text("Esc")
+                    .clicked()
+                {
                     cancel = true;
+                }
+                if applying {
+                    // Text, not a spinner: an animation would repaint every frame for a write that takes milliseconds.
+                    ui.label(RichText::new("Saving…").color(pal.text_muted));
+                }
+                // Enter confirms, as in any dialog; not while a field would take it.
+                if enabled
+                    && !ui.ctx().egui_wants_keyboard_input()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    apply = true;
                 }
             });
         });
@@ -758,13 +1221,15 @@ impl ShellApp {
         let ctrl = ui.input(|i| i.modifiers.command);
         let project_count = self.snapshot.project_count;
         let mut clicked = None;
+        // Group headers may run across the row's empty cells, but no further than the table itself.
+        let right = ui.max_rect().right();
         TableBuilder::new(ui)
             .striped(true)
             .sense(Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::initial(240.0).at_least(120.0))
-            .column(Column::exact(84.0))
-            .column(Column::exact(150.0))
+            .column(Column::initial(220.0).at_least(120.0))
+            .column(Column::exact(64.0))
+            .column(Column::exact(176.0))
             .column(Column::remainder().clip(true))
             .header(32.0, |mut h| {
                 for t in ["Name", "Type", "Status", "Target"] {
@@ -775,14 +1240,8 @@ impl ShellApp {
             })
             .body(|body| {
                 body.rows(36.0, rows.len(), |mut row| match &rows[row.index()] {
-                    GridRow::Group(title) => {
-                        row.col(|ui| {
-                            // Not clipped to the column: the title may run across the empty cells of the group row.
-                            ui.add(
-                                egui::Label::new(RichText::new(title).strong().color(pal.primary))
-                                    .extend(),
-                            );
-                        });
+                    GridRow::Group(group) => {
+                        row.col(|ui| group_header(ui, group, right));
                         for _ in 0..3 {
                             row.col(|_| {});
                         }
@@ -828,12 +1287,40 @@ impl ShellApp {
             .next()
             .filter(|_| self.selected.len() == 1)
         else {
-            let msg = if self.selected.is_empty() {
-                "Select a connection"
-            } else {
-                "Multiple connections selected"
-            };
-            ui.label(RichText::new(msg).color(pal.text_muted));
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                if self.selected.is_empty() {
+                    ui.label(
+                        RichText::new(icon::PLUGS_CONNECTED)
+                            .size(28.0)
+                            .color(pal.text_muted),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Select a connection").strong());
+                } else {
+                    ui.label(
+                        RichText::new(format!("{} connections selected", self.selected.len()))
+                            .strong(),
+                    );
+                    ui.label(
+                        RichText::new("Turn them on or off, or delete them, together.")
+                            .color(pal.text_muted),
+                    );
+                }
+                ui.add_space(12.0);
+                for (keys, what) in [
+                    ("↑ ↓".to_owned(), "move through the list"),
+                    (shortcut("K"), "all commands"),
+                    (shortcut("F"), "filter"),
+                    ("F5".to_owned(), "check every server again"),
+                ] {
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 240.0).max(0.0) / 2.0);
+                        ui.label(RichText::new(keys).monospace().color(pal.text));
+                        ui.label(RichText::new(what).color(pal.text_muted));
+                    });
+                }
+            });
             return;
         };
         // A second handle to the snapshot (a reference count), so the row can be read while `self` is borrowed
@@ -847,8 +1334,11 @@ impl ShellApp {
         ui.label(RichText::new(&s.name).heading());
         ui.horizontal(|ui| {
             flat_items(ui);
+            // Compact pills: smaller text and padding, so the tabs sit on one line and do not shout.
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
             for (tab, title) in DetailTab::ALL {
-                ui.selectable_value(&mut self.tab, tab, title);
+                ui.selectable_value(&mut self.tab, tab, RichText::new(title).size(13.5));
             }
         });
         ui.separator();
@@ -950,8 +1440,26 @@ impl ShellApp {
                 }
             }
             DetailTab::RawJson => self.raw_json(ui, s),
-            _ => {
-                ui.label(RichText::new("Not built yet.").color(pal.text_muted));
+            DetailTab::Auth => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Signing in with OAuth arrives with the add wizard. Headers and tokens can be changed in the JSON tab now.")
+                            .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
+            DetailTab::HeadersEnv => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "Environment and header values are hidden. Change them in the JSON tab ({}).",
+                            shortcut("E")
+                        ))
+                        .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
             }
         }
     }
@@ -1052,6 +1560,7 @@ impl eframe::App for ShellApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         theme::save_choice(storage, self.theme);
+        theme::save_tone(storage, self.tone);
     }
 }
 
@@ -1168,17 +1677,94 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
 
 fn bar_frame(pal: &Palette) -> Frame {
     Frame::new()
-        .fill(pal.panel_raised)
-        .stroke(egui::Stroke::new(1.0, pal.border))
+        .fill(pal.chrome)
+        .stroke(egui::Stroke::new(1.0, pal.divider))
         .inner_margin(Margin::symmetric(12, 6))
 }
 
-fn group_title(s: &ServerRow) -> String {
+fn search_id() -> egui::Id {
+    egui::Id::new("search")
+}
+
+fn group_of(s: &ServerRow) -> Group {
     match (&s.scope, &s.project) {
-        (Scope::User, _) => "User".to_owned(),
-        (scope, Some(p)) => format!("{} · {p}", scope.label()),
-        (scope, None) => scope.label().to_owned(),
+        (scope, Some(p)) => {
+            let trimmed = p.trim_end_matches(['/', '\\']);
+            let (parent, folder) = match trimmed.rfind(['/', '\\']) {
+                Some(cut) if cut + 1 < trimmed.len() => (&trimmed[..cut], &trimmed[cut + 1..]),
+                _ => ("", trimmed),
+            };
+            Group {
+                title: format!("{} · {folder}", scope.label()),
+                location: (!parent.is_empty()).then(|| parent.to_owned()),
+                full: format!("{} · {p}", scope.label()),
+                count: 0,
+            }
+        }
+        (scope, None) => Group {
+            title: scope.label().to_owned(),
+            location: None,
+            full: scope.label().to_owned(),
+            count: 0,
+        },
     }
+}
+
+/// The folder name stands out; where it lives is muted and cut to fit, with the whole path on hover. It is drawn,
+/// not laid out, so a long path can run across the row without widening the column, and it reads as one label.
+fn group_header(ui: &mut Ui, group: &Group, right: f32) {
+    let pal = theme::palette(ui.ctx());
+    let width = right;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 24.0), Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &group.full));
+    // Its own layer above the table, so the row's other cells (and their hover highlight) cannot paint over the
+    // text; clipped to the table's width and to the scrolled area.
+    let clip = ui.clip_rect();
+    let painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(
+            ui.layer_id().order,
+            egui::Id::new("group-headers"),
+        ))
+        .with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, clip.min.y.max(rect.min.y)),
+            egui::pos2(width, clip.max.y.min(rect.max.y)),
+        ));
+    let font = egui::FontId::new(15.0, theme::bold_family());
+    let title = painter.text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        &group.title,
+        font,
+        pal.primary,
+    );
+    let mut x = title.max.x + 10.0;
+    let count = format!("{}", group.count);
+    let small = egui::FontId::proportional(13.0);
+    let c = painter.text(
+        egui::pos2(x, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        count,
+        small.clone(),
+        pal.text_muted,
+    );
+    x = c.max.x + 12.0;
+    if let Some(location) = &group.location {
+        let room = (width - x - 24.0).max(0.0);
+        let galley = ui.fonts_mut(|f| {
+            let mut job =
+                egui::text::LayoutJob::simple_singleline(location.clone(), small, pal.text_muted);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+            f.layout_job(job)
+        });
+        painter.galley(
+            egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            pal.text_muted,
+        );
+    }
+    response.on_hover_text(&group.full);
 }
 
 fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
@@ -1359,7 +1945,8 @@ mod tests {
         h.run();
         let nav = h.get_by_label_contains("Secrets").rect();
         assert!(nav.height() >= 40.0, "nav item {nav:?}");
-        let add = h.get_by_label(icon::PLUS).rect();
+        // (Was the Add button; the toolbar now shows only actions that work, so the check uses Edit.)
+        let add = h.get_by_label(icon::PENCIL_SIMPLE).rect();
         assert!(
             add.width() >= 40.0 && add.height() >= 34.0,
             "toolbar button {add:?}"
@@ -1462,7 +2049,8 @@ mod tests {
         h.run();
         h.get_by_label("issue-tracker").click();
         h.run();
-        for tab in ["Auth", "Headers/Env", "General"] {
+        // (The Env tab was called "Headers/Env" when this test was written.)
+        for tab in ["Auth", "Env", "General"] {
             let before = h.get_by_label(tab).rect();
             h.get_by_label(tab).hover();
             h.run();
@@ -2099,6 +2687,10 @@ mod tests {
             warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
             nothing_to_do,
             reviews: Vec::new(),
+            summary: Vec::new(),
+            action: String::new(),
+            destructive: false,
+            notes: Vec::new(),
         }
     }
 
@@ -2682,12 +3274,12 @@ mod tests {
         h.get_by_label("alpha").click();
         h.run();
         let detail_left = h.get_by_label("General").rect().min.x;
+        // (Add and Import were in this list; they are no longer shown until they work.)
         for glyph in [
-            icon::PLUS,
             icon::PENCIL_SIMPLE,
+            icon::TOGGLE_RIGHT,
             icon::TOGGLE_LEFT,
             icon::TRASH,
-            icon::DOWNLOAD_SIMPLE,
         ] {
             let r = h.get_by_label(glyph).rect();
             assert!(
@@ -2695,5 +3287,299 @@ mod tests {
                 "{glyph:?} at {r:?}, detail panel from x={detail_left}"
             );
         }
+    }
+
+    // ---- keyboard-first: command palette and arrow keys
+
+    fn ctrl_k(h: &mut Harness<'static, ShellApp>) {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        h.run();
+    }
+
+    fn type_into_palette(h: &mut Harness<'static, ShellApp>, text: &str) {
+        *h.state_mut().command.query_mut() = text.to_owned();
+        h.run();
+    }
+
+    #[test]
+    fn the_palette_runs_a_command_by_name() {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine.events.send(snapshot_of(vec![a, b])).unwrap();
+        h.run();
+        ctrl_k(&mut h);
+        assert!(h.state().command.is_open());
+        h.get_by_label_contains("Go to alpha");
+        type_into_palette(&mut h, "refr");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(!h.state().command.is_open());
+        assert_eq!(drain(&engine), vec![Command::Refresh { live_all: true }]);
+    }
+
+    #[test]
+    fn the_palette_goes_to_a_server_and_acts_on_the_selection() {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine.events.send(snapshot_of(vec![a, b.clone()])).unwrap();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "go beta");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let selected: Vec<_> = h
+            .state()
+            .selected
+            .iter()
+            .map(|&i| h.state().snapshot.servers[i].name.clone())
+            .collect();
+        assert_eq!(selected, ["beta"]);
+        ctrl_k(&mut h);
+        h.get_by_label_contains("Turn off beta");
+        type_into_palette(&mut h, "off");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: b.id(),
+                enabled: false
+            }])]
+        );
+    }
+
+    #[test]
+    fn the_open_palette_follows_a_new_snapshot() {
+        // The palette keeps its entries while open; a snapshot arriving meanwhile must still show.
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "go");
+        h.get_by_label_contains("Go to alpha");
+        assert!(h.query_by_label_contains("Go to beta").is_none());
+        engine.events.send(snapshot_of(vec![a, b])).unwrap();
+        h.run();
+        h.get_by_label_contains("Go to beta");
+        // And one without the server takes it away again, query unchanged.
+        engine
+            .events
+            .send(snapshot_of(vec![live_row("gamma", Scope::User, None)]))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Go to alpha").is_none());
+        h.get_by_label_contains("Go to gamma");
+        // Reopening starts from the current entries too.
+        h.key_press(egui::Key::Escape);
+        h.run();
+        ctrl_k(&mut h);
+        h.get_by_label_contains("Go to gamma");
+    }
+
+    #[test]
+    fn arrows_pick_the_entry_and_escape_closes_without_running_anything() {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine.events.send(snapshot_of(vec![a, b])).unwrap();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "go to");
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        // Second "Go to" entry: beta (user servers sort before local ones; alpha is first).
+        let name = &h.state().snapshot.servers[*h.state().selected.iter().next().unwrap()].name;
+        assert_eq!(name, "beta");
+        ctrl_k(&mut h);
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(!h.state().command.is_open());
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn up_and_down_walk_the_list() {
+        let (mut h, _engine) = live_harness();
+        let rows = vec![
+            live_row("one", Scope::User, None),
+            live_row("two", Scope::User, None),
+            live_row("three", Scope::Local, Some("C:/Repos/WebApp")),
+        ];
+        let engine = _engine;
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+        let name = |h: &Harness<'static, ShellApp>| {
+            h.state()
+                .selected
+                .iter()
+                .next()
+                .map(|&i| h.state().snapshot.servers[i].name.clone())
+        };
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert_eq!(name(&h).as_deref(), Some("one"));
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert_eq!(name(&h).as_deref(), Some("three"));
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert_eq!(name(&h).as_deref(), Some("three"), "stays at the end");
+        h.key_press(egui::Key::ArrowUp);
+        h.run();
+        assert_eq!(name(&h).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn arrows_do_not_move_the_list_while_typing_in_the_filter() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(snapshot_of(vec![live_row("one", Scope::User, None)]))
+            .unwrap();
+        h.run();
+        h.get_by_role(egui::accesskit::Role::TextInput).click();
+        h.run();
+        h.key_press(egui::Key::ArrowDown);
+        h.run();
+        assert!(h.state().selected.is_empty());
+    }
+
+    // ---- the review dialog, the result, the empty places
+
+    #[test]
+    fn the_review_leads_with_words_and_its_button_says_what_it_does() {
+        let (mut h, engine) = live_harness();
+        let mut plan = plan_view(4, &["+ alpha"], &[], false);
+        plan.summary = vec!["Turn off alpha in 3 projects".into()];
+        plan.action = "Turn off".into();
+        plan.notes =
+            vec!["A running Claude Code session may need a restart before it notices this.".into()];
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label("Turn off alpha in 3 projects");
+        h.get_by_label_contains("may need a restart");
+        assert!(h.query_by_label("Apply").is_none());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(4)]);
+        // Pressed again while saving: nothing more is sent.
+        h.get_by_label("Turn off").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_success_fades_and_a_problem_stays() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 1,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("Saved.");
+        for _ in 0..((SUCCESS_SECONDS + 1.0) * 60.0) as usize {
+            h.step();
+        }
+        assert!(
+            h.query_by_label("Saved.").is_none(),
+            "gone after a few seconds"
+        );
+        engine
+            .events
+            .send(Event::ApplyFailed {
+                plan: 2,
+                error: "Claude Code is writing its configuration right now.".into(),
+            })
+            .unwrap();
+        h.run();
+        for _ in 0..((SUCCESS_SECONDS + 1.0) * 60.0) as usize {
+            h.step();
+        }
+        h.get_by_label_contains("writing its configuration");
+    }
+
+    #[test]
+    fn a_page_that_is_not_built_says_what_it_will_do_and_leads_back() {
+        let mut h = harness();
+        h.run();
+        h.get_by_label_contains("Secrets").click();
+        h.run();
+        h.get_by_label_contains("Coming soon");
+        h.get_by_label("Back to connections").click();
+        h.run();
+        assert_eq!(h.state().page, Page::Connections);
+    }
+
+    #[test]
+    fn with_nothing_selected_the_detail_panel_teaches_the_keys() {
+        let (mut h, _engine) = live_harness();
+        h.run();
+        h.get_by_label("Select a connection");
+        h.get_by_label_contains("all commands");
+        h.get_by_label_contains("move through the list");
+    }
+
+    #[test]
+    fn the_toolbar_shows_only_what_works() {
+        let (mut h, _engine) = live_harness();
+        h.run();
+        for gone in [
+            icon::PLUS,
+            icon::COPY,
+            icon::SWAP,
+            icon::SIGN_IN,
+            icon::EXPORT,
+            icon::DOWNLOAD_SIMPLE,
+        ] {
+            assert!(h.query_by_label(gone).is_none(), "{gone:?}");
+        }
+        assert!(
+            h.query_by_label_contains("selected").is_none(),
+            "no count without a selection"
+        );
+    }
+
+    // ---- settings: appearance
+
+    #[test]
+    fn settings_switch_the_greys_and_remember_them() {
+        let mut h = harness();
+        h.run();
+        h.get_by_label_contains("Settings").click();
+        h.run();
+        assert_eq!(h.state().page, Page::Settings);
+        h.get_by_label("Warm gray").click();
+        h.run();
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
+        h.get_by_label_contains("Light").click();
+        h.run();
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
+        let mut storage = theme::tests::MemoryStorage::default();
+        eframe::App::save(h.state_mut(), &mut storage);
+        assert_eq!(theme::load_tone(Some(&storage)), Tone::Warm);
+        assert_eq!(theme::load_choice(Some(&storage)), ThemeChoice::Light);
+        h.get_by_label("Cool (Catppuccin)").click();
+        h.run();
+        assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
+    }
+
+    #[test]
+    fn the_palette_changes_the_greys_too() {
+        let (mut h, _engine) = live_harness();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "greys warm");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().tone, Tone::Warm);
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
     }
 }

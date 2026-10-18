@@ -79,9 +79,17 @@ pub struct Review {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanView {
     pub id: u64,
+    /// One plain sentence per change, for the top of the review.
+    pub summary: Vec<String>,
+    /// The confirm button's label ("Turn off", "Delete", "Approve", "Save", or "Apply" for a mix).
+    pub action: String,
+    /// The plan removes something: the confirm button is shown as dangerous.
+    pub destructive: bool,
     pub files: Vec<FileDiff>,
     pub reviews: Vec<Review>,
     pub warnings: Vec<String>,
+    /// Good to know, shown more quietly than warnings.
+    pub notes: Vec<String>,
     /// The configuration already looks like this; applying would write nothing.
     pub nothing_to_do: bool,
 }
@@ -432,9 +440,9 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 Err(e) => Err(e.to_string()),
             },
         );
-        let resolved = ops::resolve(changes, &fresh)?;
+        let mut resolved = ops::resolve(changes, &fresh)?;
         let mut parts = Vec::new();
-        for (project, ops) in resolved.settings {
+        for (project, ops) in std::mem::take(&mut resolved.settings) {
             let file = Path::new(&project)
                 .join(".claude")
                 .join("settings.local.json");
@@ -445,9 +453,10 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         if !resolved.claude.is_empty() {
             let mut store = Docstore::new(paths.claude_json.clone(), backup_dir(shared)?);
             store.verify_delay = shared.config.verify_delay;
+            let claude_ops = std::mem::take(&mut resolved.claude);
             let plan = match read {
-                Ok(Some((text, bom))) => store.prepare_text(text, bom, resolved.claude),
-                _ => store.prepare(resolved.claude),
+                Ok(Some((text, bom))) => store.prepare_text(text, bom, claude_ops),
+                _ => store.prepare(claude_ops),
             }
             .map_err(|e| e.to_string())?;
             parts.push((plan, store));
@@ -455,15 +464,29 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         for (_, store) in &mut parts {
             store.verify_delay = shared.config.verify_delay;
         }
-        Ok::<_, String>((parts, resolved.guards, resolved.warnings, resolved.reviews))
+        Ok::<_, String>((parts, resolved))
     })();
     match made {
-        Ok((parts, guards, warnings, reviews)) => {
+        Ok((parts, resolved)) => {
+            let ops::Resolved {
+                guards,
+                warnings,
+                notes,
+                summary,
+                action,
+                destructive,
+                reviews,
+                ..
+            } = resolved;
             plans.next += 1;
             let id = plans.next;
             let nothing_to_do = parts.iter().all(|(plan, _)| plan.is_empty());
             let view = PlanView {
                 id,
+                summary,
+                action,
+                destructive,
+                notes: if nothing_to_do { Vec::new() } else { notes },
                 files: parts
                     .iter()
                     .flat_map(|(plan, _)| plan.changes())
@@ -2756,5 +2779,80 @@ mod tests {
             assert!(refused.contains(why), "{json}: {refused}");
         }
         assert_eq!(config_json(&env), before);
+    }
+
+    // ---- plain-language plans
+
+    #[test]
+    fn a_plan_says_in_words_what_it_does_and_what_the_button_does() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let off = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        assert_eq!(off.summary, ["Turn off gw in 2 projects"]);
+        assert_eq!(off.action, "Turn off");
+        assert!(!off.destructive);
+        assert!(
+            off.notes.iter().any(|n| n.contains("restart")),
+            "{:?}",
+            off.notes
+        );
+        assert!(
+            !off.warnings.iter().any(|w| w.contains("restart")),
+            "the restart hint is a note"
+        );
+        let delete = plan_for(
+            &core,
+            vec![Change::Delete {
+                id: local_id("loc", "/work/a"),
+            }],
+        );
+        assert_eq!(delete.summary, ["Delete loc in a"]);
+        assert_eq!(delete.action, "Delete");
+        assert!(delete.destructive);
+        let mixed = plan_for(
+            &core,
+            vec![
+                Change::SetEnabled {
+                    id: local_id("loc", "/work/a"),
+                    enabled: false,
+                },
+                Change::Delete { id: user_id("gw") },
+            ],
+        );
+        assert_eq!(mixed.action, "Apply");
+        assert_eq!(
+            mixed.summary,
+            ["Turn off loc in a", "Delete gw (user server)"]
+        );
+    }
+
+    #[test]
+    fn one_project_is_one_project() {
+        let env = quiet_env(&serde_json::json!({
+            "mcpServers": {"gw": {"type": "stdio", "command": "x"}},
+            "projects": {"/work/only": {}}
+        }));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        assert_eq!(plan.summary, ["Turn off gw in 1 project"]);
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("the 1 project it knows")),
+            "{:?}",
+            plan.warnings
+        );
     }
 }
