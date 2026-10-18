@@ -15,7 +15,6 @@ Goal: the open item in `docs/progress.md`: a timeout killed only `claude`, so a 
 - Verify-all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0, 658 passed, deny "advisories ok, bans ok, licenses ok, sources ok". No helper process left after the run.
 
 ## Open
-- Not tried with real Claude Code starting a real stdio server that hangs.
 - A process that leaves the group itself (`setsid`, a daemon) or the job (`CREATE_BREAKAWAY_FROM_JOB`, allowed by `JOB_OBJECT_LIMIT_BREAKAWAY_OK` so such a start does not fail) is not ended. Breakaway has no test.
 - A normal exit can still leave orphans: when Claude's own MCP connection timeout fires first (a user `MCP_TIMEOUT` under the 10 s check timeout, or the check timeout raised above 30 s), Claude exits 0 and kills its server but not the server's children (seen by the cross-reviewer with real Claude Code 2.1.302).
 - With `process_group(0)`, Ctrl+C in a terminal no longer reaches `claude` or its server. No matter for the GUI; `klefki-cli` should end running trees on SIGINT, or Ctrl+C during `status` leaves them behind (inferred, not run).
