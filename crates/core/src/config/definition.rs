@@ -38,18 +38,18 @@ impl Definition {
     pub const HIDDEN: &'static str = entry::MASK;
 
     /// Reads a definition (the engine's hidden-values JSON). A shape the form cannot show is refused, saying
-    /// why; the JSON tab can still edit it.
+    /// why; it can still be edited as JSON.
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let value: Value = serde_json::from_str(json)
-            .map_err(|e| format!("The JSON is not valid ({e}); fix it in the JSON tab."))?;
+        let value: Value =
+            serde_json::from_str(json).map_err(|e| format!("The JSON is not valid: {e}."))?;
         let Value::Object(base) = value else {
-            return Err(only_json_tab("the definition is not an object"));
+            return Err(only_as_json("the definition is not an object"));
         };
         let text = |key: &str| -> Result<String, String> {
             match base.get(key) {
                 None => Ok(String::new()),
                 Some(Value::String(s)) => Ok(s.clone()),
-                Some(_) => Err(only_json_tab(&format!("{key} is not text"))),
+                Some(_) => Err(only_as_json(&format!("{key} is not text"))),
             }
         };
         let list = |key: &str| -> Result<Vec<String>, String> {
@@ -59,10 +59,8 @@ impl Definition {
                     .iter()
                     .map(|i| i.as_str().map(str::to_owned))
                     .collect::<Option<_>>()
-                    .ok_or_else(|| {
-                        only_json_tab(&format!("{key} holds something other than text"))
-                    }),
-                Some(_) => Err(only_json_tab(&format!("{key} is not a list"))),
+                    .ok_or_else(|| only_as_json(&format!("{key} holds something other than text"))),
+                Some(_) => Err(only_as_json(&format!("{key} is not a list"))),
             }
         };
         let pairs = |key: &str| -> Result<Vec<(String, String)>, String> {
@@ -72,10 +70,8 @@ impl Definition {
                     .iter()
                     .map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
                     .collect::<Option<_>>()
-                    .ok_or_else(|| {
-                        only_json_tab(&format!("{key} holds something other than text"))
-                    }),
-                Some(_) => Err(only_json_tab(&format!(
+                    .ok_or_else(|| only_as_json(&format!("{key} holds something other than text"))),
+                Some(_) => Err(only_as_json(&format!(
                     "{key} is not a list of names and values"
                 ))),
             }
@@ -85,7 +81,7 @@ impl Definition {
             "http" => TransportKind::Http,
             "sse" => TransportKind::Sse,
             "ws" => TransportKind::Ws,
-            _ => return Err(only_json_tab("its type is not stdio, http, sse or ws")),
+            _ => return Err(only_as_json("its type is not stdio, http, sse or ws")),
         };
         Ok(Self {
             transport,
@@ -186,8 +182,8 @@ fn type_name(transport: TransportKind) -> &'static str {
     }
 }
 
-fn only_json_tab(why: &str) -> String {
-    format!("This definition can only be edited in the JSON tab: {why}.")
+fn only_as_json(why: &str) -> String {
+    format!("The form cannot show this definition, so it is edited as JSON: {why}.")
 }
 
 #[cfg(test)]
@@ -268,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn shapes_the_form_cannot_show_are_left_to_the_json_tab() {
+    fn shapes_the_form_cannot_show_are_left_to_the_json() {
         for (bad, why) in [
             (json!([1]), "object"),
             (json!({"type": "pigeon"}), "type"),
@@ -283,7 +279,7 @@ mod tests {
         ] {
             let err = Definition::from_json(&pretty(&bad)).unwrap_err();
             assert!(
-                err.contains(why) && err.contains("JSON tab"),
+                err.contains(why) && err.contains("edited as JSON"),
                 "{bad}: {err}"
             );
         }
