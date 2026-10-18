@@ -7,8 +7,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, Core, Definition, Diagnosis, Event, Hint, PlanView, Scope, Secret,
-    ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
+    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint, PlanView,
+    Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -301,17 +301,17 @@ impl ShellApp {
     fn apply_event(&mut self, event: Event) {
         match event {
             Event::Snapshot(snapshot) => {
-                // Rows are kept by position; carry selection, live results and diagnoses over by identity.
-                let new_index: HashMap<(Scope, Option<&str>, &str), usize> = snapshot
+                // Rows are kept by position; carry selection, live results and diagnoses over by identity: the
+                // connection, as the file spells the server, since two servers can show the same name.
+                let new_index: HashMap<&ConnectionId, usize> = snapshot
                     .servers
                     .iter()
                     .enumerate()
-                    .map(|(i, r)| ((r.scope, r.project.as_deref(), r.name.as_str()), i))
+                    .map(|(i, r)| (&r.connection, i))
                     .collect();
                 let moved = |old: usize| {
-                    let r = &self.snapshot.servers[old];
                     new_index
-                        .get(&(r.scope, r.project.as_deref(), r.name.as_str()))
+                        .get(&self.snapshot.servers[old].connection)
                         .copied()
                 };
                 let selected = self.selected.iter().filter_map(|&i| moved(i)).collect();
@@ -325,18 +325,15 @@ impl ShellApp {
                     }
                 }
                 self.live_gen += 1;
-                self.diagnoses.retain(|id, _| {
-                    new_index.contains_key(&(id.scope, id.project.as_deref(), id.name.as_str()))
-                });
+                self.diagnoses
+                    .retain(|id, _| new_index.contains_key(&id.connection));
                 self.selected = selected;
                 self.live = live;
-                if self.editor.as_ref().is_some_and(|e| {
-                    !new_index.contains_key(&(
-                        e.id.scope,
-                        e.id.project.as_deref(),
-                        e.id.name.as_str(),
-                    ))
-                }) {
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|e| !new_index.contains_key(&e.id.connection))
+                {
                     self.editor = None;
                 }
                 self.grid_cache = None;
@@ -3476,6 +3473,42 @@ mod tests {
         h.run();
         h.get_by_label_contains("could not connect");
         h.get_by_label_contains("Claude Code said: boom");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_selection_on_the_same_server_when_two_look_alike() {
+        // Review of the fix: the selection was carried over by the shown name. With "ab" and a server whose name
+        // hides a right-to-left override (also shown "ab"), a refresh moved it to the other one, and Delete would
+        // have deleted the server not selected.
+        let (mut h, engine) = live_harness();
+        let ab = live_row("ab", Scope::User, None);
+        let mut lookalike = live_row("ab", Scope::User, None);
+        lookalike.connection = klefki_core::api::ConnectionId::new(Scope::User, None, "a\u{202e}b");
+        let rows = vec![ab.clone(), lookalike.clone()];
+        engine.events.send(snapshot_of(rows.clone())).unwrap();
+        engine
+            .events
+            .send(status_event(&ab, Status::Connected, None))
+            .unwrap();
+        h.run();
+        h.state_mut().selected.insert(0);
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+        assert_eq!(h.state().selected.iter().copied().collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            h.state().effective(0).0,
+            Status::Connected,
+            "its status stays with it"
+        );
+        assert_ne!(h.state().effective(1).0, Status::Connected);
+        // And the change asked for is about the selected one.
+        h.key_press(egui::Key::Delete);
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Delete { id: ab.id() }])]
+        );
+        assert_ne!(ab.id(), lookalike.id());
     }
 
     #[test]

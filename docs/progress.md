@@ -1,34 +1,31 @@
 # Progress
 
-## Current slice
-Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done; committed as `6e43626` on branch `form-first-json-fallback`, PR #10, with main (#9 OAuth on rows, #11 keyring secrets) merged in; see below. Next: M1's remaining "v1 meta compatibility" (reading v1's `connections-meta.json` by these ids), then M2. Merged `claude/dazzling-lamport-zo0aud` (0f9a7ac, writes use the file's own keys) into this branch; the casing fix action builds on its `ServerId`.
+Since 2026-10-18 each slice has its own file in `docs/progress/` (see CLAUDE.md, "Progress" and "Parallel sessions"): sessions working at once no longer edit the same lines. This file is the log before that, newest first; it is not added to, but its open items still stand until struck.
+
+Next, as of the move: the rest of M1 in PLAN.md (legacy `mcpServersDisabled` shown read-only with a migrate action; secret-looking values masked with a `${VAR}` suggestion; the casing fix action), then M2.
 
 Decided, not done now: reading v1's `connections-meta.json`. Its fields (`clientType`, `excludedScopes`, `drift`, `lastVerified`) are used by M2 (re-authorize, OAuth edit) and M3 (drift, refresh scopes), and PLAN.md puts reading v1's files in M3 (`legacy.rs`). M1's part, ids that match v1's, is done (`ConnectionId`); reading the file now would add code and reads nothing uses yet.
+
+## Review of the raw-keys fix (2026-10-18)
+`/code-review` on `0f9a7ac` found 15 problems; all fixed, each with a test that failed before.
+- **File keys kept beside the snapshot** (`inventory::FileKey`, `FileKeys`): the core keeps, per `ConnectionId`, the project key and name as the file spells them; the text never reaches the UI's snapshot. Decoding them from the keyring id is gone. An empty project key (`""`) and an empty name are kept as they are (decoding turned `""` into "no project", so such a server could not be changed). One lookup, `inventory::locate`, used by ops and the engine.
+- **`ServerId`**: equality, hashing and order compare the `ConnectionId` only (they also compared the shown fields, so two ids for one server could differ while `is()` said they matched); `ServerId::new` cleans and cuts the shown fields like a row's.
+- **App**: after a refresh the selection, diagnoses and an open editor are carried over by `ConnectionId`, so they stay on the same server when two look alike (they could move to the look-alike).
+- **Live check** (`claude mcp get`): run under the name and project folder as the file spells them, and a result is matched back to its row by connection (it ran under the shown name, so a look-alike could be checked instead).
+- **Messages and reviews** name the server from its row (scope, project, name as shown), not from the caller's id; whether the server is in the repository comes from the row's scope.
+- **Duplicate**: a name or project already taken is found by comparing the file's spellings (a look-alike name was "taken"; a project spelled two ways was not), and refused with the ops message before anything is read.
+- **Shadowing** (found while fixing): a local server shadows a project server only when the names match as the file spells them (`ab` did shadow `a\u{202e}b`).
+- **For human review (invariant: approval writes).** The approval now writes the name as `.mcp.json` spells it to `enabledMcpjsonServers`, and is refused ("its name in .mcp.json cannot be shown exactly") unless that name, cleaned and cut, is identical to the name shown in the review. So what is approved is exactly what was shown; a name with hidden characters or over 512 characters cannot be approved from klefki.
+- Tests: core `a_server_id_is_its_connection`, `a_look_alike_name_does_not_shadow`, engine `a_server_is_checked_under_its_own_name_never_a_look_alikes`, `servers_with_an_empty_project_key_or_name_can_still_be_changed`, `the_review_names_the_server_that_is_changed`, `duplicate_compares_names_and_projects_as_the_file_spells_them`, `a_project_server_whose_name_cannot_be_shown_exactly_is_not_approved`; app `a_refresh_keeps_the_selection_on_the_same_server_when_two_look_alike`. Engine tests: `repo_env` now returns the project key as written, and one test drops the first engine before starting a second on the same files. Mutation checks, each failing a test: the check run under the shown name, results matched by shown fields, summaries from the caller's id, the repository flag from the caller's scope, duplicate comparing shown projects, approval without the exact-name check, id equality on shown fields, an empty project key dropped, the app carrying over by shown name, shadowing by shown name.
+- Left: the Duplicate dialog's "already taken" hint compares shown names. Names typed there must match `^[A-Za-z0-9_-]{1,64}$`, so it can only warn about a name that merely looks taken; the engine decides.
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 313 core + 141 app passed; `cargo deny check` 0. After merging main (#10): the same, with 313 core + 144 app passed.
 
 ## Writes use the keys as the file spells them (2026-10-18)
 The open item from the Windows review of #1: ops were written with the row's name and project as shown, which are cleaned (control and bidi characters removed) and cut at 512 characters.
 - Reproduced: with servers `ab` and `a\u{202e}b` (shown as `ab` too), turning off the second wrote `ab` to `disabledMcpServers`, switching off the other server, and reported success; editing or deleting a server whose name is cut said it was "no longer in the configuration". Worse than the item said: the two had the same `ServerId`, so the look-alike could not even be told apart.
-- `ServerId` now carries the row's `ConnectionId` (made from the keys as the file spells them) and identity compares that; `ServerId::new` builds one from file spellings. Every op (`SetEnabled`, `Delete`, `Replace`, `Duplicate`, `Approve` and its guard) and the definition shown for editing take the project and name decoded from the `ConnectionId`, not the display text.
+- `ServerId` now carries the row's `ConnectionId` (made from the keys as the file spells them) and identity compares that; `ServerId::new` builds one from file spellings. Every op (`SetEnabled`, `Delete`, `Replace`, `Duplicate`, `Approve` and its guard) and the definition shown for editing take the project and name as the file spells them, not the display text (since the review below, from a table the core keeps beside the snapshot rather than decoded from the `ConnectionId`).
 - Tests: `switching_off_a_server_writes_its_own_name_not_the_one_shown` (look-alike, and a 600-character name), `deleting_and_editing_reach_the_server_whatever_its_name_shows`; both failed before. Mutation: the toggle op written with the shown name fails the first. The engine tests' id helpers now use `ServerId::new` (same ids).
 - Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 306 core + 140 app passed; `cargo deny check` 0.
-
-## Casing fix (2026-10-18)
-Servers whose names differ only in case (the "casing" badge) can now be given one spelling. Built on top of `claude/dazzling-lamport-zo0aud` (merged into this branch as `af00c88`), so ids are the file's own keys.
-- Choice made with the owner: pick the spelling to keep; the others are renamed to it. A name already used in the same place is refused with a reason; the same name in another scope is allowed with a warning saying which one Claude uses.
-- **docstore:** `Op::RenameServer` rewrites only the server's key in place (new `jsonspan::key_end`), so its position, definition and secrets are untouched and nothing is copied. Chosen over copy + remove because a plan cannot add and remove in one server list (`adding a server and changing another in the same list is not supported`), and it keeps bytes exactly. Refused for an existing target name, an invalid name, a missing server, OAuth servers, and a server changed twice in one plan. Verify puts a rename back if Claude overwrote it, and accepts the server gone. `Op::RenameDisabled` moves a name inside `disabledMcpServers` (same place in the list, no duplicate), so a renamed server stays off where it was off; for a user server it runs for every known project.
-- **ops/engine:** `Change::Rename { id, name }` (user and local only; a project server is refused, it lives in the repository). Summary "Rename gateway to Gateway in a" / "… (user server)", confirm button "Rename". An http or sse server gets the warning that a sign-in Claude Code keeps is under the old name and is not moved.
-- **App:** a "Fix casing…" button (and palette entry "Fix casing of x") on a row with the badge opens a dialog listing the servers and the spellings ("Keep x"). A project server's spelling is fixed (the others follow it); when project servers disagree among themselves Review is disabled and the text says to change them in the `.mcp.json` files. Review sends one `Change::Rename` per server that has to change, as one plan.
-- Tests (core): docstore 5 (key-only change at every position, one-line file, every spelling of a project, refusals, OAuth, verify) + 3 for `RenameDisabled`; engine 6 (local, user, two renames in one plan, refusals, project server, OAuth). App: 6. Mutation checks: renaming every server regardless of the spelling kept fails 2 app tests; not moving the off-state fails 2 engine tests. The old names in tests that expected a wrong thing were fixed in the new tests only (a quote in a name is rightly refused; an unknown project is refused, like every other project op).
-- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 330 core + 150 app passed; no `std::fs`, `process::Command`, `std::net` or `open::` in `crates/app/src`. `cargo deny` not run (not installed here). Real window not seen.
-- Not done / unverified: a Claude Code session that is running may need a restart to see the new name (the review says so). Claude Code's own per-server state keyed by name (sign-in tokens) is not moved. A hidden-character name that is not a valid `ServerName` as the target is refused. The other session's 15 review findings are not touched here.
-
-## Secret-looking values: suggest `${VAR}` (2026-10-18)
-Picked as an M1 item that does not touch the identity work on `claude/dazzling-lamport-zo0aud` (v1 meta is deferred to M3 there).
-- `config/secretlike.rs`: `suggestion(name, value)` says what to write instead of a value typed into `env` or `headers` that looks like a secret: a `${VAR}` reference (the scheme of `Bearer`, `Basic`, `Token` stays; `Authorization` becomes `${AUTH_TOKEN}`). It looks at well-known token shapes (GitHub, GitLab, Slack, AWS, JWT, `sk-`, npm, Google), passwords inside an address, a secret-sounding name with a value that is more than a setting, and long random-looking values. Not hinted: empty, `<hidden>`, anything already holding `${`, numbers, booleans, paths, plain addresses, short values. The variable is always a valid name. The suggestion never contains the value.
-- `Definition::secret_suggestion`; the Env tab shows "Looks like a secret." with a "Use ${X} instead" button under a typed value. A kept (hidden) value never gets one: the app does not have it.
-- Tests: 9 in `secretlike` (shapes, names, false positives, variable validity, no value in the output); app `a_typed_secret_is_met_with_a_reference_to_use_instead`. Mutation: `secret_suggestion` returning `None` fails the app test. The core tests were seen failing against a stub first; the app test passed on its first run, so it was checked by the mutation instead.
-- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 313 core + 144 app passed. `cargo deny` not run (not installed here). Real window not seen.
-- Not done: only the form's Env tab hints; JSON-edit mode and the add wizard (M2) do not. The hint is advice, not a block.
 
 ## Fields first, JSON as the fallback (2026-10-18)
 Before: Edit (pencil, Ctrl+E, the palette's "Edit x", described as "JSON") opened a JSON tab; the labelled form was behind "Edit definition" on the General tab, and a definition the form could not show sent you to "the JSON tab".
@@ -298,7 +295,7 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - **Locking** (`docs/decisions/001-claude-json-locking.md`): Claude takes a `<claude.json>.lock` directory (proper-lockfile, stale 10 s), re-reads under the lock and preserves unknown keys and order (observed). It waits only about 1.5 s for someone else's lock, then writes **without** the lock, so klefki must hold the lock briefly, abort rather than write unlocked, and re-read about 1 s after writing.
 - **Disabled servers** (`docs/decisions/002-disabled-servers.md`): the real `/mcp disable` writes `projects[<key>].disabledMcpServers` in `~/.claude.json`, per project, for user, local **and** `.mcp.json` servers. Approval of `.mcp.json` servers is separate (`enabledMcpjsonServers`, now in `<project>/.claude/settings.local.json`). This contradicts PLAN.md and a CLAUDE.md invariant: proposals in `docs/proposals/spike-findings.md`, awaiting review.
 - Evidence: reproducible scripts and a PTY driver in `docs/decisions/spikes/`; both reproducer scripts were re-run from the repo and gave the same results. All experiments used a throwaway `CLAUDE_CONFIG_DIR`.
-- Found by the spikes: the inventory code is wrong for enabled/disabled (project rows use `disabledMcpjsonServers`; user rows always enabled; approval state not shown). Fixed in the later "Enabled/disabled and approval" and "Approval writes" slices.
+- Found by the spikes: the inventory code is wrong for enabled/disabled (project rows use `disabledMcpjsonServers`; user rows always enabled; approval state not shown). Not fixed yet.
 
 ## Done before the spikes (nothing committed since e422f56 except what is listed here)
 - Workspace `klefki` (renamed from klefki): `crates/core` (`klefki-core`), `crates/app` (`klefki`), `crates/cli` (`klefki-cli`, stub).
@@ -313,16 +310,16 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - `.github/workflows/ci.yml` (fmt, clippy, test on win/mac/linux). Not run yet (never pushed).
 
 ## Checks run
-Re-run on 2026-10-18 at `37b148d` (Linux container):
-
 | Command | Result |
 |---|---|
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
-| `cargo test --workspace` | 304 core + 143 app passed, 0 failed |
-| `cargo deny check` | not run: `cargo-deny` is not installed in this container (last recorded exit 0, in the slices above) |
-
-Earlier results (Windows, real window, screenshots) are in the slices above; the first check table (176 tests) was replaced by this one.
+| `cargo test --workspace` | 176 passed (125 core, 51 app incl. egui_kittest), 0 failed |
+| grep for `std::fs`, `process::Command`, `std::net`, `open::` in `crates/app/src` | 0 matches |
+| `target/debug/klefki.exe` against the real `~/.claude.json`, screenshot | lists `REMOTE_1`, `REMOTE_2` (Connected, from Claude's health cache) and `azure-devops` |
+| `target/debug/klefki.exe --demo`, screenshot | all scopes, badges, group headers render in full |
+| `klefki.exe --demo --theme light`, dropdown opened, screenshot | dropdown shows current choice, lists System, Light, Dark with icons, current one highlighted |
+| `klefki.exe --demo --theme light` and `--theme dark`, clicking a row, screenshots | both themes render nav, toolbar, grid, badges, selection and detail panel legibly |
 
 ## Findings fixed along the way
 - The plan's name regex allows a leading `-`; passed as `claude mcp get <name>` it would be read as an option. Rejected in `ServerName` (test first).
@@ -342,19 +339,22 @@ Earlier results (Windows, real window, screenshots) are in the slices above; the
 ## Not done / unverified
 - Diagnose output formats are from Claude Code 2.1.302 only; the hints match short stable fragments and say nothing rather than guess when the text changes.
 - The debug file did not repeat a configured header or env secret in two tests, but that is not a guarantee; redaction is the safeguard, with tests.
-- The runner kills only the `claude` process on a timeout, not grandchildren (for example `npx` and node for a stdio server). A Windows job object would fix it; not done.
-- A refresh that arrives while checks run drops their answers by generation; covered by reading the code and a UI test for cut-off checks, not by an engine test with a real race.
-- Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server there could shadow it. Not seen in practice.
-- Theme persistence goes through eframe's storage; the app crate has no fs calls, but this is flagged for review against the no-IO invariant. Not tested across a real restart.
+- The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.
+- A refresh that arrives while checks run drops their answers by generation; this is covered by reading the code and by the UI test for cut-off checks, not by an engine test with a real race.
+- Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server in the home folder could shadow it. Not seen in practice.
+- `cargo deny` runs now; advisories fail (see Docstore section).
+- Theme persistence goes through eframe's storage (written by the framework to the app data folder); the app crate itself still has no fs calls. Not tested across a real restart, and flagged for review against the no-IO invariant.
 - System theme follows the OS setting; only checked that it is selectable, not against a real OS theme change.
-- The CLI version in the top bar is not detected yet (`cli_version` stays `None`; hidden unless known).
-- CI (`.github/workflows/ci.yml`) has not been seen running on macOS or Linux. Spike findings are for Claude Code 2.1.302 on Windows only; a live interactive session was not tested for outside-edit survival.
-- Protected files: `crates/app/clippy.toml`, `deny.toml` and `crates/fake-claude/` exist; `fixtures/malicious/` does not. Proposals are in `docs/proposals/`; review status is not recorded here.
-- Acceptance tests were mostly written together with the code, not seen failing first (later slices record failing-first tests and mutation checks).
-- `cargo deny check` was not re-run in this container (tool missing).
+- Hover colours were only seen on one row in each theme.
+- Status is only Claude's cached hint, not a live `claude mcp get` check.
+- The CLI version in the top bar is not detected yet (hidden unless known).
+- CI untested on macOS/Linux. Spike findings are for Claude Code 2.1.302 on Windows only; a live interactive session was not tested for outside-edit survival.
+- `ConnectionId` (v1-compatible) not implemented: needs the v1 source to confirm the encoding.
+- Protected files not created, proposals in `docs/proposals/`: `crates/app/clippy.toml`, `deny.toml`, `crates/fake-claude/`, `fixtures/malicious/`. `cargo deny` not run.
+- Acceptance tests were written together with the code, not seen failing first.
+- Only 3 user-scope servers exist in the real config; local and project listing is tested on temp configs only.
 
 ## Next
-1. M1 remainder: the legacy `mcpServersDisabled` list (read-only, with a migrate action), and the keyboard shortcuts not yet built. (The casing fix action is done.) v1 meta is deferred to M3 (decision on `claude/dazzling-lamport-zo0aud`).
-2. Detect and show the CLI version in the top bar.
-3. Review the protected-file proposals and `fixtures/malicious/`.
-4. M2: add wizard, PTY login and re-authorize, move/copy, transactional upsert with rollback; spike `--no-browser` callback handling first.
+1. Review the look; tune `theme.rs`.
+2. Approve the protected-file proposals.
+3. M1 day-1 spikes (lock experiment, disabled-servers location), recorded in `docs/decisions/`, then the CLI locator/runner and live status.

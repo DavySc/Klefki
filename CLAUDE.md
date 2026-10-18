@@ -8,12 +8,13 @@ Rust + egui manager for Claude Code MCP servers. Plan: `docs/PLAN.md`.
 - Fast: `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --lib`
 - End-to-end: `cargo test -p klefki-core --tests` (fake-claude), `cargo test -p klefki` (egui_kittest), then `cargo run -p klefki`
 - Architecture: `cargo clippy -p klefki -- -D warnings` (disallowed-methods) and `cargo deny check`
+- Cloud sessions: `scripts/cloud-setup.sh` (run by the SessionStart hook in `.claude/settings.json`) installs what these need.
 
 If a command can't run, report the work as **unverified**.
 
 ## Rules
 - Write acceptance criteria first and see them fail; implement general behavior, never hard-coded examples.
-- Work in small slices: implement, verify, update `docs/progress.md`. Commit only when asked.
+- Work in small slices: implement, verify, update the slice's progress file. Commit only when asked.
 - Never weaken, skip or delete tests or checks. If one seems wrong, stop and explain.
 - Protected; propose changes instead of editing: `fixtures/malicious/`, `crates/fake-claude/`, `crates/app/clippy.toml`, `deny.toml`.
 - No suppressions (`#[allow]`, ignore lists, `--no-verify`) to get a pass.
@@ -30,7 +31,13 @@ If a command can't run, report the work as **unverified**.
 - `.mcp.json`, server metadata and CLI output are untrusted: size-limit, validate and sanitize them (ANSI, control and bidi characters).
 
 ## Progress
-Keep `docs/progress.md` factual: the current slice, done work with commits, checks run and their results, open failures, and the next action. Re-run checks rather than trusting it.
+Each slice has its own file, `docs/progress/<YYYY-MM-DD>-<slug>.md`, written only by the session doing it. Keep it factual: the goal, done work with commits, checks run and their results, open failures, and the next action. `docs/progress.md` is the log up to 2026-10-18; add nothing to it, but strike an open item there when you fix it. Re-run checks rather than trusting either.
+
+## Parallel sessions
+- Several sessions work at once, each on its own branch from the latest main, one slice per branch and pull request.
+- Before starting, read the open pull requests and the newest progress files. If your slice changes the same code as one in flight, say so first.
+- Bring main in with a merge. Never rebase or force-push a branch that has a pull request.
+- Other sessions do not see your chat: write what they need in your progress file or the pull request description.
 
 ## Final report
 **Changed / Verified** (command, exit code, evidence) **/ Not verified / Open issues / Next.**
