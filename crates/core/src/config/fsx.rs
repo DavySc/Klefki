@@ -5,6 +5,13 @@ use std::path::Path;
 
 const DENIED_FILE_NAMES: &[&str] = &[".credentials.json"];
 
+/// Compared the way Windows and macOS open files: any case, without a `:stream` suffix or trailing dots and spaces.
+fn is_denied(name: &str) -> bool {
+    let name = name.split(':').next().unwrap_or(name);
+    let name = name.trim_end_matches(['.', ' ']).to_lowercase();
+    DENIED_FILE_NAMES.contains(&name.as_str())
+}
+
 /// Reads a UTF-8 text file of at most `max_bytes`. `Ok(None)` when the file does not exist.
 pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<String>> {
     Ok(read_limited_bom(path, max_bytes)?.map(|(text, _)| text))
@@ -14,8 +21,7 @@ pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<Str
 pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option<(String, bool)>> {
     if path
         .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| DENIED_FILE_NAMES.contains(&n))
+        .is_some_and(|n| is_denied(&n.to_string_lossy()))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -107,5 +113,27 @@ mod tests {
             read_limited(&missing, 10).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn other_spellings_of_the_credentials_file_are_refused_too() {
+        // Windows and macOS ignore case; Windows also drops trailing dots and spaces and opens `name::$DATA`.
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            ".Credentials.JSON",
+            ".credentials.json.",
+            ".credentials.json ",
+            ".credentials.json::$DATA",
+        ] {
+            assert_eq!(
+                read_limited(&dir.path().join(name), 10).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+                "{name:?}"
+            );
+        }
+        // A file that merely starts the same way is fine.
+        let other = dir.path().join(".credentials.json.bak");
+        std::fs::write(&other, "{}").unwrap();
+        assert!(read_limited(&other, 10).is_ok());
     }
 }

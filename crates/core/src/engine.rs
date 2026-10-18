@@ -304,6 +304,9 @@ struct Shared {
     /// The CLI's version, for the program file it was read from. Asking costs a process start (Claude Code is a
     /// large Node program), so it is only asked again when the file changes.
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
+    /// Per file, how many changes klefki has started writing to it. A verify of an older change stands down once a
+    /// newer one exists, so it never mistakes that change for Claude overwriting its own.
+    writes: Arc<Mutex<HashMap<PathBuf, u64>>>,
     emitter: Emitter,
     /// For threads that need the engine thread to do something (read the files again).
     input: Sender<Input>,
@@ -342,6 +345,7 @@ fn engine_main(
         generation: AtomicU64::new(0),
         claude: RwLock::new(None),
         version: Mutex::new(None),
+        writes: Arc::default(),
         emitter,
         input: input_tx.clone(),
     });
@@ -526,10 +530,17 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     let mut written = Vec::new();
     let mut backups = Vec::new();
     for (plan, store) in &parts {
+        // Marked before the write, so an earlier change's verify that takes the lock after it already knows.
+        let generation = {
+            let mut writes = lock(&shared.writes);
+            let n = writes.entry(store.path.clone()).or_default();
+            *n += 1;
+            *n
+        };
         match store.apply(plan) {
             Ok(applied) => {
                 if applied.wrote {
-                    written.push((plan.clone(), store.clone()));
+                    written.push((plan.clone(), store.clone(), generation));
                 }
                 backups.extend(applied.backup);
             }
@@ -538,7 +549,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                 if !written.is_empty() {
                     let done: Vec<String> = written
                         .iter()
-                        .flat_map(|(p, _)| p.changes().iter().map(|c| c.path.clone()))
+                        .flat_map(|(p, _, _)| p.changes().iter().map(|c| c.path.clone()))
                         .collect();
                     message.push_str(&format!(
                         " Already saved: {}. The rest was not changed.",
@@ -556,10 +567,12 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         // Claude Code can write without our lock; look again shortly, off the engine thread.
         let emitter = shared.emitter.clone();
         let input = shared.input.clone();
+        let writes = Arc::clone(&shared.writes);
         std::thread::spawn(move || {
             let mut reapplied = false;
-            for (plan, store) in &written {
-                match store.verify(plan) {
+            for (plan, store, generation) in &written {
+                let superseded = || lock(&writes).get(&store.path) != Some(generation);
+                match store.verify(plan, &superseded) {
                     Ok(again) => reapplied |= again,
                     Err(e) => {
                         return emitter.emit(Event::ApplyFailed {
@@ -858,7 +871,8 @@ fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
         return version.clone();
     }
     let version = cli_version(shared, program);
-    if let Some(stamp) = stamp {
+    // Only an answer is kept: a failed ask (a timeout, a virus scan on first start) is tried again next time.
+    if let (Some(stamp), Some(_)) = (stamp, &version) {
         *lock(&shared.version) = Some((stamp, version.clone()));
     }
     version
@@ -2085,6 +2099,100 @@ mod tests {
         );
     }
 
+    /// Applies `changes` and waits for the answer.
+    fn apply_now(core: &Core, changes: Vec<Change>) {
+        let plan = plan_for(core, changes);
+        core.send(Command::Apply(plan.id));
+        collect(core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+    }
+
+    /// Events that arrive within `window`, without waiting for any in particular.
+    fn events_for(core: &Core, window: Duration) -> Vec<Event> {
+        let until = Instant::now() + window;
+        let mut events = Vec::new();
+        while Instant::now() < until {
+            while let Some(e) = core.try_recv() {
+                events.push(e);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        events
+    }
+
+    #[test]
+    fn switching_back_right_away_is_not_undone_by_the_first_change() {
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        let loc = local_id("loc", "/work/a");
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: loc.clone(),
+                enabled: false,
+            }],
+        );
+        // Within the first change's verify window, the user switches it back on.
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: loc,
+                enabled: true,
+            }],
+        );
+        let events = events_for(&core, Duration::from_millis(3000));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Reapplied { .. } | Event::ApplyFailed { .. })),
+            "{events:#?}"
+        );
+        assert_eq!(
+            config_json(&env)["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn a_later_change_to_another_server_still_leaves_both_in_place() {
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        let events = events_for(&core, Duration::from_millis(3000));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Reapplied { .. } | Event::ApplyFailed { .. })),
+            "{events:#?}"
+        );
+        let disabled = &config_json(&env)["projects"]["/work/a"]["disabledMcpServers"];
+        let names: Vec<&str> = disabled
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(names.contains(&"loc") && names.contains(&"gw"), "{names:?}");
+    }
+
     // ---- approving a project server
 
     const MCP_JSON: &str = r#"{"mcpServers":{"ps":{"type":"stdio","command":"node","args":["server.js","--port","9"],"env":{"NODE_OPTIONS":"--require ./hook.js"}}}}"#;
@@ -2455,6 +2563,22 @@ mod tests {
             });
         }
         assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    #[test]
+    fn a_failed_version_ask_is_tried_again_on_the_next_refresh() {
+        // A first run can fail for reasons that pass (a virus scan on first start, a timeout); it is not an answer.
+        let env = Env::new(
+            &two_projects("end"),
+            r#"{"rules":[{"args":["--version"],"exit_code":1}]}"#,
+            &[],
+        );
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::CliVersion(None)))
+        });
+        core.send(Command::Refresh { live_all: false });
+        collect(&core, |_| env.runs(&["--version"]) == 2);
     }
 
     /// `gw` (user) and `loc` (local, in a project folder that exists), both checkable. Returns the project key.

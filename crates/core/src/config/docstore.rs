@@ -292,20 +292,31 @@ impl Docstore {
     }
 
     /// Waits `verify_delay`, then makes sure the change is still there. Claude may write without our lock, from a
-    /// copy it read before ours; if so the ops are applied again (up to three times). Says whether it had to.
+    /// copy it read before ours; if so the ops are applied again (up to twice). Says whether it had to.
     /// Looking needs no lock (every writer replaces the file whole), so in the usual case, the change intact, Claude
     /// is never kept waiting; the lock is taken only to write.
-    pub(crate) fn verify(&self, plan: &Plan) -> Result<bool, StoreError> {
+    ///
+    /// `superseded` says whether a newer change of ours to this file has started since. Then a difference is that
+    /// change, not an overwrite by Claude, and putting this one back would undo it; the check stops quietly.
+    pub(crate) fn verify(
+        &self,
+        plan: &Plan,
+        superseded: &dyn Fn() -> bool,
+    ) -> Result<bool, StoreError> {
         let mut reapplied = false;
         for round in 0..MAX_VERIFY_ROUNDS {
             std::thread::sleep(self.verify_delay);
-            if self.edit(&self.read()?, &plan.ops)?.0.is_none() {
+            if superseded() || self.edit(&self.read()?, &plan.ops)?.0.is_none() {
                 return Ok(reapplied);
             }
             if round + 1 == MAX_VERIFY_ROUNDS {
                 break;
             }
             let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
+            // A newer change marks itself before it takes the lock, so under the lock this answer is final.
+            if superseded() {
+                return Ok(reapplied);
+            }
             let current = self.read()?;
             let (edits, _) = self.edit(&current, &plan.ops)?;
             if edits.is_some() {
@@ -377,13 +388,20 @@ impl Docstore {
             Some(self.backup(current)?)
         };
         let mut tmp = Some(tmp);
-        retry_denied(|| {
+        let replaced = retry_denied(|| {
             let file = tmp.take().expect("put back after every failed attempt");
             file.persist(&self.path).map(drop).map_err(|e| {
                 tmp = Some(e.file);
                 e.error
             })
-        })?;
+        });
+        if let Err(e) = replaced {
+            // Nothing was replaced, so the backup is of a file still in place; it would only crowd out real ones.
+            if let Some(backup) = &backup {
+                let _ = std::fs::remove_file(backup);
+            }
+            return Err(e.into());
+        }
         if let Some(backup) = &backup {
             // A hard link shares the old file's permissions until now; it is the only name of that file left.
             make_private(backup);
@@ -587,9 +605,10 @@ impl Lock {
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if is_stale(dir) {
-                        // Whoever held it is gone. `remove_dir` only removes an empty directory.
-                        let _ = std::fs::remove_dir(dir);
+                    // Whoever held it is gone. `remove_dir` only removes an empty directory; anything else at that
+                    // path (a file, a folder with contents) is not a lock we can take over, so it is waited out
+                    // like a held one rather than retried at once forever.
+                    if is_stale(dir) && std::fs::remove_dir(dir).is_ok() {
                         continue;
                     }
                 }
@@ -1660,6 +1679,69 @@ mod tests {
         assert!(!f.lock().exists(), "our own lock is released");
     }
 
+    /// Applies `plan` on another thread, so a lock loop that never ends fails the test instead of hanging it.
+    fn apply_within(f: &Fixture, plan: &Plan, limit: Duration) -> Result<Applied, StoreError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (store, plan) = (f.store.clone(), plan.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(store.apply(&plan));
+        });
+        rx.recv_timeout(limit)
+            .expect("apply never returned: the lock loop does not give up")
+    }
+
+    #[test]
+    fn a_stale_lock_that_cannot_be_removed_is_given_up_on() {
+        let old = SystemTime::now() - Duration::from_secs(60);
+        // A folder with something in it (a repository can commit one) and a plain file in place of the folder.
+        for as_file in [false, true] {
+            let text = pretty(&sample());
+            let f = Fixture::new(&text);
+            let plan = f
+                .store
+                .prepare(vec![disable("C:/work/app", "gateway")])
+                .unwrap();
+            if as_file {
+                std::fs::write(f.lock(), "x").unwrap();
+            } else {
+                std::fs::create_dir(f.lock()).unwrap();
+                std::fs::write(f.lock().join("x"), "x").unwrap();
+            }
+            filetime::set_file_mtime(f.lock(), filetime::FileTime::from_system_time(old)).unwrap();
+            assert_eq!(
+                apply_within(&f, &plan, Duration::from_secs(10)),
+                Err(StoreError::Locked),
+                "as_file={as_file}"
+            );
+            assert_eq!(f.text(), text);
+            assert!(f.backups().is_empty());
+        }
+    }
+
+    /// Windows refuses to replace a read-only file; the rename fails after the backup was made.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_replace_leaves_no_backup_behind() {
+        let text = pretty(&sample());
+        let f = Fixture::new(&text);
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        let set_readonly = |on: bool| {
+            let mut perms = std::fs::metadata(&f.store.path).unwrap().permissions();
+            perms.set_readonly(on);
+            std::fs::set_permissions(&f.store.path, perms).unwrap();
+        };
+        set_readonly(true);
+        let result = f.store.apply(&plan);
+        set_readonly(false);
+        assert!(matches!(result, Err(StoreError::Io(_))), "{result:?}");
+        assert_eq!(f.text(), text);
+        assert!(f.backups().is_empty(), "{:?}", f.backups());
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
     #[test]
     fn a_fresh_lock_is_waited_for_and_then_used() {
         let f = Fixture::new(&pretty(&sample()));
@@ -1793,13 +1875,35 @@ mod tests {
         let mut theirs = sample();
         theirs["numStartups"] = json!(99);
         std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
-        assert_eq!(f.store.verify(&plan), Ok(true));
+        assert_eq!(f.store.verify(&plan, &|| false), Ok(true));
         let j = f.json();
         assert_eq!(j["numStartups"], 99);
         assert_eq!(
             j["projects"]["C:/work/app"]["disabledMcpServers"],
             json!(["old", "gateway"])
         );
+    }
+
+    #[test]
+    fn verify_leaves_a_newer_change_of_ours_alone() {
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let newer = sample();
+        std::fs::write(&f.store.path, pretty(&newer)).unwrap();
+        assert_eq!(f.store.verify(&plan, &|| true), Ok(false));
+        assert_eq!(f.text(), pretty(&newer));
+        // Superseded only once the lock is held: still nothing written.
+        let calls = std::cell::Cell::new(0);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+        assert_eq!(f.store.verify(&plan, &late), Ok(false));
+        assert_eq!(f.text(), pretty(&newer));
     }
 
     #[test]
@@ -1811,7 +1915,7 @@ mod tests {
             .unwrap();
         f.store.apply(&plan).unwrap();
         let backups = f.backups().len();
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(f.store.verify(&plan, &|| false), Ok(false));
         assert_eq!(f.backups().len(), backups);
     }
 
@@ -1829,7 +1933,10 @@ mod tests {
             pretty(&json!({"projects": {"C:/work/app": {"disabledMcpServers": 5}}})),
         )
         .unwrap();
-        assert!(matches!(f.store.verify(&plan), Err(StoreError::Invalid(_))));
+        assert!(matches!(
+            f.store.verify(&plan, &|| false),
+            Err(StoreError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -2422,7 +2529,7 @@ mod tests {
         f.store.apply(&plan).unwrap();
         // Claude is busy saving: an intact change needs nothing from it, so verify must not wait or fail.
         std::fs::create_dir(f.lock()).unwrap();
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(f.store.verify(&plan, &|| false), Ok(false));
         assert!(f.lock().is_dir(), "someone else's lock is left alone");
     }
 
@@ -2437,7 +2544,7 @@ mod tests {
         let before = pretty(&sample());
         std::fs::write(&f.store.path, &before).unwrap();
         std::fs::create_dir(f.lock()).unwrap();
-        assert_eq!(f.store.verify(&plan), Err(StoreError::Locked));
+        assert_eq!(f.store.verify(&plan, &|| false), Err(StoreError::Locked));
         assert_eq!(f.text(), before, "nothing written without the lock");
     }
 

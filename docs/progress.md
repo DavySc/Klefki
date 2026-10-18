@@ -1,7 +1,41 @@
 # Progress
 
 ## Current slice
-Performance test after the UX pass (2026-10-18). Done; see below. Next: the edit form, duplicate, keyring secrets.
+Review of merge `bd82805` (#1) on Windows, and fixes for what it found (2026-10-18). Uncommitted. Next: the owner reviews the open items below; then the real window against a live Claude Code session.
+
+Reapplied on top of `8595172` (#2 and #3: watcher, delete/edit, UX pass, performance test, Windows rename retry) on 2026-10-18; conflicts in `shell.rs`, `docstore.rs`, `engine.rs` and this file were resolved by keeping both sides. After the merge: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 259 core + 105 app passed; `cargo deny check` 0.
+
+Previous slice: performance test after the UX pass (2026-10-18). Next there: the edit form, duplicate, keyring secrets.
+
+## Windows review of #1 (2026-10-18)
+Windows 11, Rust 1.99.1, cargo-deny 0.20.2. Before any change, `bd82805` passed everything here: fmt 0, clippy 0, `cargo test --workspace` 208 core + 70 app, four runs in a row (the 4 fewer core tests than on Linux are the `cfg(unix)` symlink, permission and inode tests), `cargo deny check` 0. Three read-only reviews followed (docstore/jsonspan/fsx; engine/ops/runner; app/inventory/sanitize/hints). Every fix below has a reproducer that failed first, and stays as a regression test.
+
+Fixed:
+- **Lock loop never ended** (`docstore`): a stale `*.lock` that cannot be removed (a file, or a folder with something in it, which a repository can commit next to `.claude/settings.local.json`) was retried at once forever, at full CPU, hanging the engine. Now it is waited out like a held lock and gives `Locked`. Test: `a_stale_lock_that_cannot_be_removed_is_given_up_on` (file and non-empty folder; runs `apply` on a thread with a 10 s limit, so a regression fails instead of hanging).
+- **Verify undid the user's own next change** (`engine` + `docstore::verify`): switching a server off and back on within the 1 s verify window made the first change's verify put "off" back, report "Claude Code overwrote the change", then fail with `Lost`. The engine now counts writes per file, marked before the write; an older verify stops once a newer change to the same file exists (checked before looking, and again under the lock). Tests: `switching_back_right_away_is_not_undone_by_the_first_change` (failed with `Reapplied` + `ApplyFailed`), variant `a_later_change_to_another_server_still_leaves_both_in_place`, and `verify_leaves_a_newer_change_of_ours_alone` (removing the under-lock check makes it fail). The doc comment's "up to three times" is now "up to twice", which is what the code does.
+- **Review dialog closed while saving** (app): Esc, a click outside or Cancel after Apply sent `Discard` and closed the dialog, but the engine still wrote the plan. Cancel is now disabled and closing ignored until the engine answers. Tests: `escape_does_not_close_the_dialog_while_the_change_is_being_saved`, `cancel_does_nothing_while_the_change_is_being_saved`.
+- **Two plans from one double click** (app): Disable or "Review and approve…" clicked twice before the engine answered sent two `Prepare`s; the second plan replaced the first without discarding it, and a late plan could replace one being saved. New `preparing` state; a plan arriving while one is open is discarded. Tests: `a_double_click_on_disable_asks_for_one_plan`, `a_double_click_on_review_and_approve_asks_for_one_plan`, `a_plan_arriving_while_another_is_open_is_discarded_not_shown`, and `the_toggle_works_again_once_a_plan_could_not_be_made` (guards against the new state sticking).
+- **Approval review: headers using the user's environment** (`ops`): header values stay hidden, but Claude Code expands `${VAR}` in them, so a repository could send e.g. `${ANTHROPIC_API_KEY}` to its server unseen. The review now says "Header X sends your environment variable NAME". A header value that is not text is refused. Test: `headers_that_fill_in_your_environment_say_which_variables`.
+- **Approval review: invisible characters** (`ops::shown`): zero-width and other format characters, U+2028/2029, the soft hyphen, tag characters, variation selectors and blank fillers passed as "shown exactly". Now refused. Test: `invisible_characters_are_refused_too`.
+- **`.gitignore` negation** (`ops`): `.claude/` followed by `!.claude/settings.local.json` counted as ignored, suppressing the "could be committed" warning. Any `!` line naming `.claude`, `settings.local` or `.local.json` now counts as not ignored. Test: `a_negated_ignore_line_means_the_file_may_be_committed`.
+- **Failed CLI version cached forever** (`engine`): a `--version` that timed out or failed was kept for that CLI build and never asked again. Only an answer is cached now. Test: `a_failed_version_ask_is_tried_again_on_the_next_refresh`.
+- **`.credentials.json` refusal by exact name only** (`fsx`): `.Credentials.JSON`, a trailing dot or space and `::$DATA` open the same file on Windows. Compared case-insensitively without those now. Test: `other_spellings_of_the_credentials_file_are_refused_too`.
+- **Stray backup after a failed replace** (`docstore`): when the final rename failed (Windows: read-only target, or a handle without share-delete) the backup link stayed and counted in the rotation. It is removed. Test (Windows only, read-only file): `a_failed_replace_leaves_no_backup_behind`.
+- **Backups in roaming AppData** (`api`): `%APPDATA%` can be synced to a server or redirected to a network share, where the hard link fails and a full copy of `.claude.json` (secrets included) would be written. Now `%LOCALAPPDATA%\klefki\klefki\data\backups` (same as before on Linux). Test: `backups_stay_in_the_local_data_folder`. Existing backups in the old folder are not moved.
+
+Checks after the fixes: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo clippy -p klefki -- -D warnings` 0; `cargo test --workspace` 219 core + 76 app passed, three runs in a row; `cargo deny check` 0. `klefki.exe --demo` opened and ran 8 s without errors (not driven by hand).
+
+Open, for the owner (not changed):
+- `crates/fake-claude/` and `deny.toml` changed in #1; progress records approval of both. `unmaintained = "workspace"` accepts every unmaintained transitive crate, and `[licenses.private] ignore = true` works like an ignore list: confirm both are intended.
+- Writes use the sanitised, clipped row name and project (`ops` from `ServerRow`). A name with stripped characters or over 512 characters writes the wrong name to `disabledMcpServers` and reports success (approval fails closed instead: `.mcp.json` is matched exactly). Needs the raw keys carried for writes.
+- Lock: never refreshed while held (Claude's rule is stale after 10 s); `Drop` removes the folder without checking it is still ours; two waiters can both take over one stale lock; on Windows a delete-pending lock folder gives `PermissionDenied`, treated as fatal.
+- A Claude write without the lock, landing between our read and our rename, is overwritten (verify only restores our ops). A size/mtime check just before the rename would narrow it.
+- Windows: backups get no owner-only ACL (they rely on the profile folder's ACL). (The rename is now retried on a transient sharing violation: `a7b9cf9`.)
+- A bare command (`node`) in an approval review could, on Windows, resolve to a file in the repository (lookup in the current folder first); not verified against Claude Code.
+- Selection: Enable/Disable also act on selected rows the search hides (the dialog lists them).
+- Backup names: within one millisecond `-10` sorts before `-2`; a clock going backwards can rotate a new backup out at once.
+- `settings.local.json` is rewritten whole: duplicate keys collapse and huge integers become floats.
+- Timing-sensitive test `a_change_claude_overwrites_a_moment_later_is_put_back` (800 ms window, non-atomic write) could flake on a slow runner; passed every run here.
 
 ## Performance test after the UX pass (2026-10-18)
 Measured in the real window (Xvfb, Mesa llvmpipe software rendering) against the commit before the UX pass, with a small config (8 servers) and a large one (3000 servers, 300 projects), and per frame in egui_kittest (release build, counting allocator).

@@ -149,6 +149,8 @@ pub struct ShellApp {
     plan: Option<PlanView>,
     /// Apply was pressed and the engine has not answered yet.
     applying: bool,
+    /// A plan was asked for and the engine has not answered yet.
+    preparing: bool,
     /// The definition being viewed or edited in the Raw JSON tab.
     editor: Option<Editor>,
     /// Ctrl+K / ⌘K.
@@ -174,6 +176,7 @@ impl ShellApp {
             cli_problem: None,
             plan: None,
             applying: false,
+            preparing: false,
             editor: None,
             command: CommandPalette::default(),
             outcome: None,
@@ -270,10 +273,16 @@ impl ShellApp {
                 }
             }
             Event::PlanReady(plan) => {
-                self.applying = false;
-                self.plan = Some(plan);
+                self.preparing = false;
+                if self.plan.is_some() {
+                    // Only one dialog at a time; the one open (perhaps being saved) keeps it.
+                    self.send(Command::Discard(plan.id));
+                } else {
+                    self.plan = Some(plan);
+                }
             }
             Event::PlanFailed(why) => {
+                self.preparing = false;
                 self.outcome = Some(Outcome {
                     text: why,
                     ok: false,
@@ -676,7 +685,7 @@ impl ShellApp {
             (icon::TOGGLE_LEFT, "Turn off"),
             (icon::TRASH, "Delete (Del)"),
         ];
-        let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.plan.is_none();
+        let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.can_prepare();
         let can_edit = self.core.is_some() && self.selected.len() == 1;
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
@@ -995,7 +1004,19 @@ impl ShellApp {
             })
             .collect();
         if !changes.is_empty() {
+            self.prepare(changes);
+        }
+    }
+
+    /// No plan is open or on its way, so a new one may be asked for.
+    fn can_prepare(&self) -> bool {
+        self.plan.is_none() && !self.preparing
+    }
+
+    fn prepare(&mut self, changes: Vec<Change>) {
+        if self.can_prepare() {
             self.outcome = None;
+            self.preparing = true;
             self.send(Command::Prepare(changes));
         }
     }
@@ -1181,8 +1202,12 @@ impl ShellApp {
                 {
                     apply = true;
                 }
+                // Once Apply is pressed the engine writes the plan; closing now would hide that.
                 if ui
-                    .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
+                    .add_enabled(
+                        !applying,
+                        egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)),
+                    )
                     .on_hover_text("Esc")
                     .clicked()
                 {
@@ -1201,7 +1226,7 @@ impl ShellApp {
                 }
             });
         });
-        if modal.should_close() {
+        if modal.should_close() && !applying {
             cancel = true;
         }
         if apply {
@@ -1380,17 +1405,13 @@ impl ShellApp {
                 {
                     ui.add_space(8.0);
                     if ui
-                        .add_enabled(
-                            self.plan.is_none(),
-                            egui::Button::new("Review and approve…"),
-                        )
+                        .add_enabled(self.can_prepare(), egui::Button::new("Review and approve…"))
                         .on_hover_text(
                             "See everything this server would run, then let Claude Code run it",
                         )
                         .clicked()
                     {
-                        self.outcome = None;
-                        self.send(Command::Prepare(vec![Change::Approve { id: s.id() }]));
+                        self.prepare(vec![Change::Approve { id: s.id() }]);
                     }
                 }
             }
@@ -2922,6 +2943,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn escape_does_not_close_the_dialog_while_the_change_is_being_saved() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Apply").click();
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        // The engine writes the plan whatever comes after Apply; saying it was dropped would be a lie.
+        assert_eq!(drain(&engine), vec![Command::Apply(7)]);
+        h.get_by_label_contains("Review the change");
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Review the change").is_none());
+    }
+
+    #[test]
+    fn cancel_does_nothing_while_the_change_is_being_saved() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Apply").click();
+        h.run();
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(7)]);
+        h.get_by_label_contains("Review the change");
+    }
+
+    #[test]
+    fn a_double_click_on_disable_asks_for_one_plan() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        // The engine has not answered the first click yet.
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        let prepares = drain(&engine)
+            .into_iter()
+            .filter(|c| matches!(c, Command::Prepare(_)))
+            .count();
+        assert_eq!(prepares, 1);
+    }
+
+    #[test]
+    fn the_toggle_works_again_once_a_plan_could_not_be_made() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanFailed("alpha is gone.".to_owned()))
+            .unwrap();
+        h.run();
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        let prepares = drain(&engine)
+            .into_iter()
+            .filter(|c| matches!(c, Command::Prepare(_)))
+            .count();
+        assert_eq!(prepares, 2);
+    }
+
+    #[test]
+    fn a_plan_arriving_while_another_is_open_is_discarded_not_shown() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Apply").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(9, &["+ zeta"], &[], false)))
+            .unwrap();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(7), Command::Discard(9)]);
+        assert!(h.query_by_label("+ zeta").is_none());
+        // Still saving plan 7: its Apply stays off and its answer closes the dialog.
+        h.get_by_label("+ alpha");
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Review the change").is_none());
+    }
+
     // ---- approving a project server
 
     fn project_row(name: &str, approval: Option<klefki_core::api::Approval>) -> ServerRow {
@@ -2951,6 +3075,23 @@ mod tests {
                 vec![Command::Prepare(vec![Change::Approve { id: row.id() }])]
             );
         }
+    }
+
+    #[test]
+    fn a_double_click_on_review_and_approve_asks_for_one_plan() {
+        let (mut h, engine) = live_harness();
+        let row = project_row("docs", Some(klefki_core::api::Approval::Pending));
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        h.run();
+        open_general(&mut h, "docs");
+        h.get_by_label_contains("Review and approve").click();
+        h.run();
+        h.get_by_label_contains("Review and approve").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Approve { id: row.id() }])]
+        );
     }
 
     #[test]

@@ -160,8 +160,7 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
             paths: ConfigPaths::discover(),
             claude: None,
             home: directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
-            backup_dir: directories::ProjectDirs::from("dev", "klefki", "klefki")
-                .map(|d| d.data_dir().join("backups")),
+            backup_dir: default_backup_dir(),
             verify_delay: std::time::Duration::from_secs(1),
             path_var: std::env::var_os("PATH"),
             cli_env: Vec::new(),
@@ -172,6 +171,14 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
         },
         wake,
     )
+}
+
+/// Where copies of `.claude.json` are kept before a change. They hold every server's settings, secrets included,
+/// so they stay on this machine: on Windows the local, not the roaming, application data folder (which a company
+/// may sync to a server or redirect to a network share).
+fn default_backup_dir() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "klefki", "klefki")
+        .map(|d| d.data_local_dir().join("backups"))
 }
 
 /// Reads the real Claude Code configuration (read-only), once, without live checks.
@@ -240,5 +247,15 @@ mod tests {
                 .filter(|r| r.scope != Scope::User)
                 .all(|r| r.project.is_some())
         );
+    }
+
+    #[test]
+    fn backups_stay_in_the_local_data_folder() {
+        let local = directories::BaseDirs::new()
+            .unwrap()
+            .data_local_dir()
+            .to_path_buf();
+        let dir = default_backup_dir().unwrap();
+        assert!(dir.starts_with(&local), "{dir:?} is not under {local:?}");
     }
 }
