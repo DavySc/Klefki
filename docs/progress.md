@@ -3,6 +3,14 @@
 ## Current slice
 Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done; committed as `6e43626` on branch `form-first-json-fallback`, PR #10, with main (#9 OAuth on rows, #11 keyring secrets) merged in; see below. Next: M1's remaining "v1 meta compatibility" (reading v1's `connections-meta.json` by these ids), then M2.
 
+## Secret-looking values: suggest `${VAR}` (2026-10-18)
+Picked as an M1 item that does not touch the identity work on `claude/dazzling-lamport-zo0aud` (v1 meta is deferred to M3 there).
+- `config/secretlike.rs`: `suggestion(name, value)` says what to write instead of a value typed into `env` or `headers` that looks like a secret: a `${VAR}` reference (the scheme of `Bearer`, `Basic`, `Token` stays; `Authorization` becomes `${AUTH_TOKEN}`). It looks at well-known token shapes (GitHub, GitLab, Slack, AWS, JWT, `sk-`, npm, Google), passwords inside an address, a secret-sounding name with a value that is more than a setting, and long random-looking values. Not hinted: empty, `<hidden>`, anything already holding `${`, numbers, booleans, paths, plain addresses, short values. The variable is always a valid name. The suggestion never contains the value.
+- `Definition::secret_suggestion`; the Env tab shows "Looks like a secret." with a "Use ${X} instead" button under a typed value. A kept (hidden) value never gets one: the app does not have it.
+- Tests: 9 in `secretlike` (shapes, names, false positives, variable validity, no value in the output); app `a_typed_secret_is_met_with_a_reference_to_use_instead`. Mutation: `secret_suggestion` returning `None` fails the app test. The core tests were seen failing against a stub first; the app test passed on its first run, so it was checked by the mutation instead.
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 313 core + 144 app passed. `cargo deny` not run (not installed here). Real window not seen.
+- Not done: only the form's Env tab hints; JSON-edit mode and the add wizard (M2) do not. The hint is advice, not a block.
+
 ## Fields first, JSON as the fallback (2026-10-18)
 Before: Edit (pencil, Ctrl+E, the palette's "Edit x", described as "JSON") opened a JSON tab; the labelled form was behind "Edit definition" on the General tab, and a definition the form could not show sent you to "the JSON tab".
 - Edit, in all three ways, now opens the form on the General tab and reads the definition (`edit_selected`). There is no JSON tab (`DetailTab::RawJson` is gone).
@@ -327,7 +335,7 @@ Earlier results (Windows, real window, screenshots) are in the slices above; the
 - `cargo deny check` was not re-run in this container (tool missing).
 
 ## Next
-1. M1 remainder: v1 meta compatibility (read v1's `connections-meta.json` by `ConnectionId`) and the keyboard shortcuts not yet built.
+1. M1 remainder: the legacy `mcpServersDisabled` list (read-only, with a migrate action), the casing fix action, and the keyboard shortcuts not yet built. v1 meta is deferred to M3 (decision on `claude/dazzling-lamport-zo0aud`).
 2. Detect and show the CLI version in the top bar.
 3. Review the protected-file proposals and `fixtures/malicious/`.
 4. M2: add wizard, PTY login and re-authorize, move/copy, transactional upsert with rollback; spike `--no-browser` callback handling first.

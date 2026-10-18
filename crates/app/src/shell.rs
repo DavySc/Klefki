@@ -2247,6 +2247,20 @@ impl ShellApp {
                     );
                 },
             );
+            if let Some(reference) = Definition::secret_suggestion(name, value) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Looks like a secret.").color(pal.warn));
+                    if ui
+                        .small_button(format!("Use {reference} instead"))
+                        .on_hover_text(
+                            "Claude Code fills the variable in from its own environment, so the secret stays out of ~/.claude.json.",
+                        )
+                        .clicked()
+                    {
+                        *value = reference;
+                    }
+                });
+            }
         }
         if let Some(i) = remove {
             pairs.remove(i);
@@ -4950,6 +4964,39 @@ mod tests {
         h.get_by_label("Remove MODE").click();
         h.run();
         assert!(!json_text(&h).contains("MODE"));
+    }
+
+    #[test]
+    fn a_typed_secret_is_met_with_a_reference_to_use_instead() {
+        let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
+        h.get_by_label("Env").click();
+        h.run();
+        // The value that is kept is never offered a hint: the app does not have it.
+        assert!(h.query_by_label_contains("Looks like a secret").is_none());
+        h.get_by_label("Add variable").click();
+        h.run();
+        form(&mut h).env[1] = ("MODE".into(), "dev".into());
+        h.run();
+        assert!(h.query_by_label_contains("Looks like a secret").is_none());
+        form(&mut h).env[1] = (
+            "GITHUB_TOKEN".into(),
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789".into(),
+        );
+        h.run();
+        h.get_by_label_contains("Looks like a secret");
+        assert!(
+            h.query_by_value("ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+                .is_none()
+        );
+        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
+        h.run();
+        assert_eq!(form(&mut h).env[1].1, "${GITHUB_TOKEN}");
+        assert!(
+            json_text(&h).contains("\"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\""),
+            "{}",
+            json_text(&h)
+        );
+        assert!(h.query_by_label_contains("Looks like a secret").is_none());
     }
 
     #[test]

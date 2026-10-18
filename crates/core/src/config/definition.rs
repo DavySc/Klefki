@@ -113,6 +113,12 @@ impl Definition {
         entry::validate(&Value::Object(self.to_map())).err()
     }
 
+    /// For a value typed into `env` or `headers` that looks like a secret: what to write instead, a `${VAR}`
+    /// reference Claude Code fills in from its environment. `None` when nothing needs saying. Only a hint.
+    pub fn secret_suggestion(name: &str, value: &str) -> Option<String> {
+        super::secretlike::suggestion(name, value)
+    }
+
     /// Changed through Claude Code's own command (M2), not this form.
     pub fn signs_in_with_oauth(&self) -> bool {
         self.base.contains_key("oauth")
