@@ -1,0 +1,3 @@
+http://localhost:56367/callback?code=97037ada5d91980c&state=xuoxhEjiYAn3QqOl_cUekyW3-orFgor-LTuIkwYrL6uk
+That doesn't look like a redirect URL for this sign-in — paste the full address from the browser page this sign-in opened.
+[1G[0JOr paste the redirect URL here: [33G

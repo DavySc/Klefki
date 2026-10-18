@@ -5,6 +5,7 @@ pub use crate::config::ConfigPaths;
 pub use crate::config::definition::Definition;
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
+    SignInFailure, SignInStep,
 };
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
@@ -256,9 +257,22 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
             watch_interval: Some(std::time::Duration::from_secs(1)),
             watch_settle: std::time::Duration::from_millis(300),
             secrets: None,
+            open_url: std::sync::Arc::new(open_https),
+            sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         },
         wake,
     )
+}
+
+/// Opens `link` in the user's browser, if it is https (CLAUDE.md: URLs opened are https only). No shell is involved.
+fn open_https(link: &str) -> std::io::Result<()> {
+    match url::Url::parse(link) {
+        Ok(url) if url.scheme() == "https" => open::that_detached(url.as_str()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only https links are opened",
+        )),
+    }
 }
 
 /// Where copies of `.claude.json` are kept before a change. They hold every server's settings, secrets included,
@@ -354,6 +368,22 @@ mod tests {
         assert_eq!(hidden.name, "ab");
         assert_ne!(hidden, ServerId::new(Scope::User, None, "ab"));
         assert_eq!(a.project.as_deref(), Some("C:/x"));
+    }
+
+    #[test]
+    fn only_https_links_are_ever_opened() {
+        // Refused before any browser is involved.
+        for link in [
+            "http://example.com/",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ms-settings:privacy",
+            "not a link",
+            "",
+        ] {
+            let err = open_https(link).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{link}");
+        }
     }
 
     #[test]

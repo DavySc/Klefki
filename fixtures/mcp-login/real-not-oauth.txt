@@ -1,0 +1,2 @@
+[0m[31m[31m"stdiosrv" doesn't support OAuth login — it's only available for HTTP and SSE servers.[39m[0m
+[?25h

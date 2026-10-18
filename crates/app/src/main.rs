@@ -1,6 +1,7 @@
 mod command;
 mod explain;
 mod shell;
+mod sign_in;
 mod theme;
 
 use shell::ShellApp;

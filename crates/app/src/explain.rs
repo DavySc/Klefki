@@ -87,6 +87,12 @@ impl Explanation {
             e.help
                 .push("Diagnose shows what the server and Claude Code logged.".to_owned());
         }
+        if hint.is_none() && status == Status::NeedsAuth {
+            e.help.push(
+                "Use Sign in: Claude Code opens the sign-in page in your browser, and Klefki waits until you are done."
+                    .to_owned(),
+            );
+        }
         // Claude Code's own words stay: they are what to search for or quote.
         e.note = detail.map(|d| format!("Claude Code said: {d}"));
         Some(e)

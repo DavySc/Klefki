@@ -1,0 +1,6 @@
+Starting authentication for "spike"…
+Visit this URL to authorize:
+  ]8;;http://127.0.0.1:8765/authorize?response_type=code&client_id=cid-56a58033&code_challenge=5T4ydpXCbcB6eEYNbE9jk15UWeBfx005TaFnJu84XgE&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A61983%2Fcallback&state=yikG7oorOB137qg1e_Nk72Ehk6xR2RxitLQlksJ1ZGM&resource=http%3A%2F%2F127.0.0.1%3A8765%2Fmcp[94mhttp://127.0.0.1:8765/authorize?response_type=code&client_id=cid-56a58033&code_challenge=5T4ydpXCbcB6eEYNbE9jk15UWeBfx005TaFnJu84XgE&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A61983%2Fcallback&state=yikG7oorOB137qg1e_Nk72Ehk6xR2RxitLQlksJ1ZGM&resource=http%3A%2F%2F127.0.0.1%3A8765%2Fmcp[39m]8;;
+
+Waiting for authorization… (^C to cancel)
+[1G[0JOr paste the redirect URL here: [33G

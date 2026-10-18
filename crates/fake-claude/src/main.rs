@@ -4,7 +4,7 @@
 //! real Claude configuration (`HOME`, `CLAUDE_CONFIG_DIR`) and never touches the network.
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,13 @@ struct Rule {
     /// When the real arguments contain `--debug-file <path>`, copy this scenario file to `<path>`, as the real
     /// CLI writes its debug log there.
     debug_file_from: Option<String>,
+    /// Like the real `mcp login`: exit 1 with Claude's message when stdin is not a terminal.
+    require_tty: bool,
+    /// After `stdout_file`, wait for one line on stdin and write it, without its line ending, to this path. Exits 1
+    /// if stdin closes first.
+    read_line_to: Option<String>,
+    /// Written to stdout after that line was read.
+    after_line_stdout_file: Option<String>,
 }
 
 /// The real arguments must start with the rule's; a `"*"` stands for exactly one argument, whatever it is.
@@ -108,6 +115,14 @@ fn main() {
         std::process::exit(2);
     };
 
+    if rule.require_tty && !std::io::stdin().is_terminal() {
+        eprintln!(
+            "Couldn't complete authentication: stdin isn't a terminal, so authentication can't be completed here."
+        );
+        log("end", &argv);
+        std::process::exit(1);
+    }
+
     if let Some(source) = &rule.debug_file_from
         && let Some(at) = argv.iter().position(|a| a == "--debug-file")
         && let Some(target) = argv.get(at + 1)
@@ -141,6 +156,18 @@ fn main() {
         }
     }
     let _ = out.flush();
+    if let Some(to) = &rule.read_line_to {
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            log("end", &argv);
+            std::process::exit(1);
+        }
+        let _ = std::fs::write(to, line.trim_end_matches(['\r', '\n']));
+        if let Some(f) = &rule.after_line_stdout_file {
+            let _ = out.write_all(&read_relative(&base, f));
+            let _ = out.flush();
+        }
+    }
     if let Some(f) = &rule.stderr_file {
         let _ = std::io::stderr().write_all(&read_relative(&base, f));
     }

@@ -1,0 +1,4 @@
+Starting authentication for "fixed"…
+[0m[31m[31mCouldn't complete authentication for "fixed": OAuth callback port 8766 is already in use — another process may be holding it. Run `lsof -ti:8766 -sTCP:LISTEN` to find it.[39m[0m
+
+[?25h

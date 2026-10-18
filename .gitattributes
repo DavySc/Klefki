@@ -5,3 +5,6 @@
 *.icns binary
 *.ttf binary
 *.otf binary
+
+# Raw terminal output: CR LF and escapes are the point.
+fixtures/mcp-login/*.txt -text
