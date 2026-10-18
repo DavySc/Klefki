@@ -5,6 +5,7 @@ pub(crate) mod entry;
 pub(crate) mod fsx;
 pub(crate) mod inventory;
 pub(crate) mod jsonspan;
+pub(crate) mod secretlike;
 
 use std::path::PathBuf;
 

@@ -221,6 +221,8 @@ pub struct ShellApp {
     command: CommandPalette,
     /// The Duplicate dialog, while open.
     duplicate: Option<DuplicateForm>,
+    /// The Fix casing dialog, while open.
+    casing: Option<CasingForm>,
     /// What is known about the shown OAuth server's client secret.
     secret: Option<SecretView>,
     /// A client secret being typed. Wiped from memory when dropped; handed to the engine, never copied.
@@ -252,6 +254,7 @@ impl ShellApp {
             editor: None,
             command: CommandPalette::default(),
             duplicate: None,
+            casing: None,
             secret: None,
             secret_input: None,
             outcome: None,
@@ -533,6 +536,7 @@ impl ShellApp {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
             && self.plan.is_none()
             && self.duplicate.is_none()
+            && self.casing.is_none()
         {
             if self.command.is_open() {
                 self.command.close();
@@ -546,7 +550,8 @@ impl ShellApp {
         let idle = !ctx.egui_wants_keyboard_input()
             && self.plan.is_none()
             && !self.command.is_open()
-            && self.duplicate.is_none();
+            && self.duplicate.is_none()
+            && self.casing.is_none();
         // Up and down walk the list, like any list.
         if idle && self.page == Page::Connections {
             let step = ctx.input(|i| {
@@ -597,6 +602,7 @@ impl ShellApp {
         }
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
+        self.casing_dialog(&ctx);
         self.outcome_toast(&ctx);
         let mut command = std::mem::take(&mut self.command);
         let chosen = command.show(&ctx, || self.commands());
@@ -906,6 +912,15 @@ impl ShellApp {
                         command::Action::Duplicate,
                     );
                 }
+                if s.casing_collision {
+                    add(
+                        icon::WARNING,
+                        format!("Fix casing of {}", s.name),
+                        "Give servers that differ only in case one spelling".into(),
+                        None,
+                        command::Action::FixCasing,
+                    );
+                }
                 add(
                     icon::PULSE,
                     format!("Check {} now", s.name),
@@ -1033,6 +1048,7 @@ impl ShellApp {
             }
             A::Settings => self.page = Page::Settings,
             A::Duplicate => self.open_duplicate(),
+            A::FixCasing => self.open_casing(),
         }
     }
 
@@ -1082,6 +1098,135 @@ impl ShellApp {
             filter: String::new(),
             focus: true,
         });
+    }
+
+    /// Opens the Fix casing dialog for the selected server: every server that differs from it only in case.
+    fn open_casing(&mut self) {
+        if self.core.is_none() || !self.can_prepare() {
+            return;
+        }
+        let Some(row) = self.single_selected().filter(|r| r.casing_collision) else {
+            return;
+        };
+        let lower = row.name.to_lowercase();
+        let members: Vec<CasingMember> = self
+            .snapshot
+            .servers
+            .iter()
+            .filter(|r| r.casing_collision && r.name.to_lowercase() == lower)
+            .map(|r| CasingMember {
+                id: r.id(),
+                name: r.name.clone(),
+                scope: r.scope,
+                project: r.project.clone(),
+            })
+            .collect();
+        let mut form = CasingForm {
+            members,
+            keep: row.name.clone(),
+        };
+        // A project server cannot change its name, so its spelling is the one to keep.
+        if let [only] = form.fixed()[..] {
+            form.keep = only.to_owned();
+        }
+        self.casing = Some(form);
+    }
+
+    fn casing_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let Some(form) = &mut self.casing else {
+            return;
+        };
+        let ready = form.fixable() && !form.changes().is_empty();
+        let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("casing_dialog")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading("Fix casing");
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "These servers differ only in upper and lower case. Choose the spelling they all get.",
+                    )
+                    .color(pal.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+            for m in &form.members {
+                let place = match (&m.project, m.scope) {
+                    (Some(p), _) => format!("{} \u{b7} {}", m.scope.label(), folder_name(p)),
+                    (None, _) => m.scope.label().to_owned(),
+                };
+                ui.add(
+                    egui::Label::new(format!("{}  \u{b7}  {place}", m.name))
+                        .truncate()
+                        .selectable(false),
+                );
+            }
+            ui.add_space(10.0);
+            let spellings = form.spellings();
+            for spelling in spellings {
+                let allowed = form.allowed(&spelling);
+                let selected = form.keep == spelling;
+                let response = ui
+                    .add_enabled(
+                        allowed,
+                        egui::Button::selectable(selected, format!("Keep {spelling}")),
+                    )
+                    .on_disabled_hover_text(
+                        "A server from a repository's .mcp.json keeps its name; the others follow it",
+                    );
+                if response.clicked() {
+                    form.keep = spelling;
+                }
+            }
+            ui.add_space(8.0);
+            if form.fixable() {
+                let n = form.changes().len();
+                ui.add(
+                    egui::Label::new(format!(
+                        "Renames {n} {} to {}. A server keeps its definition and stays off where it was off.",
+                        if n == 1 { "server" } else { "servers" },
+                        form.keep
+                    ))
+                    .wrap(),
+                );
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Servers from different repositories' .mcp.json files use different spellings, and Klefki does not edit those files. Change them there.",
+                        )
+                        .color(pal.danger),
+                    )
+                    .wrap(),
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let confirm =
+                    egui::Button::new(RichText::new("Review").strong().color(pal.on_bright))
+                        .fill(pal.primary)
+                        .min_size(egui::vec2(96.0, 34.0));
+                review |= ui
+                    .add_enabled(ready, confirm)
+                    .on_hover_text("Enter")
+                    .on_disabled_hover_text("Nothing to rename with this choice")
+                    .clicked();
+                cancel |= ui
+                    .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
+                    .on_hover_text("Esc")
+                    .clicked();
+            });
+        });
+        if review {
+            let changes = form.changes();
+            self.casing = None;
+            self.prepare(changes);
+        } else if cancel || modal.should_close() {
+            self.casing = None;
+        }
     }
 
     fn duplicate_dialog(&mut self, ctx: &egui::Context) {
@@ -1742,6 +1887,25 @@ impl ShellApp {
                         }
                         kv("Shadowed", if s.shadowed { "yes" } else { "no" }.to_owned());
                     });
+                if s.casing_collision && self.core.is_some() {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Another server's name differs from this one only in upper and lower case.",
+                            )
+                            .color(pal.warn),
+                        )
+                        .wrap(),
+                    );
+                    if ui
+                        .add_enabled(self.can_prepare(), egui::Button::new("Fix casing…"))
+                        .on_hover_text("Give them all the same spelling")
+                        .clicked()
+                    {
+                        self.open_casing();
+                    }
+                }
                 if s.scope == Scope::Project
                     && s.approval.is_some_and(|a| a != Approval::Approved)
                     && self.core.is_some()
@@ -2244,6 +2408,20 @@ impl ShellApp {
                     );
                 },
             );
+            if let Some(reference) = Definition::secret_suggestion(name, value) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Looks like a secret.").color(pal.warn));
+                    if ui
+                        .small_button(format!("Use {reference} instead"))
+                        .on_hover_text(
+                            "Claude Code fills the variable in from its own environment, so the secret stays out of ~/.claude.json.",
+                        )
+                        .clicked()
+                    {
+                        *value = reference;
+                    }
+                });
+            }
         }
         if let Some(i) = remove {
             pairs.remove(i);
@@ -2449,6 +2627,65 @@ fn bar_frame(pal: &Palette) -> Frame {
 
 fn search_id() -> egui::Id {
     egui::Id::new("search")
+}
+
+/// What the Fix casing dialog holds: the servers that differ only in case, and the spelling they are to get.
+struct CasingForm {
+    members: Vec<CasingMember>,
+    keep: String,
+}
+
+struct CasingMember {
+    id: ServerId,
+    name: String,
+    scope: Scope,
+    project: Option<String>,
+}
+
+impl CasingForm {
+    /// Each spelling once, in the order the servers are listed.
+    fn spellings(&self) -> Vec<String> {
+        let mut seen = Vec::new();
+        for m in &self.members {
+            if !seen.contains(&m.name) {
+                seen.push(m.name.clone());
+            }
+        }
+        seen
+    }
+
+    /// The spellings of project servers: they live in a repository's `.mcp.json`, which Klefki does not edit.
+    fn fixed(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for m in self.members.iter().filter(|m| m.scope == Scope::Project) {
+            if !out.contains(&m.name.as_str()) {
+                out.push(&m.name);
+            }
+        }
+        out
+    }
+
+    /// Whether every server could get this spelling.
+    fn allowed(&self, spelling: &str) -> bool {
+        self.fixed().iter().all(|f| *f == spelling)
+    }
+
+    /// Whether any spelling can be given to all: not when project servers disagree among themselves.
+    fn fixable(&self) -> bool {
+        self.fixed().len() <= 1
+    }
+
+    /// Renames the servers that Klefki can rename and that do not have the spelling yet.
+    fn changes(&self) -> Vec<Change> {
+        self.members
+            .iter()
+            .filter(|m| m.scope != Scope::Project && m.name != self.keep)
+            .map(|m| Change::Rename {
+                id: m.id.clone(),
+                name: self.keep.clone(),
+            })
+            .collect()
+    }
 }
 
 /// What the Duplicate dialog holds: the copy's name and where it goes.
@@ -4986,6 +5223,39 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_secret_is_met_with_a_reference_to_use_instead() {
+        let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
+        h.get_by_label("Env").click();
+        h.run();
+        // The value that is kept is never offered a hint: the app does not have it.
+        assert!(h.query_by_label_contains("Looks like a secret").is_none());
+        h.get_by_label("Add variable").click();
+        h.run();
+        form(&mut h).env[1] = ("MODE".into(), "dev".into());
+        h.run();
+        assert!(h.query_by_label_contains("Looks like a secret").is_none());
+        form(&mut h).env[1] = (
+            "GITHUB_TOKEN".into(),
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789".into(),
+        );
+        h.run();
+        h.get_by_label_contains("Looks like a secret");
+        assert!(
+            h.query_by_value("ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+                .is_none()
+        );
+        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
+        h.run();
+        assert_eq!(form(&mut h).env[1].1, "${GITHUB_TOKEN}");
+        assert!(
+            json_text(&h).contains("\"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\""),
+            "{}",
+            json_text(&h)
+        );
+        assert!(h.query_by_label_contains("Looks like a secret").is_none());
+    }
+
+    #[test]
     fn the_form_does_not_widen_the_detail_panel() {
         // Seen in the real window: rows that asked for the panel's whole width plus a button made the resizable
         // panel grow a little every frame, until it reached its largest size.
@@ -5273,6 +5543,140 @@ mod tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         assert!(h.state().duplicate.is_none());
+    }
+
+    // ---- fix casing
+
+    /// Gateway (user) and gateway (local in WebApp) differ only in case; `other` is fine.
+    fn casing_harness(
+        extra: Vec<ServerRow>,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let mut user = live_row("Gateway", Scope::User, None);
+        let mut local = live_row("gateway", Scope::Local, Some("C:/Repos/WebApp"));
+        user.casing_collision = true;
+        local.casing_collision = true;
+        let mut rows = vec![user, local, live_row("other", Scope::User, None)];
+        rows.extend(extra);
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: rows,
+                projects: vec!["C:/Repos/WebApp".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    fn renames(engine: &klefki_core::api::Detached) -> Vec<(ServerId, String)> {
+        duplicate_requested(engine)
+            .into_iter()
+            .map(|c| match c {
+                Change::Rename { id, name } => (id, name),
+                other => panic!("not a rename: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_a_server_with_a_casing_collision_offers_the_fix() {
+        let (mut h, _engine) = casing_harness(vec![]);
+        h.get_by_label("other").click();
+        h.run();
+        assert!(h.query_by_label("Fix casing…").is_none());
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…");
+    }
+
+    #[test]
+    fn the_fix_renames_the_others_to_the_spelling_chosen() {
+        let (mut h, engine) = casing_harness(vec![]);
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        // Both spellings are offered; the selected server's own is the starting point.
+        h.get_by_label("Keep gateway");
+        h.get_by_label("Keep Gateway");
+        assert_eq!(h.state().casing.as_ref().unwrap().keep, "gateway");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(h.state().casing.is_none());
+        let user = h.state().snapshot.servers[0].id();
+        assert_eq!(renames(&engine), vec![(user, "gateway".to_owned())]);
+    }
+
+    #[test]
+    fn choosing_the_other_spelling_renames_the_other_server() {
+        let (mut h, engine) = casing_harness(vec![]);
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        h.get_by_label("Keep Gateway").click();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let local = h.state().snapshot.servers[1].id();
+        assert_eq!(renames(&engine), vec![(local, "Gateway".to_owned())]);
+    }
+
+    #[test]
+    fn a_project_server_cannot_be_renamed_so_its_spelling_is_the_one_kept() {
+        let mut project = live_row("GATEWAY", Scope::Project, Some("C:/Repos/WebApp"));
+        project.casing_collision = true;
+        project.approval = Some(Approval::Approved);
+        let (mut h, engine) = casing_harness(vec![project]);
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        assert_eq!(h.state().casing.as_ref().unwrap().keep, "GATEWAY");
+        assert!(
+            h.get_by_label("Keep gateway")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("Review").click();
+        h.run();
+        let ids: Vec<ServerId> = renames(&engine).into_iter().map(|(id, _)| id).collect();
+        let rows = &h.state().snapshot.servers;
+        assert_eq!(ids, vec![rows[0].id(), rows[1].id()]);
+    }
+
+    #[test]
+    fn two_project_servers_that_differ_cannot_be_fixed_from_here() {
+        let mut one = live_row("GATEWAY", Scope::Project, Some("C:/Repos/WebApp"));
+        let mut two = live_row("Gateway", Scope::Project, Some("C:/Repos/Other"));
+        one.casing_collision = true;
+        two.casing_collision = true;
+        let (mut h, engine) = casing_harness(vec![one, two]);
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        h.get_by_label_contains(".mcp.json");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().casing.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn cancelling_the_fix_asks_for_nothing() {
+        let (mut h, engine) = casing_harness(vec![]);
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(h.state().casing.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
     }
 
     /// alpha (user) and beta (local in WebApp), and the forty-odd projects of a long-time Claude Code user.
