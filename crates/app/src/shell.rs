@@ -466,6 +466,16 @@ impl ShellApp {
         }
     }
 
+    /// Row `i` shows what Claude's cache last said, not an answer of this session's own checks. The cache can be
+    /// days old, so it says so until the check answers.
+    fn last_known(&self, i: usize) -> bool {
+        self.live.get(i).is_some_and(Option::is_none)
+            && matches!(
+                self.snapshot.servers[i].status,
+                Status::Connected | Status::Degraded | Status::NeedsAuth | Status::Failed
+            )
+    }
+
     /// What the engine's latest answer for row `i` most likely means, in plain words.
     fn hint(&self, i: usize) -> Option<&Hint> {
         self.live.get(i)?.as_ref()?.hint.as_ref()
@@ -1753,7 +1763,8 @@ impl ShellApp {
                         });
                         let (status, detail) = self.effective(*i);
                         let hint = self.hint(*i);
-                        row.col(|ui| status_cell(ui, s, status, detail, hint));
+                        let last_known = self.last_known(*i);
+                        row.col(|ui| status_cell(ui, s, status, detail, hint, last_known));
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
                         });
@@ -1933,7 +1944,11 @@ impl ShellApp {
                     .max_col_width(col_width)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Status").color(pal.text_muted));
-                        ui.label(status.label());
+                        if self.last_known(i) {
+                            ui.label(format!("{} (last known)", status.label()));
+                        } else {
+                            ui.label(status.label());
+                        }
                         ui.end_row();
                         if explanation.is_none() {
                             ui.label(RichText::new("Detail").color(pal.text_muted));
@@ -2982,12 +2997,15 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     }
 }
 
+const LAST_KNOWN: &str = "What Claude Code last saw, from its own cache, which can be old. klefki's own check replaces it.";
+
 fn status_cell(
     ui: &mut Ui,
     s: &ServerRow,
     status: Status,
     detail: Option<&str>,
     hint: Option<&Hint>,
+    last_known: bool,
 ) {
     let pal = theme::palette(ui.ctx());
     if !s.enabled {
@@ -3007,7 +3025,14 @@ fn status_cell(
         Status::Checking => pal.primary,
         Status::NotConfigured | Status::Unknown => pal.text_muted,
     };
-    let response = ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color));
+    // A status from Claude's cache is a faded ring, not a dot: the column has no room for words that say so; the
+    // tooltip and the Status tab do.
+    let (dot, color) = if last_known {
+        ('\u{25CB}', color.gamma_multiply(0.6))
+    } else {
+        ('\u{25CF}', color)
+    };
+    let response = ui.label(RichText::new(format!("{dot} {}", status.label())).color(color));
     match status {
         Status::Failed | Status::NeedsAuth | Status::Degraded => {
             // Not egui's tooltip, which waits half a second for a perfectly still pointer over the words alone:
@@ -3019,12 +3044,15 @@ fn status_cell(
                         ui.set_max_width(560.0);
                         explanation.show(ui, ui.id().with("tooltip"));
                     }
+                    if last_known {
+                        ui.label(RichText::new(LAST_KNOWN).color(pal.text_muted));
+                    }
                 });
             }
         }
         _ => {
-            if let Some(detail) = detail {
-                response.on_hover_text(detail);
+            if let Some(text) = detail.or(last_known.then_some(LAST_KNOWN)) {
+                response.on_hover_text(text);
             }
         }
     }
@@ -3614,6 +3642,52 @@ mod tests {
         h.run();
         h.get_by_label_contains("Connected");
         assert!(h.query_by_label_contains("Checking").is_none());
+    }
+
+    #[test]
+    fn a_status_from_claudes_cache_says_it_is_last_known_until_its_check_answers() {
+        // Bug: a cached "Connected" looked like a fresh answer, though the cache can be days old.
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("known", Scope::User, None);
+        row.status = Status::Connected;
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        h.run();
+        h.get_by_label("\u{25CB} Connected");
+        h.state_mut().selected.insert(0);
+        h.state_mut().tab = DetailTab::Status;
+        h.run();
+        h.get_by_label("Connected (last known)");
+
+        engine
+            .events
+            .send(status_event(&row, Status::Failed, Some("boom")))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("last known").is_none());
+        assert!(h.query_by_label_contains("\u{25CB}").is_none());
+        h.get_by_label("\u{25CF} Failed");
+    }
+
+    #[test]
+    fn only_statuses_a_check_establishes_are_marked_last_known() {
+        let (mut h, engine) = live_harness();
+        let mut rows = Vec::new();
+        for (name, status) in [
+            ("auth", Status::NeedsAuth),
+            ("bad", Status::Failed),
+            ("new", Status::Unknown),
+            ("waiting", Status::PendingApproval),
+        ] {
+            let mut row = live_row(name, Scope::User, None);
+            row.status = status;
+            rows.push(row);
+        }
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+        h.get_by_label("\u{25CB} Needs auth");
+        h.get_by_label("\u{25CB} Failed");
+        h.get_by_label("\u{25CF} Not checked");
+        h.get_by_label("\u{25CF} Pending approval");
     }
 
     #[test]

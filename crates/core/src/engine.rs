@@ -469,7 +469,9 @@ fn engine_main(
         watch,
     };
     let mut plans = Plans::default();
-    refresh(&shared, &mut state, false);
+    // Claude's caches can be days old: at startup every server is checked, those with nothing to show first. A row
+    // Claude knows keeps its last-known status until its own answer comes.
+    refresh(&shared, &mut state, true);
     while let Ok(input) = inputs.recv() {
         let command = match input {
             Input::Ui(command) => command,
@@ -1494,15 +1496,16 @@ mod tests {
     }
 
     #[test]
-    fn servers_claude_already_knows_are_not_rechecked_until_a_full_refresh() {
+    fn servers_claude_already_knows_are_rechecked_at_startup_keeping_their_last_known_status() {
+        // Bug: Claude's caches can be days old, and a server it called healthy was shown Connected until F5.
         let env = Env::new(
             &serde_json::json!({"mcpServers": {
                 "known": http("https://a.example.com"),
                 "fresh": {"type": "stdio", "command": "x"}}}),
-            r#"{"rules":[{"args":["mcp","get","known"],"stdout_file":"c.txt"},
+            r#"{"rules":[{"args":["mcp","get","known"],"stdout_file":"f.txt"},
                         {"args":["mcp","get","fresh"],"stdout_file":"c.txt"},
                         {"args":["--version"]}]}"#,
-            &[("c.txt", CONNECTED)],
+            &[("c.txt", CONNECTED), ("f.txt", FAILED)],
         );
         std::fs::write(
             env.dir.path().join("cfg").join("mcp-health-cache.json"),
@@ -1510,19 +1513,73 @@ mod tests {
         )
         .unwrap();
         let core = env.start();
-        collect(&core, |e| final_status(e, "fresh").is_some());
-        let names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
-        assert_eq!(
-            names,
-            vec!["fresh"],
-            "only the unknown server is checked at startup"
+        let events = collect(&core, |e| {
+            final_status(e, "fresh").is_some() && final_status(e, "known").is_some()
+        });
+        assert!(
+            matches!(&events[0], Event::Snapshot(s)
+                if s.servers.iter().any(|r| r.name == "known" && r.status == Status::Connected)),
+            "the cached status is shown at once: {:?}",
+            events[0]
         );
-
-        core.send(Command::Refresh { live_all: true });
-        collect(&core, |_| env.gets().iter().any(|g| g.0 == "known"));
+        assert_eq!(
+            final_status(&events, "known"),
+            Some(Status::Failed),
+            "the live answer replaces what the cache said"
+        );
+        assert!(
+            !events.iter().any(
+                |e| matches!(e, Event::Status { id, status: Status::Checking, .. }
+                if id.name == "known")
+            ),
+            "a known server keeps its last-known status while it is checked, not a blank \"checking\""
+        );
         let mut names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
         names.sort();
-        assert!(names.contains(&"known".to_owned()));
+        assert_eq!(names, vec!["fresh", "known"], "each is checked once");
+    }
+
+    #[test]
+    fn servers_with_nothing_to_show_are_checked_before_the_ones_claude_knows() {
+        // One check at a time, so the fake CLI's log is in queue order.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "a-auth": http("https://a.example.com"),
+                "b-known": http("https://b.example.com"),
+                "c-fresh": {"type": "stdio", "command": "x"},
+                "d-off": http("https://d.example.com")},
+                "projects": {"/p": {"disabledMcpServers": ["d-off"]}}}),
+            r#"{"rules":[{"args":["mcp","get"],"stdout_file":"c.txt"},{"args":["--version"]}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        std::fs::write(
+            env.dir.path().join("cfg").join("mcp-health-cache.json"),
+            r#"{"version":1,"servers":{"b-known":{"status":"healthy"},"d-off":{"status":"healthy"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            env.dir.path().join("cfg").join("mcp-needs-auth-cache.json"),
+            r#"{"a-auth":{}}"#,
+        )
+        .unwrap();
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| {
+            ["a-auth", "b-known", "c-fresh"]
+                .iter()
+                .all(|n| final_status(e, n).is_some())
+        });
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(
+            order,
+            vec!["c-fresh", "a-auth", "b-known"],
+            "the unknown one first, then the known ones; the one switched off is not checked"
+        );
     }
 
     #[test]
