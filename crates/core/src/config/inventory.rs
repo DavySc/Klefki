@@ -1,13 +1,15 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::{ConfigPaths, fsx};
-use crate::api::{Approval, OAuthInfo, Scope, ServerRow, Snapshot, Status, TransportKind};
+use crate::api::{
+    Approval, OAuthInfo, Scope, ServerId, ServerRow, Snapshot, Status, TransportKind,
+};
 use crate::model::ConnectionId;
 use crate::sanitize::{self, sanitize};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -15,9 +17,38 @@ pub(crate) const MAX_CLAUDE_JSON: u64 = 64 * 1024 * 1024;
 const MAX_CACHE_JSON: u64 = 4 * 1024 * 1024;
 const MAX_MCP_JSON: u64 = 1024 * 1024;
 const MAX_MCP_SERVERS: usize = 500;
-const MAX_TEXT_CHARS: usize = 512;
+const MAX_TEXT_CHARS: usize = sanitize::MAX_SHOWN_CHARS;
 
-pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
+/// A server's project key and name exactly as the file spells them, before they are cleaned and cut for display:
+/// what every write and every `claude mcp get` uses. Kept in core; the snapshot the UI holds has only the cleaned
+/// text, and tells servers apart by their opaque [`ConnectionId`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileKey {
+    pub project: Option<String>,
+    pub name: String,
+}
+
+/// Every row's [`FileKey`], by its connection.
+pub(crate) type FileKeys = HashMap<ConnectionId, FileKey>;
+
+/// The snapshot, and how the files spell each of its servers.
+#[derive(Default)]
+pub(crate) struct Inventory {
+    pub snapshot: Snapshot,
+    pub keys: FileKeys,
+}
+
+/// The row `id` names, and how the file spells it.
+pub(crate) fn locate<'a>(
+    snapshot: &'a Snapshot,
+    keys: &'a FileKeys,
+    id: &ServerId,
+) -> Option<(&'a ServerRow, &'a FileKey)> {
+    let row = snapshot.servers.iter().find(|r| r.is(id))?;
+    Some((row, keys.get(&row.connection)?))
+}
+
+pub(crate) fn load(paths: &ConfigPaths) -> Inventory {
     let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON).map_err(|e| e.to_string());
     load_text(
         paths,
@@ -27,7 +58,13 @@ pub(crate) fn load(paths: &ConfigPaths) -> Snapshot {
 
 /// [`load`] with `.claude.json` already read (`Ok(None)`: it does not exist), so a caller that needs the text too
 /// reads the file once.
-pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>) -> Snapshot {
+pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>) -> Inventory {
+    let mut keys = FileKeys::new();
+    let snapshot = build(paths, text, &mut keys);
+    Inventory { snapshot, keys }
+}
+
+fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut FileKeys) -> Snapshot {
     let mut snap = Snapshot::default();
     let root = match text.and_then(|t| t.map(parse_claude_json).transpose()) {
         Ok(Some(v)) => v,
@@ -72,6 +109,13 @@ pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>)
         for (name, entry) in servers {
             let status = hints.status_of(name);
             let mut r = row(name, entry, Scope::User, None, true, status);
+            keys.insert(
+                r.connection.clone(),
+                FileKey {
+                    project: None,
+                    name: name.clone(),
+                },
+            );
             r.disabled_in = disabled_by_project
                 .values()
                 .filter(|d| d.contains(name))
@@ -103,6 +147,13 @@ pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>)
                         Status::Unknown,
                     );
                     r.connection = ConnectionId::new(Scope::Local, Some(key), name);
+                    keys.insert(
+                        r.connection.clone(),
+                        FileKey {
+                            project: Some((*key).to_owned()),
+                            name: name.clone(),
+                        },
+                    );
                     snap.servers.push(r);
                 }
             }
@@ -143,9 +194,18 @@ pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>)
                     );
                     r.approval = Some(approval);
                     r.connection = ConnectionId::new(Scope::Project, Some(&project.raw), &name);
-                    r.shadowed = snap.servers[local_start..]
-                        .iter()
-                        .any(|o| o.scope == Scope::Local && o.name == r.name);
+                    keys.insert(
+                        r.connection.clone(),
+                        FileKey {
+                            project: Some(project.raw.clone()),
+                            name: name.clone(),
+                        },
+                    );
+                    // Claude Code compares names as the file spells them, not as shown.
+                    r.shadowed = snap.servers[local_start..].iter().any(|o| {
+                        o.scope == Scope::Local
+                            && keys.get(&o.connection).is_some_and(|k| k.name == name)
+                    });
                     snap.servers.push(r);
                 }
             }
@@ -736,7 +796,7 @@ mod tests {
             p
         }
         fn load(&self) -> Snapshot {
-            load(&self.paths())
+            load(&self.paths()).snapshot
         }
     }
 
@@ -956,6 +1016,30 @@ mod tests {
         // Cut at 512 characters, marked with an ellipsis.
         assert_eq!(repo.scopes[0].chars().count(), 513);
         assert!(repo.scopes[0].ends_with('…'));
+    }
+
+    #[test]
+    fn a_look_alike_name_does_not_shadow() {
+        // A local server shown as "ab" but spelled with a hidden character is another name to Claude Code.
+        let e = Env::new();
+        let p = e.project("app");
+        std::fs::write(
+            p.join(".mcp.json"),
+            r#"{"mcpServers":{"ab":{"command":"node"},"cd":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({"projects": {p.to_string_lossy(): {
+                "mcpServers": {"a\u{202e}b": {"command": "x"}, "cd": {"command": "y"}}
+            }}}),
+        );
+        let s = e.load();
+        assert!(!find(&s, Scope::Project, "ab").shadowed);
+        assert!(
+            find(&s, Scope::Project, "cd").shadowed,
+            "a real match still does"
+        );
     }
 
     #[test]

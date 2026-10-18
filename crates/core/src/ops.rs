@@ -1,6 +1,7 @@
 //! Turns what the user asked for into document edits. Needs the current inventory to know which projects exist.
 use crate::api::{Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot, Target};
 use crate::config::docstore::Op;
+use crate::config::inventory::{FileKey, FileKeys};
 use crate::config::{entry, fsx, inventory};
 use crate::sanitize::sanitize;
 use serde_json::Value;
@@ -54,7 +55,11 @@ fn digest(entry: &Value) -> String {
     format!("{:x}", Sha256::digest(entry.to_string().as_bytes()))
 }
 
-pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolved, String> {
+pub(crate) fn resolve(
+    changes: &[Change],
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+) -> Result<Resolved, String> {
     let mut out = Resolved::default();
     let mut verbs: Vec<&str> = Vec::new();
     for change in changes {
@@ -72,12 +77,14 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
         out.destructive |= matches!(change, Change::Delete { .. });
         out.summary.push(summarise(change, snapshot));
         match change {
-            Change::SetEnabled { id, enabled } => set_enabled(id, *enabled, snapshot, &mut out)?,
-            Change::Approve { id } => approve(id, snapshot, &mut out)?,
-            Change::Delete { id } => delete(id, snapshot, &mut out)?,
-            Change::Replace { id, json } => replace(id, json, snapshot, &mut out)?,
+            Change::SetEnabled { id, enabled } => {
+                set_enabled(id, *enabled, snapshot, keys, &mut out)?;
+            }
+            Change::Approve { id } => approve(id, snapshot, keys, &mut out)?,
+            Change::Delete { id } => delete(id, snapshot, keys, &mut out)?,
+            Change::Replace { id, json } => replace(id, json, snapshot, keys, &mut out)?,
             Change::Duplicate { id, name, targets } => {
-                duplicate(id, name, targets, snapshot, &mut out)?;
+                duplicate(id, name, targets, snapshot, keys, &mut out)?;
             }
         }
     }
@@ -94,8 +101,15 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
     Ok(out)
 }
 
-/// One plain sentence for a change, naming the server and where it applies.
+/// One plain sentence for a change, naming the server and where it applies, as the row shows them (the caller's
+/// copy of the name is only used when the row is gone, and the change then fails anyway).
 fn summarise(change: &Change, snapshot: &Snapshot) -> String {
+    let shown = |id: &ServerId| {
+        snapshot.servers.iter().find(|r| r.is(id)).map_or_else(
+            || (id.scope, id.project.clone(), sanitize(&id.name)),
+            |r| (r.scope, r.project.clone(), r.name.clone()),
+        )
+    };
     let (id, verb) = match change {
         Change::SetEnabled { id, enabled } => (id, if *enabled { "Turn on" } else { "Turn off" }),
         Change::Approve { id } => (id, "Approve"),
@@ -115,15 +129,11 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
                 (true, false) => format!(" for the user and in {}", and_list(&folders)),
                 (false, _) => format!(" in {}", and_list(&folders)),
             };
-            return format!(
-                "Duplicate {} as {}{place}",
-                sanitize(&id.name),
-                sanitize(name)
-            );
+            return format!("Duplicate {} as {}{place}", shown(id).2, sanitize(name));
         }
     };
-    let name = sanitize(&id.name);
-    let place = match (id.scope, id.project.as_deref()) {
+    let (scope, project, name) = shown(id);
+    let place = match (scope, project.as_deref()) {
         (Scope::User, _) => match change {
             Change::SetEnabled { .. } => {
                 format!(" in {}", count(snapshot.projects.len(), "project"))
@@ -164,8 +174,15 @@ pub(crate) fn folder_name(path: &str) -> String {
     }
 }
 
-fn find<'a>(id: &ServerId, snapshot: &'a Snapshot) -> Result<&'a ServerRow, String> {
-    snapshot.servers.iter().find(|r| r.is(id)).ok_or_else(|| {
+/// The row `id` names and how the file spells it. Messages use the row's own (shown) name, never the caller's
+/// copy of it; writes use the file's spellings, so a name with a hidden character, or a long one, changes that
+/// server and no other.
+fn find<'a>(
+    id: &ServerId,
+    snapshot: &'a Snapshot,
+    keys: &'a FileKeys,
+) -> Result<(&'a ServerRow, &'a FileKey), String> {
+    inventory::locate(snapshot, keys, id).ok_or_else(|| {
         format!(
             "{} is no longer in the configuration. Refresh and try again.",
             sanitize(&id.name)
@@ -177,20 +194,21 @@ fn set_enabled(
     id: &ServerId,
     enabled: bool,
     snapshot: &Snapshot,
+    keys: &FileKeys,
     out: &mut Resolved,
 ) -> Result<(), String> {
-    let row = find(id, snapshot)?;
-    let shown = sanitize(&id.name);
+    let (row, file) = find(id, snapshot, keys)?;
+    let shown = &row.name;
     let disabled = !enabled;
     match row.scope {
         Scope::Local | Scope::Project => {
-            let project = row
+            let project = file
                 .project
                 .clone()
                 .ok_or_else(|| format!("{shown} has no project"))?;
             out.claude.push(Op::SetDisabled {
                 project,
-                name: row.name.clone(),
+                name: file.name.clone(),
                 disabled,
             });
             if enabled && row.scope == Scope::Project && row.approval != Some(Approval::Approved) {
@@ -209,7 +227,7 @@ fn set_enabled(
             for project in &snapshot.projects {
                 out.claude.push(Op::SetDisabled {
                     project: project.clone(),
-                    name: row.name.clone(),
+                    name: file.name.clone(),
                     disabled,
                 });
             }
@@ -222,28 +240,36 @@ fn set_enabled(
     Ok(())
 }
 
-/// Where a user or local server lives, for an op; project servers are refused (the repository's file).
-fn own_server(id: &ServerId, snapshot: &Snapshot, what: &str) -> Result<Option<String>, String> {
-    let row = find(id, snapshot)?;
-    let shown = sanitize(&id.name);
+/// Where a user or local server lives, for an op, as the file spells it; project servers are refused (the
+/// repository's file).
+fn own_server<'a>(
+    id: &ServerId,
+    snapshot: &'a Snapshot,
+    keys: &'a FileKeys,
+    what: &str,
+) -> Result<&'a FileKey, String> {
+    let (row, file) = find(id, snapshot, keys)?;
     match row.scope {
-        Scope::User => Ok(None),
-        Scope::Local => row
-            .project
-            .clone()
-            .map(Some)
-            .ok_or_else(|| format!("{shown} has no project")),
+        Scope::User => Ok(file),
+        Scope::Local if file.project.is_some() => Ok(file),
+        Scope::Local => Err(format!("{} has no project", row.name)),
         Scope::Project => Err(format!(
-            "{shown} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here."
+            "{} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here.",
+            row.name
         )),
     }
 }
 
-fn delete(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
-    let project = own_server(id, snapshot, "delete from")?;
+fn delete(
+    id: &ServerId,
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let file = own_server(id, snapshot, keys, "delete from")?;
     out.claude.push(Op::RemoveServer {
-        project,
-        name: id.name.clone(),
+        project: file.project.clone(),
+        name: file.name.clone(),
     });
     out.warnings.push(
         "Deleting removes the definition only. A sign-in Claude Code keeps for this server is not removed."
@@ -256,9 +282,10 @@ fn replace(
     id: &ServerId,
     json: &str,
     snapshot: &Snapshot,
+    keys: &FileKeys,
     out: &mut Resolved,
 ) -> Result<(), String> {
-    let project = own_server(id, snapshot, "edit")?;
+    let file = own_server(id, snapshot, keys, "edit")?;
     if json.len() > entry::MAX_ENTRY_BYTES {
         return Err(format!(
             "The definition is longer than {} KiB.",
@@ -274,8 +301,8 @@ fn replace(
     // Checked again after hidden values are put back; this catches mistakes before anything is read.
     entry::validate(&value).map_err(|why| format!("The definition is not usable: {why}."))?;
     out.claude.push(Op::ReplaceServer {
-        project,
-        name: id.name.clone(),
+        project: file.project.clone(),
+        name: file.name.clone(),
         entry: value,
     });
     Ok(())
@@ -286,14 +313,15 @@ fn duplicate(
     name: &str,
     targets: &[Target],
     snapshot: &Snapshot,
+    keys: &FileKeys,
     out: &mut Resolved,
 ) -> Result<(), String> {
-    let row = find(id, snapshot)?;
-    let shown = sanitize(&id.name);
+    let (row, file) = find(id, snapshot, keys)?;
+    let shown = &row.name;
     let from = match row.scope {
         Scope::User => None,
         Scope::Local => Some(
-            row.project
+            file.project
                 .clone()
                 .ok_or_else(|| format!("{shown} has no project"))?,
         ),
@@ -309,6 +337,19 @@ fn duplicate(
         return Err("Choose where the copy goes.".to_owned());
     }
     let new = sanitize(name);
+    // Every other server called `name` in the file (the new name is plain ASCII, so it is spelled as shown), with
+    // its project key as the file spells it.
+    let others: Vec<(&ServerRow, &FileKey)> = snapshot
+        .servers
+        .iter()
+        .filter_map(|r| Some((r, keys.get(&r.connection)?)))
+        .filter(|(_, k)| k.name == name)
+        .collect();
+    let same_project = |k: &FileKey, p: &str| {
+        k.project
+            .as_deref()
+            .is_some_and(|q| inventory::normalise_project(q) == inventory::normalise_project(p))
+    };
     for target in targets {
         let to = match target {
             Target::User => None,
@@ -328,16 +369,10 @@ fn duplicate(
                 Some(known.clone())
             }
         };
-        let same_place = |r: &&ServerRow| match &to {
+        let same_place = |(r, k): &(&ServerRow, &FileKey)| match &to {
             None => r.scope == Scope::User,
-            Some(p) => {
-                r.scope == Scope::Local
-                    && r.project.as_deref().is_some_and(|q| {
-                        inventory::normalise_project(q) == inventory::normalise_project(p)
-                    })
-            }
+            Some(p) => r.scope == Scope::Local && same_project(k, p),
         };
-        let others: Vec<&ServerRow> = snapshot.servers.iter().filter(|r| r.name == name).collect();
         if others.iter().any(same_place) {
             return Err(format!(
                 "There is already a server called {new} {}.",
@@ -348,7 +383,7 @@ fn duplicate(
             ));
         }
         // Claude Code uses one server per name: local before project before user.
-        for other in others.iter().filter(|r| !same_place(r)) {
+        for (other, k) in others.iter().filter(|o| !same_place(o)) {
             let folder = other
                 .project
                 .as_deref()
@@ -367,11 +402,7 @@ fn duplicate(
                     "In {}, this copy is used instead of the user server {new}.",
                     sanitize(&folder_name(p))
                 )),
-                (Some(p), Scope::Project)
-                    if other.project.as_deref().is_some_and(|q| {
-                        inventory::normalise_project(q) == inventory::normalise_project(p)
-                    }) =>
-                {
+                (Some(p), Scope::Project) if same_project(k, p) => {
                     out.warnings.push(format!(
                         "In {folder}, this copy is used instead of the project server {new}."
                     ));
@@ -381,7 +412,7 @@ fn duplicate(
         }
         out.claude.push(Op::CopyServer {
             from: from.clone(),
-            name: row.name.clone(),
+            name: file.name.clone(),
             to,
             new_name: name.to_owned(),
         });
@@ -393,9 +424,14 @@ fn duplicate(
     Ok(())
 }
 
-fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
-    let row = find(id, snapshot)?;
-    let shown = sanitize(&id.name);
+fn approve(
+    id: &ServerId,
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let (row, file) = find(id, snapshot, keys)?;
+    let shown = &row.name;
     if row.scope != Scope::Project {
         return Err(format!(
             "{shown} is not a project server, so it needs no approval."
@@ -404,7 +440,14 @@ fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(),
     if row.approval == Some(Approval::Approved) {
         return Ok(());
     }
-    let project = row
+    // The approval is by name, and the name shown must be the name written: one with hidden characters, or cut for
+    // display, would approve something other than what the review says.
+    if self::shown(&file.name).as_deref() != Ok(shown.as_str()) {
+        return Err(format!(
+            "{shown} cannot be reviewed safely, so it is not approved: its name in .mcp.json cannot be shown exactly."
+        ));
+    }
+    let project = file
         .project
         .clone()
         .ok_or_else(|| format!("{shown} has no project"))?;
@@ -413,23 +456,22 @@ fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(),
             "The project folder of {shown} was not found, so it cannot be approved."
         ));
     }
-    let entry = inventory::project_server(&project, &row.name)?;
+    let entry = inventory::project_server(&project, &file.name)?;
     let lines = describe(&entry).map_err(|why| {
         format!("{shown} cannot be reviewed safely, so it is not approved: {why}.")
     })?;
-
     out.reviews.push(Review {
         title: format!("{shown} would be allowed to run:"),
         lines,
     });
     out.guards.push(Guard {
         project: project.clone(),
-        name: row.name.clone(),
+        name: file.name.clone(),
         digest: digest(&entry),
     });
     out.warnings.push(format!(
         "Claude Code will run {shown} from {} whenever you use that project. Only approve it if you trust the repository.",
-        sanitize(&project)
+        row.project.as_deref().unwrap_or_default()
     ));
     if !ignored_by_git(Path::new(&project)) {
         out.warnings.push(
@@ -439,11 +481,11 @@ fn approve(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(),
     if row.approval == Some(Approval::Rejected) {
         out.claude.push(Op::ClearRejection {
             project: project.clone(),
-            name: row.name.clone(),
+            name: file.name.clone(),
         });
     }
     out.settings.entry(project).or_default().push(Op::Approve {
-        name: row.name.clone(),
+        name: file.name.clone(),
     });
     Ok(())
 }

@@ -1,7 +1,30 @@
 # Progress
 
 ## Current slice
-Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done; committed as `6e43626` on branch `form-first-json-fallback`, PR #10, with main (#9 OAuth on rows, #11 keyring secrets) merged in; see below. Next: M1's remaining "v1 meta compatibility" (reading v1's `connections-meta.json` by these ids), then M2.
+Review of "Writes use the keys as the file spells them" (2026-10-18). Done; see below. Main merged in (#10, fields first with JSON as the fallback: no conflict in code, only this file). Next: the rest of M1 in PLAN.md (legacy `mcpServersDisabled` shown read-only with a migrate action; secret-looking values masked with a `${VAR}` suggestion; the casing fix action), then M2.
+
+Decided, not done now: reading v1's `connections-meta.json`. Its fields (`clientType`, `excludedScopes`, `drift`, `lastVerified`) are used by M2 (re-authorize, OAuth edit) and M3 (drift, refresh scopes), and PLAN.md puts reading v1's files in M3 (`legacy.rs`). M1's part, ids that match v1's, is done (`ConnectionId`); reading the file now would add code and reads nothing uses yet.
+
+## Review of the raw-keys fix (2026-10-18)
+`/code-review` on `0f9a7ac` found 15 problems; all fixed, each with a test that failed before.
+- **File keys kept beside the snapshot** (`inventory::FileKey`, `FileKeys`): the core keeps, per `ConnectionId`, the project key and name as the file spells them; the text never reaches the UI's snapshot. Decoding them from the keyring id is gone. An empty project key (`""`) and an empty name are kept as they are (decoding turned `""` into "no project", so such a server could not be changed). One lookup, `inventory::locate`, used by ops and the engine.
+- **`ServerId`**: equality, hashing and order compare the `ConnectionId` only (they also compared the shown fields, so two ids for one server could differ while `is()` said they matched); `ServerId::new` cleans and cuts the shown fields like a row's.
+- **App**: after a refresh the selection, diagnoses and an open editor are carried over by `ConnectionId`, so they stay on the same server when two look alike (they could move to the look-alike).
+- **Live check** (`claude mcp get`): run under the name and project folder as the file spells them, and a result is matched back to its row by connection (it ran under the shown name, so a look-alike could be checked instead).
+- **Messages and reviews** name the server from its row (scope, project, name as shown), not from the caller's id; whether the server is in the repository comes from the row's scope.
+- **Duplicate**: a name or project already taken is found by comparing the file's spellings (a look-alike name was "taken"; a project spelled two ways was not), and refused with the ops message before anything is read.
+- **Shadowing** (found while fixing): a local server shadows a project server only when the names match as the file spells them (`ab` did shadow `a\u{202e}b`).
+- **For human review (invariant: approval writes).** The approval now writes the name as `.mcp.json` spells it to `enabledMcpjsonServers`, and is refused ("its name in .mcp.json cannot be shown exactly") unless that name, cleaned and cut, is identical to the name shown in the review. So what is approved is exactly what was shown; a name with hidden characters or over 512 characters cannot be approved from klefki.
+- Tests: core `a_server_id_is_its_connection`, `a_look_alike_name_does_not_shadow`, engine `a_server_is_checked_under_its_own_name_never_a_look_alikes`, `servers_with_an_empty_project_key_or_name_can_still_be_changed`, `the_review_names_the_server_that_is_changed`, `duplicate_compares_names_and_projects_as_the_file_spells_them`, `a_project_server_whose_name_cannot_be_shown_exactly_is_not_approved`; app `a_refresh_keeps_the_selection_on_the_same_server_when_two_look_alike`. Engine tests: `repo_env` now returns the project key as written, and one test drops the first engine before starting a second on the same files. Mutation checks, each failing a test: the check run under the shown name, results matched by shown fields, summaries from the caller's id, the repository flag from the caller's scope, duplicate comparing shown projects, approval without the exact-name check, id equality on shown fields, an empty project key dropped, the app carrying over by shown name, shadowing by shown name.
+- Left: the Duplicate dialog's "already taken" hint compares shown names. Names typed there must match `^[A-Za-z0-9_-]{1,64}$`, so it can only warn about a name that merely looks taken; the engine decides.
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 313 core + 141 app passed; `cargo deny check` 0. After merging main (#10): the same, with 313 core + 144 app passed.
+
+## Writes use the keys as the file spells them (2026-10-18)
+The open item from the Windows review of #1: ops were written with the row's name and project as shown, which are cleaned (control and bidi characters removed) and cut at 512 characters.
+- Reproduced: with servers `ab` and `a\u{202e}b` (shown as `ab` too), turning off the second wrote `ab` to `disabledMcpServers`, switching off the other server, and reported success; editing or deleting a server whose name is cut said it was "no longer in the configuration". Worse than the item said: the two had the same `ServerId`, so the look-alike could not even be told apart.
+- `ServerId` now carries the row's `ConnectionId` (made from the keys as the file spells them) and identity compares that; `ServerId::new` builds one from file spellings. Every op (`SetEnabled`, `Delete`, `Replace`, `Duplicate`, `Approve` and its guard) and the definition shown for editing take the project and name as the file spells them, not the display text (since the review below, from a table the core keeps beside the snapshot rather than decoded from the `ConnectionId`).
+- Tests: `switching_off_a_server_writes_its_own_name_not_the_one_shown` (look-alike, and a 600-character name), `deleting_and_editing_reach_the_server_whatever_its_name_shows`; both failed before. Mutation: the toggle op written with the shown name fails the first. The engine tests' id helpers now use `ServerId::new` (same ids).
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 306 core + 140 app passed; `cargo deny check` 0.
 
 ## Fields first, JSON as the fallback (2026-10-18)
 Before: Edit (pencil, Ctrl+E, the palette's "Edit x", described as "JSON") opened a JSON tab; the labelled form was behind "Edit definition" on the General tab, and a definition the form could not show sent you to "the JSON tab".
@@ -122,7 +145,7 @@ Checks after the fixes: `cargo fmt --check` 0; `cargo clippy --workspace --all-t
 
 Open, for the owner (not changed):
 - `crates/fake-claude/` and `deny.toml` changed in #1; progress records approval of both. `unmaintained = "workspace"` accepts every unmaintained transitive crate, and `[licenses.private] ignore = true` works like an ignore list: confirm both are intended.
-- Writes use the sanitised, clipped row name and project (`ops` from `ServerRow`). A name with stripped characters or over 512 characters writes the wrong name to `disabledMcpServers` and reports success (approval fails closed instead: `.mcp.json` is matched exactly). Needs the raw keys carried for writes.
+- ~~Writes use the sanitised, clipped row name and project.~~ Fixed: see "Writes use the keys as the file spells them".
 - Lock: never refreshed while held (Claude's rule is stale after 10 s); `Drop` removes the folder without checking it is still ours; two waiters can both take over one stale lock; on Windows a delete-pending lock folder gives `PermissionDenied`, treated as fatal.
 - ~~A Claude write without the lock, landing between our read and our rename, is overwritten.~~ Narrowed to the moment between the stamp check and the rename (see "Write path" above).
 - Windows: backups get no owner-only ACL (they rely on the profile folder's ACL). (The rename is now retried on a transient sharing violation: `a7b9cf9`.)

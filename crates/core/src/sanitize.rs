@@ -45,6 +45,13 @@ fn plain_run(bytes: &[u8]) -> usize {
 }
 
 /// Cuts `s` to at most `max` characters, marking the cut with an ellipsis.
+/// How a name or path read from a file is shown: cleaned, and cut at 512 characters.
+pub(crate) const MAX_SHOWN_CHARS: usize = 512;
+
+pub(crate) fn shown(s: &str) -> String {
+    clip(&sanitize(s), MAX_SHOWN_CHARS)
+}
+
 pub(crate) fn clip(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
