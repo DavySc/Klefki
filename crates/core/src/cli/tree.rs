@@ -76,7 +76,8 @@ impl Tree {
     pub(crate) fn kill(&self) {
         #[cfg(unix)]
         if let Some(group) = self.group {
-            // SAFETY: a plain system call; a negative id names the process group, never another process.
+            // SAFETY: a plain system call. The caller has not waited for the leader yet, so its id is still taken and
+            // the group cannot be another one that reused it.
             unsafe {
                 libc::kill(-group, libc::SIGKILL);
             }
@@ -97,7 +98,9 @@ mod sys {
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
@@ -110,6 +113,19 @@ mod sys {
         }
         // SAFETY: `job` was just created and nothing else owns it.
         let job = unsafe { OwnedHandle::from_raw_handle(job as RawHandle) };
+        // A process that asks to leave the job on purpose may (it is then not ended with it); without this its start
+        // would fail. If the system refuses, the job is used as it is.
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        // SAFETY: the handle is open and `limits` is the structure this information class takes, with its size.
+        unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle() as HANDLE,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+        }
         // SAFETY: both handles are open for the length of the call.
         let ok =
             unsafe { AssignProcessToJobObject(job.as_raw_handle() as HANDLE, process as HANDLE) };

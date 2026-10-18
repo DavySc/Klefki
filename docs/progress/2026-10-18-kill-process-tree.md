@@ -16,7 +16,15 @@ Goal: the open item in `docs/progress.md`: a timeout killed only `claude`, so a 
 
 ## Open
 - Not tried with real Claude Code starting a real stdio server that hangs.
-- A process that leaves the group itself (`setsid`, a daemon) or a job (breakaway) is not ended.
+- A process that leaves the group itself (`setsid`, a daemon) or the job (`CREATE_BREAKAWAY_FROM_JOB`, allowed by `JOB_OBJECT_LIMIT_BREAKAWAY_OK` so such a start does not fail) is not ended. Breakaway has no test.
+- A normal exit can still leave orphans: when Claude's own MCP connection timeout fires first (a user `MCP_TIMEOUT` under the 10 s check timeout, or the check timeout raised above 30 s), Claude exits 0 and kills its server but not the server's children (seen by the cross-reviewer with real Claude Code 2.1.302).
+- With `process_group(0)`, Ctrl+C in a terminal no longer reaches `claude` or its server. No matter for the GUI; `klefki-cli` should end running trees on SIGINT, or Ctrl+C during `status` leaves them behind (inferred, not run).
+- Windows `resume` snapshots every thread on the system per run (a few ms); `NtResumeProcess` would be one call if Windows start-up ever shows it.
+
+## Cross-review (on 36815a5): nothing blocking
+- Reviewer ran real Claude Code 2.1.302 with a hanging stdio server (node starting node, ignoring SIGTERM/SIGHUP): on main both stayed after the 10 s timeout, with this PR both ended.
+- Polish folded in once: the job allows breakaway; the `kill` SAFETY note names the real precondition; the findings above added to Open.
+- Windows CI (8a6ee9f): the sign-in tree test waited for the helpers before driving the terminal, and a pseudo-console holds its programs until its queries are answered ("only 0 of 3 processes started"); it now drives from the start (36815a5).
 
 ## Next
 Cross-review, CI green on all three systems, merge.
