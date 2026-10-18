@@ -5,24 +5,26 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// Applied in order. Each replacement keeps the label and hides the value, so the text stays readable. A quote may
-/// arrive escaped (`\"`): the client logs a server's stderr inside a quoted string, JSON the server printed included.
+/// arrive escaped (`\"`), once or more: the client logs a server's stderr inside a quoted string, JSON the server
+/// printed included, and a server may log JSON inside JSON. A value that opens with a quote is hidden up to the next
+/// quote, spaces included.
 const RULES: &[(&str, &str)] = &[
     // Whole header and environment objects, quoted (JSON) and bare (`Environment: {...}`).
     (
-        r#"(?i)(\\?"(?:headers|env|environment|http_headers)\\?"\s*:\s*)\{[^{}]*\}"#,
+        r#"(?i)(\\*"(?:headers|env|environment|http_headers)\\*"\s*:\s*)\{[^{}]*\}"#,
         "${1}{***}",
     ),
     (r#"(?i)(\b(?:headers|env)\s*:\s*)\{[^{}]*\}"#, "${1}{***}"),
     // Authentication headers: everything after the name up to the end of the value.
     (
-        r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)((?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[^"',}\r\n]+"#,
-        "${1}${2}***",
+        r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)((?:\\*["'])?\s*[:=]\s*)(?:(\\*")[^"\r\n]*|(\\*')[^'\r\n]*|[^"',}\r\n]+)"#,
+        "${1}${2}${3}${4}***",
     ),
     (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer ***"),
     // Names that say they hold a secret, whatever the separator.
     (
-        r#"(?i)\b([a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|code[_-]?verifier)(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[^\s"',&}]+"#,
-        "${1}***",
+        r#"(?i)\b([a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|code[_-]?verifier)(?:\\*["'])?\s*[:=]\s*)(?:(\\*")[^"\r\n]*|(\\*')[^'\r\n]*|[^\s"',&}]+)"#,
+        "${1}${2}${3}***",
     ),
     // OAuth redirect parameters.
     (
@@ -40,7 +42,7 @@ const RULES: &[(&str, &str)] = &[
         "***",
     ),
     (r"\bsk-[A-Za-z0-9_-]{16,}", "sk-***"),
-    (r"\bsk_live_[A-Za-z0-9]{16,}", "sk_live_***"),
+    (r"\b([sr]k_(?:live|test)_)[A-Za-z0-9]{16,}", "${1}***"),
     (r"\bgh[pousr]_[A-Za-z0-9]{20,}", "***"),
     (r"\bgithub_pat_[A-Za-z0-9_]{20,}", "***"),
     (r"\bglpat-[A-Za-z0-9_-]{20,}", "***"),
@@ -159,9 +161,40 @@ mod tests {
                 "LEAK-1234567",
             ),
             (r#"{\"env\":{\"FOO\":\"LEAK-1234567\"}}"#, "LEAK-1234567"),
+            // Review of #27: JSON inside a JSON string, then logged inside a quoted string, as structured loggers do.
+            (
+                r#"{\"config\":\"{\\\"apiKey\\\":\\\"LEAKDOUBLE1\\\"}\"}"#,
+                "LEAKDOUBLE1",
+            ),
+            (
+                r#"{\"c\":\"{\\\"headers\\\":{\\\"X-Custom\\\":\\\"LEAKDOUBLE2\\\"}}\"}"#,
+                "LEAKDOUBLE2",
+            ),
+            (
+                r#"{\"c\":\"{\\\"Authorization\\\":\\\"Bearer LEAKDOUBLE3\\\"}\"}"#,
+                "LEAKDOUBLE3",
+            ),
         ] {
             gone(input, secret);
         }
+    }
+
+    #[test]
+    fn a_quoted_value_is_hidden_to_its_closing_quote() {
+        // Review of #27: only the first word was hidden, and the `***` read as if all of it was.
+        for input in [
+            r#"{"password":"correct horse battery"}"#,
+            r#"{\"password\":\"correct horse battery\"}"#,
+            "password='correct horse battery'",
+            r#"{"Cookie":"sid=1, correct horse battery"}"#,
+        ] {
+            for word in ["horse", "battery"] {
+                gone(input, word);
+            }
+        }
+        // The text after the value stays.
+        let out = redact(r#"{"password":"a b c","port":3000}"#);
+        assert!(out.contains(r#""port":3000"#), "{out}");
     }
 
     #[test]
@@ -229,6 +262,9 @@ mod tests {
             "glpat-abcdefghij0123456789",
             "AIzaSyA1234567890abcdefghijklmnopqrstu",
             "npm_abcdefghijklmnopqrstuvwxyz0123456789",
+            // Stripe's test and restricted keys.
+            concat!("sk_test_", "51ABCDEFGHIJKLMNOPQRSTUVWX"),
+            concat!("rk_live_", "51ABCDEFGHIJKLMNOPQRSTUVWX"),
         ] {
             gone(&format!("value is {secret} here"), secret);
         }

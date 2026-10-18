@@ -17,5 +17,11 @@ Branch `claude/review-core-y2uzla`, from main `e169d1b`. Baseline on that main: 
 - Verify all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`) on 957fbb7: exit 0, 699 tests passed (695 + 4 new), deny "advisories ok, bans ok, licenses ok, sources ok".
 - Only core changed, so the app's `cargo clippy -p klefki -- -D warnings` boundary is untouched (passes as part of the workspace clippy).
 
+## Review round 1 (from "Review performance")
+- Blocking: JSON escaped twice (a structured logger's JSON inside a JSON string, then inside Claude's quoted log string) still leaked; the rules allowed one backslash before a quote. They now allow any number (`\\*`). New cases in `escaped_quotes_hide_nothing` (`apiKey`, a `headers` object and `Authorization`, each escaped twice); failed first with `LEAKDOUBLE1 survived`.
+- Folded in: a value that opens with a quote is hidden up to the next quote, spaces included (`{"password":"correct horse battery"}` showed `*** horse battery`); test `a_quoted_value_is_hidden_to_its_closing_quote`, failed first. Stripe's `sk_test_` and `rk_live_` keys are masked here and in `config::secretlike`; failed first.
+- Left as noted by the reviewer: masking also takes the backslash of a closing `\"`, which is harmless.
+- Verify all on the new head: exit 0, 700 tests passed, deny ok.
+
 ## Next
 The rest of the review (config writes, engine, parsing, sign-in, `klefki-cli`) continues in this thread; clear fixes go in part 2, findings for Davy in `reviews/2026-10-19-core/findings.md` in the project folder.
