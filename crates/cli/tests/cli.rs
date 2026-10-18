@@ -127,8 +127,9 @@ impl Env {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_klefki-cli"));
         cmd.args(args)
             .env("CLAUDE_CONFIG_DIR", self.root().join("cfg"))
+            // Redirects the home folder on Linux and macOS. Windows finds it through the registry; a changed
+            // `USERPROFILE` only breaks that lookup (CI: every user server "not checked: no home folder").
             .env("HOME", self.root().join("home"))
-            .env("USERPROFILE", self.root().join("home"))
             .env("PATH", self.root().join("home").join(".local").join("bin"))
             .env("FAKE_CLAUDE_SCENARIO", self.root().join("scenario.json"))
             .env("FAKE_CLAUDE_LOG", self.root().join("log.jsonl"))
@@ -379,6 +380,10 @@ fn status_without_a_usable_claude_cli_says_so_and_fails() {
     assert!(env.gets().is_empty());
 }
 
+/// Not on Windows: there the search starts in the real home folder (`~/.local/bin/claude.exe`), which a test cannot
+/// redirect, so it could run the real Claude CLI (CLAUDE.md: tests never do). The search itself is core's, tested
+/// there on every platform.
+#[cfg(not(windows))]
 #[test]
 fn status_finds_the_claude_cli_like_the_app_when_not_named() {
     let env = Env::new();
