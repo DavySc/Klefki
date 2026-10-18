@@ -257,6 +257,19 @@ pub(crate) struct Done {
 /// Runs `swap`. On failure says what happened and where everything is; the configuration then holds the old server
 /// as it was (or, when even that could not be done, a recovery file holds it).
 pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
+    // Each place as the file spells it, which is how the list names a server and Klefki files its secret.
+    let respelled = |spot: &Spot| Spot {
+        project: spot
+            .project
+            .as_deref()
+            .map(|project| spelled_in(ctx.claude_json, project)),
+        name: spot.name.clone(),
+    };
+    let swap = &Swap {
+        from: respelled(&swap.from),
+        to: respelled(&swap.to),
+        ..swap.clone()
+    };
     let verb = swap.verb();
     let shown = swap.from.words();
     let old = read_entry(ctx.claude_json, &swap.from)?.ok_or_else(|| {
@@ -783,7 +796,7 @@ fn read_root(claude_json: &Path) -> Result<Value, String> {
 }
 
 /// `project` as the configuration's key for it is spelled; as given when the file has none (or cannot be read).
-fn spelled_in(claude_json: &Path, project: &str) -> String {
+pub(crate) fn spelled_in(claude_json: &Path, project: &str) -> String {
     let wanted = inventory::normalise_project(project);
     read_root(claude_json)
         .ok()

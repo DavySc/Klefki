@@ -1318,8 +1318,15 @@ fn add_with_claude(
         }
         // The name is checked, but may start with `-`: after `--` it is never read as an option.
         args.extend(["--", add.name.as_str(), add.json.as_str()]);
-        let cwd = match &add.project {
-            Some(project) => Some(Path::new(project)),
+        // From the folder as the file spells it, so Claude Code files the server under that project's own entry.
+        let folder = add.project.as_deref().map(|project| {
+            shared.config.paths.as_ref().map_or_else(
+                || project.to_owned(),
+                |paths| swap::spelled_in(&paths.claude_json, project),
+            )
+        });
+        let cwd = match &folder {
+            Some(folder) => Some(Path::new(folder)),
             None => shared.config.home.as_deref(),
         };
         // The secret reaches the command only in `MCP_CLIENT_SECRET`.

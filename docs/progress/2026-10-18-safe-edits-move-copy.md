@@ -82,7 +82,10 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
     run from the project folder as Klefki spells it (`C:/…`), not as the file does (`C:\…`), and the server landed
     under a second entry. Claude Code now runs from the file's own spelling of the folder
     (`a_server_that_signs_in_lands_under_the_projects_own_spelling`, reproduced on Linux with a trailing separator;
-    failed before). Real Claude Code on Windows not tried.
+    failed before). The swap's places are also respelled, so Klefki's copy of the secret is filed under the
+    server's id as the list shows it, and a plain Add with Claude Code runs from the same spelling (this one was on
+    main too). A 1500-case run of the model test with every project key spelled with a trailing separator passed.
+    Real Claude Code on Windows not tried.
   - Soak after all fixes: 3 × 4000 cases passed (~110 s each), twice (before and after the main merge).
 - **Merged main** with the free-port check (#23) and the CLI (#25): one conflict in `api.rs` (`real_config` from
   main, plus `changer: None`). Decision renumbered to 007: main has its own 006 (CLI output).

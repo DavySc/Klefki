@@ -1093,6 +1093,12 @@ fn a_server_that_signs_in_lands_under_the_projects_own_spelling() {
             .get("a")
             .is_some()
     );
+    // And Klefki's copy of its client secret is filed under the server as the list shows it.
+    let copy = connection(&(Some(pa.clone()), "a".to_owned()));
+    assert_eq!(
+        rig.world().klefki.get(&copy).map(String::as_str),
+        Some("sec-a")
+    );
     // The variant: a move there.
     let b = (Some(pa.clone()), "b".to_owned());
     let outcome = rig.run(vec![Change::Move {
@@ -1109,6 +1115,20 @@ fn a_server_that_signs_in_lands_under_the_projects_own_spelling() {
     assert!(
         rig.config()["projects"][&pa]["mcpServers"]
             .get("b")
+            .is_some()
+    );
+    // And a new one added there.
+    let outcome = rig.run(vec![Change::Add {
+        name: "n".to_owned(),
+        json: definition(true, 3, 0).to_string(),
+        targets: vec![Target::Local(pa.clone())],
+        secret: None,
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    assert_eq!(projects(&rig), before);
+    assert!(
+        rig.config()["projects"][&pa]["mcpServers"]
+            .get("n")
             .is_some()
     );
 }
