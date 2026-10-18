@@ -105,6 +105,11 @@ fn object_level(
     }
 }
 
+/// Where a member's key ends: the index just past its closing quote. `member.key_start` is its opening quote.
+pub(crate) fn key_end(text: &str, member: &Member) -> Result<usize, String> {
+    string_end(text.as_bytes(), member.key_start)
+}
+
 /// `i` is at an opening quote; returns the index just past the closing one. Strings hold most of the bytes of a
 /// large configuration (chat history), so this jumps between quotes and backslashes with `memchr`, which uses the
 /// CPU's vector instructions where it can.

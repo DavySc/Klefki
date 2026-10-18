@@ -47,6 +47,13 @@ pub(crate) enum Op {
         name: String,
         disabled: bool,
     },
+    /// Where `name` is in `projects[<project>].disabledMcpServers`, put `new_name` instead (same place in the list),
+    /// so a server that is renamed stays off. Does nothing for a project that does not list `name`.
+    RenameDisabled {
+        project: String,
+        name: String,
+        new_name: String,
+    },
     /// Take `name` out of `projects[<project>].disabledMcpjsonServers` (a rejection recorded in `.claude.json`),
     /// for every spelling of the project. Needed so that an approval is not overruled by an old rejection.
     ClearRejection { project: String, name: String },
@@ -58,6 +65,13 @@ pub(crate) enum Op {
     RemoveServer {
         project: Option<String>,
         name: String,
+    },
+    /// Give server `name` the name `new_name`, where it is (same places as [`Op::RemoveServer`]): only its key
+    /// changes, so its position, definition and secrets stay as they are. Refused when `new_name` is taken there.
+    RenameServer {
+        project: Option<String>,
+        name: String,
+        new_name: String,
     },
     /// Replace the definition of server `name` (same places as [`Op::RemoveServer`]). Environment and header
     /// values given as [`entry::MASK`] keep the value they had.
@@ -87,8 +101,11 @@ impl Op {
     /// The project this op changes inside, if any.
     fn project(&self) -> Option<&str> {
         match self {
-            Op::SetDisabled { project, .. } | Op::ClearRejection { project, .. } => Some(project),
+            Op::SetDisabled { project, .. }
+            | Op::RenameDisabled { project, .. }
+            | Op::ClearRejection { project, .. } => Some(project),
             Op::RemoveServer { project, .. }
+            | Op::RenameServer { project, .. }
             | Op::ReplaceServer { project, .. }
             | Op::AddServer { project, .. } => project.as_deref(),
             Op::CopyServer { to, .. } => to.as_deref(),
@@ -99,17 +116,22 @@ impl Op {
     fn is_server_op(&self) -> bool {
         matches!(
             self,
-            Op::RemoveServer { .. } | Op::ReplaceServer { .. } | Op::AddServer { .. }
+            Op::RemoveServer { .. }
+                | Op::RenameServer { .. }
+                | Op::ReplaceServer { .. }
+                | Op::AddServer { .. }
         )
     }
 
     fn server_name(&self) -> &str {
         match self {
             Op::RemoveServer { name, .. }
+            | Op::RenameServer { name, .. }
             | Op::ReplaceServer { name, .. }
             | Op::AddServer { name, .. } => name,
             Op::CopyServer { new_name, .. } => new_name,
             Op::SetDisabled { name, .. }
+            | Op::RenameDisabled { name, .. }
             | Op::ClearRejection { name, .. }
             | Op::Approve { name } => name,
         }
@@ -968,7 +990,8 @@ fn edit_valid_claude_json(
                 .filter(|op| {
                     matches!(
                         (op, list),
-                        (Op::SetDisabled { .. }, DISABLED) | (Op::ClearRejection { .. }, REJECTED)
+                        (Op::SetDisabled { .. } | Op::RenameDisabled { .. }, DISABLED)
+                            | (Op::ClearRejection { .. }, REJECTED)
                     )
                 })
                 .collect();
@@ -1019,6 +1042,24 @@ fn edit_valid_claude_json(
                             }
                         }
                     }
+                    Op::RenameDisabled { name, new_name, .. } => {
+                        if let Some(list) = &mut items
+                            && let Some(at) = list.iter().position(|v| v.as_str() == Some(name))
+                        {
+                            let present = list.iter().any(|v| v.as_str() == Some(new_name));
+                            if present {
+                                list.remove(at);
+                            } else {
+                                list[at] = Value::String(new_name.clone());
+                            }
+                            out.lines.push(header.clone());
+                            out.lines.push(format!("- {}", sanitize(name)));
+                            if !present {
+                                out.lines.push(format!("+ {}", sanitize(new_name)));
+                            }
+                            changed = true;
+                        }
+                    }
                     Op::ClearRejection { name, .. } => {
                         if let Some(list) = &mut items {
                             let before = list.len();
@@ -1032,6 +1073,7 @@ fn edit_valid_claude_json(
                     }
                     Op::Approve { .. }
                     | Op::RemoveServer { .. }
+                    | Op::RenameServer { .. }
                     | Op::ReplaceServer { .. }
                     | Op::AddServer { .. }
                     | Op::CopyServer { .. } => {}
@@ -1066,7 +1108,7 @@ fn edit_valid_claude_json(
 
 /// A delete being checked whose server is already gone: that is the delete in place.
 fn gone_is_done(op: &Op, purpose: Purpose) -> bool {
-    purpose == Purpose::Verify && matches!(op, Op::RemoveServer { .. })
+    purpose == Purpose::Verify && matches!(op, Op::RemoveServer { .. } | Op::RenameServer { .. })
 }
 
 /// What an edit of `.claude.json` produces so far.
@@ -1121,6 +1163,7 @@ fn edit_servers<'o>(
     };
     let mut found = Vec::new();
     let mut removed = Vec::new();
+    let mut renamed: Vec<(usize, &str)> = Vec::new();
     let mut added: Vec<(&str, Value)> = Vec::new();
     let mut changed_existing = false;
     for op in ops {
@@ -1185,7 +1228,10 @@ fn edit_servers<'o>(
         if old.get("oauth").is_some() {
             return Err(invalid(oauth_refusal(name)));
         }
-        if removed.contains(&index) || splices.iter().any(|(r, _)| *r == member.value) {
+        if removed.contains(&index)
+            || renamed.iter().any(|(i, _)| *i == index)
+            || splices.iter().any(|(r, _)| *r == member.value)
+        {
             return Err(invalid(format!(
                 "{} is changed twice in one plan",
                 sanitize(name)
@@ -1198,6 +1244,29 @@ fn edit_servers<'o>(
             Op::RemoveServer { .. } => {
                 lines.push(format!("- {}", sanitize(name)));
                 removed.push(index);
+            }
+            Op::RenameServer { new_name, .. } => {
+                crate::model::ServerName::parse(new_name).map_err(|e| {
+                    invalid(format!(
+                        "{:?} cannot be used as a server name: {e}",
+                        sanitize(new_name)
+                    ))
+                })?;
+                if object.members.iter().any(|m| m.key == *new_name)
+                    || renamed.iter().any(|(_, n)| *n == new_name.as_str())
+                    || added.iter().any(|(n, _)| *n == new_name.as_str())
+                {
+                    return Err(invalid(format!(
+                        "{} already exists there",
+                        sanitize(new_name)
+                    )));
+                }
+                lines.push(format!("- {}", sanitize(name)));
+                lines.push(format!("+ {}", sanitize(new_name)));
+                let end = jsonspan::key_end(text, member).map_err(invalid)?;
+                let key = serde_json::to_string(new_name).map_err(|e| invalid(e.to_string()))?;
+                splices.push((member.key_start..end, key));
+                renamed.push((index, new_name.as_str()));
             }
             Op::ReplaceServer { entry: new, .. } => {
                 let new = entry::unmasked(new, &old).map_err(invalid)?;
@@ -1790,6 +1859,70 @@ mod tests {
             keys,
             ["zeta", "numStartups", "mcpServers", "projects", "alpha"]
         );
+    }
+
+    fn rename_disabled(project: &str, name: &str, new_name: &str) -> Op {
+        Op::RenameDisabled {
+            project: project.to_owned(),
+            name: name.to_owned(),
+            new_name: new_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn renaming_a_disabled_server_keeps_it_off_under_its_new_name() {
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["disabledMcpServers"] = json!(["x", "old", "y"]);
+        let f = Fixture::new(&pretty(&doc));
+        let plan = f
+            .store
+            .prepare(vec![rename_disabled("C:/work/app", "old", "older")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let mut expected = doc.clone();
+        expected["projects"]["C:/work/app"]["disabledMcpServers"] = json!(["x", "older", "y"]);
+        assert_eq!(f.text(), pretty(&expected));
+    }
+
+    #[test]
+    fn renaming_a_server_that_was_not_disabled_changes_nothing() {
+        let f = Fixture::new(&pretty(&sample()));
+        let before = f.text();
+        // Not in that list, and a project without a list.
+        for project in ["C:/work/app", "C:/work/other"] {
+            let name = if project == "C:/work/app" {
+                "gateway"
+            } else {
+                "old"
+            };
+            let plan = f
+                .store
+                .prepare(vec![rename_disabled(project, name, "newer")])
+                .unwrap();
+            f.store.apply(&plan).unwrap();
+        }
+        assert_eq!(f.text(), before);
+        // A project that is not there is refused, as for every other change to a project's lists.
+        assert!(
+            f.store
+                .prepare(vec![rename_disabled("C:/work/none", "old", "newer")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn renaming_a_disabled_server_onto_a_name_already_off_does_not_list_it_twice() {
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["disabledMcpServers"] = json!(["old", "newer"]);
+        let f = Fixture::new(&pretty(&doc));
+        let plan = f
+            .store
+            .prepare(vec![rename_disabled("C:/work/app", "old", "newer")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let mut expected = doc.clone();
+        expected["projects"]["C:/work/app"]["disabledMcpServers"] = json!(["newer"]);
+        assert_eq!(f.text(), pretty(&expected));
     }
 
     #[test]
@@ -2969,7 +3102,9 @@ mod tests {
                             clear_rejection(&mut expected, project, name, &mut expected_lines)
                         }
                         Op::Approve { .. }
+                        | Op::RenameDisabled { .. }
                         | Op::RemoveServer { .. }
+                        | Op::RenameServer { .. }
                         | Op::ReplaceServer { .. }
                         | Op::AddServer { .. }
                         | Op::CopyServer { .. } => {
@@ -3363,6 +3498,146 @@ mod tests {
             );
         }
         assert_eq!(f.text(), pretty(&servers_doc()));
+    }
+
+    fn rename_server(project: Option<&str>, name: &str, new_name: &str) -> Op {
+        Op::RenameServer {
+            project: project.map(str::to_owned),
+            name: name.to_owned(),
+            new_name: new_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn renaming_a_server_changes_its_key_and_nothing_else() {
+        for victim in ["a", "b", "c"] {
+            let f = Fixture::new(&pretty(&servers_doc()));
+            let plan = apply_ops(&f, vec![rename_server(None, victim, "Renamed")]);
+            let mut expected = serde_json::Map::new();
+            for (k, v) in servers_doc()["mcpServers"].as_object().unwrap() {
+                expected.insert(
+                    if k == victim {
+                        "Renamed".to_owned()
+                    } else {
+                        k.clone()
+                    },
+                    v.clone(),
+                );
+            }
+            let mut want = servers_doc();
+            want["mcpServers"] = Value::Object(expected);
+            assert_eq!(f.text(), pretty(&want), "{victim}");
+            let lines = &plan.changes()[0].lines;
+            assert!(
+                lines.contains(&format!("- {victim}")) && lines.contains(&"+ Renamed".to_owned()),
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn renaming_in_a_one_line_file_keeps_it_on_one_line() {
+        let text =
+            r#"{"mcpServers":{"a":{"command":"x"},"b":{"command":"y","env":{"T":"s"}}},"k":1.50}"#;
+        let f = Fixture::new(text);
+        apply_ops(&f, vec![rename_server(None, "b", "B-q")]);
+        assert_eq!(
+            f.text(),
+            r#"{"mcpServers":{"a":{"command":"x"},"B-q":{"command":"y","env":{"T":"s"}}},"k":1.50}"#
+        );
+    }
+
+    #[test]
+    fn renaming_a_local_server_covers_every_spelling_of_its_project() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        apply_ops(&f, vec![rename_server(Some("C:/w/p"), "loc", "loc2")]);
+        let text = f.text();
+        assert!(!text.contains("\"loc\""), "{text}");
+        assert_eq!(text.matches("\"loc2\"").count(), 2, "{text}");
+        // Only the key changed: reading the old text with that key swapped back gives the old document.
+        assert_eq!(
+            serde_json::from_str::<Value>(&text.replace("\"loc2\"", "\"loc\"")).unwrap(),
+            servers_doc()
+        );
+    }
+
+    #[test]
+    fn renames_that_cannot_be_made_are_refused_and_change_nothing() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        for (ops, why) in [
+            (vec![rename_server(None, "a", "b")], "already exists"),
+            (vec![rename_server(None, "nope", "x")], "no longer"),
+            (
+                vec![rename_server(Some("/nowhere"), "a", "x")],
+                "not a project",
+            ),
+            (vec![rename_server(None, "a", "bad name")], "name"),
+            (vec![rename_server(None, "a", "-x")], "name"),
+            (
+                vec![rename_server(None, "a", "x"), rename_server(None, "b", "x")],
+                "already exists",
+            ),
+            (
+                vec![rename_server(None, "a", "x"), remove(None, "a")],
+                "twice",
+            ),
+            (
+                vec![remove(None, "a"), rename_server(None, "a", "x")],
+                "twice",
+            ),
+            (
+                vec![
+                    rename_server(None, "a", "x"),
+                    replace(None, "a", json!({"command": "q"})),
+                ],
+                "twice",
+            ),
+        ] {
+            let err = f.store.prepare(ops.clone()).unwrap_err().to_string();
+            assert!(err.contains(why), "{ops:?}: {err}");
+        }
+        assert_eq!(f.text(), pretty(&servers_doc()));
+    }
+
+    #[test]
+    fn a_server_that_signs_in_with_oauth_is_not_renamed() {
+        let doc = json!({"mcpServers": {"o": {"type": "http", "url": "https://e.example/mcp", "oauth": {"clientId": "x"}}}});
+        let f = Fixture::new(&pretty(&doc));
+        let err = f
+            .store
+            .prepare(vec![rename_server(None, "o", "p")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("OAuth"), "{err}");
+    }
+
+    #[test]
+    fn verify_renames_again_when_claude_overwrote_it_and_accepts_it_gone() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let plan = apply_ops(&f, vec![rename_server(None, "a", "A")]);
+        std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(true)
+        );
+        assert!(
+            f.json()["mcpServers"].get("A").is_some() && f.json()["mcpServers"].get("a").is_none()
+        );
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
+        // Deleted by someone since: nothing to put back.
+        let mut gone = servers_doc();
+        gone["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("a");
+        std::fs::write(&f.store.path, pretty(&gone)).unwrap();
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
     }
 
     #[test]

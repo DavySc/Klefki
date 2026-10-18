@@ -21,6 +21,7 @@ pub enum Action {
     Tone(crate::theme::Tone),
     Settings,
     Duplicate,
+    FixCasing,
 }
 
 pub struct Entry {

@@ -1,5 +1,7 @@
 //! Turns what the user asked for into document edits. Needs the current inventory to know which projects exist.
-use crate::api::{Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot, Target};
+use crate::api::{
+    Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot, Target, TransportKind,
+};
 use crate::config::docstore::Op;
 use crate::config::{entry, fsx, inventory};
 use crate::sanitize::sanitize;
@@ -64,6 +66,7 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
             Change::Approve { .. } => "Approve",
             Change::Delete { .. } => "Delete",
             Change::Replace { .. } => "Save",
+            Change::Rename { .. } => "Rename",
             Change::Duplicate { .. } => "Duplicate",
         };
         if !verbs.contains(&verb) {
@@ -76,6 +79,7 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
             Change::Approve { id } => approve(id, snapshot, &mut out)?,
             Change::Delete { id } => delete(id, snapshot, &mut out)?,
             Change::Replace { id, json } => replace(id, json, snapshot, &mut out)?,
+            Change::Rename { id, name } => rename(id, name, snapshot, &mut out)?,
             Change::Duplicate { id, name, targets } => {
                 duplicate(id, name, targets, snapshot, &mut out)?;
             }
@@ -101,6 +105,14 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         Change::Approve { id } => (id, "Approve"),
         Change::Delete { id } => (id, "Delete"),
         Change::Replace { id, .. } => (id, "Save changes to"),
+        Change::Rename { id, name } => {
+            let place = match (id.scope, id.project.as_deref()) {
+                (Scope::User, _) => " (user server)".to_owned(),
+                (_, Some(project)) => format!(" in {}", sanitize(&folder_name(project))),
+                (_, None) => String::new(),
+            };
+            return format!("Rename {} to {}{place}", sanitize(&id.name), sanitize(name));
+        }
         Change::Duplicate { id, name, targets } => {
             let user = targets.contains(&Target::User);
             let folders: Vec<String> = targets
@@ -298,6 +310,98 @@ fn replace(
         name: disk.name,
         entry: value,
     });
+    Ok(())
+}
+
+/// Gives a user or local server another name where it is: only its key changes, and the new name is switched off
+/// wherever the old one was.
+fn rename(
+    id: &ServerId,
+    name: &str,
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let disk = own_server(id, snapshot, "change")?;
+    let row = find(id, snapshot)?;
+    let shown = sanitize(&id.name);
+    let new = sanitize(name);
+    crate::model::ServerName::parse(name)
+        .map_err(|e| format!("{:?} cannot be used as a server name: {e}.", sanitize(name)))?;
+    let place = match &disk.project {
+        None => "for the user".to_owned(),
+        Some(p) => format!("in {}", sanitize(&folder_name(p))),
+    };
+    if name == disk.name {
+        return Err(format!("{shown} is already called {new}."));
+    }
+    let same_project =
+        |q: &str, p: &str| inventory::normalise_project(q) == inventory::normalise_project(p);
+    let others: Vec<&ServerRow> = snapshot
+        .servers
+        .iter()
+        .filter(|r| on_disk(r).is_ok_and(|d| d.name == name))
+        .collect();
+    let same_place = |r: &&ServerRow| match &disk.project {
+        None => r.scope == Scope::User,
+        Some(p) => {
+            r.scope == Scope::Local && r.project.as_deref().is_some_and(|q| same_project(q, p))
+        }
+    };
+    if others.iter().any(same_place) {
+        return Err(format!("There is already a server called {new} {place}."));
+    }
+    // Claude Code uses one server per name: local before project before user.
+    for other in others.iter().filter(|r| !same_place(r)) {
+        let folder = other
+            .project
+            .as_deref()
+            .map(|p| sanitize(&folder_name(p)))
+            .unwrap_or_default();
+        match (&disk.project, other.scope) {
+            (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
+                "In {folder}, the {} server {new} is used instead of {new} for the user.",
+                if other.scope == Scope::Local {
+                    "local"
+                } else {
+                    "project"
+                }
+            )),
+            (Some(p), Scope::User) => out.warnings.push(format!(
+                "In {}, {new} is used instead of the user server {new}.",
+                sanitize(&folder_name(p))
+            )),
+            (Some(p), Scope::Project)
+                if other.project.as_deref().is_some_and(|q| same_project(q, p)) =>
+            {
+                out.warnings.push(format!(
+                    "In {folder}, {new} is used instead of the project server {new}."
+                ));
+            }
+            _ => {}
+        }
+    }
+    out.claude.push(Op::RenameServer {
+        project: disk.project.clone(),
+        name: disk.name.clone(),
+        new_name: name.to_owned(),
+    });
+    let projects: Vec<String> = match &disk.project {
+        Some(p) => vec![p.clone()],
+        None => snapshot.projects.clone(),
+    };
+    for project in projects {
+        out.claude.push(Op::RenameDisabled {
+            project,
+            name: disk.name.clone(),
+            new_name: name.to_owned(),
+        });
+    }
+    if matches!(row.transport, TransportKind::Http | TransportKind::Sse) {
+        out.warnings.push(
+            "A sign-in Claude Code keeps for this server is under the old name and is not moved."
+                .to_owned(),
+        );
+    }
     Ok(())
 }
 
