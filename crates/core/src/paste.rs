@@ -4,7 +4,8 @@
 //! change.
 use crate::api::Scope;
 use crate::config::entry::MAX_ENTRY_BYTES;
-use crate::sanitize::{clip, sanitize};
+use crate::config::secretlike::shown_args;
+use crate::sanitize::{clip, sanitize, sanitize_line};
 use serde_json::{Map, Value};
 
 /// What was found in the pasted text, for the add dialog.
@@ -378,7 +379,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                         _ => {
                             problem.get_or_insert(format!(
                                 "-e takes KEY=value, not {:?}.",
-                                sanitize(v)
+                                shown_text(v)
                             ));
                         }
                     }
@@ -398,7 +399,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                         _ => {
                             problem.get_or_insert(format!(
                                 "-H takes \"Name: value\", not {:?}.",
-                                sanitize(v)
+                                shown_text(v)
                             ));
                         }
                     }
@@ -438,9 +439,11 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 asks_secret = true;
             }
             _ => {
+                // Without what follows `=`, which may be a value.
+                let option = option.split_once('=').map_or(option, |(o, _)| o);
                 problem.get_or_insert(format!(
                     "Claude Code's mcp add has no option {}.",
-                    sanitize(option)
+                    shown_text(option)
                 ));
             }
         }
@@ -713,20 +716,37 @@ fn undo_git_bash_drive(entry: &mut Value, notes: &mut Vec<String>) {
     }
 }
 
-/// What a definition runs or connects to, on one line.
+/// What a definition runs or connects to, on one line, masked as the list of servers masks it.
 fn summary(entry: &Value) -> String {
     let text = |key: &str| entry.get(key).and_then(Value::as_str).unwrap_or_default();
     let line = match text("type") {
         "" | "stdio" => {
-            let mut words = vec![quoted(text("command"))];
-            if let Some(Value::Array(args)) = entry.get("args") {
-                words.extend(args.iter().map(|a| quoted(a.as_str().unwrap_or("?"))));
-            }
-            words.join(" ")
+            let args = match entry.get("args") {
+                Some(Value::Array(args)) => {
+                    args.iter().map(|a| a.as_str().unwrap_or("?")).collect()
+                }
+                _ => Vec::new(),
+            };
+            // Each word cleaned on its own: an escape left open in one must not swallow the next.
+            std::iter::once(sanitize_line(text("command")))
+                .chain(shown_args(args).iter().map(|a| sanitize_line(a)))
+                .map(|w| quoted(&w))
+                .collect::<Vec<_>>()
+                .join(" ")
         }
-        kind => format!("{kind} \u{b7} {}", text("url")),
+        kind => {
+            let url = text("url");
+            let shown = crate::config::inventory::display_url(url, &["http", "https", "ws", "wss"])
+                .unwrap_or_else(|_| shown_text(url));
+            format!("{} \u{b7} {shown}", sanitize_line(kind))
+        }
     };
-    clip(&sanitize(&line), MAX_SUMMARY_CHARS)
+    clip(&line, MAX_SUMMARY_CHARS)
+}
+
+/// Text quoted back in a message: on one line, each word that looks secret shown as `…`.
+fn shown_text(text: &str) -> String {
+    sanitize_line(&shown_args(text.split_whitespace()).join(" "))
 }
 
 fn quoted(word: &str) -> String {
@@ -1471,6 +1491,46 @@ mod tests {
         assert!(s.summary.contains("\"has space\""), "{s:?}");
         let s = one(&format!("claude mcp add x -- node {}", "y".repeat(5000)));
         assert!(s.summary.chars().count() < 400, "{}", s.summary.len());
+    }
+
+    #[test]
+    fn the_summary_hides_what_the_list_hides() {
+        // Found reviewing main: the preview showed in full what the list of servers masks.
+        let s = one("claude mcp add a -- npx -y alpha-mcp --api-key sk-live-ARGSECRET123456");
+        assert_eq!(s.summary, "npx -y alpha-mcp --api-key …");
+        let s = one(
+            "claude mcp add --transport http b https://me:pw123456@h.example.com/mcp?token=SECRET1234",
+        );
+        assert_eq!(s.summary, "http · https://h.example.com/mcp?…");
+        let s = one(r#"{"c": {"type": "sse", "url": "not a url ghp_abcdefghijklmnop1234"}}"#);
+        assert!(!s.summary.contains("abcdefghij"), "{}", s.summary);
+        // An escape left open in one word hides none of the others.
+        let pasted = Pasted::parse(
+            r#"{"d": {"command": "node", "args": ["--title=\u001b]", "-e", "evil()", "\u0007", "server.js"]}}"#,
+        )
+        .unwrap();
+        let summary = &pasted.servers[0].summary;
+        assert!(summary.contains(" -e evil() "), "{summary:?}");
+        assert!(summary.ends_with(" server.js"), "{summary:?}");
+    }
+
+    #[test]
+    fn a_problem_never_repeats_a_secret() {
+        // Found reviewing main: a word Klefki could not place was quoted back whole.
+        for text in [
+            "claude mcp add x -k=sk-live-ARGSECRET123456 -- node",
+            "claude mcp add x -e sk-live-ARGSECRET123456 -- node",
+            r#"claude mcp add --transport http x https://h.example.com/mcp -H "Bearer sk-live-ARGSECRET123456""#,
+        ] {
+            let s = one(text);
+            let problem = s.problem.unwrap_or_else(|| panic!("no problem for {text}"));
+            assert!(!problem.contains("ARGSECRET"), "{problem}");
+        }
+        // What is not secret is still quoted back, so the mistake can be found.
+        let s = one("claude mcp add x -e VERBOSE -- node");
+        assert!(s.problem.unwrap_or_default().contains("VERBOSE"));
+        let s = one("claude mcp add x -k=1 -- node");
+        assert!(s.problem.unwrap_or_default().contains("no option -k."));
     }
 
     #[test]

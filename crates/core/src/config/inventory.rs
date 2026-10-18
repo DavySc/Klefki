@@ -374,7 +374,7 @@ fn classify(entry: &Value) -> (TransportKind, String) {
 }
 
 /// A URL for display: no credentials and no query string, which may carry tokens.
-fn display_url(raw: &str, schemes: &[&str]) -> Result<String, &'static str> {
+pub(crate) fn display_url(raw: &str, schemes: &[&str]) -> Result<String, &'static str> {
     let url = url::Url::parse(raw.trim()).map_err(|_| "invalid URL")?;
     if !schemes.contains(&url.scheme()) {
         return Err("URL scheme is not allowed for this type");
