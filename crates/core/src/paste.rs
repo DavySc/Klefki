@@ -6,6 +6,7 @@ use crate::api::Scope;
 use crate::config::entry::MAX_ENTRY_BYTES;
 use crate::sanitize::{clip, sanitize};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 /// What was found in the pasted text, for the add dialog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,10 @@ const MAX_PASTE_BYTES: usize = 256 * 1024;
 const MAX_SERVERS: usize = 100;
 /// A summary longer than this is cut; the review shows everything in full.
 const MAX_SUMMARY_CHARS: usize = 300;
+/// Skipped lines named one by one; any more are counted in one note.
+const MAX_SKIPPED_SHOWN: usize = 5;
+/// Variable names listed in a note; any more are counted.
+const MAX_NAMES_SHOWN: usize = 8;
 const SECRET_AFTER_OPTION: &str = "--client-secret takes no value: Claude Code asks for the secret. The word after it may be the secret, so nothing of this command is shown. Paste it with the name before --client-secret and no secret, and type the secret in the form.";
 const PROJECT_SCOPE: &str = "Klefki does not add project servers: they live in the repository's .mcp.json. Choose the user or a project's own list instead.";
 
@@ -73,12 +78,8 @@ impl Pasted {
                 pasted.servers.len()
             ));
         }
-        let mut seen = Vec::new();
-        pasted.notes.retain(|n| {
-            let new = !seen.contains(n);
-            seen.push(n.clone());
-            new
-        });
+        let mut seen = HashSet::new();
+        pasted.notes.retain(|n| seen.insert(n.clone()));
         Ok(pasted)
     }
 }
@@ -259,6 +260,7 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
     let lexed = lex(text);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
+    let mut skipped = HashSet::new();
     for command in &lexed.commands {
         let words: Vec<&str> = command.words.iter().map(String::as_str).collect();
         let adds = match words.as_slice() {
@@ -276,11 +278,22 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
             )),
             (Some(("add", rest)), None) => servers.push(add(rest, &mut notes)),
             (Some((_, rest)), None) => servers.push(add_json(rest, &mut notes)),
-            (None, _) => notes.push(format!(
-                "Skipped a line that is not a claude mcp add command: {}",
-                clip(&sanitize(&command.words.join(" ")), 60)
-            )),
+            (None, _) => {
+                let line = clip(&sanitize(&command.words.join(" ")), 60);
+                if skipped.insert(line.clone()) && skipped.len() <= MAX_SKIPPED_SHOWN {
+                    notes.push(format!(
+                        "Skipped a line that is not a claude mcp add command: {line}"
+                    ));
+                }
+            }
         }
+    }
+    match skipped.len().saturating_sub(MAX_SKIPPED_SHOWN) {
+        0 => {}
+        1 => notes.push("Skipped 1 more line that is not a claude mcp add command.".to_owned()),
+        more => notes.push(format!(
+            "Skipped {more} more lines that are not claude mcp add commands."
+        )),
     }
     if servers.is_empty() {
         return Err(
@@ -289,14 +302,27 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
         );
     }
     if !lexed.variables.is_empty() {
-        let names: Vec<String> = lexed.variables.iter().map(|v| format!("${v}")).collect();
         notes.push(format!(
             "Your shell would fill in {} when the command runs. Claude Code fills {} in instead, from its own environment, when it starts the server.",
-            names.join(", "),
-            if names.len() == 1 { "it" } else { "them" }
+            listed(&lexed.variables, |v| format!("${v}")),
+            if lexed.variables.len() == 1 { "it" } else { "them" }
         ));
     }
     Ok(Pasted { servers, notes })
+}
+
+/// `names`, each written by `show`, for a note: a long list names the first few and counts the rest.
+pub(crate) fn listed(names: &[String], show: impl Fn(&str) -> String) -> String {
+    let mut text = names
+        .iter()
+        .take(MAX_NAMES_SHOWN)
+        .map(|n| show(n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > MAX_NAMES_SHOWN {
+        text.push_str(&format!(" and {} more", names.len() - MAX_NAMES_SHOWN));
+    }
+    text
 }
 
 fn is_claude(word: &str) -> bool {
@@ -914,6 +940,8 @@ pub(crate) fn lex(text: &str) -> Lexed {
     }
     end_word(&mut current, &mut word, &mut in_word);
     end_command(&mut commands, &mut current);
+    let mut seen = HashSet::new();
+    variables.retain(|v| seen.insert(v.clone()));
     Lexed {
         commands,
         variables,
@@ -968,7 +996,7 @@ fn variable(
             return Ok(());
         }
     }
-    if !name.is_empty() && !variables.contains(&name) {
+    if !name.is_empty() {
         variables.push(name);
     }
     Ok(())
@@ -1099,6 +1127,86 @@ mod tests {
         let note = pasted.notes.join(" ");
         assert!(note.contains("GITHUB_TOKEN"), "{note}");
         assert!(note.contains("HOME"), "{note}");
+    }
+
+    #[test]
+    fn many_shell_variables_are_counted_not_all_listed() {
+        // Found reviewing performance: every name was listed in one note, which the add dialog lays out every frame.
+        let names: String = (0..40).map(|i| format!(" $V{i}")).collect();
+        let pasted = Pasted::parse(&format!("claude mcp add s -- node{names}")).unwrap();
+        let args = json_of(&pasted.servers[0])["args"].clone();
+        assert_eq!(args.as_array().unwrap().len(), 40, "every argument is kept");
+        assert_eq!(args[39], json!("${V39}"));
+        let [note] = pasted.notes.as_slice() else {
+            panic!("{pasted:?}")
+        };
+        assert!(
+            note.contains("$V0, $V1,") && note.contains("and 32 more"),
+            "{note}"
+        );
+        assert!(!note.contains("$V8,") && !note.contains("$V39"), "{note}");
+        // A name used again is still one name.
+        let pasted = Pasted::parse("claude mcp add s -- node $A $B $A ${B}").unwrap();
+        assert!(
+            pasted.notes[0].contains("$A, $B when"),
+            "{:?}",
+            pasted.notes
+        );
+    }
+
+    #[test]
+    fn many_skipped_lines_are_counted_not_all_listed() {
+        // Found reviewing performance: one note per skipped line, so a long text pasted around a command gave
+        // thousands of notes, each laid out every frame.
+        let lines: String = (0..40).map(|i| format!("not a command {i}\n")).collect();
+        let pasted = Pasted::parse(&format!("claude mcp add s -- node\n{lines}")).unwrap();
+        let skipped: Vec<&String> = pasted
+            .notes
+            .iter()
+            .filter(|n| n.starts_with("Skipped"))
+            .collect();
+        assert_eq!(skipped.len(), 6, "{pasted:?}");
+        assert!(skipped[0].ends_with("not a command 0"), "{skipped:?}");
+        assert!(skipped[4].ends_with("not a command 4"), "{skipped:?}");
+        assert_eq!(
+            skipped[5],
+            "Skipped 35 more lines that are not claude mcp add commands."
+        );
+        // The same line many times is one line, as before.
+        let same = "npm install thing\n".repeat(40);
+        let pasted = Pasted::parse(&format!("{same}claude mcp add s -- node\n")).unwrap();
+        assert_eq!(pasted.notes.len(), 1, "{pasted:?}");
+    }
+
+    #[test]
+    fn the_largest_paste_is_read_at_typing_speed() {
+        // Found reviewing performance: skipped lines and variable names were de-duplicated by searching every earlier
+        // one, so the largest paste took 1.5 to 2.3 s (release) to read, again after every key typed. The bound is
+        // loose, for debug builds on slow machines; the quadratic version took far longer.
+        let full = |first: &str, each: &dyn Fn(usize) -> String| {
+            let mut text = first.to_owned();
+            for i in 0.. {
+                let more = each(i);
+                if text.len() + more.len() > MAX_PASTE_BYTES {
+                    break;
+                }
+                text.push_str(&more);
+            }
+            text
+        };
+        let lines = full("claude mcp add s -- node\n", &|i| format!("l{i}\n"));
+        let vars = full("claude mcp add v -- node", &|i| format!(" $V{i}"));
+        let started = std::time::Instant::now();
+        for text in [&lines, &vars] {
+            let pasted = Pasted::parse(text).unwrap();
+            assert_eq!(pasted.servers.len(), 1);
+            assert!(pasted.notes.len() <= 6, "{}", pasted.notes.len());
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
