@@ -2,6 +2,7 @@
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::{ConfigPaths, fsx};
 use crate::api::{Approval, OAuthInfo, Scope, ServerRow, Snapshot, Status, TransportKind};
+use crate::model::ConnectionId;
 use crate::sanitize::{self, sanitize};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -87,20 +88,22 @@ pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>)
         let mut seen_local = BTreeSet::new();
         // This project's local rows are the ones pushed from here on in this iteration.
         let local_start = snap.servers.len();
-        for value in &project.values {
+        for (value, key) in project.values.iter().zip(&project.keys) {
             let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
                 continue;
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
-                    snap.servers.push(row(
+                    let mut r = row(
                         name,
                         entry,
                         Scope::Local,
                         Some(&project.display),
                         !disabled.contains(name),
                         Status::Unknown,
-                    ));
+                    );
+                    r.connection = ConnectionId::new(Scope::Local, Some(key), name);
+                    snap.servers.push(r);
                 }
             }
         }
@@ -139,6 +142,7 @@ pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>)
                         hint,
                     );
                     r.approval = Some(approval);
+                    r.connection = ConnectionId::new(Scope::Project, Some(&project.raw), &name);
                     r.shadowed = snap.servers[local_start..]
                         .iter()
                         .any(|o| o.scope == Scope::Local && o.name == r.name);
@@ -167,6 +171,8 @@ fn row(
 ) -> ServerRow {
     let (transport, target) = classify(entry);
     ServerRow {
+        // From the keys as the file spells them; callers with a project set it from that project's key.
+        connection: ConnectionId::new(scope, project, name),
         name: clip(&sanitize(name)),
         scope,
         project: project.map(|p| clip(&sanitize(p))),
@@ -321,6 +327,8 @@ struct Project<'a> {
     raw: String,
     display: String,
     values: Vec<&'a Value>,
+    /// The spelling of the key each of `values` is filed under, for the ids of the servers in it.
+    keys: Vec<&'a str>,
 }
 
 /// Claude may record one directory under several spellings (`c:\x`, `C:/x/`); merge them.
@@ -338,9 +346,13 @@ fn merged_projects(root: &serde_json::Map<String, Value>) -> BTreeMap<String, Pr
                 raw: path.clone(),
                 display: normalise_project(path),
                 values: Vec::new(),
-            })
-            .values
-            .push(value);
+                keys: Vec::new(),
+            });
+        let project = out
+            .get_mut(&normalise_project(path))
+            .expect("just inserted");
+        project.values.push(value);
+        project.keys.push(path);
     }
     out
 }
@@ -837,6 +849,45 @@ mod tests {
         assert_eq!(
             find(&s, Scope::Local, "on").project.as_deref(),
             Some(normalise_project(&p.to_string_lossy()).as_str())
+        );
+    }
+
+    #[test]
+    fn each_row_knows_its_connection_id_from_the_keys_on_disk() {
+        // Shown names and paths are cleaned for display; the id is made from what the file says, like v1's.
+        let e = Env::new();
+        let p = e.project("app");
+        std::fs::write(
+            p.join(".mcp.json"),
+            r#"{"mcpServers":{"docs":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        let spelled = format!("{}\\", p.to_string_lossy());
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"gh\u{1b}[2Jub": {"command": "x"}},
+                "projects": {
+                    p.to_string_lossy(): {},
+                    spelled.clone(): {"mcpServers": {"loc": {"command": "y"}}}
+                }
+            }),
+        );
+        let s = e.load();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        assert_ne!(user.name, "gh\u{1b}[2Jub", "shown cleaned");
+        assert_eq!(
+            user.connection,
+            ConnectionId::new(Scope::User, None, "gh\u{1b}[2Jub")
+        );
+        assert_eq!(
+            find(&s, Scope::Local, "loc").connection,
+            ConnectionId::new(Scope::Local, Some(&spelled), "loc")
+        );
+        let docs = find(&s, Scope::Project, "docs");
+        assert_eq!(
+            ConnectionId::parse(docs.connection.as_str()).unwrap().2,
+            "docs"
         );
     }
 
