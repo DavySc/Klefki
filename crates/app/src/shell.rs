@@ -208,6 +208,10 @@ pub struct ShellApp {
     grid_cache: Option<(String, Arc<[GridRow]>)>,
     /// The notice about old switch-off lists, for the snapshot it was built from.
     legacy_cache: Option<(Arc<Snapshot>, Arc<LegacyNotice>)>,
+    /// The servers drawn in the grid at the last change, as told to the engine (its background checks do these
+    /// first), and a buffer for this frame's: compared each frame, sent only when they differ.
+    on_screen: Vec<usize>,
+    on_screen_now: Vec<usize>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
     cli_version: Option<String>,
@@ -248,6 +252,8 @@ impl ShellApp {
             core: None,
             live: vec![None; snapshot.servers.len()],
             grid_cache: None,
+            on_screen: Vec::new(),
+            on_screen_now: Vec::new(),
             live_gen: 0,
             explained: None,
             legacy_cache: None,
@@ -336,6 +342,8 @@ impl ShellApp {
                     .retain(|id, _| new_index.contains_key(&id.connection));
                 self.selected = selected;
                 self.live = live;
+                // Positions now mean other servers: tell the engine again.
+                self.on_screen.clear();
                 if self
                     .editor
                     .as_ref()
@@ -471,6 +479,12 @@ impl ShellApp {
             Some(live) => (live.status, live.detail.as_deref()),
             None => (self.snapshot.servers[i].status, None),
         }
+    }
+
+    /// Row `i` shows what Claude's cache last said, not an answer of this session's own checks. The cache can be
+    /// days old, so it says so until the check answers.
+    fn last_known(&self, i: usize) -> bool {
+        self.live.get(i).is_some_and(Option::is_none) && self.snapshot.servers[i].status_cached
     }
 
     /// What the engine's latest answer for row `i` most likely means, in plain words.
@@ -1950,6 +1964,9 @@ impl ShellApp {
         let mut clicked = None;
         // Group headers may run across the row's empty cells, but no further than the table itself.
         let right = ui.max_rect().right();
+        // Only the rows in view are drawn, so the ones drawn are the ones on screen.
+        let mut shown = std::mem::take(&mut self.on_screen_now);
+        shown.clear();
         TableBuilder::new(ui)
             .striped(true)
             .sense(Sense::click())
@@ -1974,6 +1991,7 @@ impl ShellApp {
                         }
                     }
                     GridRow::Server(i) => {
+                        shown.push(*i);
                         let s = &self.snapshot.servers[*i];
                         row.set_selected(self.selected.contains(i));
                         row.col(|ui| name_cell(ui, s, project_count));
@@ -1982,7 +2000,8 @@ impl ShellApp {
                         });
                         let (status, detail) = self.effective(*i);
                         let hint = self.hint(*i);
-                        row.col(|ui| status_cell(ui, s, status, detail, hint));
+                        let last_known = self.last_known(*i);
+                        row.col(|ui| status_cell(ui, s, status, detail, hint, last_known));
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
                         });
@@ -1992,6 +2011,18 @@ impl ShellApp {
                     }
                 });
             });
+        if shown == self.on_screen {
+            self.on_screen_now = shown;
+        } else {
+            let servers = &self.snapshot.servers;
+            self.send(Command::Visible(
+                shown
+                    .iter()
+                    .map(|&i| servers[i].connection.clone())
+                    .collect(),
+            ));
+            self.on_screen_now = std::mem::replace(&mut self.on_screen, shown);
+        }
         if let Some(i) = clicked {
             if ctrl {
                 if !self.selected.remove(&i) {
@@ -2162,7 +2193,11 @@ impl ShellApp {
                     .max_col_width(col_width)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Status").color(pal.text_muted));
-                        ui.label(status.label());
+                        if self.last_known(i) {
+                            ui.label(format!("{} (last known)", status.label()));
+                        } else {
+                            ui.label(status.label());
+                        }
                         ui.end_row();
                         if explanation.is_none() {
                             ui.label(RichText::new("Detail").color(pal.text_muted));
@@ -3537,12 +3572,15 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     }
 }
 
+const LAST_KNOWN: &str = "What Claude Code last saw, from its own cache, which can be old.";
+
 fn status_cell(
     ui: &mut Ui,
     s: &ServerRow,
     status: Status,
     detail: Option<&str>,
     hint: Option<&Hint>,
+    last_known: bool,
 ) {
     let pal = theme::palette(ui.ctx());
     if !s.enabled {
@@ -3562,7 +3600,25 @@ fn status_cell(
         Status::Checking => pal.primary,
         Status::NotConfigured | Status::Unknown => pal.text_muted,
     };
-    let response = ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color));
+    let response = if last_known {
+        // A status from Claude's cache: a ring in the status colour and muted words, not a dot. The column has no
+        // room for words that say so; the tooltip and the Status tab do. Both colours keep the palette's contrast.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "\u{25CB} ",
+            0.0,
+            egui::TextFormat::simple(font.clone(), color),
+        );
+        job.append(
+            status.label(),
+            0.0,
+            egui::TextFormat::simple(font, pal.text_muted),
+        );
+        ui.label(job)
+    } else {
+        ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color))
+    };
     match status {
         Status::Failed | Status::NeedsAuth | Status::Degraded => {
             // Not egui's tooltip, which waits half a second for a perfectly still pointer over the words alone:
@@ -3574,12 +3630,15 @@ fn status_cell(
                         ui.set_max_width(560.0);
                         explanation.show(ui, ui.id().with("tooltip"));
                     }
+                    if last_known {
+                        ui.label(RichText::new(LAST_KNOWN).color(pal.text_muted));
+                    }
                 });
             }
         }
         _ => {
-            if let Some(detail) = detail {
-                response.on_hover_text(detail);
+            if let Some(text) = detail.or(last_known.then_some(LAST_KNOWN)) {
+                response.on_hover_text(text);
             }
         }
     }
@@ -3794,6 +3853,7 @@ mod tests {
             approval: None,
             shadowed: false,
             casing_collision: false,
+            status_cached: false,
             oauth: None,
         };
         let mut h = harness_with(Snapshot {
@@ -3918,6 +3978,7 @@ mod tests {
             approval: None,
             shadowed: false,
             casing_collision: false,
+            status_cached: false,
             oauth: None,
         }
     }
@@ -4172,6 +4233,85 @@ mod tests {
     }
 
     #[test]
+    fn a_status_from_claudes_cache_says_it_is_last_known_until_its_check_answers() {
+        // Bug: a cached "Connected" looked like a fresh answer, though the cache can be days old.
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("known", Scope::User, None);
+        row.status = Status::Connected;
+        row.status_cached = true;
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        h.run();
+        h.get_by_label("\u{25CB} Connected");
+        h.state_mut().selected.insert(0);
+        h.state_mut().tab = DetailTab::Status;
+        h.run();
+        h.get_by_label("Connected (last known)");
+
+        engine
+            .events
+            .send(status_event(&row, Status::Failed, Some("boom")))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("last known").is_none());
+        assert!(h.query_by_label_contains("\u{25CB}").is_none());
+        h.get_by_label("\u{25CF} Failed");
+    }
+
+    #[test]
+    fn only_statuses_from_claudes_cache_are_marked_last_known() {
+        let (mut h, engine) = live_harness();
+        let mut rows = Vec::new();
+        for (name, status, cached) in [
+            ("auth", Status::NeedsAuth, true),
+            ("bad", Status::Failed, true),
+            // Claude wrote it minutes ago: as good as a check.
+            ("recent", Status::NeedsAuth, false),
+            ("new", Status::Unknown, false),
+            ("waiting", Status::PendingApproval, false),
+        ] {
+            let mut row = live_row(name, Scope::User, None);
+            row.status = status;
+            row.status_cached = cached;
+            rows.push(row);
+        }
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+        assert_eq!(h.query_all_by_label("\u{25CB} Needs auth").count(), 1);
+        assert_eq!(h.query_all_by_label("\u{25CF} Needs auth").count(), 1);
+        h.get_by_label("\u{25CB} Failed");
+        h.get_by_label("\u{25CF} Not checked");
+        h.get_by_label("\u{25CF} Pending approval");
+    }
+
+    #[test]
+    fn the_engine_is_told_which_servers_are_on_screen_when_that_changes() {
+        let (mut h, engine) = live_harness();
+        let rows: Vec<ServerRow> = (0..60)
+            .map(|i| live_row(&format!("s{i:02}"), Scope::User, None))
+            .collect();
+        engine.events.send(snapshot_of(rows.clone())).unwrap();
+        h.run();
+        let told = visible_sent(&engine);
+        assert_eq!(told.len(), 1, "once, not every frame: {told:?}");
+        let shown = &told[0];
+        assert!(
+            !shown.is_empty() && shown.len() < rows.len(),
+            "only those in view: {}",
+            shown.len()
+        );
+        assert_eq!(shown[0], rows[0].connection);
+        h.run();
+        assert!(
+            visible_sent(&engine).is_empty(),
+            "nothing changed, nothing sent"
+        );
+        // A search changes what is in view.
+        h.state_mut().search = "s59".to_owned();
+        h.run();
+        assert_eq!(visible_sent(&engine), [vec![rows[59].connection.clone()]]);
+    }
+
+    #[test]
     fn every_status_has_its_own_readable_label() {
         let (mut h, engine) = live_harness();
         let statuses = [
@@ -4294,9 +4434,9 @@ mod tests {
         h.get_by_label_contains("runs this server's command");
         h.get_by_label_contains("Check now").click();
         h.run();
-        let sent = engine.commands.try_recv().expect("a command was sent");
+        let sent = next_command(&engine).expect("a command was sent");
         assert_eq!(sent, klefki_core::api::Command::Check(row.id()));
-        assert!(engine.commands.try_recv().is_err(), "exactly one command");
+        assert!(next_command(&engine).is_none(), "exactly one command");
     }
 
     #[test]
@@ -4536,10 +4676,10 @@ mod tests {
         h.get_by_label("Diagnose").click();
         h.run();
         assert_eq!(
-            engine.commands.try_recv().unwrap(),
+            next_command(&engine).unwrap(),
             klefki_core::api::Command::Diagnose(row.id())
         );
-        assert!(engine.commands.try_recv().is_err(), "exactly one command");
+        assert!(next_command(&engine).is_none(), "exactly one command");
         // While a check or diagnosis is running, asking again would only queue a duplicate.
         engine
             .events
@@ -4723,12 +4863,39 @@ mod tests {
         )
     }
 
+    /// The commands sent since the last drain, without [`Command::Visible`]: the grid sends that by itself whenever
+    /// the rows in view change, and it asks for nothing (see `visible_sent`).
     fn drain(engine: &klefki_core::api::Detached) -> Vec<Command> {
+        drain_all(engine)
+            .into_iter()
+            .filter(|c| !matches!(c, Command::Visible(_)))
+            .collect()
+    }
+
+    /// The next command other than [`Command::Visible`].
+    fn next_command(engine: &klefki_core::api::Detached) -> Option<Command> {
+        std::iter::from_fn(|| engine.commands.try_recv().ok())
+            .find(|c| !matches!(c, Command::Visible(_)))
+    }
+
+    fn drain_all(engine: &klefki_core::api::Detached) -> Vec<Command> {
         let mut out = Vec::new();
         while let Ok(c) = engine.commands.try_recv() {
             out.push(c);
         }
         out
+    }
+
+    fn visible_sent(
+        engine: &klefki_core::api::Detached,
+    ) -> Vec<Vec<klefki_core::api::ConnectionId>> {
+        drain_all(engine)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::Visible(v) => Some(v),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

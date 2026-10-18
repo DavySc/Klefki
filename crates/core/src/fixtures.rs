@@ -77,6 +77,7 @@ pub(crate) fn load() -> Snapshot {
                 }),
                 shadowed: s.shadowed,
                 casing_collision: s.casing_collision,
+                status_cached: false,
                 oauth: None,
             })
             .collect(),

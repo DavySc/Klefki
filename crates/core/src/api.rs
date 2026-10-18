@@ -167,6 +167,9 @@ pub struct ServerRow {
     pub approval: Option<Approval>,
     pub shadowed: bool,
     pub casing_collision: bool,
+    /// `status` is what Claude's own cache last said, which can be old, not an answer klefki got itself. Such rows
+    /// are checked again in the background; until then the app shows the status as last known.
+    pub status_cached: bool,
     /// Which connection this is, from its scope, project key and name as the file has them (the same id as v1's):
     /// the key its secret is stored under.
     pub connection: crate::model::ConnectionId,
