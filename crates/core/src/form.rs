@@ -1,6 +1,7 @@
 //! The Add dialog's form: a new server's parts as the user types them, turned into a definition that is checked and
 //! described the way a pasted one is, and a definition turned back into parts (to finish a pasted server there).
 use crate::api::TransportKind;
+use crate::config::entry;
 use crate::paste::{self, PastedServer};
 use crate::sanitize::sanitize;
 use serde_json::{Map, Value};
@@ -18,14 +19,19 @@ pub struct ServerFields {
     pub env: Vec<(String, String)>,
     /// Headers sent with every request. Http and sse only.
     pub headers: Vec<(String, String)>,
-    /// Signs in with OAuth. Http and sse only. The client secret is not a part: it never goes in a definition.
+    /// The provider gave OAuth client settings. Http and sse only; with none filled in (and no client secret)
+    /// there are none, as most servers sign the user in without them.
     pub oauth: bool,
     /// Optional: without it Claude Code registers itself with the server.
     pub client_id: String,
+    /// A client secret was typed. The secret itself is not a part: it never goes in a definition.
+    pub has_secret: bool,
     /// Optional: a fixed port for the sign-in to come back to, for servers that need it registered.
     pub callback_port: String,
     /// Optional, separated by spaces.
     pub scopes: String,
+    /// Optional: where the sign-in server describes itself, when it is not found on its own. https only.
+    pub metadata_url: String,
 }
 
 impl Default for ServerFields {
@@ -38,19 +44,38 @@ impl Default for ServerFields {
             headers: Vec::new(),
             oauth: false,
             client_id: String::new(),
+            has_secret: false,
             callback_port: String::new(),
             scopes: String::new(),
+            metadata_url: String::new(),
         }
     }
 }
 
+/// The part of the form a problem is about, so it is said next to that part.
+/// Ordered as the form shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Part {
+    Command,
+    Address,
+    Variables,
+    Headers,
+    ClientId,
+    CallbackPort,
+    Scopes,
+    MetadataUrl,
+    /// The definition as a whole: a rule no single part breaks, such as its size.
+    Definition,
+}
+
 impl ServerFields {
     /// The server these parts make, called `name`, as a pasted one would be: its definition, a one-line summary,
-    /// why it cannot be added yet (the first thing to fix), and hints about secrets typed into values.
+    /// why it cannot be added yet (the first thing to fix; [`problems`](Self::problems) has them all), and hints.
     pub fn read(&self, name: &str) -> PastedServer {
         let mut notes = Vec::new();
-        let mut server = match self.definition(&mut notes) {
-            Ok(entry) => {
+        let (entry, problems) = self.definition(&mut notes);
+        let mut server = match problems.into_iter().next() {
+            None => {
                 let mut server = PastedServer::with_entry(name, entry, &mut notes);
                 // The form says which values look like secrets next to each one (see [`secret_reference`]).
                 server.hints = serde_json::from_str(&server.json)
@@ -58,99 +83,188 @@ impl ServerFields {
                     .unwrap_or_default();
                 server
             }
-            Err(problem) => PastedServer::refused(name, problem),
+            Some((_, problem)) => PastedServer::refused(name, problem),
         };
         server.hints.extend(notes);
         server
     }
 
-    fn definition(&self, notes: &mut Vec<String>) -> Result<Value, String> {
+    /// Everything that stops these parts from making a server, each with the part it is about, in the form's order.
+    pub fn problems(&self) -> Vec<(Part, String)> {
+        let (entry, mut problems) = self.definition(&mut Vec::new());
+        if problems.is_empty()
+            && let Some(problem) = PastedServer::with_entry("", entry, &mut Vec::new()).problem
+        {
+            problems.push((Part::Definition, problem));
+        }
+        problems
+    }
+
+    /// The definition, and what is wrong with each part (nothing, when it can be added).
+    fn definition(&self, notes: &mut Vec<String>) -> (Value, Vec<(Part, String)>) {
         let mut entry = Map::new();
+        let mut problems = Vec::new();
         match self.transport {
             TransportKind::Stdio => {
-                let lexed = paste::lex(&self.command);
-                let words = match lexed.commands.as_slice() {
-                    [] => return Err("Type the command that starts the server.".to_owned()),
-                    [one] => match one.shell {
-                        Some(what) => {
-                            return Err(format!(
-                                "The command uses the shell ({what}). Claude Code starts the program directly, without a shell."
-                            ));
-                        }
-                        None => &one.words,
-                    },
-                    _ => {
-                        return Err(
-                            "Type one command. Claude Code starts the program directly, without a shell."
-                                .to_owned(),
+                entry.insert("type".into(), "stdio".into());
+                match self.command_words(notes) {
+                    Ok(words) => {
+                        entry.insert("command".into(), words[0].clone().into());
+                        entry.insert(
+                            "args".into(),
+                            words[1..].iter().map(|w| Value::from(w.as_str())).collect(),
                         );
                     }
-                };
-                if !lexed.variables.is_empty() {
-                    let names: Vec<String> = lexed
-                        .variables
-                        .iter()
-                        .map(|v| format!("${{{v}}}"))
-                        .collect();
-                    notes.push(format!(
-                        "Claude Code fills in {} from its own environment when it starts the server.",
-                        names.join(", ")
-                    ));
+                    Err(problem) => problems.push((Part::Command, problem)),
                 }
-                entry.insert("type".into(), "stdio".into());
-                entry.insert("command".into(), words[0].clone().into());
-                entry.insert(
-                    "args".into(),
-                    words[1..].iter().map(|w| Value::from(w.as_str())).collect(),
-                );
-                if self.oauth {
-                    return Err("Only a server with an address signs in with OAuth.".to_owned());
-                }
-                if let Some(env) = pairs("variable", &self.env)? {
-                    entry.insert("env".into(), env);
+                // A program does not sign in with OAuth: settings left from an address are not shown, and not used.
+                match pairs("variable", &self.env) {
+                    Ok(Some(env)) => {
+                        entry.insert("env".into(), env);
+                    }
+                    Ok(None) => {}
+                    Err(problem) => problems.push((Part::Variables, problem)),
                 }
             }
             TransportKind::Http | TransportKind::Sse => {
                 let url = self.url.trim();
-                if url.is_empty() {
-                    return Err("Type the server's address.".to_owned());
-                }
                 entry.insert("type".into(), self.transport.label().into());
                 entry.insert("url".into(), url.into());
-                if let Some(headers) = pairs("header", &self.headers)? {
-                    entry.insert("headers".into(), headers);
+                if let Err(problem) = address_problem(&entry) {
+                    problems.push((Part::Address, problem));
+                }
+                match pairs("header", &self.headers) {
+                    Ok(Some(headers)) => {
+                        entry.insert("headers".into(), headers);
+                    }
+                    Ok(None) => {}
+                    Err(problem) => problems.push((Part::Headers, problem)),
                 }
                 if self.oauth {
-                    entry.insert("oauth".into(), self.oauth_settings()?);
+                    let (oauth, wrong) = self.oauth_settings();
+                    problems.extend(wrong);
+                    if !oauth.is_empty() || self.has_secret {
+                        entry.insert("oauth".into(), Value::Object(oauth));
+                    }
                 }
             }
             TransportKind::Ws | TransportKind::Invalid => {
-                return Err("Choose a program (stdio), http or sse.".to_owned());
+                problems.push((
+                    Part::Address,
+                    "Choose a program (stdio), http or sse.".to_owned(),
+                ));
             }
         }
-        Ok(Value::Object(entry))
+        problems.sort_by_key(|(part, _)| *part);
+        (Value::Object(entry), problems)
     }
 
-    fn oauth_settings(&self) -> Result<Value, String> {
+    fn command_words(&self, notes: &mut Vec<String>) -> Result<Vec<String>, String> {
+        let lexed = paste::lex(&self.command);
+        let words = match lexed.commands.as_slice() {
+            [] => return Err("Type the command that starts the server.".to_owned()),
+            [one] => match one.shell {
+                Some(what) => {
+                    return Err(format!(
+                        "The command uses the shell ({what}). Claude Code starts the program directly, without a shell."
+                    ));
+                }
+                None => one.words.clone(),
+            },
+            _ => {
+                return Err(
+                    "Type one command. Claude Code starts the program directly, without a shell."
+                        .to_owned(),
+                );
+            }
+        };
+        if !lexed.variables.is_empty() {
+            let names: Vec<String> = lexed
+                .variables
+                .iter()
+                .map(|v| format!("${{{v}}}"))
+                .collect();
+            notes.push(format!(
+                "Claude Code fills in {} from its own environment when it starts the server.",
+                names.join(", ")
+            ));
+        }
+        Ok(words)
+    }
+
+    /// The `oauth` settings filled in, and what is wrong with any of them.
+    fn oauth_settings(&self) -> (Map<String, Value>, Vec<(Part, String)>) {
         let mut oauth = Map::new();
+        let mut wrong = Vec::new();
         let id = self.client_id.trim();
         if !id.is_empty() {
             oauth.insert("clientId".into(), id.into());
         }
         let port = self.callback_port.trim();
         if !port.is_empty() {
-            let port = port
-                .parse::<u16>()
-                .ok()
-                .filter(|p| *p > 0)
-                .ok_or("The callback port must be a number from 1 to 65535.")?;
-            oauth.insert("callbackPort".into(), port.into());
+            match port.parse::<u16>().ok().filter(|p| *p > 0) {
+                Some(port) => {
+                    oauth.insert("callbackPort".into(), port.into());
+                }
+                None => wrong.push((
+                    Part::CallbackPort,
+                    "The callback port must be a number from 1 to 65535.".to_owned(),
+                )),
+            }
         }
         let scopes = self.scopes.split_whitespace().collect::<Vec<_>>().join(" ");
         if !scopes.is_empty() {
             oauth.insert("scopes".into(), scopes.into());
         }
-        Ok(Value::Object(oauth))
+        let metadata = self.metadata_url.trim();
+        if !metadata.is_empty() {
+            oauth.insert("authServerMetadataUrl".into(), metadata.into());
+        }
+        // Each setting on its own, by Claude Code's rules, so a problem is said next to its field.
+        for (key, part) in [
+            ("clientId", Part::ClientId),
+            ("scopes", Part::Scopes),
+            ("authServerMetadataUrl", Part::MetadataUrl),
+        ] {
+            let Some(value) = oauth.get(key) else {
+                continue;
+            };
+            let alone = serde_json::json!({"type": "http", "url": "https://x.invalid", "oauth": {key: value}});
+            if let Err(why) = entry::validate_new(&alone) {
+                wrong.push((part, sentence(&why)));
+            }
+        }
+        (oauth, wrong)
+    }
+
+    /// Puts `https://` before an address typed without a scheme (`mcp.example.com/mcp`), as a browser does.
+    pub fn complete_url(&mut self) {
+        let url = self.url.trim();
+        if !url.is_empty() && !url.contains("://") && !url.contains(char::is_whitespace) {
+            self.url = format!("https://{url}");
+        }
+    }
+
+    /// A name for the server, from what it connects to or runs: `linear` for `https://mcp.linear.app/mcp`,
+    /// `filesystem` for `npx -y @modelcontextprotocol/server-filesystem`. Empty when nothing gives one.
+    pub fn suggested_name(&self) -> String {
+        let raw = match self.transport {
+            TransportKind::Stdio => program_name(&self.command),
+            _ => host_name(&self.url),
+        };
+        let name: String = raw
+            .unwrap_or_default()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .take(64)
+            .collect();
+        name.trim_matches('-').to_ascii_lowercase()
     }
 
     /// The parts of `json`, a definition, to finish in the form: `None` when it has anything the form does not
@@ -199,30 +313,135 @@ impl ServerFields {
                 fields.headers = list("headers")?;
                 if let Some(oauth) = object.get("oauth") {
                     let oauth = oauth.as_object()?;
-                    let known = ["clientId", "callbackPort", "scopes"];
+                    let known = [
+                        "clientId",
+                        "callbackPort",
+                        "scopes",
+                        "authServerMetadataUrl",
+                    ];
                     if oauth.keys().any(|k| !known.contains(&k.as_str())) {
                         return None;
                     }
                     fields.oauth = true;
-                    let get = |key: &str| oauth.get(key);
-                    fields.client_id = match get("clientId") {
-                        None => String::new(),
-                        Some(v) => v.as_str()?.to_owned(),
+                    let get = |key: &str| -> Option<String> {
+                        match oauth.get(key) {
+                            None => Some(String::new()),
+                            Some(Value::Number(n)) if key == "callbackPort" => {
+                                Some(n.as_u64()?.to_string())
+                            }
+                            Some(v) => Some(v.as_str()?.to_owned()),
+                        }
                     };
-                    fields.callback_port = match get("callbackPort") {
-                        None => String::new(),
-                        Some(v) => v.as_u64()?.to_string(),
-                    };
-                    fields.scopes = match get("scopes") {
-                        None => String::new(),
-                        Some(v) => v.as_str()?.to_owned(),
-                    };
+                    fields.client_id = get("clientId")?;
+                    fields.callback_port = get("callbackPort")?;
+                    fields.scopes = get("scopes")?;
+                    fields.metadata_url = get("authServerMetadataUrl")?;
                 }
             }
             _ => return None,
         }
         Some(fields)
     }
+}
+
+/// What is wrong with the address of `entry`, a remote definition with only its type and url, said so the user
+/// knows what to type.
+fn address_problem(entry: &Map<String, Value>) -> Result<(), String> {
+    let url = entry.get("url").and_then(Value::as_str).unwrap_or_default();
+    if url.is_empty() {
+        return Err("Type the server's address.".to_owned());
+    }
+    if !url.contains("://") {
+        return Err("Start the address with https://.".to_owned());
+    }
+    entry::validate(&Value::Object(entry.clone())).map_err(|why| sentence(&why))
+}
+
+fn sentence(why: &str) -> String {
+    let mut c = why.chars();
+    let mut out: String = c
+        .next()
+        .map(|f| f.to_uppercase().collect())
+        .unwrap_or_default();
+    out.push_str(c.as_str());
+    if !out.ends_with('.') {
+        out.push('.');
+    }
+    out
+}
+
+/// The label of the host that names the service: `linear` in `mcp.linear.app`, `githubcopilot` in
+/// `api.githubcopilot.com`. `None` for an address with no such label, such as an IP address.
+fn host_name(url: &str) -> Option<String> {
+    let url = url.trim();
+    let full = if url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
+    };
+    let host = url::Url::parse(&full).ok()?.host_str()?.to_owned();
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return None;
+    }
+    let mut labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if labels.len() > 1 {
+        labels.pop();
+    }
+    labels
+        .into_iter()
+        .rev()
+        .find(|l| !matches!(*l, "mcp" | "api" | "www" | "server" | "co" | "com"))
+        .map(str::to_owned)
+}
+
+/// The package or program a command runs, without what every server's name has: `filesystem` for
+/// `npx -y @modelcontextprotocol/server-filesystem /srv`, `github` for `C:\tools\github-mcp-server.exe`.
+fn program_name(command: &str) -> Option<String> {
+    let lexed = paste::lex(command);
+    let words = &lexed.commands.first()?.words;
+    let stem = |w: &str| -> String {
+        let file = w.rsplit(['/', '\\']).next().unwrap_or(w);
+        let file = file
+            .strip_suffix(".exe")
+            .or_else(|| file.strip_suffix(".js"))
+            .or_else(|| file.strip_suffix(".py"))
+            .or_else(|| file.strip_suffix(".jar"))
+            .unwrap_or(file);
+        file.to_owned()
+    };
+    let launchers = [
+        "npx", "uvx", "bunx", "pnpx", "node", "python", "python3", "py", "deno", "bun", "uv",
+        "pnpm", "yarn", "docker", "podman", "java", "dotnet",
+    ];
+    let program = stem(words.first()?).to_ascii_lowercase();
+    let what = if launchers.contains(&program.as_str()) {
+        // The first word after the launcher that is not an option or a launcher's own verb.
+        let verbs = ["run", "dlx", "exec", "x", "tool"];
+        let found = words[1..]
+            .iter()
+            .find(|w| !verbs.contains(&w.as_str()) && !w.starts_with('-'))?;
+        // A package's scope and version are not its name: `@x/fs@1.2` is `fs`.
+        let package = found.rsplit('/').next()?;
+        let package = package.split_once('@').map_or(package, |(p, _)| p);
+        let package = package.split_once(':').map_or(package, |(p, _)| p);
+        stem(package)
+    } else {
+        program
+    };
+    let mut name = what.to_ascii_lowercase();
+    for prefix in ["mcp-server-", "server-", "mcp-"] {
+        if let Some(rest) = name.strip_prefix(prefix).filter(|r| !r.is_empty()) {
+            name = rest.to_owned();
+            break;
+        }
+    }
+    for suffix in ["-mcp-server", "-mcp", "-server", "_mcp"] {
+        if let Some(rest) = name.strip_suffix(suffix).filter(|r| !r.is_empty()) {
+            name = rest.to_owned();
+            break;
+        }
+    }
+    (!name.is_empty()).then_some(name)
 }
 
 /// The `${VAR}` reference to write instead of `value`, the value of the variable or header `name`, when it looks
@@ -361,20 +580,127 @@ mod tests {
                    "oauth": {"clientId": "client-7", "callbackPort": 8123, "scopes": "read write"}})
         );
         assert_eq!(keys(&d), ["type", "url", "headers", "oauth"]);
-        // OAuth with nothing filled in: Claude Code registers itself.
+        // Ticked with nothing filled in: no settings, so none are written, and the server is added like any other
+        // (most servers sign the user in without client settings).
         let mut bare = remote("https://x.example");
         bare.transport = TransportKind::Sse;
         bare.oauth = true;
         assert_eq!(
             definition(&bare.read("x")),
+            json!({"type": "sse", "url": "https://x.example"})
+        );
+        // A client secret alone still needs Claude Code's command, which takes it.
+        bare.has_secret = true;
+        assert_eq!(
+            definition(&bare.read("x")),
             json!({"type": "sse", "url": "https://x.example", "oauth": {}})
+        );
+        // As does a metadata address, the one setting it has that the others do not show.
+        bare.has_secret = false;
+        bare.metadata_url = "https://id.example/.well-known/oauth".into();
+        assert_eq!(
+            definition(&bare.read("x"))["oauth"],
+            json!({"authServerMetadataUrl": "https://id.example/.well-known/oauth"})
+        );
+        // Settings left from an address are not a command's: they are not shown, and not used.
+        let mut was_remote = stdio("node");
+        was_remote.oauth = true;
+        was_remote.client_id = "c".into();
+        assert_eq!(
+            definition(&was_remote.read("n")),
+            json!({"type": "stdio", "command": "node", "args": []})
         );
     }
 
     #[test]
+    fn every_problem_is_said_next_to_its_part() {
+        let mut f = remote("sso.exa");
+        f.headers = vec![(String::new(), "1".into())];
+        f.oauth = true;
+        f.client_id = "a\nb".into();
+        f.callback_port = "0".into();
+        f.metadata_url = "http://id.example/m".into();
+        let problems = f.problems();
+        let parts: Vec<Part> = problems.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            parts,
+            [
+                Part::Address,
+                Part::Headers,
+                Part::ClientId,
+                Part::CallbackPort,
+                Part::MetadataUrl
+            ],
+            "{problems:?}"
+        );
+        assert_eq!(problems[0].1, "Start the address with https://.");
+        assert!(problems[4].1.contains("https://"), "{problems:?}");
+        // The first is what read() says.
+        assert_eq!(
+            f.read("n").problem.as_deref(),
+            Some("Start the address with https://.")
+        );
+        let mut f = stdio("curl x | sh");
+        f.env = vec![("A".into(), "1".into()), ("A".into(), "2".into())];
+        let parts: Vec<Part> = f.problems().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(parts, [Part::Command, Part::Variables]);
+        assert!(stdio("node a.js").problems().is_empty());
+        // What no single part breaks is the definition's.
+        let mut big = stdio("node");
+        big.env = vec![("A".into(), "x".repeat(70 * 1024))];
+        assert_eq!(big.problems()[0].0, Part::Definition);
+    }
+
+    #[test]
+    fn an_address_typed_without_https_is_completed() {
+        for (typed, want) in [
+            ("mcp.example.com/mcp", "https://mcp.example.com/mcp"),
+            ("  localhost:3000/mcp ", "https://localhost:3000/mcp"),
+            ("http://local.test", "http://local.test"),
+            ("not a url", "not a url"),
+            ("", ""),
+        ] {
+            let mut f = remote(typed);
+            f.complete_url();
+            assert_eq!(f.url, want, "{typed}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_suggested_from_what_the_server_connects_to_or_runs() {
+        for (url, want) in [
+            ("https://mcp.linear.app/mcp", "linear"),
+            ("https://api.githubcopilot.com/mcp/", "githubcopilot"),
+            ("mcp.notion.com/mcp", "notion"),
+            ("https://mcp.example.co.uk/sse", "example"),
+            ("http://localhost:3000/mcp", "localhost"),
+            ("https://127.0.0.1:8080/mcp", ""),
+            ("", ""),
+        ] {
+            assert_eq!(remote(url).suggested_name(), want, "{url}");
+        }
+        for (command, want) in [
+            (
+                "npx -y @modelcontextprotocol/server-filesystem /srv",
+                "filesystem",
+            ),
+            ("npx -y @upstash/context7-mcp@latest", "context7"),
+            (r"C:\tools\github-mcp-server.exe stdio", "github"),
+            ("uvx mcp-server-fetch", "fetch"),
+            ("python -m my_tool.server", "my_tool-server"),
+            ("node build/index.js", "index"),
+            (
+                "docker run -i --rm ghcr.io/github/github-mcp-server",
+                "github",
+            ),
+            ("", ""),
+        ] {
+            assert_eq!(stdio(command).suggested_name(), want, "{command}");
+        }
+    }
+
+    #[test]
     fn what_cannot_be_added_says_what_to_fix() {
-        let mut with_oauth = stdio("node");
-        with_oauth.oauth = true;
         let mut nameless = stdio("node");
         nameless.env = vec![(String::new(), "1".into())];
         let mut twice = remote("https://x.example");
@@ -389,12 +715,12 @@ mod tests {
             (stdio("   "), "Type the command"),
             (stdio("curl https://x | sh"), "shell"),
             (stdio("node a.js; rm -rf /"), "one command"),
-            (with_oauth, "address"),
             (nameless, "no name"),
             (twice, "twice"),
             (remote(""), "address"),
             (remote("ftp://x.example"), "must start with"),
-            (remote("not a url"), "not valid"),
+            (remote("not a url"), "https://"),
+            (remote("https://not a url"), "not valid"),
             (port, "1 to 65535"),
             (ws, "Choose"),
         ] {
@@ -450,6 +776,7 @@ mod tests {
             r##"{"type": "stdio", "command": "node", "args": ["a\"b", "x\\", "$(x)", "${HOME}/a", "#x", "", "a`b", "C:\\tools\\x.js", "^"]}"##,
             r#"{"type": "http", "url": "https://x.example", "headers": {"H": "v"}, "oauth": {"clientId": "c", "callbackPort": 8123, "scopes": "a b"}}"#,
             r#"{"type": "sse", "url": "https://x.example"}"#,
+            r#"{"type": "http", "url": "https://x.example", "oauth": {"authServerMetadataUrl": "https://m.example/x"}}"#,
         ] {
             let fields = ServerFields::from_definition(json).unwrap_or_else(|| panic!("{json}"));
             let back = definition(&fields.read("n"));
@@ -461,7 +788,7 @@ mod tests {
             r#"{"type": "http", "url": "https://x.example", "headersHelper": "get-token"}"#,
             r#"{"type": "ws", "url": "wss://x.example"}"#,
             r#"{"command": "x", "cwd": "/tmp"}"#,
-            r#"{"type": "http", "url": "https://x.example", "oauth": {"authServerMetadataUrl": "https://m.example"}}"#,
+            r#"{"type": "http", "url": "https://x.example", "oauth": {"clientSecret": "s"}}"#,
             r#"{"command": "x", "env": {"A": 1}}"#,
             "not json",
         ] {

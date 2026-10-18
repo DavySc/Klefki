@@ -4,7 +4,7 @@ use crate::api::{
 };
 use crate::config::docstore::Op;
 use crate::config::inventory::{FileKey, FileKeys};
-use crate::config::{entry, fsx, inventory};
+use crate::config::{entry, fsx, inventory, secretlike};
 use crate::sanitize::sanitize;
 use crate::secrets::Secret;
 use serde_json::Value;
@@ -699,6 +699,9 @@ fn add(
         }
         _ => {}
     }
+    if oauth {
+        typed_secret_refused(&new, &value)?;
+    }
     // Typed-in values are not shown (they may be secrets); which of the user's variables are read still is.
     let lines = describe(&shown_values(&value))
         .map_err(|why| format!("{new} cannot be reviewed safely, so it is not added: {why}."))?;
@@ -749,6 +752,27 @@ fn add(
     let note = "Klefki checks a new server once it is added: it starts its command, or connects to its address.";
     if !out.notes.iter().any(|n| n == note) {
         out.notes.push(note.to_owned());
+    }
+    Ok(())
+}
+
+/// Refuses a secret typed into the environment or headers of a server Claude Code's command adds: the command takes
+/// the definition in its arguments, which other programs on the computer can read while it runs. The value is
+/// never named, only its variable or header and what to write instead.
+fn typed_secret_refused(new: &str, entry: &Value) -> Result<(), String> {
+    for (key, what) in [("env", "variable"), ("headers", "header")] {
+        let Some(Value::Object(values)) = entry.get(key) else {
+            continue;
+        };
+        for (name, value) in values {
+            if let Some(reference) = value.as_str().and_then(|v| secretlike::suggestion(name, v)) {
+                return Err(format!(
+                    "The {what} {} of {new} looks like a secret. Claude Code's command would show it to other programs on this computer while it adds the server, so write {} instead and set that variable where Claude Code starts.",
+                    sanitize(name),
+                    sanitize(&reference)
+                ));
+            }
+        }
     }
     Ok(())
 }

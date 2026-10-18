@@ -6,10 +6,15 @@ pub use crate::config::definition::Definition;
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
 };
-pub use crate::form::{ServerFields, secret_reference};
+pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::secrets::{Secret, SecretError};
+
+/// Whether two project keys name the same folder, as the engine compares them: `c:\Repos\x\` is `C:/Repos/x`.
+pub fn same_project(a: &str, b: &str) -> bool {
+    crate::config::inventory::normalise_project(a) == crate::config::inventory::normalise_project(b)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {

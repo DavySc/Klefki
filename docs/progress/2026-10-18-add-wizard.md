@@ -1,7 +1,7 @@
 # Add wizard: fill in, OAuth through Claude Code, select what was added (2026-10-18)
 Goal: the rest of the M2 add wizard, on top of paste-to-add (#17). It adds a form for typing a server in part by part. Servers that sign in with OAuth are added through `claude mcp add-json --client-secret`, as CLAUDE.md requires. The new rows are selected once they are in the list.
 
-Branch `claude/add-wizard-y3wsyn`, from main `3472538`. Commits: the slice is one commit on this branch; see the pull request.
+Branch `claude/add-wizard-y3wsyn`, from main `3472538`. Commits: `5d17f79` (the slice), then the fixes for the first cross-review (the next commit; section "Review round 1").
 
 ## Done
 - **What the real `claude mcp add-json` does** (2.1.302, in a temp `HOME`/`CLAUDE_CONFIG_DIR`). The form and checks follow this behaviour:
@@ -101,12 +101,58 @@ Branch `claude/add-wizard-y3wsyn`, from main `3472538`. Commits: the slice is on
 - "OAuth entries are written only via `claude mcp add-json --client-secret`": an OAuth server *without* a client secret (one that registers itself, or a public client) is added through `add-json` without `--client-secret`. Passing the flag with no secret would make Claude Code prompt, or silently add nothing. The docstore never writes `oauth` either way.
 - Klefki keeps its own copy of the client secret in the OS keyring (keyed by `ConnectionId`) in addition to Claude Code's copy. This matches the existing Auth tab. When the store is unavailable, an add with a secret is refused before anything runs, so there is no plaintext fallback.
 
+## Review round 1 (cross-review of `5d17f79`: 4 blocking, 9 should-fix, 5 nits)
+Each fix below has a test, and every app test was seen failing with its fix undone, except B1 and B3, whose reproducers were seen failing before the fix.
+- **B1:** a word right after `--client-secret` (or `--client-secret=…`) that is not an option, address or JSON is taken for a secret. The whole paste is then refused and nothing of it is shown. A name there is refused too, since it cannot be told from a secret.
+  - Reproducers: secret before an address with no name (which made the secret the name); `add-json --client-secret S name`; `=` forms; the secret after the name; the secret at the end.
+- **B2:** the Add dialog is kept, hidden, while its review is asked for.
+  - When the review fails, or the add fails after review, the dialog comes back as it was, with the reason shown in it rather than in a toast.
+  - The review has **← Back**, which returns to the form. Cancel drops the whole add.
+- **B3:** on the add-json path, an env or header value that `secretlike` flags is refused before anything runs. The message names the variable or header and the reference to use, never the value. `Bearer ${X}` and plain values pass.
+- **B4:**
+  - The dialog's top is anchored, so the tabs never move.
+  - The body (form or paste, plus places) is one scroll area with a solid, visible bar, sized to the window. The summary line and buttons stay below it.
+  - Ticking OAuth scrolls its settings into view.
+- **S1:** the form has a Metadata URL field (`authServerMetadataUrl`). A pasted server that asks for a secret but has settings the form cannot hold (e.g. `headersHelper`) is left out with a reason and no Fill in button.
+- **S2:** a field's problem is said once the field has been left, or Review was pressed; never while it is first typed in. A message goes as soon as it is fixed. An address without a scheme gets `https://` when left. A missing scheme reads "Start the address with https://."
+- **S3:** `ServerFields::problems()` returns every problem with its `Part`. Each is drawn under its field, in the form's order.
+- **S4:** Review is always pressable. Pressed too soon, it says everything that stops it and focuses the first field that needs work.
+- **S5:**
+  - The toggle reads "Use OAuth client settings from the provider", with a help line.
+  - Ticked with nothing filled in and no secret, no `oauth` is written, so the server goes through the docstore and no Node start is needed.
+  - Settings left from an address are not used for a command (they were a hidden error).
+- **S6:**
+  - `PastedServer.asks_secret`: only a paste with `--client-secret` goes to the form. Other OAuth pastes are added as pasted.
+  - The summary says "N need finishing in the form" separately from what is left out.
+- **S7:**
+  - Show/hide buttons on the client secret and on each value row.
+  - On close, egui's memory of the secret, value and paste fields (undo steps) is removed (`forget_typed`). The undoer is not serialised by egui's persistence.
+- **S8:** "Use ${X} instead" then says "Set X in the environment Claude Code starts from…" and offers **Undo**. The button sits in the field column.
+- **S9:** `api::same_project` (the engine's `normalise_project`) is used by `select_added` and by `Places::taken`.
+- **N1:** tabs on the left as framed buttons, at a fixed place. **N2:** labels are left-aligned in a column. **N3:** "SSE (older servers)".
+- **N4:** the name follows the address or command until typed: `mcp.linear.app` gives `linear`; `@modelcontextprotocol/server-filesystem` gives `filesystem`. The first field is now the command or address.
+- **N5:** the toast says "Added sso for the user. Sign in to it from Claude Code (/mcp)."
+- **Code:**
+  - `still_applies` compares changes only.
+  - A failed `store.set` keeps the "Already added" suffix for earlier adds. This is a message change, with no test: the mock store cannot fail on `set` only.
+- **Tests changed, for review:**
+  - App tests that checked Review was disabled now check `ready()`, the same `changes()` that used to enable it. Tests that checked the dialog closed on Review now check that it waits behind the review.
+  - `add_explains_what_it_cannot_add…` now uses a stdio `--client-id` line as its refused server, since an http one with a client id is now addable.
+  - The form test's "OAuth on stdio is refused" case became "settings left from an address are not used".
+  - In `an_address_with_headers_and_oauth…`, ticking OAuth with nothing filled in now writes no `oauth`.
+- Real window (Xvfb 960×600, real CLI 2.1.302):
+  - `mcp.linear.app/mcp` became `https://mcp.linear.app/mcp`, and the name became `linear`.
+  - Ticking OAuth scrolled the settings into view. Show and hide worked on the secret.
+  - Review with a secret failed here (no Secret Service). The failure was shown in the dialog with every field kept.
+  - With the secret cleared: Review, then Back, then Review, then Add. `.claude.json` held `linear` with `oauth.clientId`, and the row was selected.
+- Checks after the round: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo clippy -p klefki -- -D warnings` 0; `cargo test --workspace` 412 core + 188 app passed; `cargo deny check` 0. No IO calls in `crates/app/src`.
+
 ## Open / known limits
-- For OAuth servers, typed env and header values travel in `add-json`'s argv, as Claude Code's own command takes them. Values that look like secrets get the "Use ${X} instead" button.
+- For OAuth servers, typed env and header values that do not look like secrets still travel in `add-json`'s argv, as Claude Code's own command takes them. Those that do are refused (B3).
 - Not tried on Windows or macOS. In particular, the cwd-based project key for `-s local` on Windows is unverified.
 - The Paste/Fill in choice is remembered for the session only.
 - `ServerFields` is separate from the edit form's `Definition`; they could share code later.
 - The plan's free-port check for the callback port is not done. Neither is sign-in itself (PTY login): the user signs in from Claude Code's `/mcp`.
 
 ## Next
-Cross-review with a critical UX look (owner's request), then merge. After that: PTY sign-in and re-authorise (the callback-port spike), and the free-port check.
+Re-review of the round-1 fixes, then merge once nothing blocking is open and CI is green on all 3 OSes. After that: PTY sign-in and re-authorise (the callback-port spike), and the free-port check.

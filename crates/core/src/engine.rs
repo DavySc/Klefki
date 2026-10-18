@@ -1031,12 +1031,13 @@ fn add_with_claude(
                 done(added)
             ));
         };
+        let earlier = done(added);
         added.push(format!("{name} {place}"));
         if let (Some(secret), Some(store)) = (&add.secret, &steps.store)
             && let Err(e) = store.set(&row.connection, secret)
         {
             return Err(format!(
-                "{name} was added {place}, and Claude Code keeps its client secret, but Klefki could not keep its own copy: {e} Type it in on the server's Auth tab to try again."
+                "{name} was added {place}, and Claude Code keeps its client secret, but Klefki could not keep its own copy: {e} Type it in on the server's Auth tab to try again.{earlier}"
             ));
         }
     }
@@ -5541,13 +5542,43 @@ mod tests {
                 },
                 "handed to Claude Code on its own",
             ),
+            // Claude Code's command takes the definition in its arguments, which other programs can read.
+            (
+                Change::Add {
+                    name: "h".into(),
+                    json: r#"{"type": "http", "url": "https://h.example", "headers": {"Authorization": "Bearer ghp_inlineS3cretValue123"}, "oauth": {}}"#.into(),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+                "Bearer ${AUTH_TOKEN}",
+            ),
+            (
+                Change::Add {
+                    name: "e".into(),
+                    json: r#"{"type": "sse", "url": "https://e.example", "env": {"API_TOKEN": "inline-s3cret-42"}, "oauth": {"clientId": "c"}}"#.into(),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+                "${API_TOKEN}",
+            ),
         ] {
             let refused = plan_failure(&core, vec![change.clone()]);
             assert!(refused.contains(why), "{change:?}: {refused}");
             assert!(!refused.contains("inline-s3cret"), "{refused}");
+            assert!(!refused.contains("inlineS3cret"), "{refused}");
         }
         let _ = key;
         assert!(env.add_json_runs().is_empty());
+        // A reference is what goes instead, and an ordinary value is no secret.
+        plan_for(
+            &core,
+            vec![Change::Add {
+                name: "h".into(),
+                json: r#"{"type": "http", "url": "https://h.example", "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}", "X-Team": "engineering"}, "oauth": {}}"#.into(),
+                targets: vec![Target::User],
+                secret: None,
+            }],
+        );
     }
 
     #[test]

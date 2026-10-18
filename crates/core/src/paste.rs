@@ -31,9 +31,11 @@ pub struct PastedServer {
     pub problem: Option<String>,
     /// Values that look like secrets, and the `${VAR}` reference to write instead. Never the value itself.
     pub hints: Vec<String>,
-    /// It signs in with OAuth (its definition has `oauth` settings), and may need a client secret, which is never
-    /// pasted: the dialog has it finished in the form, where the secret is typed.
+    /// It signs in with OAuth (its definition has `oauth` settings), so Claude Code's own command adds it.
     pub oauth: bool,
+    /// The command asks for a client secret (`--client-secret`), which is never pasted: the dialog has it finished
+    /// in the form, where the secret is typed.
+    pub asks_secret: bool,
 }
 
 /// Pasted text larger than this is refused: a few servers are a few KiB.
@@ -41,7 +43,7 @@ const MAX_PASTE_BYTES: usize = 256 * 1024;
 const MAX_SERVERS: usize = 100;
 /// A summary longer than this is cut; the review shows everything in full.
 const MAX_SUMMARY_CHARS: usize = 300;
-const SECRET_AFTER_OPTION: &str = "--client-secret takes no value: Claude Code asks for the secret. Paste the command without it, and type the secret in the form.";
+const SECRET_AFTER_OPTION: &str = "--client-secret takes no value: Claude Code asks for the secret. The word after it may be the secret, so nothing of this command is shown. Paste it with the name before --client-secret and no secret, and type the secret in the form.";
 const PROJECT_SCOPE: &str = "Klefki does not add project servers: they live in the repository's .mcp.json. Choose the user or a project's own list instead.";
 
 impl Pasted {
@@ -88,6 +90,7 @@ impl PastedServer {
             problem: None,
             hints: Vec::new(),
             oauth: false,
+            asks_secret: false,
         }
     }
 
@@ -418,6 +421,9 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             }
             // Claude Code asks for the secret itself; the option takes no value.
             "--client-secret" => {
+                if inline.is_some() || words.get(i).is_some_and(|w| may_be_secret(w, "://")) {
+                    return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+                }
                 oauth.get_or_insert_default();
                 asks_secret = true;
             }
@@ -515,6 +521,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
         }
     };
     server.scope = scope;
+    server.asks_secret = asks_secret && server.problem.is_none();
     server
 }
 
@@ -533,7 +540,15 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 scope = words.get(i).copied();
                 i += 1;
             }
-            _ if word == "--client-secret" => asks_secret = true,
+            Some(("--client-secret", _)) => {
+                return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+            }
+            _ if word == "--client-secret" => {
+                if words.get(i).is_some_and(|w| may_be_secret(w, "{")) {
+                    return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+                }
+                asks_secret = true;
+            }
             _ => positional.push(word),
         }
     }
@@ -581,7 +596,15 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
         ),
     };
     server.scope = scope;
+    server.asks_secret = asks_secret && server.problem.is_none();
     server
+}
+
+/// Whether `next`, the word after `--client-secret`, may be a secret typed after it: anything but an option or the
+/// address or definition that may follow the option (it has `follows`: `://` or `{`). A name is taken for a secret
+/// too, since the two cannot be told apart.
+fn may_be_secret(next: &str, follows: &str) -> bool {
+    !next.starts_with('-') && !next.contains(follows)
 }
 
 fn is_option(word: &str) -> bool {
@@ -1126,7 +1149,7 @@ mod tests {
             "claude mcp add --transport http --client-id abc123 --client-secret --callback-port 8080 corp https://corp.example/mcp",
         );
         assert_eq!(s.problem, None, "{s:?}");
-        assert!(s.oauth);
+        assert!(s.oauth && s.asks_secret);
         assert_eq!(
             json_of(&s),
             json!({"type": "http", "url": "https://corp.example/mcp", "oauth": {"clientId": "abc123", "callbackPort": 8080}})
@@ -1139,12 +1162,24 @@ mod tests {
             r#"claude mcp add-json --client-secret -s user o '{"type":"sse","url":"https://o.example"}'"#,
         );
         assert_eq!(json_of(&s)["oauth"], json!({}));
-        assert!(s.oauth && s.problem.is_none(), "{s:?}");
+        assert!(s.oauth && s.asks_secret && s.problem.is_none(), "{s:?}");
         assert!(!one("claude mcp add -s user plain node").oauth);
-        // A secret typed after --client-secret (it takes none) is never shown, not even as the name.
+        // Without --client-secret nothing is asked for: it can be added as pasted.
+        let s = one("claude mcp add -t http --client-id abc x https://x.example/mcp");
+        assert!(s.oauth && !s.asks_secret && s.problem.is_none(), "{s:?}");
+        // A secret typed after --client-secret (it takes none) is never shown, not even as the name: also when the
+        // name is left out, so the secret would be taken for it, or with the secret after `=`.
         for text in [
             "claude mcp add -t http --client-secret Sup3rSecret corp https://corp.example/mcp",
             r#"claude mcp add-json --client-secret Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
+            "claude mcp add --transport http --client-secret Sup3rSecret https://mcp.linear.app/mcp",
+            "claude mcp add-json --client-secret Sup3rSecret sso",
+            "claude mcp add-json --client-secret Sup3rSecret",
+            "claude mcp add -t http corp --client-secret Sup3rSecret https://corp.example/mcp",
+            "claude mcp add -t http corp https://corp.example/mcp --client-secret Sup3rSecret",
+            "claude mcp add -t http --client-secret=Sup3rSecret corp https://corp.example/mcp",
+            r#"claude mcp add-json --client-secret=Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
+            r#"claude mcp add-json o --client-secret Sup3rSecret '{"type":"http","url":"https://o.example"}'"#,
         ] {
             let s = one(text);
             assert!(
@@ -1152,6 +1187,15 @@ mod tests {
                 "{s:?}"
             );
             assert!(!format!("{s:?}").contains("Sup3rSecret"), "{s:?}");
+        }
+        // The option itself, before the address or the definition, is fine.
+        for text in [
+            "claude mcp add -t http corp --client-secret https://corp.example/mcp",
+            r#"claude mcp add-json o --client-secret '{"type":"http","url":"https://o.example"}'"#,
+        ] {
+            let s = one(text);
+            assert!(s.oauth && s.problem.is_none(), "{text}: {s:?}");
+            assert_eq!(s.name, if text.contains("corp") { "corp" } else { "o" });
         }
         for (text, why) in [
             ("claude mcp add --client-id x corp node", "address"),

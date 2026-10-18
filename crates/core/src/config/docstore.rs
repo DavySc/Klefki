@@ -397,7 +397,7 @@ impl Docstore {
     pub(crate) fn still_applies(&self, plan: &Plan) -> Result<(), StoreError> {
         let current = self.read()?;
         let (_, changes) = self.edit(&current, &plan.ops, Purpose::Preview)?;
-        if changes != plan.changes && current.hash() != plan.base_hash {
+        if changes != plan.changes {
             return Err(StoreError::Changed);
         }
         Ok(())
