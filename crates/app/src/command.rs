@@ -39,6 +39,12 @@ pub struct CommandPalette {
     cursor: usize,
     /// Give the text field the keyboard on the first frame.
     focus: bool,
+    /// The entries, built once when the palette opens and again only after [`invalidate`](Self::invalidate),
+    /// rather than every frame: with thousands of servers that is thousands of strings per frame.
+    entries: Option<Vec<Entry>>,
+    /// The query `matches` was filtered for; typing re-filters, other frames reuse it.
+    matched: Option<String>,
+    matches: Vec<usize>,
 }
 
 /// How many entries are shown at once; typing narrows the rest down.
@@ -50,6 +56,13 @@ impl CommandPalette {
         self.query.clear();
         self.cursor = 0;
         self.focus = true;
+        self.invalidate();
+    }
+
+    /// The entries no longer match what they were built from (a new snapshot): build them again when next shown.
+    pub fn invalidate(&mut self) {
+        self.entries = None;
+        self.matched = None;
     }
 
     pub fn close(&mut self) {
@@ -65,13 +78,29 @@ impl CommandPalette {
         &mut self.query
     }
 
-    /// Draws the palette over everything and returns the action chosen this frame, if any.
-    pub fn show(&mut self, ctx: &egui::Context, entries: &[Entry]) -> Option<Action> {
+    /// Draws the palette over everything and returns the action chosen this frame, if any. `entries` is called
+    /// only when the palette has none built yet.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        entries: impl FnOnce() -> Vec<Entry>,
+    ) -> Option<Action> {
         if !self.open {
             return None;
         }
+        let entries = std::mem::take(&mut self.entries).unwrap_or_else(entries);
+        let chosen = self.show_entries(ctx, &entries);
+        self.entries = Some(entries);
+        chosen
+    }
+
+    fn show_entries(&mut self, ctx: &egui::Context, entries: &[Entry]) -> Option<Action> {
         let pal = theme::palette(ctx);
-        let matches = filter(&self.query, entries);
+        if self.matched.as_deref() != Some(self.query.as_str()) {
+            self.matches = filter(&self.query, entries);
+            self.matched = Some(self.query.clone());
+        }
+        let matches = std::mem::take(&mut self.matches);
         self.cursor = self.cursor.min(matches.len().saturating_sub(1));
         // Arrows move the highlight and are taken before the text field sees them.
         let (down, up, enter) = ctx.input_mut(|i| {
@@ -196,6 +225,8 @@ impl CommandPalette {
         if modal.should_close() || chosen.is_some() {
             self.open = false;
         }
+        // Typing this frame changed the query; the next frame filters again.
+        self.matches = matches;
         chosen
     }
 }
@@ -223,16 +254,28 @@ pub fn filter(query: &str, entries: &[Entry]) -> Vec<usize> {
 /// How well `query` matches `text`: its letters in order, case ignored. Letters that start a word and letters
 /// next to each other count more, so "off gh" finds "Turn off github" before "Go to github". `None`: no match.
 pub fn score(query: &str, text: &str) -> Option<i32> {
-    let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+    // One pass over `text`, lower-cased as it is read: no copy of it is made. `at` counts lower-cased characters.
+    let mut text = text.chars().flat_map(char::to_lowercase);
     let mut at = 0;
+    let mut before: Option<char> = None;
     let mut total = 0;
     let mut previous: Option<usize> = None;
     for q in query.chars().flat_map(char::to_lowercase) {
         if q == ' ' {
             continue;
         }
-        let found = (at..text.len()).find(|&i| text[i] == q)?;
-        let word_start = found == 0 || !text[found - 1].is_alphanumeric();
+        let start = at;
+        let found = loop {
+            let c = text.next()?;
+            let here = at;
+            at += 1;
+            let word_start = before.is_none_or(|b| !b.is_alphanumeric());
+            before = Some(c);
+            if c == q {
+                break (here, word_start);
+            }
+        };
+        let (found, word_start) = found;
         total += 1;
         if word_start {
             total += 8;
@@ -241,9 +284,8 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
             total += 5;
         }
         // Gaps cost a little, so tighter matches win.
-        total -= (found - at).min(10) as i32;
+        total -= (found - start).min(10) as i32;
         previous = Some(found);
-        at = found + 1;
     }
     Some(total)
 }
@@ -299,6 +341,69 @@ mod tests {
     fn an_empty_query_lists_everything_in_order() {
         let entries = [entry("b", ""), entry("a", "")];
         assert_eq!(filter("  ", &entries), [0, 1]);
+    }
+
+    /// The scoring as first written, copying the text into a vector of lower-cased characters.
+    fn score_reference(query: &str, text: &str) -> Option<i32> {
+        let text: Vec<char> = text.chars().flat_map(char::to_lowercase).collect();
+        let mut at = 0;
+        let mut total = 0;
+        let mut previous: Option<usize> = None;
+        for q in query.chars().flat_map(char::to_lowercase) {
+            if q == ' ' {
+                continue;
+            }
+            let found = (at..text.len()).find(|&i| text[i] == q)?;
+            let word_start = found == 0 || !text[found - 1].is_alphanumeric();
+            total += 1;
+            if word_start {
+                total += 8;
+            }
+            if previous.is_some_and(|p| p + 1 == found) {
+                total += 5;
+            }
+            total -= (found - at).min(10) as i32;
+            previous = Some(found);
+            at = found + 1;
+        }
+        Some(total)
+    }
+
+    #[test]
+    fn scoring_without_copying_scores_the_same() {
+        let texts = [
+            "",
+            "github",
+            "Turn off github",
+            "Go to my-server_2 (Local · ~/work/x)",
+            "aaaa bbbb aaaa",
+            "İstanbul ǅemal ẞtraße", // lower-case to more than one character, or to another length
+            "a-b c.d/e",
+            "x y z",
+        ];
+        let queries = [
+            "",
+            " ",
+            "a",
+            "gh",
+            "off gh",
+            "GO MY",
+            "ab",
+            "aa aa",
+            "i̇s",
+            "i",
+            "ss",
+            "ǆ",
+            "xyz",
+            "zz",
+            "-",
+            "a b c d e",
+        ];
+        for t in texts {
+            for q in queries {
+                assert_eq!(score(q, t), score_reference(q, t), "{q:?} in {t:?}");
+            }
+        }
     }
 
     #[test]

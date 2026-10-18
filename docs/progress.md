@@ -1,7 +1,15 @@
 # Progress
 
 ## Current slice
-UX pass (2026-10-18). Done; see below. Next: the edit form, duplicate, keyring secrets.
+Performance test after the UX pass (2026-10-18). Done; see below. Next: the edit form, duplicate, keyring secrets.
+
+## Performance test after the UX pass (2026-10-18)
+Measured in the real window (Xvfb, Mesa llvmpipe software rendering) against the commit before the UX pass, with a small config (8 servers) and a large one (3000 servers, 300 projects), and per frame in egui_kittest (release build, counting allocator).
+- No regression from the UX pass: window shown in about 530 ms both before and after; RSS about 121 MB both (about 70 MB of it is Mesa's llvmpipe and LLVM, which a GPU driver does not need); idle CPU 0-20 ms per 10 s (no repaint while nothing changes); release binary 15.34 → 15.42 MB (+78 KB: palette, settings, the second palette of greys).
+- Frame cost is flat in the number of servers for the grid (it lays out only the rows in view): 0.25-0.36 ms and about 1.2k allocations per frame at 30, 300 and 3000 servers.
+- Found and fixed: the command palette rebuilt every entry and re-scored all of them, each score copying the text, on every frame while open. At 3000 servers that cost 5.7 ms and 46k allocations per frame. Now the entries are built when the palette opens (and again when a new snapshot arrives), the matches are filtered only when the query changes, and `score` reads the text once without copying it. Results: 0.30 ms and about 1.4k allocations per frame at 30, 300 or 3000 servers; a keystroke at 3000 servers is 1.1 ms. A differential test checks the new `score` against the old one, including text whose lower case has a different length (İ, ẞ, ǅ). A new UI test checks that an open palette follows a new snapshot; it fails without the invalidation.
+- Looked at and left alone: (1) the large config draws 19 frames at startup against 7 for the small one, mostly egui's scroll bar fading in under the pointer (`scroll_area.rs`, about 80 ms); this is a visible effect, not idle work. (2) Turning off egui_extras' default features saved 0 bytes: fat LTO already drops what is unused. (3) About 670 KB of the binary are egui's default Ubuntu and Hack fonts, which JetBrains Mono shadows. Removing them means embedding the emoji fallback fonts ourselves (egui's own glyphs, such as ✔ and ⏷, come from them). That would be a 4% saving and is not done yet.
+- Checks: fmt 0; clippy workspace 0; `cargo test --workspace` 250 core + 99 app passed; `cargo deny check` 0.
 
 ## Quieter interface and appearance settings (2026-10-18)
 Following the owner's notes on Linear's refresh: structure without clutter, and nothing competing for attention it has not earned.

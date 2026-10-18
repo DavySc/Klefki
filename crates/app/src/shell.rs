@@ -258,6 +258,7 @@ impl ShellApp {
                     self.editor = None;
                 }
                 self.grid_cache = None;
+                self.command.invalidate();
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
@@ -473,8 +474,10 @@ impl ShellApp {
         }
         self.plan_dialog(&ctx);
         self.outcome_toast(&ctx);
-        let entries = self.commands();
-        if let Some(action) = self.command.show(&ctx, &entries) {
+        let mut command = std::mem::take(&mut self.command);
+        let chosen = command.show(&ctx, || self.commands());
+        self.command = command;
+        if let Some(action) = chosen {
             self.run(&ctx, action);
         }
         egui::CentralPanel::default()
@@ -712,9 +715,6 @@ impl ShellApp {
 
     /// Everything the command palette offers right now: actions on the selection first, then the rest.
     fn commands(&self) -> Vec<Entry> {
-        if !self.command.is_open() {
-            return Vec::new();
-        }
         let mut out = Vec::new();
         let selected: Vec<&ServerRow> = self
             .selected
@@ -3346,6 +3346,35 @@ mod tests {
                 enabled: false
             }])]
         );
+    }
+
+    #[test]
+    fn the_open_palette_follows_a_new_snapshot() {
+        // The palette keeps its entries while open; a snapshot arriving meanwhile must still show.
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "go");
+        h.get_by_label_contains("Go to alpha");
+        assert!(h.query_by_label_contains("Go to beta").is_none());
+        engine.events.send(snapshot_of(vec![a, b])).unwrap();
+        h.run();
+        h.get_by_label_contains("Go to beta");
+        // And one without the server takes it away again, query unchanged.
+        engine
+            .events
+            .send(snapshot_of(vec![live_row("gamma", Scope::User, None)]))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Go to alpha").is_none());
+        h.get_by_label_contains("Go to gamma");
+        // Reopening starts from the current entries too.
+        h.key_press(egui::Key::Escape);
+        h.run();
+        ctrl_k(&mut h);
+        h.get_by_label_contains("Go to gamma");
     }
 
     #[test]
