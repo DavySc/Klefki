@@ -482,10 +482,14 @@ pub(crate) fn normalise_project(path: &str) -> String {
     p
 }
 
-/// Only local absolute paths are opened. UNC paths would make Windows contact (and authenticate to) a remote host.
+/// Only local absolute paths are opened. UNC paths would make Windows contact (and authenticate to) a remote host;
+/// Windows takes either slash in their `\\server` prefix (`/\server`, `\/server`).
 pub(crate) fn is_safe_project_path(path: &str) -> bool {
-    !(path.starts_with("\\\\") || path.starts_with("//") || path.contains('\0'))
-        && Path::new(path).is_absolute()
+    let two_slashes = path
+        .as_bytes()
+        .get(..2)
+        .is_some_and(|start| start.iter().all(|&b| b == b'/' || b == b'\\'));
+    !(two_slashes || path.contains('\0')) && Path::new(path).is_absolute()
 }
 
 /// The definition of one server, read fresh: a user server (`project` `None`), a local server (`project` in any
@@ -1379,6 +1383,9 @@ mod tests {
         for bad in [
             "\\\\evil\\share\\x",
             "//evil/share/x",
+            // Found reviewing main: Windows reads either slash in the prefix, so these are UNC paths too.
+            "/\\evil\\share\\x",
+            "\\/evil/share/x",
             "relative/dir",
             "..\\x",
             "a\0b",
