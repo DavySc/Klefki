@@ -2,6 +2,8 @@
 //! never executed or followed. Patterns come from messages seen in real Claude Code output and from the MCP
 //! debugging guide (protocol errors -32022, -32021 and -32602).
 
+use crate::engine::Focus;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HintKind {
     CommandNotFound,
@@ -50,7 +52,7 @@ impl HintKind {
             Self::PackageInstallFailed => "Installing the package failed",
             Self::PermissionDenied => "Permission was denied",
             Self::ConnectionRefused => "Nothing is listening at that address",
-            Self::HostNotFound => "The host name does not resolve",
+            Self::HostNotFound => "Can't reach the server's host",
             Self::CertificateProblem => "The server's certificate is not trusted",
             Self::TimedOut => "The server took too long to answer",
             Self::NeedsAuthentication => "The server needs you to sign in",
@@ -60,61 +62,129 @@ impl HintKind {
             Self::ProtocolVersion => "Client and server disagree on the protocol version",
             Self::MissingClientCapability => "The server needs a feature this client did not offer",
             Self::InvalidParams => "The request was rejected as malformed",
-            Self::ExitedImmediately => "The server started and then exited",
+            Self::ExitedImmediately => "The server stopped before it answered",
         }
     }
 
-    pub(crate) fn advice(self) -> &'static str {
+    /// What to do, one step per line, the most likely fix first.
+    pub(crate) fn help(self) -> &'static [&'static str] {
+        match self {
+            Self::CommandNotFound => &[
+                "Install the program, or put its full path in the command.",
+                "If it works in your terminal, the PATH there may differ from the one Claude Code sees.",
+            ],
+            Self::MissingFile => &[
+                "Check the paths in the arguments.",
+                "Claude Code may start servers from another working directory than you expect, so use absolute paths.",
+            ],
+            Self::PackageInstallFailed => &[
+                "npx, uvx or a similar launcher could not download or install the server's package.",
+                "Check the package name and version, your network or proxy, and the registry settings.",
+            ],
+            Self::PermissionDenied => &[
+                "Check that the program is executable and that your user can read the files it needs.",
+            ],
+            Self::ConnectionRefused => &[
+                "Check that the server is running.",
+                "Check the host name and port in the URL.",
+            ],
+            Self::HostNotFound => &[
+                "You are probably offline or not connected to your VPN: check those first.",
+                "If both are fine, check the URL for typos.",
+            ],
+            Self::CertificateProblem => &[
+                "On a company network this is often a TLS-inspecting proxy.",
+                "Its certificate authority has to be trusted by Node, for example through NODE_EXTRA_CA_CERTS.",
+            ],
+            Self::TimedOut => &[
+                "The server may be slow to start, or blocked by a firewall or proxy.",
+                "Try again, and check the server's own logs.",
+            ],
+            Self::NeedsAuthentication => &[
+                "The server rejected the request, or no token is stored for it.",
+                "Use Re-authorize to sign in again.",
+            ],
+            Self::Forbidden => &["Check that your account has access to this server."],
+            Self::UrlNotFound => &[
+                "The server answered, but not at this path.",
+                "Check the path, such as /mcp, against the server's documentation.",
+            ],
+            Self::ServerError => &[
+                "The server may be down or restarting: try again later.",
+                "Check the server's own logs.",
+            ],
+            Self::ProtocolVersion => &[
+                "Update the server or Claude Code so they share a protocol version.",
+                "The error lists the versions the server supports.",
+            ],
+            Self::MissingClientCapability => &[
+                "The server asked for a client feature, such as elicitation, that Claude Code did not offer.",
+                "Use a Claude Code version that supports it, or a server version that does not need it.",
+            ],
+            Self::InvalidParams => &[
+                "This usually means the client and server versions do not match.",
+                "Update both, then try again.",
+            ],
+            Self::ExitedImmediately => &[
+                "The program may not exist, or it exited straight away without saying why.",
+                "Run Diagnose, or the same command in a terminal, to see what it printed.",
+            ],
+        }
+    }
+
+    /// The part of the server's command or URL the failure is about, and what to say under it.
+    pub(crate) fn points_at(self) -> Option<(Focus, &'static str)> {
         match self {
             Self::CommandNotFound => {
-                "Claude could not start the server because the program is not on the PATH it uses. Install it, or put its full path in the command. If it works in your terminal, the PATH there may differ from the one Claude sees."
+                Some((Focus::Command, "not found on the PATH Claude Code uses"))
             }
-            Self::MissingFile => {
-                "The server started but could not find a file or package it needs. Check the paths in the arguments. Claude may start servers from a different working directory than you expect, so use absolute paths."
-            }
-            Self::PackageInstallFailed => {
-                "npx, uvx or a similar launcher could not download or install the server's package. Check the package name and version, your network or proxy, and the registry settings."
-            }
-            Self::PermissionDenied => {
-                "The server or a file it uses could not be opened because of permissions. Check that the program is executable and that your user can read the files it needs."
-            }
-            Self::ConnectionRefused => {
-                "The server did not accept the connection. Check that it is running, and that the host name, port and path in the URL are right."
-            }
-            Self::HostNotFound => {
-                "The server's host name could not be found. Check the URL for typos, and whether you need a VPN or a different network to reach it."
-            }
-            Self::CertificateProblem => {
-                "The TLS certificate could not be verified. On a company network this is often a TLS-inspecting proxy: its certificate authority has to be trusted by Node, for example through NODE_EXTRA_CA_CERTS."
-            }
-            Self::TimedOut => {
-                "The connection or a request timed out. The server may be slow to start, blocked by a firewall or proxy, or stuck. Try again, and check the server's own logs."
-            }
-            Self::NeedsAuthentication => {
-                "The server rejected the request, or no token is stored for it. Use Re-authorize to sign in again."
-            }
-            Self::Forbidden => {
-                "The server understood the request but forbids it. Check that your account has access to this server."
-            }
-            Self::UrlNotFound => {
-                "The server answered, but not at this path. Check the URL, especially the path such as /mcp, against the server's documentation."
-            }
-            Self::ServerError => {
-                "The server answered with a 5xx error. It may be down or restarting. Try again later, and check the server's own logs."
-            }
-            Self::ProtocolVersion => {
-                "The server does not support the MCP protocol version this client uses. Update the server or Claude Code so they share a version; the error lists the versions the server supports."
-            }
-            Self::MissingClientCapability => {
-                "The server asked for a client capability, such as elicitation, that Claude Code did not declare. Use a client version that supports it, or a server version that does not require it."
-            }
-            Self::InvalidParams => {
-                "The server rejected a request as invalid. This usually means the client and server versions do not match; update both, then try again."
-            }
-            Self::ExitedImmediately => {
-                "Claude connected to the process, but it closed straight away without saying why. Run the same command in a terminal to see what it prints, and check its logs."
-            }
+            Self::ConnectionRefused => Some((Focus::Address, "nothing is listening here")),
+            Self::HostNotFound => Some((Focus::Host, "this name could not be looked up")),
+            Self::CertificateProblem => Some((Focus::Host, "its certificate is not trusted")),
+            Self::TimedOut => Some((Focus::Host, "no answer in time")),
+            Self::UrlNotFound => Some((Focus::Path, "not found on this server")),
+            _ => None,
         }
+    }
+
+    /// The error codes this failure is reported with, as a client or server spells them.
+    fn codes(self) -> &'static [&'static str] {
+        match self {
+            Self::CommandNotFound => &["ENOENT"],
+            Self::MissingFile => &["MODULE_NOT_FOUND"],
+            Self::PackageInstallFailed => &["ERESOLVE"],
+            Self::PermissionDenied => &["EACCES", "EPERM"],
+            Self::ConnectionRefused => &["ECONNREFUSED"],
+            Self::HostNotFound => &["ENOTFOUND", "EAI_AGAIN"],
+            Self::CertificateProblem => &[
+                "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+                "SELF_SIGNED_CERT_IN_CHAIN",
+                "DEPTH_ZERO_SELF_SIGNED_CERT",
+                "CERT_HAS_EXPIRED",
+                "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+                "CERT_UNTRUSTED",
+            ],
+            Self::TimedOut => &["ETIMEDOUT", "ESOCKETTIMEDOUT"],
+            Self::NeedsAuthentication => &["401"],
+            Self::Forbidden => &["403"],
+            Self::UrlNotFound => &["404"],
+            Self::ServerError => &["500", "501", "502", "503", "504"],
+            Self::ProtocolVersion => &["-32022"],
+            Self::MissingClientCapability => &["-32021"],
+            Self::InvalidParams => &["-32602"],
+            Self::ExitedImmediately => &["CONNECTION_CLOSED"],
+        }
+    }
+
+    /// The first of this failure's codes that `text` contains as a whole word, to name it by.
+    pub(crate) fn code_in(self, text: &str) -> Option<&'static str> {
+        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        self.codes().iter().copied().find(|code| {
+            text.match_indices(code).any(|(at, _)| {
+                !text[..at].chars().next_back().is_some_and(word)
+                    && !text[at + code.len()..].chars().next().is_some_and(word)
+            })
+        })
     }
 }
 
@@ -351,8 +421,14 @@ mod tests {
     fn every_hint_has_a_title_and_advice_worth_reading() {
         for kind in HintKind::ALL {
             assert!(kind.title().len() >= 8, "{kind:?}");
-            assert!(kind.advice().len() >= 40, "{kind:?}");
-            assert!(kind.advice().ends_with('.'), "{kind:?}");
+            // Each step reads on its own, and together they say enough to act on.
+            let help = kind.help();
+            assert!(!help.is_empty(), "{kind:?}");
+            for line in help {
+                assert!(line.len() >= 20, "{kind:?}: {line:?}");
+                assert!(line.ends_with('.'), "{kind:?}: {line:?}");
+            }
+            assert!(help.join(" ").len() >= 40, "{kind:?}");
         }
         let titles: std::collections::BTreeSet<_> =
             HintKind::ALL.iter().map(|k| k.title()).collect();

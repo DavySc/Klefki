@@ -1,12 +1,13 @@
 //! The desktop-style shell: left nav, top bar, icon toolbar, grid and detail panel.
 //! Pure UI over an immutable `Snapshot`; no IO.
 use crate::command::{self, CommandPalette, Entry, shortcut};
+use crate::explain::Explanation;
 use crate::theme::{self, Palette, ThemeChoice, Tone};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, Core, Diagnosis, Event, PlanView, Scope, ServerId, ServerRow,
+    Approval, Change, Command, Core, Diagnosis, Event, Hint, PlanView, Scope, ServerId, ServerRow,
     Snapshot, Status, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
@@ -138,7 +139,7 @@ pub struct ShellApp {
     core: Option<Core>,
     /// Live results from the engine, which take precedence over the snapshot's hints. One slot per row of the
     /// snapshot, by position, so drawing a row looks its status up without building a key.
-    live: Vec<Option<(Status, Option<String>)>>,
+    live: Vec<Option<Live>>,
     /// The grid's rows for the current snapshot and search, built when either changes rather than every frame.
     grid_cache: Option<(String, Arc<[GridRow]>)>,
     /// The latest explanation per server, from the Diagnose action.
@@ -241,7 +242,7 @@ impl ShellApp {
                 for (old, result) in self.live.iter_mut().enumerate() {
                     // A check that was running is cut off by a refresh.
                     if let (Some(new), Some(r)) = (moved(old), result.take())
-                        && r.0 != Status::Checking
+                        && r.status != Status::Checking
                     {
                         live[new] = Some(r);
                     }
@@ -348,9 +349,18 @@ impl ShellApp {
             }
             Event::CliVersion(version) => self.cli_version = version,
             Event::CliProblem(problem) => self.cli_problem = Some(problem),
-            Event::Status { id, status, detail } => {
+            Event::Status {
+                id,
+                status,
+                detail,
+                hint,
+            } => {
                 if let Some(i) = self.snapshot.servers.iter().position(|r| r.is(&id)) {
-                    self.live[i] = Some((status, detail));
+                    self.live[i] = Some(Live {
+                        status,
+                        detail,
+                        hint,
+                    });
                 }
             }
         }
@@ -359,9 +369,14 @@ impl ShellApp {
     /// What to show for row `i`: the engine's latest answer, else what Claude's own cache said.
     fn effective(&self, i: usize) -> (Status, Option<&str>) {
         match self.live.get(i).and_then(Option::as_ref) {
-            Some((status, detail)) => (*status, detail.as_deref()),
+            Some(live) => (live.status, live.detail.as_deref()),
             None => (self.snapshot.servers[i].status, None),
         }
+    }
+
+    /// What the engine's latest answer for row `i` most likely means, in plain words.
+    fn hint(&self, i: usize) -> Option<&Hint> {
+        self.live.get(i)?.as_ref()?.hint.as_ref()
     }
 
     /// Indices into the snapshot matching the search, ordered by scope, project and name.
@@ -474,10 +489,13 @@ impl ShellApp {
             )
             .show(ui, |ui| self.nav(ui));
         if self.page == Page::Connections {
-            egui::Panel::right("detail")
-                .default_size(360.0)
+            // A share of the window, so explanations get room on a wide screen without crowding a narrow one.
+            let width = ui.available_width();
+            // Named anew when its sizes changed: egui remembers a panel's width by name.
+            egui::Panel::right("detail-panel")
+                .default_size((width * 0.34).clamp(360.0, 640.0))
                 .min_size(280.0)
-                .max_size(460.0)
+                .max_size((width * 0.5).max(460.0))
                 .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(12)))
                 .show(ui, |ui| self.detail(ui));
         }
@@ -1279,7 +1297,8 @@ impl ShellApp {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
                         let (status, detail) = self.effective(*i);
-                        row.col(|ui| status_cell(ui, s, status, detail));
+                        let hint = self.hint(*i);
+                        row.col(|ui| status_cell(ui, s, status, detail, hint));
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
                         });
@@ -1356,6 +1375,7 @@ impl ShellApp {
             let (status, detail) = self.effective(i);
             (status, detail.map(str::to_owned))
         };
+        let explanation = Explanation::for_status(s, status, detail.as_deref(), self.hint(i));
         ui.label(RichText::new(&s.name).heading());
         ui.horizontal(|ui| {
             flat_items(ui);
@@ -1424,10 +1444,16 @@ impl ShellApp {
                         ui.label(RichText::new("Status").color(pal.text_muted));
                         ui.label(status.label());
                         ui.end_row();
-                        ui.label(RichText::new("Detail").color(pal.text_muted));
-                        ui.add(egui::Label::new(detail.as_deref().unwrap_or("-")).wrap());
-                        ui.end_row();
+                        if explanation.is_none() {
+                            ui.label(RichText::new("Detail").color(pal.text_muted));
+                            ui.add(egui::Label::new(detail.as_deref().unwrap_or("-")).wrap());
+                            ui.end_row();
+                        }
                     });
+                if let Some(explanation) = &explanation {
+                    ui.add_space(10.0);
+                    explanation.show(ui, ui.id().with("status"));
+                }
                 ui.add_space(8.0);
                 if s.scope == Scope::Project && s.transport == TransportKind::Stdio {
                     ui.label(
@@ -1621,8 +1647,10 @@ fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
     if !d.hints.is_empty() {
         out.push_str("possible causes:\n");
         for hint in &d.hints {
-            let _ = writeln!(out, "  - {}: {}", hint.title, hint.advice);
+            out.push('\n');
+            out.push_str(&Explanation::for_hint(row, d.status, hint, d.detail.as_deref()).text());
         }
+        out.push('\n');
     }
     if !d.server_said.is_empty() {
         out.push_str("the server said:\n");
@@ -1654,14 +1682,10 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
                 .family(theme::bold_family())
                 .size(16.0),
         );
-        for hint in &d.hints {
-            ui.label(
-                RichText::new(&hint.title)
-                    .family(theme::bold_family())
-                    .color(pal.primary),
-            );
-            ui.label(RichText::new(&hint.advice).color(pal.text_muted));
-            ui.add_space(4.0);
+        for (i, hint) in d.hints.iter().enumerate() {
+            Explanation::for_hint(row, d.status, hint, d.detail.as_deref())
+                .show(ui, ui.id().with(("cause", i)));
+            ui.add_space(6.0);
         }
     }
     if !d.server_said.is_empty() {
@@ -1818,7 +1842,13 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     }
 }
 
-fn status_cell(ui: &mut Ui, s: &ServerRow, status: Status, detail: Option<&str>) {
+fn status_cell(
+    ui: &mut Ui,
+    s: &ServerRow,
+    status: Status,
+    detail: Option<&str>,
+    hint: Option<&Hint>,
+) {
     let pal = theme::palette(ui.ctx());
     if !s.enabled {
         ui.label(RichText::new("Disabled").color(pal.disabled));
@@ -1838,8 +1868,21 @@ fn status_cell(ui: &mut Ui, s: &ServerRow, status: Status, detail: Option<&str>)
         Status::NotConfigured | Status::Unknown => pal.text_muted,
     };
     let response = ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color));
-    if let Some(detail) = detail {
-        response.on_hover_text(detail);
+    match status {
+        Status::Failed | Status::NeedsAuth | Status::Degraded => {
+            // Built only while hovered, not every frame.
+            response.on_hover_ui(|ui| {
+                if let Some(explanation) = Explanation::for_status(s, status, detail, hint) {
+                    ui.set_max_width(560.0);
+                    explanation.show(ui, ui.id().with("tooltip"));
+                }
+            });
+        }
+        _ => {
+            if let Some(detail) = detail {
+                response.on_hover_text(detail);
+            }
+        }
     }
 }
 
@@ -1852,6 +1895,14 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32) {
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().color(pal.on_bright));
         });
+}
+
+/// The engine's latest answer for one row.
+#[derive(Clone)]
+struct Live {
+    status: Status,
+    detail: Option<String>,
+    hint: Option<Hint>,
 }
 
 #[cfg(test)]
@@ -2141,7 +2192,80 @@ mod tests {
             id: row.id(),
             status,
             detail: detail.map(str::to_owned),
+            hint: None,
         }
+    }
+
+    fn unknown_host_event(row: &ServerRow) -> klefki_core::api::Event {
+        klefki_core::api::Event::Status {
+            id: row.id(),
+            status: Status::Failed,
+            detail: Some("ENOTFOUND: getaddrinfo ENOTFOUND acme-prod.example.com".to_owned()),
+            hint: Some(klefki_core::api::Hint {
+                title: "Can't reach the server's host".to_owned(),
+                code: Some("ENOTFOUND".to_owned()),
+                help: vec![
+                    "You are probably offline or not connected to your VPN: check those first."
+                        .to_owned(),
+                ],
+                points_at: Some((
+                    klefki_core::api::Focus::Host,
+                    "this name could not be looked up".to_owned(),
+                )),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_status_tab_explains_a_failure_in_plain_words_and_keeps_claudes() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let row = live_row("acme-prod", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        h.get_by_label("acme-prod").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Can't reach the server's host");
+        h.get_by_label_contains("not connected to your VPN");
+        h.get_by_label_contains("getaddrinfo ENOTFOUND acme-prod.example.com");
+    }
+
+    #[test]
+    fn the_explanation_survives_a_refresh_of_the_configuration() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let row = live_row("acme-prod", Scope::User, None);
+        let other = live_row("other", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        // A new snapshot, with the row at a different position, carries live results over by identity.
+        engine
+            .events
+            .send(snapshot_of(vec![other, row.clone()]))
+            .unwrap();
+        h.run();
+        h.get_by_label("acme-prod").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Can't reach the server's host");
+    }
+
+    #[test]
+    fn hovering_a_failed_status_explains_it() {
+        let (mut h, engine) = live_harness();
+        let row = live_row("acme-prod", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        h.get_by_label_contains(Status::Failed.label()).hover();
+        h.run();
+        h.get_by_label_contains("Can't reach the server's host");
+        h.get_by_label_contains("getaddrinfo ENOTFOUND acme-prod.example.com");
     }
 
     #[test]
@@ -2449,7 +2573,9 @@ mod tests {
                 .iter()
                 .map(|(t, a)| klefki_core::api::Hint {
                     title: (*t).to_owned(),
-                    advice: (*a).to_owned(),
+                    code: None,
+                    help: vec![(*a).to_owned()],
+                    points_at: None,
                 })
                 .collect(),
             server_said: said.iter().map(|l| (*l).to_owned()).collect(),

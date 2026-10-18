@@ -1,7 +1,30 @@
 # Progress
 
 ## Current slice
-Review of merge `bd82805` (#1) on Windows, and fixes for what it found (2026-10-18). Uncommitted. Next: the owner reviews the open items below; then the real window against a live Claude Code session.
+Status explanations laid out like compiler errors (2026-10-18), committed on branch `windows-review-fixes` after `fa6062e` and pushed. Next: open a pull request; light theme not yet seen.
+
+## Explanations laid out like compiler errors (2026-10-18)
+Owner's feedback on the first version below: still hard to read; use more space, align the text, use colours that say what is happening, like rustc's errors.
+- `crates/app/src/explain.rs` (new): `Explanation` builds the lines once as data and either draws them or gives them as plain text. Header `error[CODE]: title` (warning for degraded and needs-auth), `-->` the server and scope, a `|` gutter, the command or URL with `^^^` under the part the failure is about plus a label, then `= help:` one step per line and `= note: Claude Code said: …`. Colours from the palette: danger/warn for the level and markers, link blue for the gutter, success for `help`, muted for Claude's words. Text after a prefix wraps under itself; the command or URL never wraps (it scrolls sideways) so the markers stay aligned; the label moves under the markers when it does not fit after them. A failure no pattern explains still gets the block, with "Diagnose shows what the server and Claude Code logged."
+- Used in the Status tab, the grid's status tooltip, every cause in the Diagnose panel, and the copied report (same text, plain).
+- Core: `Hint` is now `title`, `code` (the code it was reported with, e.g. `ENOTFOUND`, whole words only), `help: Vec<String>` (was one `advice` paragraph) and `points_at: Option<(Focus, label)>`; `Hint::span` finds the host, host:port, path or program in a row's target (for a program path with spaces, the longest prefix Claude's message names). `HintKind::advice` became `help`; `every_hint_has_a_title_and_advice_worth_reading` now checks each step (≥ 20 characters, ends with a full stop) and still the ≥ 40 characters in total.
+- `ExitedImmediately` reworded: Claude reports a command that does not exist only as `CONNECTION_CLOSED`, so "The server started and then exited" was wrong; now "The server stopped before it answered", with "The program may not exist, …" first.
+- Detail panel: default about a third of the window (360–640 px), draggable to half; renamed `detail-panel` so the width egui remembered for the old 460 px cap does not keep it narrow.
+- Tests: `an_unknown_host_reads_like_a_compiler_error` (exact text), `the_marker_sits_under_its_part_whatever_comes_before_it` (non-ASCII host, port), `a_label_that_does_not_fit_after_the_markers_goes_under_them_whole`, `a_failure_nothing_explains_still_says_what_to_do_next`, `a_warning_is_not_called_an_error_and_a_healthy_server_has_nothing`; core `a_hint_points_at_the_part_of_the_url_it_is_about`, `a_hint_points_at_the_program_even_when_its_path_has_spaces`, `a_hint_is_named_by_the_code_it_was_reported_with`. These were written with the code, not seen failing first; the UI tests from the first version (which did fail first) still pass.
+- Real window, seen (Windows 11, real Claude CLI 2.1.302, temporary `CLAUDE_CONFIG_DIR`, driven through UI Automation): `acme-prod.invalid` → `error[ENOTFOUND]` with the markers under the host; `127.0.0.1:9` → `error[ECONNREFUSED]` with markers under host:port; a missing command → `error[CONNECTION_CLOSED]`; the hover tooltip.
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 263 core + 113 app passed; `cargo deny check` 0.
+- Then, on the owner's note that it looked put into a text box: the frame (field fill, border, rounded corners) is gone; the lines sit on the panel with the same left edge as the rest, and the tooltip no longer shows a box inside its own frame. Seen in the real window (Status tab and hover). Checks again: fmt 0; clippy workspace and `-p klefki` 0; 263 core + 113 app passed; deny 0.
+
+## Plain-language status explanations, first version (2026-10-18)
+Asked for by the owner after Claude Code showed `ENOTFOUND: getaddrinfo ENOTFOUND <host>` for two company servers off the VPN.
+- Every live `Event::Status` for a failed, degraded or needs-auth server now carries `hint: Option<Hint>`: the first of the existing Diagnose patterns (`diagnose/hints.rs`) that matches Claude's text, worked out once in the engine. Before, the explanation only appeared after Diagnose.
+- The app shows it in the Status tab (Problem, the advice, then "Claude Code said" with the raw text) and in the grid's status tooltip (built only while hovered). It is carried over a refresh like the status.
+- Host not found reworded: "Can't reach the server's host. … Usually this means you are offline or not connected to your VPN, so check those first. If both are fine, check the URL for typos." (was: typo first, VPN second).
+- Tests: `an_unknown_host_is_explained_as_the_network_or_vpn_with_claudes_words_kept` (core, through fake-claude; `ENOTFOUND` and variant `EAI_AGAIN`; a connected server gets no hint; fails on the old wording), `the_status_tab_explains_a_failure_in_plain_words_and_keeps_claudes`, `the_explanation_survives_a_refresh_of_the_configuration`, `hovering_a_failed_status_explains_it` (all three fail with the hint withheld).
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 260 core + 108 app passed; `cargo deny check` 0. Not seen in the real window.
+
+## Windows review of #1: merge and commit (2026-10-18)
+Committed as `fa6062e`. Next there: the owner reviews the open items below; then the real window against a live Claude Code session.
 
 Reapplied on top of `8595172` (#2 and #3: watcher, delete/edit, UX pass, performance test, Windows rename retry) on 2026-10-18; conflicts in `shell.rs`, `docstore.rs`, `engine.rs` and this file were resolved by keeping both sides. After the merge: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 259 core + 105 app passed; `cargo deny check` 0.
 
