@@ -539,7 +539,7 @@ pub(crate) fn project_server(project: &str, name: &str) -> Result<Value, String>
         .ok_or_else(|| format!("{} no longer defines that server", display_path(&path)))
 }
 
-/// Names of servers in a project's `.mcp.json`, plus any names defined twice.
+/// Names of servers in a project's `.mcp.json`, plus each name defined more than once.
 type ProjectServers = (Vec<(String, Value)>, Vec<String>);
 
 fn read_project_servers(path: &Path) -> Result<Option<ProjectServers>, String> {
@@ -579,7 +579,10 @@ impl<'de> Deserialize<'de> for Pairs {
                 while let Some((k, v)) = map.next_entry::<String, Value>()? {
                     if let Some(slot) = entries.iter_mut().find(|(e, _)| *e == k) {
                         slot.1 = v;
-                        duplicates.push(k);
+                        // Once per name: at most one per entry, however often it repeats.
+                        if !duplicates.contains(&k) {
+                            duplicates.push(k);
+                        }
                     } else if entries.len() >= MAX_MCP_SERVERS {
                         return Err(A::Error::custom(format!(
                             "more than {MAX_MCP_SERVERS} servers"
@@ -1269,6 +1272,34 @@ mod tests {
             s.warnings
         );
         assert_eq!(s.servers.iter().filter(|r| r.name == "a").count(), 1);
+    }
+
+    #[test]
+    fn a_name_defined_many_times_is_reported_once() {
+        // Found reviewing main: one warning per repeat, so a file repeating a name buried every other warning (the
+        // app shows the first few) and `klefki-cli` printed them all.
+        let e = Env::new();
+        let p = e.project("dup");
+        let repeats: String = (0..1000)
+            .map(|i| format!(r#""a":{{"command":"c{i}"}},"b":{{"command":"x"}},"#))
+            .collect();
+        std::fs::write(
+            p.join(".mcp.json"),
+            format!(r#"{{"mcpServers":{{{repeats}"c":{{"command":"y"}}}}}}"#),
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({"projects": {p.to_string_lossy(): {}}}),
+        );
+        let s = e.load();
+        let repeated: Vec<_> = s
+            .warnings
+            .iter()
+            .filter(|w| w.contains("more than once"))
+            .collect();
+        assert_eq!(repeated.len(), 2, "{repeated:?}");
+        assert_eq!(find(&s, Scope::Project, "a").target, "c999");
     }
 
     #[test]
