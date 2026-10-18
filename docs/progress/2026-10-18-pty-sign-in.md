@@ -26,6 +26,10 @@ Goal: PLAN.md M2 "PTY login and re-authorize", starting with the callback-port s
 - Real window with real Claude Code 2.1.302: a click beside kept the dialog; Cancel left no `mcp login`; a server that is down said "Nothing is listening at that address." with Try again; a plain HTTP server said "This server does not sign in through Claude Code." with Close only and no HTML; sign-in with the browser following ended Connected.
 - Verify-all: exit 0, 653 passed, deny ok.
 
+## Review round 2 (on 7dd1417): nothing blocking
+- Polish folded in once: the host uses the bold face; "1 second"; the same-site rule needs one more label under shared suffixes (`co.uk`-style, `github.io`, `vercel.app`, …), with a unit test that fails under the old rule.
+- Verify-all: exit 0, 654 passed, deny ok.
+
 ## Open
 - Windows (ConPTY) and macOS run only in CI; not tried by hand.
 - Not done: checking the link's host against the server's OAuth metadata (needs the planned HTTP client in core).

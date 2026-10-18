@@ -252,8 +252,11 @@ impl SignInView {
         } else {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new(format!("Klefki stops waiting in {} seconds.", left.ceil()))
-                        .color(pal.warn),
+                    RichText::new(match left.ceil() {
+                        1.0 => "Klefki stops waiting in 1 second.".to_owned(),
+                        n => format!("Klefki stops waiting in {n} seconds."),
+                    })
+                    .color(pal.warn),
                 );
                 if ui.button("Keep waiting").clicked() {
                     self.ends_at = Some(now + self.wait);
@@ -412,6 +415,22 @@ impl SignInView {
     }
 }
 
+/// Hosting suffixes under which every subdomain belongs to someone else.
+const SHARED_SUFFIXES: [&str; 12] = [
+    "github.io",
+    "gitlab.io",
+    "vercel.app",
+    "netlify.app",
+    "pages.dev",
+    "workers.dev",
+    "fly.dev",
+    "onrender.com",
+    "herokuapp.com",
+    "azurewebsites.net",
+    "cloudfront.net",
+    "amazonaws.com",
+];
+
 /// When the dialog offers to wait longer.
 const WARN_BEFORE: f64 = 30.0;
 
@@ -455,13 +474,19 @@ fn with_host(ui: &mut Ui, before: &str, host: &str, after: &str) {
     let format = |color| egui::TextFormat::simple(font.clone(), color);
     let mut job = egui::text::LayoutJob::default();
     job.append(&format!("{before} "), 0.0, format(visuals.text_color()));
-    job.append(host, 0.0, format(visuals.strong_text_color()));
+    let bold = egui::FontId::new(font.size, theme::bold_family());
+    job.append(
+        host,
+        0.0,
+        egui::TextFormat::simple(bold, visuals.strong_text_color()),
+    );
     job.append(&format!(" {after}"), 0.0, format(visuals.text_color()));
     ui.add(egui::Label::new(job).wrap());
 }
 
-/// The server's own host when the sign-in page is somewhere else. Hosts that share their last two labels
-/// (`auth.example.com` for `mcp.example.com`) count as the same place.
+/// The server's own host when the sign-in page is somewhere else. Hosts on the same registered domain
+/// (`auth.example.com` for `mcp.example.com`) count as the same place; under a suffix that many owners share
+/// (`co.uk`, `github.io`) one more label is needed. A rough rule, which errs towards pointing it out.
 fn elsewhere(page_host: &str, target: &str) -> Option<String> {
     let rest = target.split_once("://").map_or(target, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -473,13 +498,21 @@ fn elsewhere(page_host: &str, target: &str) -> Option<String> {
     };
     let page = page_host.trim_start_matches('[').trim_end_matches(']');
     let site = |h: &str| {
-        let labels: Vec<String> = h
-            .to_ascii_lowercase()
-            .rsplit('.')
-            .take(2)
-            .map(str::to_owned)
-            .collect();
+        let h = h.to_ascii_lowercase();
+        let labels: Vec<&str> = h.rsplit('.').collect();
+        let shared = match labels.as_slice() {
+            [tld, second, ..] => {
+                (tld.len() == 2 && second.len() <= 3)
+                    || SHARED_SUFFIXES.contains(&format!("{second}.{tld}").as_str())
+            }
+            _ => false,
+        };
+        let take = if shared { 3 } else { 2 };
         labels
+            .iter()
+            .take(take)
+            .map(|l| (*l).to_owned())
+            .collect::<Vec<_>>()
     };
     (!own.is_empty() && site(own) != site(page)).then(|| own.to_owned())
 }
@@ -494,4 +527,47 @@ fn busy(ui: &mut Ui, pal: &theme::Palette, text: &str) {
         );
         ui.label(RichText::new(text).color(pal.text));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sign_in_page_elsewhere_is_told_apart_from_one_on_the_same_site() {
+        let same = [
+            ("auth.example.com", "https://mcp.example.com/mcp"),
+            ("localhost", "https://localhost:8443/mcp"),
+            ("login.example.co.uk", "https://api.example.co.uk/mcp"),
+            (
+                "AUTH.Example.com",
+                "https://user:pw@mcp.example.com:8443/x?y#z",
+            ),
+            ("::1", "http://[::1]:9/mcp"),
+        ];
+        for (page, target) in same {
+            assert_eq!(elsewhere(page, target), None, "{page} for {target}");
+        }
+        let other = [
+            (
+                "login.other.org",
+                "https://mcp.example.com/mcp",
+                "mcp.example.com",
+            ),
+            ("b.co.uk", "https://a.co.uk/mcp", "a.co.uk"),
+            (
+                "evil.github.io",
+                "https://tool.github.io/mcp",
+                "tool.github.io",
+            ),
+            ("x.vercel.app", "https://y.vercel.app/mcp", "y.vercel.app"),
+        ];
+        for (page, target, own) in other {
+            assert_eq!(
+                elsewhere(page, target).as_deref(),
+                Some(own),
+                "{page} for {target}"
+            );
+        }
+    }
 }
