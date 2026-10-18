@@ -107,8 +107,9 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
 
     if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
         for (name, entry) in servers {
-            let status = hints.status_of(name);
+            let (status, cached) = hints.status_of(name);
             let mut r = row(name, entry, Scope::User, None, true, status);
+            r.status_cached = cached;
             keys.insert(
                 r.connection.clone(),
                 FileKey {
@@ -244,6 +245,7 @@ fn row(
         approval: None,
         shadowed: false,
         casing_collision: false,
+        status_cached: false,
         oauth: oauth_info(entry),
     }
 }
@@ -595,16 +597,36 @@ impl ApprovalLists {
 // ---------------------------------------------------------------- hints
 
 /// Instant status hints from Claude's own caches. Only a hint; live checks come later.
+///
+/// Claude Code 2.1.302 no longer writes `mcp-health-cache.json`: what is in it was left by an older version and can
+/// be any age, so it is only ever a last-known status. `mcp-needs-auth-cache.json` is still written, with a time per
+/// entry; Claude trusts an entry for its `ttlMs` (15 minutes by default) and ignores it after, and so does klefki.
 struct Hints {
     health: BTreeMap<String, String>,
-    needs_auth: BTreeSet<String>,
+    needs_auth: BTreeMap<String, Freshness>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Freshness {
+    /// Written by Claude within its time to live: as good as a check.
+    Fresh,
+    /// No time recorded (an older format): a last-known status.
+    Undated,
+}
+
+/// How long Claude Code trusts a needs-auth entry without its own `ttlMs` (2.1.302: 15 minutes).
+const NEEDS_AUTH_TTL_MS: f64 = 15.0 * 60.0 * 1000.0;
+/// The longest time to live Claude Code gives an entry itself (4 hours, for claude.ai and plugin servers). An
+/// entry's own `ttlMs` comes from a file anyone could have written, so it is held to this.
+const NEEDS_AUTH_MAX_TTL_MS: f64 = 4.0 * 60.0 * 60.0 * 1000.0;
+/// How far in the future an entry's time may be, for clocks that disagree (Claude allows a minute too).
+const CLOCK_SKEW_MS: f64 = 60.0 * 1000.0;
 
 impl Hints {
     fn load(paths: &ConfigPaths, warnings: &mut Vec<String>) -> Self {
         let mut hints = Self {
             health: BTreeMap::new(),
-            needs_auth: BTreeSet::new(),
+            needs_auth: BTreeMap::new(),
         };
         let health = paths.claude_dir.join("mcp-health-cache.json");
         match read_json(&health, MAX_CACHE_JSON) {
@@ -622,23 +644,49 @@ impl Hints {
         }
         let needs = paths.claude_dir.join("mcp-needs-auth-cache.json");
         match read_json(&needs, MAX_CACHE_JSON) {
-            Ok(Some(Value::Object(o))) => hints.needs_auth.extend(o.keys().cloned()),
+            Ok(Some(Value::Object(o))) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |d| d.as_millis() as f64);
+                for (name, entry) in o {
+                    if let Some(freshness) = needs_auth_freshness(&entry, now) {
+                        hints.needs_auth.insert(name, freshness);
+                    }
+                }
+            }
             Ok(_) => {}
             Err(e) => warnings.push(format!("Ignored {}: {e}", display_path(&needs))),
         }
         hints
     }
 
-    fn status_of(&self, name: &str) -> Status {
-        if self.needs_auth.contains(name) {
-            return Status::NeedsAuth;
+    /// The status the caches give `name`, and whether it is only a last-known one (to be checked again).
+    fn status_of(&self, name: &str) -> (Status, bool) {
+        match self.needs_auth.get(name) {
+            Some(Freshness::Fresh) => return (Status::NeedsAuth, false),
+            Some(Freshness::Undated) => return (Status::NeedsAuth, true),
+            None => {}
         }
         match self.health.get(name).map(String::as_str) {
-            Some("healthy") => Status::Connected,
-            Some(_) => Status::Failed,
-            None => Status::Unknown,
+            Some("healthy") => (Status::Connected, true),
+            Some(_) => (Status::Failed, true),
+            None => (Status::Unknown, false),
         }
     }
+}
+
+/// What a needs-auth entry is worth at `now` (milliseconds since 1970): `None` once Claude itself would ignore it.
+fn needs_auth_freshness(entry: &Value, now: f64) -> Option<Freshness> {
+    let Some(at) = entry.get("timestamp").and_then(Value::as_f64) else {
+        return Some(Freshness::Undated);
+    };
+    let ttl = entry
+        .get("ttlMs")
+        .and_then(Value::as_f64)
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .map_or(NEEDS_AUTH_TTL_MS, |t| t.min(NEEDS_AUTH_MAX_TTL_MS));
+    let age = now - at;
+    (age > -CLOCK_SKEW_MS && age < ttl).then_some(Freshness::Fresh)
 }
 
 // ---------------------------------------------------------------- reading .claude.json
@@ -882,13 +930,92 @@ mod tests {
         );
         e.write(
             "mcp-needs-auth-cache.json",
-            &json!({"auth":{"timestamp":1,"id":"x"}}),
+            // Written just now, as Claude Code writes it: within its time to live. (Was `"timestamp":1`, 1970, which
+            // Claude Code itself ignores.)
+            &json!({"auth":{"timestamp":now_ms(),"id":"x"}}),
         );
         let s = e.load();
         assert_eq!(find(&s, Scope::User, "ok").status, Status::Connected);
         assert_eq!(find(&s, Scope::User, "bad").status, Status::Failed);
         assert_eq!(find(&s, Scope::User, "auth").status, Status::NeedsAuth);
         assert_eq!(find(&s, Scope::User, "new").status, Status::Unknown);
+        // The health cache is left by older Claude Code versions and can be any age: last known only.
+        assert!(find(&s, Scope::User, "ok").status_cached);
+        assert!(find(&s, Scope::User, "bad").status_cached);
+        // A needs-auth entry Claude wrote within its time to live is as good as a check.
+        assert!(!find(&s, Scope::User, "auth").status_cached);
+        assert!(!find(&s, Scope::User, "new").status_cached);
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    #[test]
+    fn a_needs_auth_entry_counts_only_as_long_as_claude_trusts_it() {
+        let e = Env::new();
+        let servers: serde_json::Map<String, Value> = [
+            "fresh",
+            "own-ttl",
+            "expired",
+            "own-ttl-gone",
+            "future",
+            "undated",
+            "junk-time",
+            "huge-ttl",
+            "negative-ttl",
+        ]
+        .iter()
+        .map(|n| {
+            (
+                (*n).to_owned(),
+                json!({"type":"http","url":"https://a.example.com"}),
+            )
+        })
+        .collect();
+        e.write(".claude.json", &json!({ "mcpServers": servers }));
+        e.write(
+            "mcp-health-cache.json",
+            &json!({"version":1,"servers":{"expired":{"status":"healthy"}}}),
+        );
+        let now = now_ms();
+        let min = 60 * 1000;
+        e.write(
+            "mcp-needs-auth-cache.json",
+            &json!({
+                "fresh": {"timestamp": now - 14 * min},
+                "own-ttl": {"timestamp": now - 3 * 60 * min, "ttlMs": 4 * 60 * min},
+                "expired": {"timestamp": now - 16 * min},
+                "own-ttl-gone": {"timestamp": now - 2 * min, "ttlMs": min},
+                "future": {"timestamp": now + 5 * min},
+                "undated": {},
+                "junk-time": {"timestamp": "yesterday"},
+                // From an untrusted file: a time to live of ages would make the entry fresh for ever.
+                "huge-ttl": {"timestamp": now - 5 * 60 * min, "ttlMs": 1e300},
+                "negative-ttl": {"timestamp": now - min, "ttlMs": -5}
+            }),
+        );
+        let s = e.load();
+        let got = |n: &str| {
+            let r = find(&s, Scope::User, n);
+            (r.status, r.status_cached)
+        };
+        assert_eq!(got("fresh"), (Status::NeedsAuth, false));
+        assert_eq!(got("own-ttl"), (Status::NeedsAuth, false));
+        // Past its time Claude ignores the entry; what is left is the health cache's last-known answer.
+        assert_eq!(got("expired"), (Status::Connected, true));
+        assert_eq!(got("own-ttl-gone"), (Status::Unknown, false));
+        // A time too far ahead is a broken clock or a broken file: not trusted.
+        assert_eq!(got("future"), (Status::Unknown, false));
+        // No usable time: shown, but only as last known.
+        assert_eq!(got("undated"), (Status::NeedsAuth, true));
+        assert_eq!(got("junk-time"), (Status::NeedsAuth, true));
+        // At most Claude's longest default (4 hours); a nonsense one counts as no time to live of its own.
+        assert_eq!(got("huge-ttl"), (Status::Unknown, false));
+        assert_eq!(got("negative-ttl"), (Status::NeedsAuth, false));
     }
 
     #[test]
