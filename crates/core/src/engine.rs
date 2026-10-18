@@ -370,6 +370,9 @@ pub(crate) struct EngineConfig {
     pub cli_env: Vec<(String, OsString)>,
     pub max_checks: usize,
     pub check_timeout: Duration,
+    /// Check, in the background, the servers with no status of their own (the app). Off for a command-line run,
+    /// which checks only the servers it is asked about.
+    pub background_checks: bool,
     /// How often to look for changes made to the configuration from outside; `None` turns watching off.
     pub watch_interval: Option<Duration>,
     /// How long changed files must hold still before they are read again.
@@ -1275,7 +1278,9 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
     let keys = &state.keys;
     for row in &snapshot.servers {
         // Project servers run the repository's own command: only on an explicit request.
-        let wanted = row.scope != Scope::Project && row.enabled && (live_all || needs_check(row));
+        let wanted = row.scope != Scope::Project
+            && row.enabled
+            && (live_all || (shared.config.background_checks && needs_check(row)));
         if wanted
             && let Some(mut job) = build_job(
                 shared,
@@ -1753,6 +1758,7 @@ mod tests {
                 verify_delay: Duration::from_millis(50),
                 max_checks: 3,
                 check_timeout: Duration::from_secs(10),
+                background_checks: true,
                 watch_interval: Some(Duration::from_millis(40)),
                 watch_settle: Duration::from_millis(120),
                 // Never the real keychain in tests.

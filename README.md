@@ -17,5 +17,7 @@ M0/M1 in progress: a themed shell (nav, top bar, toolbar, grid, detail panel) th
 
 ```
 cargo run -p klefki
+cargo run -p klefki-cli -- list            # the servers, grouped by scope and project; runs nothing
+cargo run -p klefki-cli -- status [NAME]   # asks Claude Code whether they connect; --json for scripts
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
