@@ -123,6 +123,16 @@ pub struct ServerRow {
     pub approval: Option<Approval>,
     pub shadowed: bool,
     pub casing_collision: bool,
+    /// Signs in with OAuth: the client id and scopes from its entry (not secrets; the client secret lives in the
+    /// keyring and is never read into a row). `None` for a server without an `oauth` entry.
+    pub oauth: Option<OAuthInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthInfo {
+    /// `None` when the client registers itself (no id configured).
+    pub client_id: Option<String>,
+    pub scopes: Vec<String>,
 }
 
 impl ServerRow {

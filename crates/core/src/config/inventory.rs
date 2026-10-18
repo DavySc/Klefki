@@ -1,7 +1,7 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::{ConfigPaths, fsx};
-use crate::api::{Approval, Scope, ServerRow, Snapshot, Status, TransportKind};
+use crate::api::{Approval, OAuthInfo, Scope, ServerRow, Snapshot, Status, TransportKind};
 use crate::sanitize::{self, sanitize};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, Visitor};
@@ -178,7 +178,36 @@ fn row(
         approval: None,
         shadowed: false,
         casing_collision: false,
+        oauth: oauth_info(entry),
     }
+}
+
+/// At most this many scopes are kept per server; more is not a configuration anyone reads.
+const MAX_SCOPES: usize = 256;
+
+/// The OAuth client id and scopes of `entry`, cleaned and cut like every other text. Only those two keys: anything
+/// else under `oauth` (a client secret, say) is never read into a row. Values of the wrong kind are left out.
+fn oauth_info(entry: &Value) -> Option<OAuthInfo> {
+    let oauth = entry.get("oauth")?.as_object()?;
+    let client_id = oauth
+        .get("clientId")
+        .and_then(Value::as_str)
+        .map(|id| clip(&sanitize(id)));
+    let scopes: Vec<String> = match oauth.get("scopes") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| clip(&sanitize(s)))
+            .take(MAX_SCOPES)
+            .collect(),
+        Some(Value::String(spaced)) => spaced
+            .split_whitespace()
+            .map(|s| clip(&sanitize(s)))
+            .take(MAX_SCOPES)
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some(OAuthInfo { client_id, scopes })
 }
 
 fn classify(entry: &Value) -> (TransportKind, String) {
@@ -746,13 +775,16 @@ mod tests {
             &json!({"mcpServers": {
                 "a": {"type": "http", "url": "https://user:pw-S3CRET@h.example.com/p?token=S3CRET#S3CRET",
                       "headers": {"Authorization": "Bearer S3CRET"},
-                      "oauth": {"clientId": "S3CRET"}},
+                      "oauth": {"clientId": "client-1", "clientSecret": "S3CRET"}},
                 "b": {"type": "stdio", "command": "x", "env": {"API_KEY": "S3CRET"}}
             }}),
         );
         let s = e.load();
         let dump = format!("{s:?}");
         assert!(!dump.contains("S3CRET"), "{dump}");
+        // Changed with the owner's decision: an OAuth client id
+        // is not a secret and is kept on the row. Anything else under `oauth` still is not.
+        assert!(dump.contains("client-1"), "{dump}");
         assert_eq!(
             find(&s, Scope::User, "a").target,
             "https://h.example.com/p?…"
@@ -806,6 +838,73 @@ mod tests {
             find(&s, Scope::Local, "on").project.as_deref(),
             Some(normalise_project(&p.to_string_lossy()).as_str())
         );
+    }
+
+    #[test]
+    fn oauth_client_ids_and_scopes_are_kept_on_the_rows() {
+        let e = Env::new();
+        let p = e.project("app");
+        std::fs::write(
+            p.join(".mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"repo":{{"type":"http","url":"https://r.example.com",
+                    "oauth":{{"clientId":"evil\u001b[31mid","scopes":["{}"]}}}}}}}}"#,
+                "s".repeat(600)
+            ),
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {
+                    "listed": {"type": "http", "url": "https://a.example.com",
+                               "oauth": {"clientId": "abc", "callbackPort": 1234, "scopes": ["read", "write"]}},
+                    "spaced": {"type": "http", "url": "https://b.example.com",
+                               "oauth": {"clientId": "def", "scopes": "read  write admin"}},
+                    "dynamic": {"type": "http", "url": "https://c.example.com", "oauth": {"callbackPort": 9}},
+                    "odd": {"type": "http", "url": "https://d.example.com", "oauth": {"clientId": 7, "scopes": [1, "x"]}},
+                    "plain": {"type": "http", "url": "https://e.example.com"}
+                },
+                "projects": {p.to_string_lossy(): {}}
+            }),
+        );
+        let s = e.load();
+        let oauth = |scope, name| find(&s, scope, name).oauth.clone();
+        assert_eq!(
+            oauth(Scope::User, "listed"),
+            Some(OAuthInfo {
+                client_id: Some("abc".into()),
+                scopes: vec!["read".into(), "write".into()]
+            })
+        );
+        assert_eq!(
+            oauth(Scope::User, "spaced").unwrap().scopes,
+            ["read", "write", "admin"]
+        );
+        // Signs in with OAuth, the client registered on the fly: no id, still OAuth.
+        assert_eq!(
+            oauth(Scope::User, "dynamic"),
+            Some(OAuthInfo {
+                client_id: None,
+                scopes: Vec::new()
+            })
+        );
+        // Values of the wrong kind are left out, not guessed.
+        assert_eq!(
+            oauth(Scope::User, "odd"),
+            Some(OAuthInfo {
+                client_id: None,
+                scopes: vec!["x".into()]
+            })
+        );
+        assert_eq!(oauth(Scope::User, "plain"), None);
+        // From a repository: untrusted, so cleaned and cut like every other text.
+        let repo = oauth(Scope::Project, "repo").unwrap();
+        let id = repo.client_id.unwrap();
+        assert!(id.starts_with("evil") && !id.contains('\u{1b}'), "{id:?}");
+        // Cut at 512 characters, marked with an ellipsis.
+        assert_eq!(repo.scopes[0].chars().count(), 513);
+        assert!(repo.scopes[0].ends_with('…'));
     }
 
     #[test]
