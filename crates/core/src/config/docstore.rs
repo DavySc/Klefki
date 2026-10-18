@@ -949,8 +949,37 @@ fn edit_valid_claude_json(
     }
 
     // Servers to delete or replace in a project: an error if no spelling of the project has them.
+    // Each spelling's old list (where it is and its names), for the projects a migration is about; and per project
+    // the names of all of them, which every spelling's toggle list gets, as a toggle covers every spelling.
+    let migrating: Vec<&str> = ops
+        .iter()
+        .zip(&targets)
+        .filter(|(op, _)| matches!(op, Op::MigrateLegacyDisabled { .. }))
+        .filter_map(|(_, t)| t.as_deref())
+        .collect();
+    let mut legacy_at = vec![None; projects.members.len()];
+    let mut legacy_union: std::collections::HashMap<&str, Vec<String>> =
+        std::collections::HashMap::new();
+    for (i, (member, key)) in projects.members.iter().zip(&keys).enumerate() {
+        if !migrating.contains(&key.as_str()) {
+            continue;
+        }
+        let Some(entry) = &member.object else {
+            continue;
+        };
+        if let Some((at, names)) = legacy_names(text, entry, &member.key)? {
+            let union = legacy_union.entry(key.as_str()).or_default();
+            for name in &names {
+                if !union.contains(name) {
+                    union.push(name.clone());
+                }
+            }
+            legacy_at[i] = Some((at, names));
+        }
+    }
+
     let mut server_found = vec![false; ops.len()];
-    for (member, key) in projects.members.iter().zip(&keys) {
+    for (i, (member, key)) in projects.members.iter().zip(&keys).enumerate() {
         let here: Vec<&Op> = ops
             .iter()
             .zip(&targets)
@@ -994,15 +1023,8 @@ fn edit_valid_claude_json(
             }
         }
         // The old list, when this spelling has one and a migration asks for it: its member and its names.
-        let legacy = if here
-            .iter()
-            .any(|op| matches!(op, Op::MigrateLegacyDisabled { .. }))
-        {
-            legacy_names(text, entry, &member.key)?
-        } else {
-            None
-        };
-        if let Some((_, names)) = &legacy {
+        let legacy = &legacy_at[i];
+        if let Some((_, names)) = legacy {
             out.lines
                 .push(format!("  projects[\"{shown_key}\"].{LEGACY}"));
             for name in names {
@@ -1090,7 +1112,7 @@ fn edit_valid_claude_json(
                         }
                     }
                     Op::MigrateLegacyDisabled { .. } => {
-                        for name in legacy.iter().flat_map(|(_, names)| names) {
+                        for name in legacy_union.get(key.as_str()).into_iter().flatten() {
                             let list = items.get_or_insert_with(Vec::new);
                             if !list.iter().any(|v| v.as_str() == Some(name)) {
                                 list.push(Value::String(name.clone()));
@@ -1818,8 +1840,9 @@ mod tests {
         }
     }
 
-    /// The migration of the old list, on the parsed document. `original` is the file before the plan: where its entry
-    /// had no toggle list, the toggle list sits where the old list was, even if an earlier op in the plan created it.
+    /// The migration of the old list, on the parsed document: every spelling of the project gets the names of all its
+    /// old lists. `original` is the file before the plan: where an entry had no toggle list, the toggle list sits
+    /// where the old list was, even if an earlier op in the plan created it.
     fn migrate_legacy(
         doc: &mut Value,
         original: &Value,
@@ -1832,43 +1855,61 @@ mod tests {
             .get_mut("projects")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| invalid("no projects"))?;
-        let mut found = false;
+        if !projects.keys().any(|k| normalise_project(k) == wanted) {
+            return Err(invalid("unknown project"));
+        }
+        let mut union: Vec<String> = Vec::new();
+        for (key, entry) in projects.iter() {
+            if normalise_project(key) != wanted {
+                continue;
+            }
+            let Some(legacy) = entry.get(LEGACY) else {
+                continue;
+            };
+            for v in legacy.as_array().ok_or_else(|| invalid("not a list"))? {
+                let name = v.as_str().ok_or_else(|| invalid("not a name"))?;
+                if !union.iter().any(|n| n == name) {
+                    union.push(name.to_owned());
+                }
+            }
+        }
         for (key, entry) in projects.iter_mut() {
             if normalise_project(key) != wanted {
                 continue;
             }
-            found = true;
-            let Some(legacy) = entry.get(LEGACY) else {
-                continue;
-            };
-            let names: Vec<String> = legacy
-                .as_array()
-                .ok_or_else(|| invalid("not a list"))?
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| invalid("not a name"))
-                })
-                .collect::<Result<_, _>>()?;
             let shown = sanitize(&key.replace('"', "\\\""));
-            lines.push(format!("  projects[\"{shown}\"].{LEGACY}"));
-            for name in &names {
-                lines.push(format!("- {}", sanitize(name)));
+            let own: Option<Vec<String>> = entry.get(LEGACY).map(|l| {
+                l.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_owned())
+                    .collect()
+            });
+            if let Some(own) = &own {
+                lines.push(format!("  projects[\"{shown}\"].{LEGACY}"));
+                for name in own {
+                    lines.push(format!("- {}", sanitize(name)));
+                }
             }
-            let had_list = original["projects"][key.as_str()].get(DISABLED).is_some();
             let object = entry.as_object_mut().unwrap();
-            let mut items = object
+            let existing = object
                 .get(DISABLED)
                 .map(|v| v.as_array().cloned().ok_or_else(|| invalid("not a list")))
-                .transpose()?
-                .unwrap_or_default();
-            for name in names {
-                if !items.iter().any(|v| v.as_str() == Some(&name)) {
+                .transpose()?;
+            let mut items = existing.clone().unwrap_or_default();
+            for name in &union {
+                if !items.iter().any(|v| v.as_str() == Some(name)) {
                     lines.push(format!("  projects[\"{shown}\"].{DISABLED}"));
-                    lines.push(format!("+ {}", sanitize(&name)));
-                    items.push(Value::String(name));
+                    lines.push(format!("+ {}", sanitize(name)));
+                    items.push(Value::String(name.clone()));
                 }
+            }
+            let had_list = original["projects"][key.as_str()].get(DISABLED).is_some();
+            if own.is_none() {
+                if existing.is_some() || !union.is_empty() {
+                    object.insert(DISABLED.to_owned(), Value::Array(items));
+                }
+                continue;
             }
             let mut out = serde_json::Map::new();
             for (k, v) in std::mem::take(object) {
@@ -1888,11 +1929,7 @@ mod tests {
             }
             *object = out;
         }
-        if found {
-            Ok(())
-        } else {
-            Err(invalid("unknown project"))
-        }
+        Ok(())
     }
 
     fn clear_rejection(
@@ -4110,9 +4147,12 @@ mod tests {
 
     #[test]
     fn migrating_covers_every_spelling_of_the_project() {
+        // Like a toggle, every spelling gets every name, also a spelling without an old list of its own (review: the
+        // names went only to the spelling that held them, so x stayed on if Claude read the other entry).
         let doc = json!({"projects": {
             "c:\\work\\app": {"mcpServersDisabled": ["a"]},
-            "C:/work/app/": {"disabledMcpServers": [], "mcpServersDisabled": ["b"]},
+            "C:/work/app/": {"disabledMcpServers": [], "mcpServersDisabled": ["b", "a"]},
+            "C:/work/app": {"k": 1},
             "C:/work/other": {"mcpServersDisabled": ["c"]}
         }});
         let f = Fixture::new(&pretty(&doc));
@@ -4120,11 +4160,15 @@ mod tests {
         let after = f.json();
         assert_eq!(
             after["projects"]["c:\\work\\app"],
-            json!({"disabledMcpServers": ["a"]})
+            json!({"disabledMcpServers": ["a", "b"]})
         );
         assert_eq!(
             after["projects"]["C:/work/app/"],
-            json!({"disabledMcpServers": ["b"]})
+            json!({"disabledMcpServers": ["a", "b"]})
+        );
+        assert_eq!(
+            after["projects"]["C:/work/app"],
+            json!({"k": 1, "disabledMcpServers": ["a", "b"]})
         );
         // Another project is left alone.
         assert_eq!(

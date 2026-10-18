@@ -837,6 +837,8 @@ impl ShellApp {
                     let folder = folder_name(&l.shown);
                     let line = if l.malformed {
                         format!("{folder}: holds something other than server names; edit it in .claude.json by hand")
+                    } else if l.names.is_empty() {
+                        format!("{folder}: an empty list")
                     } else {
                         let state = match l.turns_off.as_slice() {
                             [] => "already off".to_owned(),
@@ -862,7 +864,7 @@ impl ShellApp {
                     } else if lists.iter().all(|l| l.malformed) {
                         "Only lists of server names can be migrated"
                     } else {
-                        "Finish the open review first"
+                        "Wait for the open change to finish"
                     })
                     .clicked();
             });
@@ -2966,7 +2968,8 @@ fn parent_folder(path: &str) -> &str {
 
 /// Names joined with commas; past the first few, only counted, so a long list stays readable.
 fn some_names(names: &[String]) -> String {
-    const NAMED: usize = 6;
+    // As many as the review's summary names.
+    const NAMED: usize = 5;
     if names.len() <= NAMED + 1 {
         return names.join(", ");
     }
@@ -5706,8 +5709,10 @@ mod tests {
         let (h, _engine) = legacy_harness(vec![
             legacy("C:/Repos/WebApp", &["gw", "old"], &["gw"], false),
             legacy("/home/x/api", &["a"], &[], false),
+            legacy("/srv/empty", &[], &[], false),
         ]);
-        h.get_by_label_contains("Old switch-off lists in 2 projects");
+        h.get_by_label_contains("Old switch-off lists in 3 projects");
+        h.get_by_label_contains("empty: an empty list");
         h.get_by_label_contains("Claude Code no longer reads");
         h.get_by_label_contains("WebApp: gw, old (gw is on)");
         h.get_by_label_contains("api: a (already off)");
