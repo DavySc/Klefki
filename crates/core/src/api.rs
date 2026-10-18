@@ -7,6 +7,7 @@ pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
 };
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
+pub use crate::paste::{Pasted, PastedServer};
 pub use crate::secrets::{Secret, SecretError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

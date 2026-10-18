@@ -74,6 +74,7 @@ pub(crate) fn resolve(
             Change::Rename { .. } => "Rename",
             Change::Duplicate { .. } => "Duplicate",
             Change::MigrateLegacyDisabled { .. } => "Migrate",
+            Change::Add { .. } => "Add",
         };
         if !verbs.contains(&verb) {
             verbs.push(verb);
@@ -94,6 +95,11 @@ pub(crate) fn resolve(
             Change::MigrateLegacyDisabled { project } => {
                 migrate_legacy(project, snapshot, &mut out)?;
             }
+            Change::Add {
+                name,
+                json,
+                targets,
+            } => add(name, json, targets, snapshot, keys, &mut out)?,
         }
     }
     out.action = match verbs.as_slice() {
@@ -151,20 +157,15 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             };
         }
         Change::Duplicate { id, name, targets } => {
-            let user = targets.contains(&Target::User);
-            let folders: Vec<String> = targets
-                .iter()
-                .filter_map(|t| match t {
-                    Target::Local(p) => Some(sanitize(&folder_name(p))),
-                    Target::User => None,
-                })
-                .collect();
-            let place = match (user, folders.is_empty()) {
-                (true, true) => " for the user".to_owned(),
-                (true, false) => format!(" for the user and in {}", and_list(&folders)),
-                (false, _) => format!(" in {}", and_list(&folders)),
-            };
-            return format!("Duplicate {} as {}{place}", shown(id).2, sanitize(name));
+            return format!(
+                "Duplicate {} as {}{}",
+                shown(id).2,
+                sanitize(name),
+                places(targets)
+            );
+        }
+        Change::Add { name, targets, .. } => {
+            return format!("Add {}{}", sanitize(name), places(targets));
         }
     };
     let (scope, project, name) = shown(id);
@@ -179,6 +180,23 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         (_, None) => String::new(),
     };
     format!("{verb} {name}{place}")
+}
+
+/// ` for the user`, ` in a and b`, ` for the user and in a`.
+fn places(targets: &[Target]) -> String {
+    let user = targets.contains(&Target::User);
+    let folders: Vec<String> = targets
+        .iter()
+        .filter_map(|t| match t {
+            Target::Local(p) => Some(sanitize(&folder_name(p))),
+            Target::User => None,
+        })
+        .collect();
+    match (user, folders.is_empty()) {
+        (true, true) => " for the user".to_owned(),
+        (true, false) => format!(" for the user and in {}", and_list(&folders)),
+        (false, _) => format!(" in {}", and_list(&folders)),
+    }
 }
 
 /// `a`, `a and b`, `a, b and c`.
@@ -505,6 +523,32 @@ fn duplicate(
     if targets.is_empty() {
         return Err("Choose where the copy goes.".to_owned());
     }
+    for to in new_places(name, targets, "this copy", snapshot, keys, out)? {
+        out.claude.push(Op::CopyServer {
+            from: from.clone(),
+            name: file.name.clone(),
+            to,
+            new_name: name.to_owned(),
+        });
+    }
+    out.notes.push(
+        "The copy keeps the original's environment and header values; it does not share a sign-in."
+            .to_owned(),
+    );
+    Ok(())
+}
+
+/// Where a new server called `name` goes, as the file spells each project: refused when a target is unknown or
+/// already has a server by that name (the docstore refuses one added twice in a plan), with a warning wherever
+/// Claude Code would use another server of that name instead. `what` names the new server in those warnings.
+fn new_places(
+    name: &str,
+    targets: &[Target],
+    what: &str,
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<Vec<Option<String>>, String> {
     let new = sanitize(name);
     // Every other server called `name` in the file (the new name is plain ASCII, so it is spelled as shown), with
     // its project key as the file spells it.
@@ -514,11 +558,10 @@ fn duplicate(
         .filter_map(|r| Some((r, keys.get(&r.connection)?)))
         .filter(|(_, k)| k.name == name)
         .collect();
-    let same_project = |k: &FileKey, p: &str| {
-        k.project
-            .as_deref()
-            .is_some_and(|q| inventory::normalise_project(q) == inventory::normalise_project(p))
+    let same_project = |k: Option<&str>, p: &str| {
+        k.is_some_and(|q| inventory::normalise_project(q) == inventory::normalise_project(p))
     };
+    let mut places = Vec::new();
     for target in targets {
         let to = match target {
             Target::User => None,
@@ -538,18 +581,16 @@ fn duplicate(
                 Some(known.clone())
             }
         };
+        let place = match &to {
+            None => "for the user".to_owned(),
+            Some(p) => format!("in {}", sanitize(&folder_name(p))),
+        };
         let same_place = |(r, k): &(&ServerRow, &FileKey)| match &to {
             None => r.scope == Scope::User,
-            Some(p) => r.scope == Scope::Local && same_project(k, p),
+            Some(p) => r.scope == Scope::Local && same_project(k.project.as_deref(), p),
         };
         if others.iter().any(same_place) {
-            return Err(format!(
-                "There is already a server called {new} {}.",
-                match &to {
-                    None => "for the user".to_owned(),
-                    Some(p) => format!("in {}", sanitize(&folder_name(p))),
-                }
-            ));
+            return Err(format!("There is already a server called {new} {place}."));
         }
         // Claude Code uses one server per name: local before project before user.
         for (other, k) in others.iter().filter(|o| !same_place(o)) {
@@ -565,32 +606,133 @@ fn duplicate(
             };
             match (&to, other.scope) {
                 (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
-                    "In {folder}, the {scope} server {new} is used instead of this copy."
+                    "In {folder}, the {scope} server {new} is used instead of {what}."
                 )),
                 (Some(p), Scope::User) => out.warnings.push(format!(
-                    "In {}, this copy is used instead of the user server {new}.",
+                    "In {}, {what} is used instead of the user server {new}.",
                     sanitize(&folder_name(p))
                 )),
-                (Some(p), Scope::Project) if same_project(k, p) => {
+                (Some(p), Scope::Project) if same_project(k.project.as_deref(), p) => {
                     out.warnings.push(format!(
-                        "In {folder}, this copy is used instead of the project server {new}."
+                        "In {folder}, {what} is used instead of the project server {new}."
                     ));
                 }
                 _ => {}
             }
         }
-        out.claude.push(Op::CopyServer {
-            from: from.clone(),
-            name: file.name.clone(),
-            to,
-            new_name: name.to_owned(),
+        places.push(to);
+    }
+    Ok(places)
+}
+
+/// Adds a new server from a definition the user gave (pasted, say): checked as an edit is, and shown in full
+/// before anything is written, since Klefki checks it right after and that starts what it runs.
+fn add(
+    name: &str,
+    json: &str,
+    targets: &[Target],
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    crate::model::ServerName::parse(name)
+        .map_err(|e| format!("{:?} cannot be used as a server name: {e}.", sanitize(name)))?;
+    let new = sanitize(name);
+    if targets.is_empty() {
+        return Err(format!("Choose where {new} goes."));
+    }
+    if json.len() > entry::MAX_ENTRY_BYTES {
+        return Err(format!(
+            "The definition of {new} is longer than {} KiB.",
+            entry::MAX_ENTRY_BYTES / 1024
+        ));
+    }
+    let value: Value = serde_json::from_str(json).map_err(|e| {
+        format!(
+            "The definition of {new} is not valid JSON: {}",
+            sanitize(&e.to_string())
+        )
+    })?;
+    entry::validate(&value).map_err(|why| format!("{new} cannot be added: {why}."))?;
+    // Typed-in values are not shown (they may be secrets); which of the user's variables are read still is.
+    let lines = describe(&shown_values(&value))
+        .map_err(|why| format!("{new} cannot be reviewed safely, so it is not added: {why}."))?;
+    for to in new_places(name, targets, "this server", snapshot, keys, out)? {
+        out.claude.push(Op::AddServer {
+            project: to,
+            name: name.to_owned(),
+            entry: value.clone(),
         });
     }
-    out.notes.push(
-        "The copy keeps the original's environment and header values; it does not share a sign-in."
-            .to_owned(),
-    );
+    let remote = value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t != "stdio");
+    out.reviews.push(Review {
+        title: format!("{new} would {}:", if remote { "connect" } else { "run" }),
+        lines,
+    });
+    let note = "Klefki checks a new server once it is added: it starts its command, or connects to its address.";
+    if !out.notes.iter().any(|n| n == note) {
+        out.notes.push(note.to_owned());
+    }
     Ok(())
+}
+
+/// `entry` with every environment and header value hidden. A value that reads the user's variables shows only
+/// those (`<hidden> ${SUFFIX}`), so the review still says which are read; one made of nothing but references, after
+/// an auth scheme (`Bearer ${TOKEN}`), is shown as it is.
+fn shown_values(entry: &Value) -> Value {
+    let mut out = entry::masked(entry);
+    for key in ["env", "headers"] {
+        if let (Some(Value::Object(values)), Some(Value::Object(was))) =
+            (out.get_mut(key), entry.get(key))
+        {
+            for (name, value) in values.iter_mut() {
+                let Some(original) = was.get(name).and_then(Value::as_str) else {
+                    continue;
+                };
+                let names = env_references(original);
+                if names.is_empty() {
+                    continue;
+                }
+                *value = Value::String(if only_references(original) {
+                    original.to_owned()
+                } else {
+                    let refs: Vec<String> = names.iter().map(|n| format!("${{{n}}}")).collect();
+                    format!("{} {}", entry::MASK, refs.join(" "))
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `${A}`, `${A}${B}`, `Bearer ${TOKEN}`: nothing typed in that could be a secret (no default value either).
+fn only_references(value: &str) -> bool {
+    let mut rest = ["Bearer ", "Basic ", "Token "]
+        .iter()
+        .find_map(|scheme| value.strip_prefix(scheme))
+        .unwrap_or(value);
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(inner) = rest.strip_prefix("${") else {
+            return false;
+        };
+        let Some(end) = inner.find('}') else {
+            return false;
+        };
+        let name = &inner[..end];
+        let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return false;
+        }
+        rest = &inner[end + 1..];
+    }
+    true
 }
 
 fn approve(

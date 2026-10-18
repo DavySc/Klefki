@@ -21,6 +21,7 @@ pub enum Action {
     Tone(crate::theme::Tone),
     Settings,
     Duplicate,
+    Add,
     FixCasing,
     /// Move every old switch-off list (`mcpServersDisabled`) into the one Claude Code reads.
     MigrateLegacy,
