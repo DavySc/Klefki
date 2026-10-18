@@ -72,22 +72,21 @@ pub enum DetailTab {
     General,
     Auth,
     HeadersEnv,
-    RawJson,
     Status,
 }
 
 impl DetailTab {
-    const ALL: [(DetailTab, &'static str); 5] = [
+    // No JSON tab: the definition is edited in labelled fields, and as JSON only from there, when they fall short.
+    const ALL: [(DetailTab, &'static str); 4] = [
         // Short names keep the tabs on one line in a panel of a third of the window.
         (DetailTab::General, "General"),
         (DetailTab::Status, "Status"),
-        (DetailTab::RawJson, "JSON"),
         (DetailTab::HeadersEnv, "Env"),
         (DetailTab::Auth, "Auth"),
     ];
 }
 
-/// The Raw JSON tab's editor, for one server.
+/// The definition being edited, for one server: in the form, or as JSON.
 struct Editor {
     id: ServerId,
     state: EditorState,
@@ -100,7 +99,7 @@ enum EditorState {
     Ready {
         /// As the engine sent it, to tell whether anything was edited.
         original: String,
-        /// The draft, as JSON: what the JSON tab edits and what is sent for review.
+        /// The draft, as JSON: what the JSON editor edits and what is sent for review.
         text: String,
         /// Project servers are shown but not edited (they live in the repository).
         editable: bool,
@@ -112,6 +111,9 @@ enum EditorState {
         /// `text` and `form` as they were when last brought in line, to tell which one was edited since.
         synced_text: String,
         synced_form: Option<Box<Definition>>,
+        /// Edited as JSON rather than in the form: asked for, or a definition the form cannot show. It stays until
+        /// the user goes back, so the form does not replace the JSON under the cursor once it becomes readable.
+        as_json: bool,
     },
 }
 
@@ -125,8 +127,12 @@ impl EditorState {
             problem: None,
             synced_text: String::new(),
             synced_form: None,
+            as_json: false,
         };
         state.sync();
+        if let Self::Ready { form, as_json, .. } = &mut state {
+            *as_json = form.is_err();
+        }
         state
     }
 
@@ -209,7 +215,7 @@ pub struct ShellApp {
     applying: bool,
     /// A plan was asked for and the engine has not answered yet.
     preparing: bool,
-    /// The definition being viewed or edited in the Raw JSON tab.
+    /// The definition being viewed or edited, in the form or as JSON.
     editor: Option<Editor>,
     /// Ctrl+K / ⌘K.
     command: CommandPalette,
@@ -362,7 +368,19 @@ impl ShellApp {
                 backup,
             } => {
                 if changed {
-                    self.editor = None;
+                    // Read again what was saved, for the server still being edited; drop it for any other.
+                    let open = self
+                        .editor
+                        .take()
+                        .map(|e| e.id)
+                        .filter(|id| self.single_selected().is_some_and(|s| s.is(id)));
+                    if let Some(id) = open {
+                        self.editor = Some(Editor {
+                            id: id.clone(),
+                            state: EditorState::Loading,
+                        });
+                        self.send(Command::Inspect(id));
+                    }
                 }
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.plan = None;
@@ -547,7 +565,7 @@ impl ShellApp {
             if self.selected.len() == 1
                 && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E))
             {
-                self.tab = DetailTab::RawJson;
+                self.edit_selected();
             }
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
                 self.open_duplicate();
@@ -809,7 +827,7 @@ impl ShellApp {
                         g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
                         g if g == icon::TRASH => self.prepare_delete(),
                         g if g == icon::COPY => self.open_duplicate(),
-                        _ => self.tab = DetailTab::RawJson,
+                        _ => self.edit_selected(),
                     }
                 }
             }
@@ -875,7 +893,7 @@ impl ShellApp {
                 add(
                     icon::PENCIL_SIMPLE,
                     format!("Edit {}", s.name),
-                    "JSON".into(),
+                    "Command, address, arguments, environment".into(),
                     Some(shortcut("E")),
                     command::Action::Edit,
                 );
@@ -986,7 +1004,7 @@ impl ShellApp {
             A::TurnOn => self.prepare_toggle(true),
             A::TurnOff => self.prepare_toggle(false),
             A::Delete => self.prepare_delete(),
-            A::Edit => self.tab = DetailTab::RawJson,
+            A::Edit => self.edit_selected(),
             A::Check | A::Diagnose | A::Approve => {
                 if let Some(s) = self.single_selected() {
                     let id = s.id();
@@ -1795,7 +1813,6 @@ impl ShellApp {
                     diagnosis_panel(ui, s, d);
                 }
             }
-            DetailTab::RawJson => self.raw_json(ui, s),
             DetailTab::Auth => {
                 let muted = |ui: &mut Ui, text: &str| {
                     ui.add(egui::Label::new(RichText::new(text).color(pal.text_muted)).wrap());
@@ -1855,92 +1872,54 @@ impl ShellApp {
         }
     }
 
-    /// The server's definition as JSON: editable for user and local servers, then saved through a reviewed plan.
-    fn raw_json(&mut self, ui: &mut Ui, s: &ServerRow) {
-        let pal = theme::palette(ui.ctx());
-        if self.core.is_none() {
-            ui.label(RichText::new("Not available for sample data.").color(pal.text_muted));
-            return;
-        }
-        if !self.editor.as_ref().is_some_and(|e| s.is(&e.id)) {
-            self.editor = Some(Editor {
-                id: s.id(),
-                state: EditorState::Loading,
-            });
-            self.send(Command::Inspect(s.id()));
-        }
-        let can_review = self.can_prepare();
-        let Some(editor) = &mut self.editor else {
+    /// Edit (toolbar, Ctrl+E, palette): the selected server's definition, in the form on the General tab.
+    fn edit_selected(&mut self) {
+        let Some(s) = self.single_selected().cloned() else {
             return;
         };
-        let mut review = None;
-        match &mut editor.state {
-            EditorState::Loading => {
-                ui.label(RichText::new("Loading…").color(pal.text_muted));
-            }
-            EditorState::Failed(why) => {
-                ui.add(egui::Label::new(RichText::new(why.as_str()).color(pal.danger)).wrap());
-            }
-            EditorState::Ready {
-                original,
-                editable: false,
-                ..
-            } => {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Defined in the repository's .mcp.json. Klefki shows it but does not edit files in a repository.")
-                            .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(&mut original.as_str())
-                        .code_editor()
-                        .desired_width(f32::INFINITY),
-                );
-            }
-            EditorState::Ready {
-                original,
-                text,
-                editable: true,
-                ..
-            } => {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Values shown as <hidden> keep what they are now. Type a new value to change one.")
-                            .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(4.0);
-                ui.add(
-                    egui::TextEdit::multiline(text)
-                        .code_editor()
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(14),
-                );
-                let edited = text != original;
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(edited && can_review, egui::Button::new("Review and save…"))
-                        .clicked()
-                    {
-                        review = Some(text.clone());
-                    }
-                    if ui
-                        .add_enabled(edited, egui::Button::new("Revert"))
-                        .clicked()
-                    {
-                        *text = original.clone();
-                    }
-                });
-            }
+        self.tab = DetailTab::General;
+        if self.core.is_some() && self.editor_for(&s).is_none() {
+            self.open_editor(&s);
         }
-        if let Some(json) = review {
-            self.prepare(vec![Change::Replace { id: s.id(), json }]);
+    }
+
+    /// Whether `s`'s definition is being edited as JSON instead of in the form.
+    fn editing_as_json(&mut self, s: &ServerRow) -> bool {
+        matches!(
+            self.editor_for(s),
+            Some(EditorState::Ready { as_json, form, .. }) if *as_json || form.is_err()
+        )
+    }
+
+    /// The definition as JSON, in place of the form, for what the form does not show. Saved through the same
+    /// review as the form.
+    fn json_editor(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        let Some(EditorState::Ready { text, form, .. }) = self.editor_for(s) else {
+            return;
+        };
+        if let Err(why) = form.as_ref() {
+            ui.add(egui::Label::new(RichText::new(why.as_str()).color(pal.warn)).wrap());
+            ui.add_space(4.0);
         }
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Values shown as <hidden> keep what they are now. Type a new value to change one.",
+                )
+                .color(pal.text_muted),
+            )
+            .wrap(),
+        );
+        ui.add_space(4.0);
+        ui.add(
+            egui::TextEdit::multiline(text)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .desired_rows(14),
+        );
+        ui.add_space(6.0);
+        self.save_bar(ui, s);
     }
 
     /// The OAuth client secret of `s`: whether the system's secret store holds one, and setting, replacing or
@@ -2043,7 +2022,7 @@ impl ShellApp {
         }
     }
 
-    /// Asks the engine for `s`'s definition, for the form and the JSON tab.
+    /// Asks the engine for `s`'s definition, for the form and the JSON editor.
     fn open_editor(&mut self, s: &ServerRow) {
         self.editor = Some(Editor {
             id: s.id(),
@@ -2081,16 +2060,21 @@ impl ShellApp {
             EditorState::Loading => muted(ui, "Loading…", pal.text_muted),
             EditorState::Failed(why) => muted(ui, why, pal.danger),
             EditorState::Ready {
-                editable: false, ..
-            } => muted(
-                ui,
-                "Defined in the repository's .mcp.json. Klefki shows it but does not edit files in a repository.",
-                pal.text_muted,
-            ),
-            EditorState::Ready { form, .. } if form.is_err() => {
-                let why = form.as_ref().as_ref().err().cloned().unwrap_or_default();
-                muted(ui, &why, pal.text_muted);
-                self.save_bar(ui, s);
+                editable: false,
+                original,
+                ..
+            } => {
+                muted(
+                    ui,
+                    "Defined in the repository's .mcp.json. Klefki shows it but does not edit files in a repository.",
+                    pal.text_muted,
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut original.as_str())
+                        .code_editor()
+                        .desired_width(f32::INFINITY),
+                );
             }
             EditorState::Ready { form, .. }
                 if form
@@ -2115,6 +2099,10 @@ impl ShellApp {
         ui.label(RichText::new("Definition").color(pal.text_muted));
         ui.add_space(4.0);
         if self.form_unavailable(ui, s) {
+            return;
+        }
+        if self.editing_as_json(s) {
+            self.json_editor(ui, s);
             return;
         }
         let Some(EditorState::Ready { form, .. }) = self.editor_for(s) else {
@@ -2200,6 +2188,11 @@ impl ShellApp {
         if self.form_unavailable(ui, s) {
             return;
         }
+        // Environment and headers are part of the definition: while it is edited as JSON, they are there.
+        if self.editing_as_json(s) {
+            self.json_editor(ui, s);
+            return;
+        }
         let Some(EditorState::Ready { form, .. }) = self.editor_for(s) else {
             return;
         };
@@ -2262,7 +2255,7 @@ impl ShellApp {
         self.save_bar(ui, s);
     }
 
-    /// What stops saving, then Review and save… and Revert, for the form.
+    /// What stops saving, then Review and save… and Revert, and on the right the way to the JSON and back.
     fn save_bar(&mut self, ui: &mut Ui, s: &ServerRow) {
         let pal = theme::palette(ui.ctx());
         let can_prepare = self.can_prepare();
@@ -2270,6 +2263,8 @@ impl ShellApp {
             original,
             text,
             problem,
+            form,
+            as_json,
             ..
         }) = self.editor_for(s)
         else {
@@ -2300,6 +2295,25 @@ impl ShellApp {
                 *text = original.clone();
             }
         });
+        // Quiet, on a line of its own under the buttons (beside them it would not fit a narrow panel): the fields
+        // are the way to edit, the JSON the way out when they fall short.
+        let quiet =
+            |text: &str| egui::Button::new(RichText::new(text).color(pal.link)).frame(false);
+        if *as_json || form.is_err() {
+            if ui
+                .add_enabled(form.is_ok(), quiet("Back to the form"))
+                .on_disabled_hover_text("The form cannot show the JSON as it is now: see above")
+                .clicked()
+            {
+                *as_json = false;
+            }
+        } else if ui
+            .add(quiet("Edit as JSON"))
+            .on_hover_text("Every key of the definition, including those the form does not show")
+            .clicked()
+        {
+            *as_json = true;
+        }
         if let Some(json) = review {
             self.prepare(vec![Change::Replace { id: s.id(), json }]);
         }
@@ -4466,7 +4480,7 @@ mod tests {
         assert!(drain(&engine).is_empty());
     }
 
-    fn open_raw_json(h: &mut Harness<'static, ShellApp>, name: &str) {
+    fn press_edit(h: &mut Harness<'static, ShellApp>, name: &str) {
         h.get_by_label(name).click();
         h.run();
         h.get_by_label(icon::PENCIL_SIMPLE).click();
@@ -4474,18 +4488,141 @@ mod tests {
     }
 
     #[test]
-    fn edit_opens_the_raw_json_and_asks_for_the_definition() {
+    fn edit_opens_the_form_and_asks_for_the_definition() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
         engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
         h.run();
-        open_raw_json(&mut h, "alpha");
-        assert_eq!(h.state().tab, DetailTab::RawJson);
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Status")
+            .click();
+        h.run();
+        h.get_by_label(icon::PENCIL_SIMPLE).click();
+        h.run();
+        assert_eq!(h.state().tab, DetailTab::General);
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
         h.get_by_label_contains("Loading");
         // Asked once, not every frame.
         h.run();
         assert!(drain(&engine).is_empty());
+        engine
+            .events
+            .send(entry_event(&a, FORM_ORIGINAL, true))
+            .unwrap();
+        h.run();
+        // Labelled fields, not the JSON: that is a fallback, reached from the form.
+        assert!(
+            h.query_all_by_value("node").next().is_some(),
+            "the command field"
+        );
+        assert!(
+            h.query_all_by_value("a.js").next().is_some(),
+            "the argument field"
+        );
+        assert!(h.query_by_value(FORM_ORIGINAL).is_none());
+        assert!(h.query_by_label("JSON").is_none(), "no JSON tab");
+        h.get_by_label("Edit as JSON");
+    }
+
+    #[test]
+    fn every_way_to_edit_opens_the_form() {
+        type Way = fn(&mut Harness<'static, ShellApp>);
+        let ways: [(&str, Way); 2] = [
+            ("Ctrl+E", |h| {
+                h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+                h.run();
+            }),
+            ("the palette", |h| {
+                ctrl_k(h);
+                type_into_palette(h, "edit alpha");
+                h.key_press(egui::Key::Enter);
+                h.run();
+            }),
+        ];
+        for (how, way) in ways {
+            let (mut h, engine) = live_harness();
+            let (a, _) = two_rows();
+            engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+            h.run();
+            h.get_by_label("alpha").click();
+            h.run();
+            h.get_by_role_and_label(egui::accesskit::Role::Button, "Status")
+                .click();
+            h.run();
+            way(&mut h);
+            assert_eq!(h.state().tab, DetailTab::General, "{how}");
+            assert_eq!(drain(&engine), vec![Command::Inspect(a.id())], "{how}");
+        }
+    }
+
+    #[test]
+    fn json_is_reached_from_the_form_and_leads_back_to_it() {
+        let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
+        h.get_by_label("Edit as JSON").click();
+        h.run();
+        h.get_by_value(&json_text(&h));
+        h.get_by_label_contains("keep what they are now");
+        assert!(
+            h.query_by_value("a.js").is_none(),
+            "the form is not shown next to the JSON"
+        );
+        set_json_text(&mut h, |t| t.replace("\"node\"", "\"deno\""));
+        h.run();
+        h.get_by_label("Back to the form").click();
+        h.run();
+        assert!(h.query_all_by_value("deno").next().is_some());
+        assert!(h.query_by_value(&json_text(&h)).is_none());
+        // JSON the form cannot read keeps you in the JSON, saying why.
+        h.get_by_label("Edit as JSON").click();
+        h.run();
+        set_json_text(&mut h, |_| "{ \"command\": ".into());
+        h.run();
+        h.get_by_label_contains("not valid");
+        assert!(
+            h.get_by_label("Back to the form")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("Revert").click();
+        h.run();
+        assert!(
+            !h.get_by_label("Back to the form")
+                .accesskit_node()
+                .is_disabled()
+        );
+        // The Env tab follows: the definition is being edited as JSON.
+        h.get_by_label("Env").click();
+        h.run();
+        h.get_by_value(&json_text(&h));
+        assert!(h.query_by_label("hidden").is_none());
+    }
+
+    #[test]
+    fn a_definition_the_form_cannot_show_opens_as_json() {
+        let odd = "{\n  \"command\": \"x\",\n  \"args\": \"a b\"\n}";
+        let (mut h, engine, a) = form_harness(odd, true);
+        h.get_by_label_contains("The form cannot show this definition");
+        h.get_by_value(odd);
+        assert!(
+            h.get_by_label("Back to the form")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let fixed = "{\n  \"command\": \"x\",\n  \"args\": [\"a\", \"b\"]\n}";
+        set_json_text(&mut h, |_| fixed.into());
+        h.run();
+        // Still the JSON being typed in, not the form popping up under the cursor.
+        h.get_by_value(fixed);
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Replace {
+                id: a.id(),
+                json: fixed.into()
+            }])]
+        );
     }
 
     fn entry_event(row: &ServerRow, json: &str, editable: bool) -> Event {
@@ -4502,11 +4639,13 @@ mod tests {
         let (a, _) = two_rows();
         engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
         h.run();
-        open_raw_json(&mut h, "alpha");
+        press_edit(&mut h, "alpha");
         drain(&engine);
         let original =
             "{\n  \"command\": \"node\",\n  \"env\": {\n    \"TOKEN\": \"<hidden>\"\n  }\n}";
         engine.events.send(entry_event(&a, original, true)).unwrap();
+        h.run();
+        h.get_by_label("Edit as JSON").click();
         h.run();
         h.get_by_label_contains("keep what they are now");
         // Unchanged: nothing to review.
@@ -4579,6 +4718,16 @@ mod tests {
                 .as_mut()
                 .expect("the form reads the definition"),
             _ => panic!("no form"),
+        }
+    }
+
+    fn set_json_text(h: &mut Harness<'static, ShellApp>, edit: impl FnOnce(&str) -> String) {
+        match &mut h.state_mut().editor {
+            Some(Editor {
+                state: EditorState::Ready { text, .. },
+                ..
+            }) => *text = edit(text),
+            _ => panic!("no editor"),
         }
     }
 
@@ -4770,8 +4919,8 @@ mod tests {
                 json: text
             }])]
         );
-        // The JSON tab shows the same draft.
-        h.get_by_label("JSON").click();
+        // The JSON shows the same draft.
+        h.get_by_label("Edit as JSON").click();
         h.run();
         h.get_by_value(&json_text(&h));
     }
@@ -4797,7 +4946,7 @@ mod tests {
             *text = "{ \"command\": ".into();
         }
         h.run();
-        h.get_by_label_contains("fix it in the JSON tab");
+        h.get_by_label_contains("not valid");
         // Revert brings the form back.
         h.get_by_label("Revert").click();
         h.run();
@@ -4911,7 +5060,7 @@ mod tests {
         let p = live_row("docs", Scope::Project, Some("C:/Repos/WebApp"));
         engine.events.send(snapshot_of(vec![p.clone()])).unwrap();
         h.run();
-        open_raw_json(&mut h, "docs");
+        press_edit(&mut h, "docs");
         engine
             .events
             .send(entry_event(&p, "{\n  \"command\": \"x\"\n}", false))
@@ -4919,6 +5068,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("does not edit files in a repository");
         assert!(h.query_by_label("Review and save…").is_none());
+        h.get_by_value("{\n  \"command\": \"x\"\n}");
     }
 
     #[test]
@@ -4927,7 +5077,7 @@ mod tests {
         let (a, _) = two_rows();
         engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
         h.run();
-        open_raw_json(&mut h, "alpha");
+        press_edit(&mut h, "alpha");
         engine
             .events
             .send(Event::Entry {
@@ -4946,7 +5096,7 @@ mod tests {
         let (a, _) = two_rows();
         engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
         h.run();
-        open_raw_json(&mut h, "alpha");
+        press_edit(&mut h, "alpha");
         engine.events.send(entry_event(&a, "{}", true)).unwrap();
         h.run();
         drain(&engine);
