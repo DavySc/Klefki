@@ -1986,6 +1986,7 @@ dependencies = [
  "directories",
  "filetime",
  "keyring-core",
+ "libc",
  "memchr",
  "open",
  "portable-pty",
@@ -1996,6 +1997,7 @@ dependencies = [
  "tempfile",
  "url",
  "windows-native-keyring-store",
+ "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
  "zeroize",
 ]
