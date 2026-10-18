@@ -1234,12 +1234,18 @@ mod tests {
             }
             let (tx, rx) = mpsc::channel();
             let mut pty = launch(cmd, tx.clone()).unwrap();
+            // Driven from the start: a Windows pseudo-console holds its programs until its queries are answered.
+            let timeout = Duration::from_secs(if cancel { 60 } else { 10 });
+            let driving = std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                drive(&mut pty, &rx, timeout, &mut |p| seen.push(p));
+                (pty, seen)
+            });
             let started = crate::cli::testutil::tree_pids(&pids, 3);
             if cancel {
                 tx.send(Message::Cancel).unwrap();
             }
-            let mut seen = Vec::new();
-            drive(&mut pty, &rx, Duration::from_secs(2), &mut |p| seen.push(p));
+            let (pty, seen) = driving.join().unwrap();
             let want = if cancel {
                 Outcome::Cancelled
             } else {
