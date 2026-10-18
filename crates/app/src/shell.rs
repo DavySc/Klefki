@@ -1022,16 +1022,35 @@ impl ShellApp {
             return;
         };
         let here = row.project.as_deref();
+        let projects: Vec<(String, bool)> = self
+            .snapshot
+            .projects
+            .iter()
+            .map(|p| (p.clone(), Some(p.as_str()) == here))
+            .collect();
+        let mut order: Vec<usize> = (0..projects.len()).collect();
+        order.sort_by_cached_key(|&i| {
+            let path = &projects[i].0;
+            (
+                Some(path.as_str()) != here,
+                folder_name(path).to_lowercase(),
+            )
+        });
+        let mut seen = BTreeSet::new();
+        let shared_folders = projects
+            .iter()
+            .map(|(p, _)| folder_name(p).to_lowercase())
+            .filter(|f| !seen.insert(f.clone()))
+            .collect();
         self.duplicate = Some(DuplicateForm {
             source: row.id(),
+            about: format!("{} \u{b7} {}", row.transport.label(), row.target),
             name: format!("{}_copy", row.name),
             user: row.scope == Scope::User,
-            projects: self
-                .snapshot
-                .projects
-                .iter()
-                .map(|p| (p.clone(), Some(p.as_str()) == here))
-                .collect(),
+            projects,
+            order,
+            shared_folders,
+            filter: String::new(),
             focus: true,
         });
     }
@@ -1048,14 +1067,21 @@ impl ShellApp {
                 .map(|f| f.to_uppercase().chain(c).collect::<String>())
                 .unwrap_or(e)
         });
-        let placed = form.user || form.projects.iter().any(|(_, on)| *on);
-        let ready = problem.is_none() && placed;
+        let taken = form.taken(&self.snapshot.servers);
+        let places = form.places();
+        let ready = problem.is_none() && taken.is_none() && places.is_some();
         let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
+        // The list of projects gets what the window has left once the rest of the dialog is laid out.
+        let list_height = (ctx.content_rect().height() - 500.0).clamp(96.0, 320.0);
         let modal = egui::Modal::new(egui::Id::new("duplicate_dialog")).show(ctx, |ui| {
-            ui.set_width(460.0);
+            ui.set_width(520.0);
             ui.heading(format!("Duplicate {}", form.source.name));
-            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(RichText::new(&form.about).small().color(pal.text_muted))
+                    .truncate(),
+            );
+            ui.add_space(12.0);
             ui.label(RichText::new("Name").color(pal.text_muted));
             let field =
                 ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(f32::INFINITY));
@@ -1065,33 +1091,100 @@ impl ShellApp {
             if let Some(problem) = &problem {
                 ui.label(RichText::new(problem).small().color(pal.danger));
             }
-            ui.add_space(8.0);
-            ui.label(RichText::new("Where").color(pal.text_muted));
-            ui.checkbox(&mut form.user, "For the user (every project)");
-            for (path, on) in &mut form.projects {
-                ui.checkbox(on, format!("In {}", folder_name(path)))
-                    .on_hover_text(path.as_str());
-            }
-            if !placed {
-                ui.label(
-                    RichText::new("Tick at least one place.")
-                        .small()
-                        .color(pal.text_muted),
-                );
-            }
+            ui.add_space(12.0);
+            ui.label(RichText::new("Add it").color(pal.text_muted));
+            place_row(ui, &mut form.user, "For the user", "in every project", None);
             ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let ticked = form.projects.iter().filter(|(_, on)| *on).count();
+                let mut heading = format!("Projects ({})", form.projects.len());
+                if ticked > 0 {
+                    heading.push_str(&format!(", {ticked} ticked"));
+                }
+                ui.label(RichText::new(heading).color(pal.text_muted));
+                // A short list is read at a glance; a long one is searched.
+                if form.projects.len() > 8 {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.filter)
+                                .hint_text(format!("{} Filter projects", icon::MAGNIFYING_GLASS))
+                                .desired_width(220.0),
+                        );
+                    });
+                }
+            });
+            // As tall as the whole list would be, up to that room, and no shorter while filtering: the dialog keeps
+            // its size and its buttons stay where they are as you type.
+            let rows = form.projects.len().max(1) as f32;
+            let height = (rows * (PLACE_ROW + PLACE_GAP)).min(list_height);
+            egui::ScrollArea::vertical()
+                .max_height(height)
+                .min_scrolled_height(height)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = PLACE_GAP;
+                    let needle = form.filter.trim().to_lowercase();
+                    let mut shown = 0;
+                    for &i in &form.order {
+                        let (path, on) = &mut form.projects[i];
+                        if !path.to_lowercase().contains(&needle) {
+                            continue;
+                        }
+                        shown += 1;
+                        let here = form.source.project.as_deref() == Some(path.as_str());
+                        let folder = folder_name(path);
+                        let parent = if form.shared_folders.contains(&folder.to_lowercase()) {
+                            parent_folder(path)
+                        } else {
+                            ""
+                        };
+                        place_row(ui, on, folder, parent, here.then_some("where it is now"))
+                            .on_hover_text(path.as_str());
+                    }
+                    if shown == 0 {
+                        ui.label(RichText::new("No project matches.").color(pal.text_muted));
+                    }
+                });
+            ui.add_space(10.0);
+            // What Review will lead to, or why it cannot yet.
+            if let Some(taken) = &taken {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{} already exists {taken}. Choose another name, or untick it there.",
+                            form.name
+                        ))
+                        .color(pal.danger),
+                    )
+                    .wrap(),
+                );
+            } else if let Some(places) = &places {
+                if problem.is_none() {
+                    ui.add(egui::Label::new(format!("Adds {} {places}.", form.name)).wrap());
+                }
+            } else {
+                ui.label(RichText::new("Tick at least one place.").color(pal.text_muted));
+            }
             ui.label(
                 RichText::new("The copy keeps the original's environment and header values.")
                     .small()
                     .color(pal.text_muted),
             );
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.horizontal(|ui| {
+                let confirm =
+                    egui::Button::new(RichText::new("Review").strong().color(pal.on_bright))
+                        .fill(pal.primary)
+                        .min_size(egui::vec2(96.0, 34.0));
                 review |= ui
-                    .add_enabled(ready, egui::Button::new("Review"))
+                    .add_enabled(ready, confirm)
+                    .on_hover_text("Enter")
                     .on_disabled_hover_text("Give it a usable name and tick a place")
                     .clicked();
-                cancel |= ui.button("Cancel").clicked();
+                cancel |= ui
+                    .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
+                    .on_hover_text("Esc")
+                    .clicked();
             });
         });
         if review {
@@ -1099,12 +1192,7 @@ impl ShellApp {
                 .user
                 .then_some(Target::User)
                 .into_iter()
-                .chain(
-                    form.projects
-                        .iter()
-                        .filter(|(_, on)| *on)
-                        .map(|(p, _)| Target::Local(p.clone())),
-                )
+                .chain(form.ticked().map(|p| Target::Local(p.to_owned())))
                 .collect();
             let change = Change::Duplicate {
                 id: form.source.clone(),
@@ -2201,12 +2289,175 @@ fn search_id() -> egui::Id {
 /// What the Duplicate dialog holds: the copy's name and where it goes.
 struct DuplicateForm {
     source: ServerId,
+    /// What is being copied, under the title: `http · https://…`.
+    about: String,
     name: String,
     user: bool,
-    /// Every project Claude Code knows, and whether the copy goes there.
+    /// Every project Claude Code knows, in the snapshot's order, and whether the copy goes there.
     projects: Vec<(String, bool)>,
+    /// The order the projects are listed in: the one the server is in first, then by folder name.
+    order: Vec<usize>,
+    /// Folder names (lower case) that more than one project has: only those rows also say where they live. The rest
+    /// would all repeat the same few parent folders.
+    shared_folders: BTreeSet<String>,
+    /// Narrows the list of projects: part of a path, any case.
+    filter: String,
     /// Give the name field the keyboard on the first frame.
     focus: bool,
+}
+
+impl DuplicateForm {
+    /// The projects ticked, in the snapshot's order.
+    fn ticked(&self) -> impl Iterator<Item = &str> {
+        self.projects
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(p, _)| p.as_str())
+    }
+
+    /// Where the copy goes, in words: `for the user and in a and b`. None when nothing is ticked.
+    fn places(&self) -> Option<String> {
+        let folders: Vec<&str> = self.ticked().map(folder_name).collect();
+        places_in_words(self.user, &folders)
+    }
+
+    /// The ticked places that already have a server by the copy's name, in words. Only the lists a copy is written
+    /// to count: the engine refuses those, while a name in a project's `.mcp.json` is only hidden by the copy, which
+    /// the review warns about.
+    fn taken(&self, servers: &[ServerRow]) -> Option<String> {
+        let has = |scope: Scope, project: Option<&str>| {
+            servers
+                .iter()
+                .any(|s| s.name == self.name && s.scope == scope && s.project.as_deref() == project)
+        };
+        let user = self.user && has(Scope::User, None);
+        let folders: Vec<&str> = self
+            .ticked()
+            .filter(|p| has(Scope::Local, Some(p)))
+            .map(folder_name)
+            .collect();
+        places_in_words(user, &folders)
+    }
+}
+
+/// `for the user`, `in a and b`, `for the user and in 5 projects`; None for nowhere.
+fn places_in_words(user: bool, folders: &[&str]) -> Option<String> {
+    let projects = match folders {
+        [] => None,
+        [one] => Some(format!("in {one}")),
+        [rest @ .., last] if folders.len() <= 3 => {
+            Some(format!("in {} and {last}", rest.join(", ")))
+        }
+        _ => Some(format!("in {} projects", folders.len())),
+    };
+    match (user, projects) {
+        (false, None) => None,
+        (true, None) => Some("for the user".to_owned()),
+        (true, Some(p)) => Some(format!("for the user and {p}")),
+        (false, Some(p)) => Some(p),
+    }
+}
+
+/// Height of a place in the Duplicate dialog, and the space between two.
+const PLACE_ROW: f32 = 32.0;
+const PLACE_GAP: f32 = 2.0;
+
+/// One place in the Duplicate dialog: a tick box, a name and where it is, as wide as the list so the whole row can be
+/// clicked. Drawn rather than laid out, so a long path is cut to fit instead of widening the dialog.
+fn place_row(
+    ui: &mut Ui,
+    on: &mut bool,
+    title: &str,
+    detail: &str,
+    tag: Option<&str>,
+) -> egui::Response {
+    let pal = theme::palette(ui.ctx());
+    let (rect, mut response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), PLACE_ROW), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let ticked = *on;
+    response.widget_info(|| {
+        let label = if detail.is_empty() {
+            title.to_owned()
+        } else {
+            format!("{title}, {detail}")
+        };
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, ticked, label)
+    });
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter_at(rect);
+    if response.hovered() || response.has_focus() {
+        painter.rect_filled(rect, 6.0, pal.hover);
+    }
+    let tick = egui::Rect::from_center_size(
+        rect.left_center() + egui::vec2(18.0, 0.0),
+        egui::vec2(18.0, 18.0),
+    );
+    if ticked {
+        painter.rect_filled(tick, 4.0, pal.primary);
+        painter.text(
+            tick.center(),
+            egui::Align2::CENTER_CENTER,
+            icon::CHECK,
+            egui::FontId::proportional(13.0),
+            pal.on_bright,
+        );
+    } else {
+        painter.rect_stroke(
+            tick,
+            4.0,
+            egui::Stroke::new(1.5, pal.text_muted),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let name = painter.text(
+        egui::pos2(tick.right() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(15.0),
+        pal.text,
+    );
+    let small = egui::FontId::proportional(13.0);
+    let mut right = rect.right() - 10.0;
+    if let Some(tag) = tag {
+        let t = painter.text(
+            egui::pos2(right, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            tag,
+            small.clone(),
+            pal.primary,
+        );
+        right = t.left() - 12.0;
+    }
+    let x = name.right() + 10.0;
+    if !detail.is_empty() && right > x {
+        let galley = ui.fonts_mut(|f| {
+            let mut job =
+                egui::text::LayoutJob::simple_singleline(detail.to_owned(), small, pal.text_muted);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(right - x);
+            f.layout_job(job)
+        });
+        painter.galley(
+            egui::pos2(x, rect.center().y - galley.size().y / 2.0),
+            galley,
+            pal.text_muted,
+        );
+    }
+    response
+}
+
+/// Where a project folder lives: `C:/work/app` -> `C:/work`. Empty for a root.
+fn parent_folder(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(cut) if cut + 1 < trimmed.len() => &trimmed[..cut],
+        _ => "",
+    }
 }
 
 /// The last part of a project path: `C:/work/app` -> `app`.
@@ -2357,13 +2608,17 @@ fn status_cell(
     let response = ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color));
     match status {
         Status::Failed | Status::NeedsAuth | Status::Degraded => {
-            // Built only while hovered, not every frame.
-            response.on_hover_ui(|ui| {
-                if let Some(explanation) = Explanation::for_status(s, status, detail, hint) {
-                    ui.set_max_width(560.0);
-                    explanation.show(ui, ui.id().with("tooltip"));
-                }
-            });
+            // Not egui's tooltip, which waits half a second for a perfectly still pointer over the words alone:
+            // the whole cell answers, moving or not, after a moment that lets a sweep down the column pass by.
+            if hovered_for(ui, response.id, ui.max_rect(), EXPLAIN_AFTER) {
+                // Built only while shown, not every frame.
+                response.show_tooltip_ui(|ui| {
+                    if let Some(explanation) = Explanation::for_status(s, status, detail, hint) {
+                        ui.set_max_width(560.0);
+                        explanation.show(ui, ui.id().with("tooltip"));
+                    }
+                });
+            }
         }
         _ => {
             if let Some(detail) = detail {
@@ -2371,6 +2626,29 @@ fn status_cell(
             }
         }
     }
+}
+
+/// Seconds the pointer rests on a failed status before it is explained.
+const EXPLAIN_AFTER: f64 = 0.1;
+
+/// Whether the pointer has been over `rect` for `delay` seconds, moving or not, with no button down. Asks for the
+/// frame in which that comes true, so it does not wait for the next mouse event.
+fn hovered_for(ui: &Ui, id: egui::Id, rect: egui::Rect, delay: f64) -> bool {
+    let ctx = ui.ctx();
+    let key = id.with("hovered-since");
+    let busy = ctx.input(|i| i.pointer.any_down() || i.is_scrolling());
+    if busy || !ui.rect_contains_pointer(rect) {
+        ctx.data_mut(|d| d.remove::<f64>(key));
+        return false;
+    }
+    let now = ctx.input(|i| i.time);
+    let since = ctx.data_mut(|d| *d.get_temp_mut_or(key, now));
+    let left = delay - (now - since);
+    if left > 0.0 {
+        ctx.request_repaint_after_secs(left as f32);
+        return false;
+    }
+    true
 }
 
 fn badge(ui: &mut Ui, text: &str, fill: Color32) {
@@ -2680,8 +2958,19 @@ mod tests {
     }
 
     fn live_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        live_harness_from(Harness::builder())
+    }
+
+    /// Frames 1/60 s apart, as on a screen, so a delay is seen as it is and not skipped in quarter seconds.
+    fn live_harness_at_60fps() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        live_harness_from(Harness::builder().with_step_dt(1.0 / 60.0))
+    }
+
+    fn live_harness_from(
+        builder: egui_kittest::HarnessBuilder<ShellApp>,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         let (core, engine) = klefki_core::api::Core::detached();
-        let h = Harness::builder()
+        let h = builder
             .with_size(egui::vec2(1100.0, 900.0))
             .build_eframe(move |cc| {
                 crate::theme::apply(&cc.egui_ctx, ThemeChoice::Dark);
@@ -2802,6 +3091,49 @@ mod tests {
         h.run();
         h.get_by_label_contains("Can't reach the server's host");
         h.get_by_label_contains("getaddrinfo ENOTFOUND acme-prod.example.com");
+    }
+
+    #[test]
+    fn a_failed_status_explains_itself_at_once_even_while_the_mouse_moves() {
+        let (mut h, engine) = live_harness_at_60fps();
+        let row = live_row("acme-prod", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        let at = h
+            .get_by_label_contains(Status::Failed.label())
+            .rect()
+            .center();
+        // A hand on a mouse is rarely still: drift a pixel a frame, for a fifth of a second.
+        for dx in 0..12 {
+            h.hover_at(at + egui::vec2(dx as f32, 0.0));
+            h.step();
+        }
+        h.get_by_label_contains("Can't reach the server's host");
+    }
+
+    #[test]
+    fn the_whole_status_cell_explains_not_only_its_text() {
+        let (mut h, engine) = live_harness_at_60fps();
+        let row = live_row("acme-prod", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        let text = h.get_by_label_contains(Status::Failed.label()).rect();
+        h.hover_at(egui::pos2(text.right() + 60.0, text.center().y));
+        for _ in 0..12 {
+            h.step();
+        }
+        h.get_by_label_contains("Can't reach the server's host");
+        // And it goes when the pointer leaves the cell.
+        h.hover_at(egui::pos2(text.right() + 60.0, text.center().y + 300.0));
+        for _ in 0..12 {
+            h.step();
+        }
+        assert!(
+            h.query_by_label_contains("Can't reach the server's host")
+                .is_none()
+        );
     }
 
     #[test]
@@ -4367,8 +4699,8 @@ mod tests {
         h.run();
         // User is ticked for a user server; add both projects, untick the user.
         h.get_by_label_contains("For the user").click();
-        h.get_by_label("In WebApp").click();
-        h.get_by_label("In notes").click();
+        h.get_by_label("WebApp").click();
+        h.get_by_label("notes").click();
         h.run();
         h.state_mut().duplicate.as_mut().unwrap().name = "alpha-2".into();
         h.run();
@@ -4439,6 +4771,161 @@ mod tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         assert!(h.state().duplicate.is_none());
+    }
+
+    /// alpha (user) and beta (local in WebApp), and the forty-odd projects of a long-time Claude Code user.
+    fn duplicate_harness_with_many_projects()
+    -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        let projects = (0..40)
+            .map(|i| format!("C:/Users/me/source/Repos/project-{i:02}"))
+            .chain(["C:/Repos/WebApp".into(), "/home/me/notes".into()])
+            .collect();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, b],
+                projects,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    fn open_duplicate_of(h: &mut Harness<'static, ShellApp>, name: &str) {
+        h.get_by_label(name).click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run();
+        assert!(h.state().duplicate.is_some());
+    }
+
+    #[test]
+    fn duplicate_fits_in_the_window_however_many_projects_claude_knows() {
+        let (mut h, _engine) = duplicate_harness_with_many_projects();
+        open_duplicate_of(&mut h, "alpha");
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 900.0));
+        for label in ["Review", "Cancel"] {
+            let r = h.get_by_label(label).rect();
+            assert!(
+                window.contains_rect(r),
+                "{label} at {r:?}, window {window:?}"
+            );
+        }
+        let title = h.get_by_label_contains("Duplicate alpha").rect();
+        assert!(window.contains_rect(title), "title at {title:?}");
+    }
+
+    #[test]
+    fn duplicate_finds_a_project_by_part_of_its_path_and_keeps_what_was_ticked() {
+        let (mut h, engine) = duplicate_harness_with_many_projects();
+        open_duplicate_of(&mut h, "alpha");
+        h.state_mut().duplicate.as_mut().unwrap().filter = "HOME/me".into();
+        h.run();
+        assert!(h.query_by_label("project-00").is_none());
+        h.get_by_label("notes").click();
+        h.run();
+        h.state_mut().duplicate.as_mut().unwrap().filter = "web".into();
+        h.run();
+        assert!(h.query_by_label("notes").is_none());
+        h.get_by_label("WebApp").click();
+        h.run();
+        h.state_mut().duplicate.as_mut().unwrap().filter.clear();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Duplicate {
+                id: h.state().snapshot.servers[0].id(),
+                name: "alpha_copy".into(),
+                targets: vec![
+                    Target::User,
+                    Target::Local("C:/Repos/WebApp".into()),
+                    Target::Local("/home/me/notes".into()),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_says_where_a_project_lives_only_when_its_folder_name_is_not_enough() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a],
+                projects: vec![
+                    "C:/work/app".into(),
+                    "D:/play/App/".into(),
+                    "C:/Repos/WebApp".into(),
+                ],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        open_duplicate_of(&mut h, "alpha");
+        h.get_by_label("app, C:/work");
+        h.get_by_label("App, D:/play");
+        h.get_by_label("WebApp");
+    }
+
+    #[test]
+    fn duplicate_lists_the_project_the_server_is_in_first() {
+        let (mut h, _engine) = duplicate_harness_with_many_projects();
+        open_duplicate_of(&mut h, "beta");
+        let here = h.get_by_label("WebApp").rect();
+        let other = h.get_by_label("project-00").rect();
+        assert!(
+            here.top() < other.top(),
+            "WebApp {here:?}, project-00 {other:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_says_in_words_where_the_copy_will_go() {
+        let (mut h, _engine) = duplicate_harness();
+        open_duplicate_of(&mut h, "alpha");
+        h.get_by_label("Adds alpha_copy for the user.");
+        h.get_by_label("WebApp").click();
+        h.get_by_label("notes").click();
+        h.run();
+        h.get_by_label("Adds alpha_copy for the user and in WebApp and notes.");
+        h.get_by_label_contains("For the user").click();
+        h.run();
+        h.get_by_label("Adds alpha_copy in WebApp and notes.");
+        h.get_by_label("WebApp").click();
+        h.get_by_label("notes").click();
+        h.run();
+        h.get_by_label("Tick at least one place.");
+    }
+
+    #[test]
+    fn duplicate_says_where_the_name_is_already_taken_before_review() {
+        let (mut h, _engine) = duplicate_harness();
+        open_duplicate_of(&mut h, "alpha");
+        // beta is a local server in WebApp; the user has none by that name.
+        h.state_mut().duplicate.as_mut().unwrap().name = "beta".into();
+        h.run();
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        h.get_by_label("WebApp").click();
+        h.run();
+        h.get_by_label_contains("beta already exists in WebApp");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        // The user's own alpha.
+        h.state_mut().duplicate.as_mut().unwrap().name = "alpha".into();
+        h.run();
+        h.get_by_label_contains("alpha already exists for the user");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        // gamma comes from WebApp's .mcp.json, not from a place a copy is written to: allowed,
+        // and the review warns that the local copy would hide it.
+        h.state_mut().duplicate.as_mut().unwrap().name = "gamma".into();
+        h.get_by_label_contains("For the user").click();
+        h.run();
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
     }
 
     #[test]
