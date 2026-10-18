@@ -152,6 +152,10 @@ impl Op {
 enum Purpose {
     Change,
     Verify,
+    /// To show a change another program will write: Claude Code's own `mcp add-json`, which adds servers that sign
+    /// in with OAuth. Only here may a new server have `oauth` settings; a plan made this way is never written (its
+    /// ops are made again as a [`Purpose::Change`] to write them, which refuses them).
+    Preview,
 }
 
 /// Which file a [`Docstore`] writes, and so which ops it accepts.
@@ -370,6 +374,33 @@ impl Docstore {
             }
             Ok(text)
         })
+    }
+
+    /// Works out what another program will change: Claude Code's own `mcp add-json`, adding servers that sign in
+    /// with OAuth (see [`Purpose::Preview`]). The plan is only shown and checked with [`still_applies`]; written, it
+    /// is refused.
+    ///
+    /// [`still_applies`]: Self::still_applies
+    pub(crate) fn preview(&self, ops: Vec<Op>) -> Result<Plan, StoreError> {
+        let current = self.read()?;
+        let (_, changes) = self.edit(&current, &ops, Purpose::Preview)?;
+        Ok(Plan {
+            ops,
+            base_hash: current.hash(),
+            changes,
+        })
+    }
+
+    /// Whether a [`preview`](Self::preview) would still make the change it showed, on the file as it is now: the
+    /// check [`apply`](Self::apply) makes, just before the other program runs. Takes no lock, since that program
+    /// takes it, and writes nothing.
+    pub(crate) fn still_applies(&self, plan: &Plan) -> Result<(), StoreError> {
+        let current = self.read()?;
+        let (_, changes) = self.edit(&current, &plan.ops, Purpose::Preview)?;
+        if changes != plan.changes {
+            return Err(StoreError::Changed);
+        }
+        Ok(())
     }
 
     /// Under the lock: reads the file, makes `edit`'s change and writes it. When the file is replaced between our
@@ -1330,7 +1361,11 @@ fn edit_servers<'o>(
             }
             // A new definition has no earlier values, so `<hidden>` in it is refused.
             let new = entry::unmasked(new, &Value::Null).map_err(invalid)?;
-            entry::validate(&new).map_err(invalid)?;
+            if purpose == Purpose::Preview {
+                entry::validate_new(&new).map_err(invalid)?;
+            } else {
+                entry::validate(&new).map_err(invalid)?;
+            }
             lines.push(header.clone());
             lines.push(format!("+ {}", sanitize(name)));
             let shown = serde_json::to_string_pretty(&entry::masked(&new)).unwrap_or_default();
@@ -2085,6 +2120,41 @@ mod tests {
             keys,
             ["zeta", "numStartups", "mcpServers", "projects", "alpha"]
         );
+    }
+
+    #[test]
+    fn a_server_that_signs_in_with_oauth_is_only_ever_previewed_never_written() {
+        let f = Fixture::new(&pretty(&sample()));
+        let add = || {
+            vec![Op::AddServer {
+                project: None,
+                name: "sso".into(),
+                entry: json!({"type": "http", "url": "https://sso.example", "oauth": {"clientId": "c"}}),
+            }]
+        };
+        assert!(f.store.prepare(add()).is_err());
+        let preview = f.store.preview(add()).unwrap();
+        assert!(
+            preview.changes()[0].lines.iter().any(|l| l == "+ sso"),
+            "{preview:?}"
+        );
+        assert_eq!(f.store.still_applies(&preview), Ok(()));
+        // Written, a preview is refused, and the file is left as it was.
+        assert!(matches!(
+            f.store.apply(&preview),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(f.text(), pretty(&sample()));
+        // Once the name is taken, it no longer applies.
+        let mut taken = sample();
+        taken["mcpServers"]["sso"] = json!({"command": "x"});
+        std::fs::write(&f.store.path, pretty(&taken)).unwrap();
+        assert!(f.store.still_applies(&preview).is_err());
+        // A variant: something else in the file changing does not stop it.
+        let mut other = sample();
+        other["numStartups"] = json!(13);
+        std::fs::write(&f.store.path, pretty(&other)).unwrap();
+        assert_eq!(f.store.still_applies(&preview), Ok(()));
     }
 
     fn rename_disabled(project: &str, name: &str, new_name: &str) -> Op {

@@ -87,11 +87,14 @@ pub enum Change {
     /// Claude Code reads, so the servers on it are off again, and remove the old list.
     MigrateLegacyDisabled { project: String },
     /// Add a new server `name` with the definition `json` (from [`Pasted`](crate::api::Pasted), say) to each of
-    /// `targets`. The plan shows everything it would run first.
+    /// `targets`. The plan shows everything it would run first. A definition that signs in with OAuth (an `oauth`
+    /// object) is added by Claude Code's own `claude mcp add-json`, which keeps `secret`, the client secret, in its
+    /// own secure storage; Klefki keeps a copy in the system's secret store. Only such a server takes a secret.
     Add {
         name: String,
         json: String,
         targets: Vec<crate::model::Target>,
+        secret: Option<Secret>,
     },
 }
 
@@ -626,19 +629,9 @@ fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
     if matches!(&op, SecretOp::Store(s) if s.is_empty()) {
         return answer(Err("The client secret is empty.".to_owned()));
     }
-    let store = {
-        let mut held = lock(&shared.secret_store);
-        match (&*held, &shared.config.secrets) {
-            (Some(store), _) | (None, Some(store)) => Arc::clone(store),
-            (None, None) => match crate::secrets::Keyring::platform() {
-                Ok(store) => {
-                    let store: Arc<dyn SecretStore> = Arc::new(store);
-                    *held = Some(Arc::clone(&store));
-                    store
-                }
-                Err(e) => return answer(Err(e.to_string())),
-            },
-        }
+    let store = match secret_store(shared) {
+        Ok(store) => store,
+        Err(e) => return answer(Err(e.to_string())),
     };
     let connection = row.connection.clone();
     let emitter = shared.emitter.clone();
@@ -653,6 +646,20 @@ fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
             stored: stored.map_err(|e| e.to_string()),
         });
     });
+}
+
+/// The store client secrets are kept in: the one tests give, else the system's own, opened the first time it is
+/// needed and kept.
+fn secret_store(shared: &Shared) -> Result<Arc<dyn SecretStore>, crate::secrets::SecretError> {
+    let mut held = lock(&shared.secret_store);
+    match (&*held, &shared.config.secrets) {
+        (Some(store), _) | (None, Some(store)) => Ok(Arc::clone(store)),
+        (None, None) => {
+            let store: Arc<dyn SecretStore> = Arc::new(crate::secrets::Keyring::platform()?);
+            *held = Some(Arc::clone(&store));
+            Ok(store)
+        }
+    }
 }
 
 fn inspect(shared: &Shared, state: &State, id: ServerId) {
@@ -679,10 +686,21 @@ fn inspect(shared: &Shared, state: &State, id: ServerId) {
     });
 }
 
-/// A prepared change: one plan per file, written settings files first and `.claude.json` last.
+/// A prepared change: one plan per file, written settings files first and `.claude.json` last, after the servers
+/// Claude Code adds itself.
 struct Stored {
     parts: Vec<(Plan, Docstore)>,
     guards: Vec<ops::Guard>,
+    cli: Option<CliSteps>,
+}
+
+/// Servers Claude Code adds with its own command, with what they will change in `.claude.json` (shown, and checked
+/// again just before the command runs) and the store their client secrets are kept in, when any have one.
+struct CliSteps {
+    adds: Vec<ops::CliAdd>,
+    preview: (Plan, Docstore),
+    program: PathBuf,
+    store: Option<Arc<dyn SecretStore>>,
 }
 
 #[derive(Default)]
@@ -736,10 +754,45 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         for (_, store) in &mut parts {
             store.verify_delay = shared.config.verify_delay;
         }
-        Ok::<_, String>((parts, resolved))
+        let cli = if resolved.cli.is_empty() {
+            None
+        } else {
+            let program = claude_program(shared).ok_or(
+                "Servers that sign in with OAuth are added with Claude Code's command (claude mcp add-json), and Klefki cannot find it.",
+            )?;
+            // Asked now, so a store that is missing or locked stops the change before anything runs.
+            let store = if resolved.cli.iter().any(|a| a.secret.is_some()) {
+                let store = secret_store(shared).map_err(|e| e.to_string())?;
+                let first = &resolved.cli[0];
+                let id = crate::model::ConnectionId::new(
+                    if first.project.is_some() {
+                        Scope::Local
+                    } else {
+                        Scope::User
+                    },
+                    first.project.as_deref(),
+                    &first.name,
+                );
+                store.get(&id).map_err(|e| e.to_string())?;
+                Some(store)
+            } else {
+                None
+            };
+            let docstore = Docstore::new(paths.claude_json.clone(), backup_dir(shared)?);
+            let preview = docstore
+                .preview(std::mem::take(&mut resolved.preview))
+                .map_err(|e| e.to_string())?;
+            Some(CliSteps {
+                adds: std::mem::take(&mut resolved.cli),
+                preview: (preview, docstore),
+                program,
+                store,
+            })
+        };
+        Ok::<_, String>((parts, cli, resolved))
     })();
     match made {
-        Ok((parts, resolved)) => {
+        Ok((parts, cli, resolved)) => {
             let ops::Resolved {
                 guards,
                 warnings,
@@ -752,15 +805,17 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             } = resolved;
             plans.next += 1;
             let id = plans.next;
-            let nothing_to_do = parts.iter().all(|(plan, _)| plan.is_empty());
+            let nothing_to_do = cli.is_none() && parts.iter().all(|(plan, _)| plan.is_empty());
             let view = PlanView {
                 id,
                 summary,
                 action,
                 destructive,
                 notes: if nothing_to_do { Vec::new() } else { notes },
-                files: parts
+                files: cli
                     .iter()
+                    .map(|c| &c.preview)
+                    .chain(&parts)
                     .flat_map(|(plan, _)| plan.changes())
                     .filter(|c| !c.lines.is_empty())
                     .map(|c| FileDiff {
@@ -773,7 +828,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 warnings,
                 nothing_to_do,
             };
-            plans.stored.insert(id, Stored { parts, guards });
+            plans.stored.insert(id, Stored { parts, guards, cli });
             shared.emitter.emit(Event::PlanReady(view));
         }
         Err(e) => shared.emitter.emit(Event::PlanFailed(sanitize(&e))),
@@ -784,7 +839,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     let fail = |error: String| {
         shared.emitter.emit(Event::ApplyFailed { plan: id, error });
     };
-    let Some(Stored { parts, guards }) = plans.stored.remove(&id) else {
+    let Some(Stored { parts, guards, cli }) = plans.stored.remove(&id) else {
         return fail("This change was already applied or discarded. Prepare it again.".to_owned());
     };
     // What the user reviewed must still be what is there.
@@ -794,6 +849,12 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
             sanitize(&changed.name),
             sanitize(&changed.project)
         ));
+    }
+    let mut added = Vec::new();
+    if let Some(steps) = &cli
+        && let Err(e) = add_with_claude(shared, state, steps, &mut added)
+    {
+        return fail(e);
     }
     let mut written = Vec::new();
     let mut backups = Vec::new();
@@ -820,6 +881,9 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
             }
             Err(e) => {
                 let mut message = e.to_string();
+                if !added.is_empty() {
+                    message.push_str(&format!(" Claude Code already added {}.", added.join(", ")));
+                }
                 if !written.is_empty() {
                     let done: Vec<String> = written
                         .iter()
@@ -837,10 +901,10 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
             }
         }
     }
-    let changed = !written.is_empty();
-    if changed {
+    if !written.is_empty() {
         reload_after_change(shared, state);
     }
+    let changed = !written.is_empty() || !added.is_empty();
     check_later(shared, id, started);
     shared.emitter.emit(Event::Applied {
         plan: id,
@@ -855,6 +919,129 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
             )
         }),
     });
+}
+
+/// Has Claude Code add each server of `steps` with `claude mcp add-json`, one after the other, and keeps each client
+/// secret in Klefki's store under the new server's connection. `added` collects what was added, in words, so a
+/// failure part way can say what is already done. The secret reaches the command only in `MCP_CLIENT_SECRET`.
+fn add_with_claude(
+    shared: &Shared,
+    state: &mut State,
+    steps: &CliSteps,
+    added: &mut Vec<String>,
+) -> Result<(), String> {
+    let (preview, docstore) = &steps.preview;
+    // What the user reviewed must still fit the file: the name still free in every place.
+    docstore.still_applies(preview).map_err(|e| e.to_string())?;
+    let done = |added: &[String]| {
+        if added.is_empty() {
+            String::new()
+        } else {
+            format!(" Already added: {}.", added.join(", "))
+        }
+    };
+    for add in &steps.adds {
+        let name = sanitize(&add.name);
+        let place = match &add.project {
+            None => "for the user".to_owned(),
+            Some(p) => format!("in {}", sanitize(&ops::folder_name(p))),
+        };
+        let mut args = vec![
+            "mcp",
+            "add-json",
+            "-s",
+            if add.project.is_some() {
+                "local"
+            } else {
+                "user"
+            },
+        ];
+        if add.secret.is_some() {
+            args.push("--client-secret");
+        }
+        // The name is checked, but may start with `-`: after `--` it is never read as an option.
+        args.extend(["--", add.name.as_str(), add.json.as_str()]);
+        let mut env = cli_env(shared);
+        if let Some(secret) = &add.secret {
+            env.push(("MCP_CLIENT_SECRET", OsStr::new(secret.expose())));
+        }
+        let cwd = match &add.project {
+            Some(project) => Some(Path::new(project)),
+            None => shared.config.home.as_deref(),
+        };
+        let out = runner::run(&RunSpec {
+            program: &steps.program,
+            args: &args,
+            cwd,
+            env: &env,
+            timeout: shared.config.check_timeout,
+            max_output: MAX_CHECK_OUTPUT,
+        });
+        let said = |out: &RunOutput| {
+            let text = if out.stderr.trim().is_empty() {
+                &out.stdout
+            } else {
+                &out.stderr
+            };
+            clip(text.trim(), MAX_DETAIL_CHARS)
+        };
+        match out {
+            Err(e) => {
+                return Err(format!(
+                    "{name} was not added {place}: Claude Code's command could not be started ({}).{}",
+                    sanitize(&e.to_string()),
+                    done(added)
+                ));
+            }
+            Ok(out) if out.timed_out => {
+                reload_after_change(shared, state);
+                return Err(format!(
+                    "Claude Code did not finish adding {name} {place} in {} s, so it may or may not be there; look in the list.{}",
+                    shared.config.check_timeout.as_secs(),
+                    done(added)
+                ));
+            }
+            Ok(out) if out.exit_code != Some(0) => {
+                return Err(format!(
+                    "{name} was not added {place}. Claude Code said: {}{}",
+                    said(&out),
+                    done(added)
+                ));
+            }
+            Ok(_) => {}
+        }
+        reload_after_change(shared, state);
+        let row = state.snapshot.servers.iter().find(|r| {
+            state
+                .keys
+                .get(&r.connection)
+                .is_some_and(|k| k.name == add.name)
+                && match &add.project {
+                    None => r.scope == Scope::User,
+                    Some(p) => {
+                        r.scope == Scope::Local
+                            && r.project.as_deref().map(inventory::normalise_project)
+                                == Some(inventory::normalise_project(p))
+                    }
+                }
+        });
+        let Some(row) = row else {
+            return Err(format!(
+                "Claude Code said it added {name} {place}, but Klefki cannot find it there.{}",
+                done(added)
+            ));
+        };
+        let earlier = done(added);
+        added.push(format!("{name} {place}"));
+        if let (Some(secret), Some(store)) = (&add.secret, &steps.store)
+            && let Err(e) = store.set(&row.connection, secret)
+        {
+            return Err(format!(
+                "{name} was added {place}, and Claude Code keeps its client secret, but Klefki could not keep its own copy: {e} Type it in on the server's Auth tab to try again.{earlier}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The changes klefki wrote to one file and has not yet checked, oldest first: a small redo log. Claude Code may
@@ -2674,12 +2861,12 @@ mod tests {
                 .any(|x| matches!(x, Event::PlanReady(_) | Event::PlanFailed(_)))
         });
         events
-            .into_iter()
+            .iter()
             .find_map(|e| match e {
-                Event::PlanReady(p) => Some(p),
+                Event::PlanReady(p) => Some(p.clone()),
                 _ => None,
             })
-            .expect("a plan")
+            .unwrap_or_else(|| panic!("a plan, got {events:?}"))
     }
 
     fn disabled_list(env: &Env, project: &str) -> serde_json::Value {
@@ -4075,6 +4262,7 @@ mod tests {
             name: name.to_owned(),
             json: json.to_owned(),
             targets,
+            secret: None,
         }
     }
 
@@ -4237,10 +4425,11 @@ mod tests {
                 "Choose where",
             ),
             (vec![add("n", "{not json", a())], "JSON"),
+            // OAuth is for remote servers: Claude Code would drop it here without a word.
             (
                 vec![add(
                     "n",
-                    r#"{"type": "http", "url": "https://o.example", "oauth": {"clientId": "c"}}"#,
+                    r#"{"command": "x", "oauth": {"clientId": "c"}}"#,
                     a(),
                 )],
                 "OAuth",
@@ -5012,6 +5201,421 @@ mod tests {
                 .any(|w| w.contains("the 1 project it knows")),
             "{:?}",
             plan.warnings
+        );
+    }
+
+    // ---- adding a server that signs in with OAuth, through Claude Code's own command
+
+    const OAUTH_DEF: &str = r#"{"type": "http", "url": "https://sso.example.com/mcp", "headers": {"X-Team": "${TEAM}"}, "oauth": {"clientId": "client-7", "callbackPort": 8123}}"#;
+    const CLIENT_SECRET: &str = "Client-S3cret-Value";
+
+    fn oauth_add(name: &str, targets: Vec<Target>, secret: Option<&str>) -> Change {
+        Change::Add {
+            name: name.to_owned(),
+            json: OAUTH_DEF.to_owned(),
+            targets,
+            secret: secret.map(|s| crate::secrets::Secret::new(s.to_owned())),
+        }
+    }
+
+    /// Claude Code's `mcp add-json` takes a moment and then says it added the server; the test plays Claude's part
+    /// and writes the entry while it runs, as the fake CLI cannot.
+    const ADD_JSON_OK: &str = r#"{"rules":[
+        {"args":["mcp","add-json"],"delay_ms":1500,"stdout_file":"added.txt"}]}"#;
+
+    fn oauth_add_env(scenario: &str) -> (Env, String, PathBuf) {
+        let env = Env::new(
+            &serde_json::json!({}),
+            scenario,
+            &[
+                ("added.txt", b"Added http MCP server sso2 to user config\n"),
+                (
+                    "exists.txt",
+                    b"MCP server sso2 already exists in user config\n",
+                ),
+            ],
+        );
+        let repo = env.dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let key = repo.to_string_lossy().replace('\\', "/");
+        write_config(
+            &env,
+            &serde_json::json!({"numStartups": 1, "projects": {key.clone(): {"mcpServers": {}}}}),
+        );
+        (env, key, repo)
+    }
+
+    impl Env {
+        /// The `start` lines of every `mcp add-json` the fake CLI ran.
+        fn add_json_runs(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .filter(|l| l["event"] == "start" && l["argv"][1] == "add-json")
+                .collect()
+        }
+
+        /// Waits until `mcp add-json` is running, then writes `entry` the way Claude Code would: in the user's list
+        /// or the project's.
+        fn claude_writes_when_asked(&self, project: Option<&str>, name: &str, entry: &str) {
+            let deadline = Instant::now() + WAIT;
+            while self.add_json_runs().is_empty() {
+                assert!(Instant::now() < deadline, "add-json never ran");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let mut config = config_json(self);
+            let entry: serde_json::Value = serde_json::from_str(entry).unwrap();
+            match project {
+                None => config["mcpServers"][name] = entry,
+                Some(p) => config["projects"][p]["mcpServers"][name] = entry,
+            }
+            write_config(self, &config);
+        }
+    }
+
+    fn sha256(text: &str) -> String {
+        use sha2::Digest;
+        format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
+    }
+
+    #[test]
+    fn an_oauth_server_is_added_by_claude_code_with_its_secret_only_in_the_environment() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
+        );
+        assert_eq!(plan.summary, ["Add sso2 for the user"]);
+        assert_eq!(plan.action, "Add");
+        let review = &plan.reviews[0];
+        for line in [
+            "Connects to: https://sso.example.com/mcp",
+            "Signs in with OAuth as client client-7, callback port 8123",
+        ] {
+            assert!(review.lines.iter().any(|l| l == line), "{line}: {review:?}");
+        }
+        assert!(
+            plan.notes.iter().any(|n| n.contains("Claude Code adds it")),
+            "{:?}",
+            plan.notes
+        );
+        assert!(
+            plan.files
+                .iter()
+                .any(|f| f.lines.iter().any(|l| l.contains("sso2"))),
+            "{:?}",
+            plan.files
+        );
+        assert!(!format!("{plan:?}").contains(CLIENT_SECRET));
+        // Nothing has run yet.
+        assert!(env.add_json_runs().is_empty());
+
+        core.send(Command::Apply(plan.id));
+        env.claude_writes_when_asked(
+            None,
+            "sso2",
+            r#"{"type": "http", "url": "https://sso.example.com/mcp", "headers": {"X-Team": "${TEAM}"}, "oauth": {"clientId": "client-7", "callbackPort": 8123}}"#,
+        );
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        let runs = env.add_json_runs();
+        assert_eq!(runs.len(), 1);
+        let argv: Vec<&str> = runs[0]["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            argv[..7],
+            [
+                "mcp",
+                "add-json",
+                "-s",
+                "user",
+                "--client-secret",
+                "--",
+                "sso2"
+            ]
+        );
+        assert_eq!(argv.len(), 8);
+        let sent: serde_json::Value = serde_json::from_str(argv[7]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::from_str::<serde_json::Value>(OAUTH_DEF).unwrap()
+        );
+        // The secret travels only in MCP_CLIENT_SECRET.
+        assert_eq!(runs[0]["secret_set"], true);
+        assert_eq!(runs[0]["secret_sha256"], sha256(CLIENT_SECRET));
+        let log = std::fs::read_to_string(&env.log).unwrap();
+        assert!(!log.contains(CLIENT_SECRET), "{log}");
+        // Klefki keeps its own copy under the new server's connection, and nowhere else.
+        let id = crate::model::ConnectionId::new(Scope::User, None, "sso2");
+        assert_eq!(
+            store
+                .values
+                .lock()
+                .unwrap()
+                .get(&crate::secrets::user_for(&id)),
+            Some(&CLIENT_SECRET.to_owned())
+        );
+        assert!(!walk(env.dir.path()).contains(CLIENT_SECRET));
+        let rows = &snapshots(&events).last().unwrap().servers;
+        assert!(rows.iter().any(|r| r.name == "sso2" && r.oauth.is_some()));
+    }
+
+    #[test]
+    fn an_oauth_server_for_a_project_is_added_from_that_project_folder() {
+        let (env, key, repo) = oauth_add_env(ADD_JSON_OK);
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![oauth_add(
+                "sso2",
+                vec![Target::Local(key.clone())],
+                Some(CLIENT_SECRET),
+            )],
+        );
+        core.send(Command::Apply(plan.id));
+        env.claude_writes_when_asked(Some(&key), "sso2", OAUTH_DEF);
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Applied { .. })),
+            "{events:#?}"
+        );
+        let run = &env.add_json_runs()[0];
+        assert_eq!(run["argv"][2], "-s");
+        assert_eq!(run["argv"][3], "local");
+        // Claude Code adds a local server to the project it runs in.
+        assert_eq!(
+            std::fs::canonicalize(run["cwd"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&repo).unwrap()
+        );
+        let id = crate::model::ConnectionId::new(Scope::Local, Some(&key), "sso2");
+        assert!(
+            store
+                .values
+                .lock()
+                .unwrap()
+                .contains_key(&crate::secrets::user_for(&id))
+        );
+    }
+
+    #[test]
+    fn an_oauth_server_without_a_client_secret_is_added_without_one() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(&core, vec![oauth_add("sso2", vec![Target::User], None)]);
+        core.send(Command::Apply(plan.id));
+        env.claude_writes_when_asked(None, "sso2", OAUTH_DEF);
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        let run = &env.add_json_runs()[0];
+        assert_eq!(run["secret_set"], false);
+        assert!(
+            !run["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "--client-secret")
+        );
+        assert!(store.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn when_claude_code_refuses_the_add_its_reason_is_shown_and_no_secret_is_kept() {
+        let (env, _, _) = oauth_add_env(
+            r#"{"rules":[{"args":["mcp","add-json"],"exit_code":1,"stderr_file":"exists.txt"}]}"#,
+        );
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
+        );
+        let events = apply_and_wait(&core, &plan);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("a failure");
+        assert!(error.contains("already exists"), "{error}");
+        assert!(error.contains("not added"), "{error}");
+        assert!(store.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn claude_code_saying_it_added_a_server_that_is_not_there_is_reported() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
+        );
+        let events = apply_and_wait(&core, &plan);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("a failure");
+        assert!(error.contains("cannot find it"), "{error}");
+        assert!(store.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn without_a_secret_store_an_oauth_server_with_a_secret_is_not_added() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        *store.fail.lock().unwrap() = Some(crate::secrets::SecretError::Unavailable(
+            "no Secret Service".into(),
+        ));
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let refused = plan_failure(
+            &core,
+            vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
+        );
+        assert!(refused.contains("no plaintext copy"), "{refused}");
+        assert!(env.add_json_runs().is_empty());
+    }
+
+    #[test]
+    fn an_oauth_add_that_cannot_be_made_is_refused_before_anything_runs() {
+        let (env, key, _) = oauth_add_env(ADD_JSON_OK);
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        let gone = env
+            .dir
+            .path()
+            .join("gone")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut config = config_json(&env);
+        config["projects"][&gone] = serde_json::json!({});
+        write_config(&env, &config);
+        collect(&core, |e| {
+            snapshots(e).iter().any(|s| s.projects.len() == 2)
+        });
+        let plain = || Change::Add {
+            name: "p".into(),
+            json: r#"{"type": "http", "url": "https://p.example"}"#.into(),
+            targets: vec![Target::User],
+            secret: Some(crate::secrets::Secret::new("x".into())),
+        };
+        for (change, why) in [
+            (plain(), "only a server that signs in with OAuth"),
+            (oauth_add("sso2", vec![Target::User], Some("")), "empty"),
+            (oauth_add("sso2", vec![Target::Local(gone.clone())], None), "folder"),
+            (
+                Change::Add {
+                    name: "s".into(),
+                    json: r#"{"type": "http", "url": "https://s.example", "oauth": {"clientSecret": "inline-s3cret"}}"#.into(),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+                "handed to Claude Code on its own",
+            ),
+            // Claude Code's command takes the definition in its arguments, which other programs can read.
+            (
+                Change::Add {
+                    name: "h".into(),
+                    json: r#"{"type": "http", "url": "https://h.example", "headers": {"Authorization": "Bearer ghp_inlineS3cretValue123"}, "oauth": {}}"#.into(),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+                "Bearer ${AUTH_TOKEN}",
+            ),
+            (
+                Change::Add {
+                    name: "e".into(),
+                    json: r#"{"type": "sse", "url": "https://e.example", "env": {"API_TOKEN": "inline-s3cret-42"}, "oauth": {"clientId": "c"}}"#.into(),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+                "${API_TOKEN}",
+            ),
+        ] {
+            let refused = plan_failure(&core, vec![change.clone()]);
+            assert!(refused.contains(why), "{change:?}: {refused}");
+            assert!(!refused.contains("inline-s3cret"), "{refused}");
+            assert!(!refused.contains("inlineS3cret"), "{refused}");
+        }
+        let _ = key;
+        assert!(env.add_json_runs().is_empty());
+        // A reference is what goes instead, and an ordinary value is no secret.
+        plan_for(
+            &core,
+            vec![Change::Add {
+                name: "h".into(),
+                json: r#"{"type": "http", "url": "https://h.example", "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}", "X-Team": "engineering"}, "oauth": {}}"#.into(),
+                targets: vec![Target::User],
+                secret: None,
+            }],
+        );
+    }
+
+    #[test]
+    fn an_oauth_server_is_not_added_without_claude_codes_command() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let mut config = env.config();
+        config.claude = Some(
+            env.dir
+                .path()
+                .join(if cfg!(windows) { "nope.exe" } else { "nope" }),
+        );
+        let core = start_with(config, || {});
+        collect(&core, |e| !snapshots(e).is_empty());
+        let refused = plan_failure(&core, vec![oauth_add("sso2", vec![Target::User], None)]);
+        assert!(refused.contains("Claude Code's command"), "{refused}");
+    }
+
+    #[test]
+    fn a_name_taken_after_review_stops_the_oauth_add_before_it_runs() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let core = env.start();
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(&core, vec![oauth_add("sso2", vec![Target::User], None)]);
+        let mut config = config_json(&env);
+        config["mcpServers"]["sso2"] = serde_json::json!({"command": "someone-else"});
+        write_config(&env, &config);
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ApplyFailed { .. })),
+            "{events:#?}"
+        );
+        assert!(env.add_json_runs().is_empty());
+        assert_eq!(
+            config_json(&env)["mcpServers"]["sso2"]["command"],
+            "someone-else"
         );
     }
 }

@@ -4,8 +4,9 @@ use crate::api::{
 };
 use crate::config::docstore::Op;
 use crate::config::inventory::{FileKey, FileKeys};
-use crate::config::{entry, fsx, inventory};
+use crate::config::{entry, fsx, inventory, secretlike};
 use crate::sanitize::sanitize;
+use crate::secrets::Secret;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -34,6 +35,24 @@ pub(crate) struct Resolved {
     pub reviews: Vec<Review>,
     /// Definitions that were reviewed; they must be unchanged when the plan is applied.
     pub guards: Vec<Guard>,
+    /// Servers Claude Code adds itself, with `claude mcp add-json`: those that sign in with OAuth.
+    pub cli: Vec<CliAdd>,
+    /// What [`Self::cli`] will change in `~/.claude.json`, as edits klefki never makes: they show the change in the
+    /// plan, and say whether the file still allows it just before the command runs.
+    pub preview: Vec<Op>,
+}
+
+/// A server Claude Code adds with its own command, `claude mcp add-json`, because it signs in with OAuth: Claude
+/// Code keeps the client secret in its own secure storage, out of `~/.claude.json`.
+pub(crate) struct CliAdd {
+    pub name: String,
+    /// The definition, on one line, as the command is given it. Holds no secret.
+    pub json: String,
+    /// `None` for the user. Else the project, spelled as Claude Code knows it: the command adds a local server to
+    /// the project it runs in, so it runs in that folder.
+    pub project: Option<String>,
+    /// Handed to the command only in `MCP_CLIENT_SECRET`.
+    pub secret: Option<Secret>,
 }
 
 /// An approval is by name. If the repository edits the definition after the user looked at it, the approval
@@ -99,14 +118,23 @@ pub(crate) fn resolve(
                 name,
                 json,
                 targets,
-            } => add(name, json, targets, snapshot, keys, &mut out)?,
+                secret,
+            } => add(
+                name,
+                json,
+                targets,
+                secret.as_ref(),
+                snapshot,
+                keys,
+                &mut out,
+            )?,
         }
     }
     out.action = match verbs.as_slice() {
         [one] => (*one).to_owned(),
         _ => "Apply".to_owned(),
     };
-    if !out.claude.is_empty() {
+    if !out.claude.is_empty() || !out.cli.is_empty() {
         out.notes.push(
             "A running Claude Code session may need a restart before it notices this.".to_owned(),
         );
@@ -627,11 +655,13 @@ fn new_places(
 }
 
 /// Adds a new server from a definition the user gave (pasted, say): checked as an edit is, and shown in full
-/// before anything is written, since Klefki checks it right after and that starts what it runs.
+/// before anything is written, since Klefki checks it right after and that starts what it runs. One that signs in
+/// with OAuth is left to Claude Code's own command, with its client secret (see [`CliAdd`]).
 fn add(
     name: &str,
     json: &str,
     targets: &[Target],
+    secret: Option<&Secret>,
     snapshot: &Snapshot,
     keys: &FileKeys,
     out: &mut Resolved,
@@ -654,15 +684,51 @@ fn add(
             sanitize(&e.to_string())
         )
     })?;
-    entry::validate(&value).map_err(|why| format!("{new} cannot be added: {why}."))?;
+    entry::validate_new(&value).map_err(|why| format!("{new} cannot be added: {why}."))?;
+    let oauth = value.get("oauth").is_some();
+    match secret {
+        Some(_) if !oauth => {
+            return Err(format!(
+                "{new} does not sign in with OAuth; only a server that signs in with OAuth takes a client secret."
+            ));
+        }
+        Some(s) if s.is_empty() => {
+            return Err(format!(
+                "The client secret for {new} is empty. Leave it out if the server has none."
+            ));
+        }
+        _ => {}
+    }
+    if oauth {
+        typed_secret_refused(&new, &value)?;
+    }
     // Typed-in values are not shown (they may be secrets); which of the user's variables are read still is.
     let lines = describe(&shown_values(&value))
         .map_err(|why| format!("{new} cannot be reviewed safely, so it is not added: {why}."))?;
     for to in new_places(name, targets, "this server", snapshot, keys, out)? {
-        out.claude.push(Op::AddServer {
-            project: to,
+        let op = Op::AddServer {
+            project: to.clone(),
             name: name.to_owned(),
             entry: value.clone(),
+        };
+        if !oauth {
+            out.claude.push(op);
+            continue;
+        }
+        if let Some(project) = &to
+            && !Path::new(project).is_dir()
+        {
+            return Err(format!(
+                "The folder of {} is not there, and Claude Code adds a project's server from inside it.",
+                sanitize(&folder_name(project))
+            ));
+        }
+        out.preview.push(op);
+        out.cli.push(CliAdd {
+            name: name.to_owned(),
+            json: value.to_string(),
+            project: to,
+            secret: secret.cloned(),
         });
     }
     let remote = value
@@ -673,9 +739,40 @@ fn add(
         title: format!("{new} would {}:", if remote { "connect" } else { "run" }),
         lines,
     });
+    if oauth {
+        out.notes.push(format!(
+            "Claude Code adds it with its own command (claude mcp add-json){}. Sign in to it from Claude Code (/mcp) once it is added.",
+            if secret.is_some() {
+                ", and keeps the client secret in its own secure storage; Klefki keeps a copy in the system's secret store"
+            } else {
+                ""
+            }
+        ));
+    }
     let note = "Klefki checks a new server once it is added: it starts its command, or connects to its address.";
     if !out.notes.iter().any(|n| n == note) {
         out.notes.push(note.to_owned());
+    }
+    Ok(())
+}
+
+/// Refuses a secret typed into the environment or headers of a server Claude Code's command adds: the command takes
+/// the definition in its arguments, which other programs on the computer can read while it runs. The value is
+/// never named, only its variable or header and what to write instead.
+fn typed_secret_refused(new: &str, entry: &Value) -> Result<(), String> {
+    for (key, what) in [("env", "variable"), ("headers", "header")] {
+        let Some(Value::Object(values)) = entry.get(key) else {
+            continue;
+        };
+        for (name, value) in values {
+            if let Some(reference) = value.as_str().and_then(|v| secretlike::suggestion(name, v)) {
+                return Err(format!(
+                    "The {what} {} of {new} looks like a secret. Claude Code's command would show it to other programs on this computer while it adds the server, so write {} instead and set that variable where Claude Code starts.",
+                    sanitize(name),
+                    sanitize(&reference)
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -894,8 +991,34 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
             lines.push(format!("Runs this to get headers: {}", shown(helper)?));
             lines.extend(environment_line("The header command", "uses", helper)?);
         }
+        if let Some(oauth) = object.get("oauth").and_then(Value::as_object) {
+            lines.push(oauth_line(oauth)?);
+        }
     }
     Ok(lines)
+}
+
+/// `Signs in with OAuth as client a, callback port 8123, scopes "read write"`: the settings Claude Code signs in with.
+/// None of them is a secret.
+fn oauth_line(oauth: &serde_json::Map<String, Value>) -> Result<String, String> {
+    let mut parts = Vec::new();
+    if let Some(id) = oauth.get("clientId").and_then(Value::as_str) {
+        parts.push(format!("as client {}", shown(id)?));
+    }
+    if let Some(port) = oauth.get("callbackPort").and_then(Value::as_u64) {
+        parts.push(format!("callback port {port}"));
+    }
+    if let Some(scopes) = oauth.get("scopes").and_then(Value::as_str) {
+        parts.push(format!("scopes \"{}\"", shown(scopes)?));
+    }
+    if let Some(url) = oauth.get("authServerMetadataUrl").and_then(Value::as_str) {
+        parts.push(format!("sign-in metadata from {}", shown(url)?));
+    }
+    Ok(if parts.is_empty() {
+        "Signs in with OAuth, registering itself".to_owned()
+    } else {
+        format!("Signs in with OAuth {}", parts.join(", "))
+    })
 }
 
 /// The variable names in `${NAME}` and `${NAME:-default}`, as Claude Code expands them, each once, in order. A

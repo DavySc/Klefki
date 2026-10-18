@@ -130,6 +130,69 @@ pub(crate) fn validate(entry: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// [`validate`] for a server about to be added, which may sign in with OAuth: such a server is added through Claude
+/// Code's own `add-json`, so its `oauth` settings are checked the way that command takes them (it refuses a bad
+/// one, and silently drops one on a server that is not http or sse). The client secret never goes in here.
+pub(crate) fn validate_new(entry: &Value) -> Result<(), String> {
+    let Some(oauth) = entry.get("oauth") else {
+        return validate(entry);
+    };
+    let kind = entry.get("type").and_then(Value::as_str).unwrap_or("stdio");
+    if !matches!(kind, "http" | "sse") {
+        return Err("only http and sse servers sign in with OAuth".to_owned());
+    }
+    let oauth = oauth
+        .as_object()
+        .ok_or("oauth must be an object of settings")?;
+    for (key, value) in oauth {
+        match key.as_str() {
+            "clientId" => match value.as_str() {
+                Some(id) if !id.trim().is_empty() && id.len() <= 512 && sanitize(id) == id => {
+                    no_line_breaks("the client id", id)?;
+                }
+                _ => return Err("the client id must be a line of text".to_owned()),
+            },
+            "callbackPort" => {
+                if !value.as_u64().is_some_and(|p| (1..=65535).contains(&p)) {
+                    return Err("the callback port must be a number from 1 to 65535".to_owned());
+                }
+            }
+            "scopes" => {
+                let scopes = value
+                    .as_str()
+                    .ok_or("the scopes must be text, separated by spaces")?;
+                no_line_breaks("the scopes", scopes)?;
+            }
+            "authServerMetadataUrl" => {
+                let https = value
+                    .as_str()
+                    .and_then(|u| url::Url::parse(u).ok())
+                    .is_some_and(|u| u.scheme() == "https");
+                if !https {
+                    return Err("the sign-in metadata address must start with https://".to_owned());
+                }
+            }
+            "clientSecret" => {
+                return Err(
+                    "the client secret does not go in the definition; it is handed to Claude Code on its own"
+                        .to_owned(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "oauth has no setting {:?} that Claude Code knows",
+                    sanitize(other)
+                ));
+            }
+        }
+    }
+    let mut rest = entry.clone();
+    if let Some(object) = rest.as_object_mut() {
+        object.remove("oauth");
+    }
+    validate(&rest)
+}
+
 fn check_values(key: &str, values: &Map<String, Value>) -> Result<(), String> {
     for (name, value) in values {
         let valid_name = !name.is_empty()
@@ -276,6 +339,86 @@ mod tests {
         ] {
             let err = validate(&bad).unwrap_err();
             assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_new_server_may_sign_in_with_oauth_as_claude_code_takes_it() {
+        for ok in [
+            json!({"type": "http", "url": "https://x.example/mcp", "oauth": {"clientId": "abc"}}),
+            json!({"type": "sse", "url": "https://x.example/sse", "oauth": {"clientId": "abc", "callbackPort": 8123}}),
+            json!({"type": "http", "url": "https://x.example", "oauth": {"callbackPort": 1}}),
+            json!({"type": "http", "url": "https://x.example", "oauth": {"clientId": "a", "scopes": "read write", "authServerMetadataUrl": "https://id.example/.well-known/x"}}),
+            json!({"type": "http", "url": "https://x.example", "oauth": {}}),
+            // Without oauth it is checked as any definition.
+            json!({"command": "node"}),
+        ] {
+            assert_eq!(validate_new(&ok), Ok(()), "{ok}");
+        }
+        for (bad, why) in [
+            // Claude Code drops oauth for these, so it would be lost without a word.
+            (
+                json!({"command": "node", "oauth": {"clientId": "a"}}),
+                "http and sse",
+            ),
+            (
+                json!({"type": "ws", "url": "wss://x.example", "oauth": {"clientId": "a"}}),
+                "http and sse",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": "a"}),
+                "object",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"clientId": ""}}),
+                "client id",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"clientId": 7}}),
+                "client id",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"clientId": "a\nb"}}),
+                "client id",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"callbackPort": 0}}),
+                "port",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"callbackPort": 70000}}),
+                "port",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"callbackPort": "8080"}}),
+                "port",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"scopes": ["a"]}}),
+                "scopes",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"authServerMetadataUrl": "http://id.example/m"}}),
+                "https",
+            ),
+            // A secret never sits in the definition: it goes to Claude Code on its own.
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"clientSecret": "s3cret"}}),
+                "client secret",
+            ),
+            (
+                json!({"type": "http", "url": "https://x", "oauth": {"bogus": 1}}),
+                "bogus",
+            ),
+            // The rest is still checked.
+            (
+                json!({"type": "http", "url": "file:///x", "oauth": {"clientId": "a"}}),
+                "must start with",
+            ),
+        ] {
+            let err = validate_new(&bad).unwrap_err();
+            assert!(err.contains(why), "{bad}: {err}");
+            assert!(!err.contains("s3cret"), "{err}");
         }
     }
 

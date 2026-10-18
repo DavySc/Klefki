@@ -8,8 +8,8 @@ use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
     Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint,
-    LegacyDisabled, Pasted, PastedServer, PlanView, Scope, Secret, ServerId, ServerName, ServerRow,
-    Snapshot, Status, Target, TransportKind,
+    LegacyDisabled, Part, Pasted, PastedServer, PlanView, Scope, Secret, ServerFields, ServerId,
+    ServerName, ServerRow, Snapshot, Status, Target, TransportKind, same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -230,6 +230,16 @@ pub struct ShellApp {
     duplicate: Option<DuplicateForm>,
     /// The Add dialog, while open.
     add: Option<AddForm>,
+    /// How the Add dialog was last used, pasting or filling in; it opens that way again.
+    add_mode: AddMode,
+    /// The servers the prepared change adds, by name and place: selected once they are in the list.
+    adding: Vec<(String, Vec<Target>)>,
+    /// What is being added signs in with OAuth: once added, the user is reminded to sign in.
+    adding_signs_in: bool,
+    /// egui still remembers text typed into the closed Add dialog (undo steps of secrets): forget it.
+    forget_typed: bool,
+    /// A server to bring into view in the list, once.
+    reveal: Option<usize>,
     /// The Fix casing dialog, while open.
     casing: Option<CasingForm>,
     /// What is known about the shown OAuth server's client secret.
@@ -267,6 +277,11 @@ impl ShellApp {
             command: CommandPalette::default(),
             duplicate: None,
             add: None,
+            add_mode: AddMode::default(),
+            adding: Vec::new(),
+            adding_signs_in: false,
+            forget_typed: false,
+            reveal: None,
             casing: None,
             secret: None,
             secret_input: None,
@@ -374,11 +389,21 @@ impl ShellApp {
             }
             Event::PlanFailed(why) => {
                 self.preparing = false;
-                self.outcome = Some(Outcome {
-                    text: why,
-                    ok: false,
-                    shown_at: None,
-                })
+                self.adding.clear();
+                match self.add.as_mut().filter(|f| f.reviewing) {
+                    // Said in the Add dialog, which comes back as it was, so nothing typed is lost.
+                    Some(form) => {
+                        form.reviewing = false;
+                        form.failed = Some(why);
+                    }
+                    None => {
+                        self.outcome = Some(Outcome {
+                            text: why,
+                            ok: false,
+                            shown_at: None,
+                        })
+                    }
+                }
             }
             Event::Applied {
                 plan,
@@ -404,12 +429,22 @@ impl ShellApp {
                     self.plan = None;
                     self.applying = false;
                 }
+                let added = self.added_in_words();
+                if self.add.as_ref().is_some_and(|f| f.reviewing) {
+                    self.close_add();
+                }
+                // The list already holds what was saved: the engine sends it first.
+                self.select_added();
+                let kept = backup
+                    .map(|b| format!(" The previous file is kept in {b}"))
+                    .unwrap_or_default();
                 self.outcome = Some(Outcome {
                     // What was saved is read again next time it is shown.
-                    text: match (changed, backup) {
+                    text: match (changed, added) {
                         (false, _) => "Nothing needed to change.".to_owned(),
-                        (true, Some(b)) => format!("Saved. The previous file is kept in {b}"),
-                        (true, None) => "Saved.".to_owned(),
+                        (true, Some(added)) => format!("{added}{kept}"),
+                        (true, None) if kept.is_empty() => "Saved.".to_owned(),
+                        (true, None) => format!("Saved.{kept}"),
                     },
                     ok: true,
                     shown_at: None,
@@ -419,6 +454,14 @@ impl ShellApp {
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.plan = None;
                     self.applying = false;
+                }
+                // Claude Code may have added some before one failed.
+                self.select_added();
+                if let Some(form) = self.add.as_mut().filter(|f| f.reviewing) {
+                    // Said in the Add dialog, which comes back as it was, to try again or cancel.
+                    form.reviewing = false;
+                    form.failed = Some(error);
+                    return;
                 }
                 self.outcome = Some(Outcome {
                     text: error,
@@ -629,6 +672,9 @@ impl ShellApp {
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
         self.add_dialog(&ctx);
+        if std::mem::take(&mut self.forget_typed) {
+            forget_typed(&ctx);
+        }
         self.casing_dialog(&ctx);
         self.outcome_toast(&ctx);
         let mut command = std::mem::take(&mut self.command);
@@ -1436,15 +1482,7 @@ impl ShellApp {
             .and_then(|r| r.project.clone());
         let mut places = Places::new(&self.snapshot.projects, here.as_deref());
         places.user = true;
-        self.add = Some(AddForm {
-            text: String::new(),
-            read_for: String::new(),
-            read: Err(String::new()),
-            names: Vec::new(),
-            places,
-            places_chosen: false,
-            focus: true,
-        });
+        self.add = Some(AddForm::new(self.add_mode, places));
     }
 
     fn add_dialog(&mut self, ctx: &egui::Context) {
@@ -1452,7 +1490,12 @@ impl ShellApp {
         let Some(form) = &mut self.add else {
             return;
         };
+        if form.reviewing {
+            // Behind the review, as it was, to come Back to.
+            return;
+        }
         form.reread();
+        form.refill();
         let checked = form.check(&self.snapshot.servers);
         let places = form.places.in_words();
         let addable: Vec<usize> = (0..checked.len())
@@ -1461,134 +1504,140 @@ impl ShellApp {
         let ready = !addable.is_empty()
             && places.is_some()
             && checked.iter().all(|c| !matches!(c, Check::Name(_)));
-        let mut review =
-            ready && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+        let mut review = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
-        // The lists get what the window has left once the rest of the dialog is laid out.
-        let room = (ctx.content_rect().height() - 560.0).clamp(96.0, 320.0);
-        let modal = egui::Modal::new(egui::Id::new("add_dialog")).show(ctx, |ui| {
+        // The top stays put, so the tabs and fields do not move as the dialog grows or shrinks; the body scrolls
+        // as one, between the tabs and the buttons, which stay in view.
+        let screen = ctx.content_rect().height();
+        let top = (screen * 0.06).clamp(12.0, 48.0);
+        // What the tabs, the line above the buttons and the buttons take, and a failure said there.
+        let fixed = 230.0 + if form.failed.is_some() { 88.0 } else { 0.0 };
+        let body = (screen - 2.0 * top - fixed).max(120.0);
+        let id = egui::Id::new("add_dialog");
+        let area =
+            egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, top));
+        let modal = egui::Modal::new(id).area(area).show(ctx, |ui| {
             ui.set_width(640.0);
-            ui.heading("Add servers");
-            ui.add(
-                egui::Label::new(
-                    RichText::new(
-                        "Paste a claude mcp add command, or JSON such as {\"mcpServers\": {…}}. Klefki only reads it; nothing is run until you review it.",
-                    )
-                    .small()
-                    .color(pal.text_muted),
-                )
-                .wrap(),
-            );
-            ui.add_space(8.0);
-            let field = ui.add(
-                egui::TextEdit::multiline(&mut form.text)
-                    .code_editor()
-                    .desired_rows(5)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("claude mcp add --transport http notion https://mcp.notion.com/mcp"),
-            );
-            if std::mem::take(&mut form.focus) {
-                field.request_focus();
-            }
-            ui.add_space(8.0);
-            match &form.read {
-                Err(why) if !why.is_empty() => {
-                    ui.add(egui::Label::new(RichText::new(why).color(pal.danger)).wrap());
+            ui.horizontal(|ui| {
+                for (mode, label) in [(AddMode::Paste, "Paste"), (AddMode::Fill, "Fill in")] {
+                    let tab = egui::Button::new(label)
+                        .selected(form.mode == mode)
+                        .frame(true)
+                        .min_size(egui::vec2(80.0, 30.0));
+                    if ui.add(tab).clicked() && form.mode != mode {
+                        form.mode = mode;
+                        form.focus = true;
+                        form.tried = false;
+                        form.failed = None;
+                    }
                 }
-                Err(_) => {}
-                Ok(read) => {
-                    egui::ScrollArea::vertical()
-                        .id_salt("add_servers")
-                        .max_height(room)
-                        .min_scrolled_height(room)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for (i, server) in read.servers.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    if server.problem.is_none() {
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut form.names[i])
-                                                .hint_text("name")
-                                                .desired_width(180.0),
-                                        );
-                                    } else {
-                                        ui.label(RichText::new(&server.name).strikethrough());
-                                    }
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&server.summary).color(pal.text_muted),
-                                        )
-                                        .truncate(),
-                                    );
-                                });
-                                let problem = match &checked[i] {
-                                    Check::Skipped(why) | Check::Name(why) => Some(why.as_str()),
-                                    Check::Ready => None,
-                                };
-                                if let Some(why) = problem {
-                                    ui.add(
-                                        egui::Label::new(RichText::new(why).small().color(pal.danger))
-                                            .wrap(),
-                                    );
-                                }
-                                for hint in &server.hints {
-                                    ui.add(
-                                        egui::Label::new(RichText::new(hint).small().color(pal.warn))
-                                            .wrap(),
-                                    );
-                                }
-                                ui.add_space(4.0);
-                            }
-                            for note in &read.notes {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(note).small().color(pal.text_muted),
-                                    )
-                                    .wrap(),
-                                );
-                            }
-                        });
-                }
+                ui.add_space(12.0);
+                ui.heading(match form.mode {
+                    AddMode::Paste => "Add servers",
+                    AddMode::Fill => "Add a server",
+                });
+            });
+            ui.add_space(4.0);
+            // A solid bar, not one that shows on hover: a body that scrolls has to look like it.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle {
+                // The handle in the text's colour: the theme's fill is the dialog's own.
+                foreground_color: true,
+                ..egui::style::ScrollStyle::solid()
+            };
+            egui::ScrollArea::vertical()
+                .id_salt("add_body")
+                .max_height(body)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    match form.mode {
+                        AddMode::Paste => form.paste_ui(ui, pal, &checked),
+                        AddMode::Fill => form.fill_ui(ui, pal, &checked),
+                    }
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(match form.mode {
+                            AddMode::Paste => "Add them",
+                            AddMode::Fill => "Add it",
+                        })
+                        .color(pal.text_muted),
+                    );
+                    if form
+                        .places
+                        .ui(ui, 6.0 * (PLACE_ROW + PLACE_GAP), Some("selected"))
+                    {
+                        form.places_chosen = true;
+                    }
+                });
+            ui.separator();
+            if let Some(failed) = &form.failed {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::WARNING_CIRCLE).color(pal.danger));
+                    ui.add(egui::Label::new(RichText::new(failed).color(pal.danger)).wrap());
+                });
             }
-            ui.add_space(10.0);
-            ui.label(RichText::new("Add them").color(pal.text_muted));
-            if form.places.ui(ui, room, Some("selected")) {
-                form.places_chosen = true;
-            }
-            ui.add_space(10.0);
             // What Review will lead to, or why it cannot yet.
-            let skipped = checked.iter().filter(|c| matches!(c, Check::Skipped(_))).count();
-            if skipped > 0 && form.read.is_ok() {
-                ui.label(
-                    RichText::new(if skipped == 1 {
-                        "1 server cannot be added and is left out.".to_owned()
+            let count = |f: fn(&Check) -> bool| checked.iter().filter(|c| f(c)).count();
+            let skipped = count(|c| matches!(c, Check::Skipped(_)));
+            let unfinished = count(|c| matches!(c, Check::FillIn(_)));
+            if form.mode == AddMode::Paste && form.read.is_ok() && skipped + unfinished > 0 {
+                let mut parts = Vec::new();
+                if skipped > 0 {
+                    parts.push(if skipped == 1 {
+                        "1 server cannot be added and is left out".to_owned()
                     } else {
-                        format!("{skipped} servers cannot be added and are left out.")
-                    })
-                    .color(pal.text_muted),
-                );
+                        format!("{skipped} servers cannot be added and are left out")
+                    });
+                }
+                if unfinished > 0 {
+                    parts.push(if unfinished == 1 {
+                        "1 needs finishing in the form".to_owned()
+                    } else {
+                        format!("{unfinished} need finishing in the form")
+                    });
+                }
+                ui.label(RichText::new(format!("{}.", parts.join("; "))).color(pal.text_muted));
             }
+            let stop = if form.tried {
+                pal.danger
+            } else {
+                pal.text_muted
+            };
             match &places {
                 None => {
-                    ui.label(RichText::new("Tick at least one place.").color(pal.text_muted));
+                    ui.label(RichText::new("Tick at least one place.").color(stop));
                 }
                 Some(places) if ready => {
-                    let names: Vec<&str> = addable.iter().map(|&i| form.names[i].as_str()).collect();
-                    ui.add(egui::Label::new(format!("Adds {} {places}.", list_in_words(&names, "server"))).wrap());
+                    let names = form.names_to_add(&addable);
+                    ui.add(
+                        egui::Label::new(format!(
+                            "Adds {} {places}.",
+                            list_in_words(&names, "server")
+                        ))
+                        .wrap(),
+                    );
                 }
-                Some(_) => {}
+                Some(_) if form.tried && form.mode == AddMode::Paste => {
+                    ui.label(
+                        RichText::new("Paste a server that can be added, with a usable name.")
+                            .color(stop),
+                    );
+                }
+                Some(_) if form.tried => {
+                    ui.label(RichText::new("Fix what is marked above.").color(stop));
+                }
+                // The line is kept, so the buttons do not move when it fills in.
+                Some(_) => {
+                    ui.label(" ");
+                }
             }
-            ui.add_space(12.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
+                // Always pressable: pressed too soon, it says what is missing rather than doing nothing.
                 let confirm =
                     egui::Button::new(RichText::new("Review").strong().color(pal.on_bright))
                         .fill(pal.primary)
                         .min_size(egui::vec2(96.0, 34.0));
-                review |= ui
-                    .add_enabled(ready, confirm)
-                    .on_hover_text(shortcut("Enter"))
-                    .on_disabled_hover_text("Paste a server, give it a usable name and tick a place")
-                    .clicked();
+                review |= ui.add(confirm).on_hover_text(shortcut("Enter")).clicked();
                 cancel |= ui
                     .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
                     .on_hover_text("Esc")
@@ -1596,18 +1645,35 @@ impl ShellApp {
             });
         });
         settle(ctx, &modal.response);
+        self.add_mode = form.mode;
         // The text and names may have changed in this frame: what is sent is checked again as it is now.
         let changes = review
             .then(|| form.changes(&self.snapshot.servers))
             .flatten();
+        let signs_in = form.signs_in();
+        if changes.is_none() && review {
+            let checked = form.check(&self.snapshot.servers);
+            form.show_what_stops_review(&checked);
+        }
         if let Some(changes) = changes {
-            self.add = None;
-            self.prepare(changes);
-        } else if cancel || modal.should_close() {
-            self.add = None;
+            if self.can_prepare() {
+                self.prepare(changes);
+                self.adding_signs_in = signs_in;
+                if let Some(form) = &mut self.add {
+                    form.reviewing = true;
+                    form.failed = None;
+                }
+            }
+        } else if (cancel || modal.should_close()) && !review {
+            self.close_add();
         }
     }
 
+    /// Closes the Add dialog, and has egui forget what it remembers of the secrets typed into it.
+    fn close_add(&mut self) {
+        self.add = None;
+        self.forget_typed = true;
+    }
     fn single_selected(&self) -> Option<&ServerRow> {
         let mut it = self.selected.iter();
         match (it.next(), it.next()) {
@@ -1718,8 +1784,76 @@ impl ShellApp {
         if self.can_prepare() {
             self.outcome = None;
             self.preparing = true;
+            self.adding = changes
+                .iter()
+                .filter_map(|c| match c {
+                    Change::Add { name, targets, .. } => Some((name.clone(), targets.clone())),
+                    _ => None,
+                })
+                .collect();
             self.send(Command::Prepare(changes));
         }
+    }
+
+    /// What was just added and where, as the success message says it, with what to do next for OAuth. `None`
+    /// when the change added nothing.
+    fn added_in_words(&self) -> Option<String> {
+        if self.adding.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self.adding.iter().map(|(n, _)| n.as_str()).collect();
+        let targets = &self.adding[0].1;
+        let user = targets.contains(&Target::User);
+        let folders: Vec<&str> = targets
+            .iter()
+            .filter_map(|t| match t {
+                Target::Local(p) => Some(folder_name(p)),
+                Target::User => None,
+            })
+            .collect();
+        let places = places_in_words(user, &folders).unwrap_or_default();
+        let next = if self.adding_signs_in {
+            " Sign in to it from Claude Code (/mcp)."
+        } else {
+            ""
+        };
+        Some(format!(
+            "Added {} {places}.{next}",
+            list_in_words(&names, "server")
+        ))
+    }
+
+    /// Selects the servers the change just made added, those that are in the list, and brings the first into view.
+    fn select_added(&mut self) {
+        let adding = std::mem::take(&mut self.adding);
+        let added: BTreeSet<usize> = self
+            .snapshot
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                adding.iter().any(|(name, targets)| {
+                    row.name == *name
+                        && targets.iter().any(|t| match t {
+                            Target::User => row.scope == Scope::User,
+                            Target::Local(p) => {
+                                row.scope == Scope::Local
+                                    && row.project.as_deref().is_some_and(|r| same_project(r, p))
+                            }
+                        })
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let Some(&first) = added.iter().next() else {
+            return;
+        };
+        if !self.visible().contains(&first) {
+            // A search that hides it would hide what was just added.
+            self.search.clear();
+        }
+        self.selected = added;
+        self.reveal = Some(first);
     }
 
     /// The banner for the last change.
@@ -1790,7 +1924,9 @@ impl ShellApp {
             return;
         };
         let applying = self.applying;
+        let from_add = self.add.as_ref().is_some_and(|f| f.reviewing);
         let mut apply = false;
+        let mut back = false;
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("plan_dialog")).show(ctx, |ui| {
             ui.set_width(540.0);
@@ -1917,6 +2053,19 @@ impl ShellApp {
                 {
                     apply = true;
                 }
+                // Back to the Add dialog, as it was, to change something.
+                if from_add
+                    && ui
+                        .add_enabled(
+                            !applying,
+                            egui::Button::new(format!("{} Back", icon::ARROW_LEFT))
+                                .min_size(egui::vec2(80.0, 34.0)),
+                        )
+                        .on_hover_text("Change what is added")
+                        .clicked()
+                {
+                    back = true;
+                }
                 // Once Apply is pressed the engine writes the plan; closing now would hide that.
                 if ui
                     .add_enabled(
@@ -1949,10 +2098,16 @@ impl ShellApp {
             self.applying = true;
             self.send(Command::Apply(plan.id));
             // The dialog stays until the engine answers, so a second click cannot apply twice.
-        } else if cancel {
+        } else if back || cancel {
             self.send(Command::Discard(plan.id));
             self.plan = None;
             self.applying = false;
+            self.adding.clear();
+            if back && let Some(form) = &mut self.add {
+                form.reviewing = false;
+            } else if from_add {
+                self.close_add();
+            }
         }
     }
 
@@ -1967,7 +2122,15 @@ impl ShellApp {
         // Only the rows in view are drawn, so the ones drawn are the ones on screen.
         let mut shown = std::mem::take(&mut self.on_screen_now);
         shown.clear();
-        TableBuilder::new(ui)
+        let reveal = self.reveal.take().and_then(|i| {
+            rows.iter()
+                .position(|r| matches!(r, GridRow::Server(s) if *s == i))
+        });
+        let mut table = TableBuilder::new(ui);
+        if let Some(at) = reveal {
+            table = table.scroll_to_row(at, Some(Align::Center));
+        }
+        table
             .striped(true)
             .sense(Sense::click())
             .cell_layout(Layout::left_to_right(Align::Center))
@@ -2952,8 +3115,56 @@ impl CasingForm {
     }
 }
 
-/// What the Add dialog holds: the pasted text, what was read from it, the names to add the servers under and where.
+/// How the Add dialog takes a server: pasted (a command or JSON, several at once), or filled in, part by part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AddMode {
+    #[default]
+    Paste,
+    Fill,
+}
+
+/// A field of the form, for what is said under it and for giving it the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Field {
+    Name,
+    Part(Part),
+}
+
+fn field_id(field: Field) -> egui::Id {
+    egui::Id::new(("add_field", field))
+}
+
+/// The client secret's text field, and each value row's: what egui remembers of them (undo steps) is forgotten
+/// when the dialog closes, so a secret does not outlive the form.
+fn secret_id() -> egui::Id {
+    egui::Id::new("add_client_secret")
+}
+
+fn value_id(noun: &str, row: usize) -> egui::Id {
+    egui::Id::new(("add_value", noun, row))
+}
+
+/// The most value rows whose text-field memory is forgotten on close; a server has a handful.
+const FORGET_ROWS: usize = 64;
+
+/// What the value rows remember between frames: the rows shown as typed, and the value last replaced.
+#[derive(Default)]
+struct RowsState {
+    shown: BTreeSet<usize>,
+    replaced: Option<Replaced>,
+}
+
+/// A value replaced by a `${VAR}` reference: what to do next, and the way back.
+struct Replaced {
+    row: usize,
+    variable: String,
+    before: Secret,
+}
+
+/// What the Add dialog holds: the pasted text, what was read from it and the names to add those servers under; or
+/// the form's server; and where they go.
 struct AddForm {
+    mode: AddMode,
     text: String,
     /// The text `read` was read from: it is read again only when the text changes.
     read_for: String,
@@ -2961,24 +3172,84 @@ struct AddForm {
     read: Result<Pasted, String>,
     /// One name per server read, as the user may have changed it.
     names: Vec<String>,
+    /// The form's server: its name and parts.
+    name: String,
+    /// The name was typed; until then it follows what the server connects to or runs.
+    name_edited: bool,
+    fields: ServerFields,
+    /// The form's OAuth client secret, typed hidden. Wiped from memory when dropped; handed to the engine once.
+    secret: Secret,
+    /// The client secret is shown as typed, to check a paste.
+    show_secret: bool,
+    /// Which value rows are shown as typed, and the value last replaced by a reference.
+    rows: RowsState,
+    /// What `fields` make under `name`, and every problem with them, read again only when either changes.
+    filled: Option<Filled>,
     places: Places,
     /// A place was ticked by hand: what is pasted next no longer moves the ticks.
     places_chosen: bool,
-    /// Give the text field the keyboard on the first frame.
+    /// Give the first field the keyboard on the next frame.
     focus: bool,
+    /// Give this field the keyboard, and bring it into view, on the next frame.
+    focus_on: Option<Field>,
+    /// Fields the keyboard has left: what is wrong with them is said from then on, not while they are typed in.
+    left: BTreeSet<Field>,
+    /// Review was pressed: everything that stops it is said.
+    tried: bool,
+    /// Review asked for a plan: the dialog waits behind it, as it was, to come back to.
+    reviewing: bool,
+    /// Why the last review or add failed, said in the dialog.
+    failed: Option<String>,
+    /// Bring the OAuth settings into view on the next frame.
+    reveal_oauth: bool,
 }
 
-/// Whether one pasted server can be added.
+struct Filled {
+    name: String,
+    fields: ServerFields,
+    read: PastedServer,
+    problems: Vec<(Part, String)>,
+}
+
+/// Whether one server can be added.
 #[derive(Debug, PartialEq)]
 enum Check {
     Ready,
-    /// It cannot be added as pasted, and is left out.
+    /// It cannot be added as it is, and is left out.
     Skipped(String),
     /// Its name needs changing before anything is added.
     Name(String),
+    /// Pasted, it asks for a client secret: it is finished in the form, where the secret is typed.
+    FillIn(String),
 }
 
 impl AddForm {
+    fn new(mode: AddMode, places: Places) -> Self {
+        Self {
+            mode,
+            text: String::new(),
+            read_for: String::new(),
+            read: Err(String::new()),
+            names: Vec::new(),
+            name: String::new(),
+            name_edited: false,
+            fields: ServerFields::default(),
+            secret: Secret::new(String::new()),
+            show_secret: false,
+            rows: RowsState::default(),
+            filled: None,
+            places,
+            places_chosen: false,
+            focus: true,
+            focus_on: None,
+            left: BTreeSet::new(),
+            tried: false,
+            reviewing: false,
+            failed: None,
+            reveal_oauth: false,
+        }
+    }
+
     /// Reads the text again if it changed. A name the user changed is kept while the server it names is still read
     /// with the same name in the same place; the ticks follow what the text asks for until one is set by hand.
     fn reread(&mut self) {
@@ -3017,59 +3288,705 @@ impl AddForm {
         self.read_for.clone_from(&self.text);
     }
 
+    /// Reads the form's server again if its name or parts changed. Until a name is typed, it is the one the parts
+    /// suggest.
+    fn refill(&mut self) {
+        self.fields.has_secret = !self.secret.is_empty();
+        let parts_changed = self.filled.as_ref().is_none_or(|f| f.fields != self.fields);
+        if parts_changed && !self.name_edited {
+            self.name = self.fields.suggested_name();
+        }
+        let current = self
+            .filled
+            .as_ref()
+            .is_some_and(|f| f.name == self.name && f.fields == self.fields);
+        if !current {
+            self.filled = Some(Filled {
+                name: self.name.clone(),
+                fields: self.fields.clone(),
+                read: self.fields.read(&self.name),
+                problems: self.fields.problems(),
+            });
+        }
+    }
+
     /// What Review sends, read and checked as the dialog is now; `None` while something stops it.
     fn changes(&mut self, servers: &[ServerRow]) -> Option<Vec<Change>> {
         self.reread();
+        self.refill();
         let checked = self.check(servers);
         let targets = self.places.targets();
-        let read = self.read.as_ref().ok()?;
         if targets.is_empty() || checked.iter().any(|c| matches!(c, Check::Name(_))) {
             return None;
         }
-        let changes: Vec<Change> = (0..checked.len())
-            .filter(|&i| checked[i] == Check::Ready)
-            .map(|i| Change::Add {
-                name: self.names[i].clone(),
-                json: read.servers[i].json.clone(),
-                targets: targets.clone(),
-            })
-            .collect();
+        let changes: Vec<Change> = match self.mode {
+            AddMode::Paste => {
+                let read = self.read.as_ref().ok()?;
+                (0..checked.len())
+                    .filter(|&i| checked[i] == Check::Ready)
+                    .map(|i| Change::Add {
+                        name: self.names[i].clone(),
+                        json: read.servers[i].json.clone(),
+                        targets: targets.clone(),
+                        secret: None,
+                    })
+                    .collect()
+            }
+            AddMode::Fill => {
+                let filled = self.filled.as_ref()?;
+                if checked != [Check::Ready] {
+                    return None;
+                }
+                vec![Change::Add {
+                    name: self.name.clone(),
+                    json: filled.read.json.clone(),
+                    targets,
+                    // Only a server that signs in with OAuth has one; an empty field means none.
+                    secret: (filled.fields.oauth
+                        && filled.fields.transport != TransportKind::Stdio
+                        && !self.secret.is_empty())
+                    .then(|| self.secret.clone()),
+                }]
+            }
+        };
         (!changes.is_empty()).then_some(changes)
     }
 
-    /// Each server read, in order: ready, left out, or waiting for a better name.
-    fn check(&self, servers: &[ServerRow]) -> Vec<Check> {
-        let Ok(read) = &self.read else {
-            return Vec::new();
-        };
-        read.servers
-            .iter()
-            .enumerate()
-            .map(|(i, server)| {
-                if let Some(problem) = &server.problem {
-                    return Check::Skipped(problem.clone());
-                }
-                let name = &self.names[i];
-                if name.is_empty() {
-                    return Check::Name("Give it a name.".to_owned());
-                }
-                if let Some(problem) = name_problem(name) {
-                    return Check::Name(problem);
-                }
-                let twice =
-                    (0..i).any(|j| read.servers[j].problem.is_none() && self.names[j] == *name);
-                if twice {
-                    return Check::Name(format!("{name} is named twice in what you pasted."));
-                }
-                if let Some(taken) = self.places.taken(name, servers) {
-                    return Check::Name(format!(
-                        "{name} already exists {taken}. Choose another name, or untick it there."
-                    ));
-                }
-                Check::Ready
-            })
-            .collect()
+    /// Whether what is added signs in with OAuth, so the user is reminded to sign in once it is added.
+    fn signs_in(&self) -> bool {
+        match self.mode {
+            AddMode::Paste => self
+                .read
+                .as_ref()
+                .is_ok_and(|r| r.servers.iter().any(|s| s.oauth)),
+            AddMode::Fill => self.filled.as_ref().is_some_and(|f| f.read.oauth),
+        }
     }
+
+    /// Each server, in order: ready, left out, or waiting for a better name. The form has one.
+    fn check(&self, servers: &[ServerRow]) -> Vec<Check> {
+        match self.mode {
+            AddMode::Paste => {
+                let Ok(read) = &self.read else {
+                    return Vec::new();
+                };
+                read.servers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, server)| {
+                        if let Some(problem) = &server.problem {
+                            return Check::Skipped(problem.clone());
+                        }
+                        if server.asks_secret {
+                            return if ServerFields::from_definition(&server.json).is_some() {
+                                Check::FillIn(
+                                    "It asks for a client secret. Fill it in to add it, and type the secret there."
+                                        .to_owned(),
+                                )
+                            } else {
+                                Check::Skipped(
+                                    "It asks for a client secret and has settings the form does not show. Add it with Claude Code's own command, which asks for the secret."
+                                        .to_owned(),
+                                )
+                            };
+                        }
+                        let earlier = (0..i)
+                            .filter(|&j| {
+                                read.servers[j].problem.is_none() && !read.servers[j].asks_secret
+                            })
+                            .map(|j| self.names[j].as_str());
+                        self.name_check(&self.names[i], earlier, servers)
+                    })
+                    .collect()
+            }
+            AddMode::Fill => {
+                let Some(filled) = &self.filled else {
+                    return Vec::new();
+                };
+                vec![match (
+                    self.name_check(&self.name, std::iter::empty(), servers),
+                    &filled.read.problem,
+                ) {
+                    (Check::Ready, Some(problem)) => Check::Skipped(problem.clone()),
+                    (check, _) => check,
+                }]
+            }
+        }
+    }
+
+    /// Whether `name` can be added, after the names `earlier` in the same paste, to the places ticked.
+    fn name_check<'a>(
+        &self,
+        name: &str,
+        mut earlier: impl Iterator<Item = &'a str>,
+        servers: &[ServerRow],
+    ) -> Check {
+        if name.is_empty() {
+            return Check::Name("Give it a name.".to_owned());
+        }
+        if let Some(problem) = name_problem(name) {
+            return Check::Name(problem);
+        }
+        if earlier.any(|e| e == name) {
+            return Check::Name(format!("{name} is named twice in what you pasted."));
+        }
+        if let Some(taken) = self.places.taken(name, servers) {
+            return Check::Name(format!(
+                "{name} already exists {taken}. Choose another name, or untick it there."
+            ));
+        }
+        Check::Ready
+    }
+
+    /// The names of the servers at `addable`, for the line above the buttons.
+    fn names_to_add(&self, addable: &[usize]) -> Vec<&str> {
+        match self.mode {
+            AddMode::Paste => addable.iter().map(|&i| self.names[i].as_str()).collect(),
+            AddMode::Fill => vec![self.name.as_str()],
+        }
+    }
+
+    /// Review was pressed but cannot go ahead: says everything that stops it, and gives the first field that
+    /// needs work the keyboard.
+    fn show_what_stops_review(&mut self, checked: &[Check]) {
+        self.tried = true;
+        if self.mode != AddMode::Fill {
+            return;
+        }
+        let name = matches!(checked.first(), Some(Check::Name(_))).then_some(Field::Name);
+        let part = self
+            .filled
+            .as_ref()
+            .and_then(|f| f.problems.first())
+            .map(|(p, _)| Field::Part(*p));
+        // In the order the form shows them: what it runs or connects to comes before the name.
+        self.focus_on = match (part, name) {
+            (Some(Field::Part(Part::Command | Part::Address)), _) => part,
+            (_, Some(name)) => Some(name),
+            (part, None) => part,
+        };
+    }
+
+    /// Moves pasted server `i` into the form, to finish it there. False when the form cannot hold all of it.
+    fn fill_in_from(&mut self, i: usize) -> bool {
+        let Some(server) = self.read.as_ref().ok().and_then(|r| r.servers.get(i)) else {
+            return false;
+        };
+        let Some(fields) = ServerFields::from_definition(&server.json) else {
+            return false;
+        };
+        self.fields = fields;
+        self.name = self.names[i].clone();
+        self.name_edited = true;
+        self.secret = Secret::new(String::new());
+        self.mode = AddMode::Fill;
+        self.focus_on = Some(Field::Part(Part::ClientId));
+        self.reveal_oauth = true;
+        true
+    }
+
+    /// The text field and what was read from it.
+    fn paste_ui(&mut self, ui: &mut Ui, pal: &Palette, checked: &[Check]) {
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Paste a claude mcp add command, or JSON such as {\"mcpServers\": {…}}. Klefki only reads it; nothing is run until you review it.",
+                )
+                .small()
+                .color(pal.text_muted),
+            )
+            .wrap(),
+        );
+        ui.add_space(8.0);
+        let field = ui.add(
+            egui::TextEdit::multiline(&mut self.text)
+                .id(egui::Id::new("add_paste"))
+                .code_editor()
+                .desired_rows(5)
+                .desired_width(f32::INFINITY)
+                .hint_text("claude mcp add --transport http notion https://mcp.notion.com/mcp"),
+        );
+        if std::mem::take(&mut self.focus) {
+            field.request_focus();
+        }
+        ui.add_space(8.0);
+        let mut fill_in = None;
+        match &self.read {
+            Err(why) if !why.is_empty() => {
+                ui.add(egui::Label::new(RichText::new(why).color(pal.danger)).wrap());
+            }
+            Err(_) => {}
+            Ok(read) => {
+                for (i, server) in read.servers.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if server.problem.is_none() && !server.asks_secret {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.names[i])
+                                    .hint_text("name")
+                                    .desired_width(180.0),
+                            );
+                        } else if server.problem.is_none() {
+                            ui.label(&server.name);
+                        } else {
+                            ui.label(RichText::new(&server.name).strikethrough());
+                        }
+                        ui.add(
+                            egui::Label::new(RichText::new(&server.summary).color(pal.text_muted))
+                                .truncate(),
+                        );
+                    });
+                    match &checked[i] {
+                        Check::Skipped(why) | Check::Name(why) => {
+                            ui.add(
+                                egui::Label::new(RichText::new(why).small().color(pal.danger))
+                                    .wrap(),
+                            );
+                        }
+                        Check::FillIn(why) => {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(why).small().color(pal.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                                if ui
+                                    .button(format!("{} Fill in", icon::PENCIL_SIMPLE))
+                                    .clicked()
+                                {
+                                    fill_in = Some(i);
+                                }
+                            });
+                        }
+                        Check::Ready => {}
+                    }
+                    for hint in &server.hints {
+                        ui.add(
+                            egui::Label::new(RichText::new(hint).small().color(pal.warn)).wrap(),
+                        );
+                    }
+                    ui.add_space(4.0);
+                }
+                for note in &read.notes {
+                    ui.add(
+                        egui::Label::new(RichText::new(note).small().color(pal.text_muted)).wrap(),
+                    );
+                }
+            }
+        }
+        if let Some(i) = fill_in {
+            self.fill_in_from(i);
+        }
+    }
+
+    /// What is wrong with `field`, once it has been left or Review was pressed; never while it is first typed in.
+    fn message<'a>(&'a self, field: Field, name_check: Option<&'a str>) -> Option<&'a str> {
+        if !self.tried && !self.left.contains(&field) {
+            return None;
+        }
+        match field {
+            Field::Name => name_check,
+            Field::Part(part) => self
+                .filled
+                .as_ref()?
+                .problems
+                .iter()
+                .find(|(p, _)| *p == part)
+                .map(|(_, why)| why.as_str()),
+        }
+    }
+
+    /// Draws a text field for `field`: gives it the keyboard when asked, and notes when the keyboard leaves it.
+    fn track(&mut self, field: Field, response: &egui::Response) {
+        if self.focus_on == Some(field) {
+            self.focus_on = None;
+            response.request_focus();
+            response.scroll_to_me(Some(Align::Center));
+        }
+        if response.lost_focus() {
+            self.left.insert(field);
+        }
+    }
+
+    /// The form: what the server runs or connects to, its name, its environment or headers, and the OAuth client
+    /// settings the provider gave, if any. Each problem is said under its field.
+    fn fill_ui(&mut self, ui: &mut Ui, pal: &Palette, checked: &[Check]) {
+        ui.add_space(8.0);
+        let label_width = 128.0;
+        let field_width = (ui.available_width() - label_width - 16.0).max(120.0);
+        let name_check = match checked.first() {
+            Some(Check::Name(why)) => Some(why.clone()),
+            _ => None,
+        };
+        let first = std::mem::take(&mut self.focus);
+        let was = self.fields.transport;
+        field_row(ui, pal, "Type", label_width, |ui| {
+            for kind in [
+                TransportKind::Stdio,
+                TransportKind::Http,
+                TransportKind::Sse,
+            ] {
+                ui.radio_value(&mut self.fields.transport, kind, transport_name(kind));
+            }
+        });
+        if self.fields.transport != was {
+            // Another list of rows: what was shown or replaced was in the other one.
+            self.rows = RowsState::default();
+        }
+        if self.fields.transport == TransportKind::Stdio {
+            let field = Field::Part(Part::Command);
+            let response = field_row(ui, pal, "Command", label_width, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fields.command)
+                        .id(field_id(field))
+                        .code_editor()
+                        .hint_text("e.g. npx -y @modelcontextprotocol/server-filesystem /path")
+                        .desired_width(field_width),
+                )
+            });
+            if first {
+                response.request_focus();
+            }
+            self.track(field, &response);
+            field_note(
+                ui,
+                pal,
+                label_width,
+                self.message(field, None),
+                "As you would type it in a terminal; put quotes around a path with spaces.",
+            );
+        } else {
+            let field = Field::Part(Part::Address);
+            let response = field_row(ui, pal, "Address", label_width, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fields.url)
+                        .id(field_id(field))
+                        .hint_text("e.g. https://mcp.example.com/mcp")
+                        .desired_width(field_width),
+                )
+            });
+            if first {
+                response.request_focus();
+            }
+            if response.lost_focus() {
+                self.fields.complete_url();
+            }
+            self.track(field, &response);
+            field_note(ui, pal, label_width, self.message(field, None), "");
+        }
+        let response = field_row(ui, pal, "Name", label_width, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.name)
+                    .id(field_id(Field::Name))
+                    .hint_text("e.g. github")
+                    .desired_width(field_width),
+            )
+        });
+        if response.changed() {
+            // Cleared, it follows the parts again.
+            self.name_edited = !self.name.is_empty();
+        }
+        self.track(Field::Name, &response);
+        field_note(
+            ui,
+            pal,
+            label_width,
+            self.message(Field::Name, name_check.as_deref()),
+            if self.name_edited || self.name.is_empty() {
+                ""
+            } else {
+                "Taken from the address or command; type another if you like."
+            },
+        );
+        if self.fields.transport == TransportKind::Stdio {
+            let field = Field::Part(Part::Variables);
+            value_rows(
+                ui,
+                pal,
+                "Environment",
+                "variable",
+                label_width,
+                &mut self.fields.env,
+                &mut self.rows,
+            );
+            field_note(ui, pal, label_width, self.message(field, None), "");
+            return;
+        }
+        let field = Field::Part(Part::Headers);
+        value_rows(
+            ui,
+            pal,
+            "Headers",
+            "header",
+            label_width,
+            &mut self.fields.headers,
+            &mut self.rows,
+        );
+        field_note(ui, pal, label_width, self.message(field, None), "");
+        ui.add_space(4.0);
+        let toggled = field_row(ui, pal, "", label_width, |ui| {
+            // Drawn like the places below: egui's own small box reads as a radio button here.
+            place_row(
+                ui,
+                &mut self.fields.oauth,
+                "Use OAuth client settings from the provider",
+                "",
+                None,
+            )
+        });
+        if toggled.changed() && self.fields.oauth {
+            self.reveal_oauth = true;
+        }
+        field_note(
+            ui,
+            pal,
+            label_width,
+            None,
+            "Most servers sign you in on their own. Tick this only if the provider gave you a client ID or secret.",
+        );
+        if !self.fields.oauth {
+            return;
+        }
+        let block = ui.scope(|ui| {
+            let half = field_width.min(300.0);
+            for (part, label, hint, width) in [
+                (Part::ClientId, "Client ID", "optional", half),
+                (Part::CallbackPort, "Callback port", "optional", 96.0),
+                (Part::Scopes, "Scopes", "optional, separated by spaces", half),
+                (Part::MetadataUrl, "Metadata URL", "optional, rarely needed: https://…", field_width),
+            ] {
+                if part == Part::CallbackPort {
+                    self.secret_row(ui, pal, label_width, half);
+                }
+                let field = Field::Part(part);
+                let text = match part {
+                    Part::ClientId => &mut self.fields.client_id,
+                    Part::CallbackPort => &mut self.fields.callback_port,
+                    Part::Scopes => &mut self.fields.scopes,
+                    _ => &mut self.fields.metadata_url,
+                };
+                let response = field_row(ui, pal, label, label_width, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(text)
+                            .id(field_id(field))
+                            .hint_text(hint)
+                            .desired_width(width),
+                    )
+                });
+                self.track(field, &response);
+                field_note(ui, pal, label_width, self.message(field, None), "");
+            }
+            field_note(
+                ui,
+                pal,
+                label_width,
+                None,
+                "Claude Code keeps the client secret in its own secure storage, and Klefki keeps a copy in your system's. Leave it empty if the provider gave you none.",
+            );
+        });
+        if std::mem::take(&mut self.reveal_oauth) {
+            ui.scroll_to_rect(block.response.rect, None);
+        }
+    }
+
+    /// The client secret: typed hidden, with a button to show it while checking a paste.
+    fn secret_row(&mut self, ui: &mut Ui, pal: &Palette, label_width: f32, width: f32) {
+        let show = &mut self.show_secret;
+        let secret = &mut self.secret;
+        field_row(ui, pal, "Client secret", label_width, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(secret.edit())
+                    .id(secret_id())
+                    .password(!*show)
+                    .hint_text("optional")
+                    .desired_width(width),
+            );
+            let (glyph, label) = if *show {
+                (icon::EYE_SLASH, "Hide the client secret")
+            } else {
+                (icon::EYE, "Show the client secret")
+            };
+            if icon_button(ui, glyph, label) {
+                *show = !*show;
+            }
+        });
+        field_note(ui, pal, label_width, None, "");
+    }
+}
+
+/// A row of the form: its label, left-aligned in a column, then what `add` draws.
+/// Has egui forget the text fields of the closed Add dialog that may have held a secret: their undo steps keep
+/// copies of what was typed.
+fn forget_typed(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove::<egui::text_edit::TextEditState>(secret_id());
+        d.remove::<egui::text_edit::TextEditState>(egui::Id::new("add_paste"));
+        for row in 0..FORGET_ROWS {
+            for noun in ["variable", "header"] {
+                d.remove::<egui::text_edit::TextEditState>(value_id(noun, row));
+            }
+        }
+    });
+}
+
+fn field_row<R>(
+    ui: &mut Ui,
+    pal: &Palette,
+    label: &str,
+    label_width: f32,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(label_width, 30.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_min_size(egui::vec2(label_width, 30.0));
+                ui.label(RichText::new(label).color(pal.text_muted));
+            },
+        );
+        add(ui)
+    })
+    .inner
+}
+
+/// Under a field, in its column: what is wrong with it, in red, or else `help`, quietly. Nothing when both are
+/// empty.
+fn field_note(ui: &mut Ui, pal: &Palette, label_width: f32, problem: Option<&str>, help: &str) {
+    let (text, color) = match problem {
+        Some(problem) => (problem, pal.danger),
+        None if !help.is_empty() => (help, pal.text_muted),
+        None => return,
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(label_width + 8.0);
+        ui.add(egui::Label::new(RichText::new(text).small().color(color)).wrap());
+    });
+}
+
+/// The rows of a new server's environment or headers, as on the Env tab: a name and a value each (typed hidden,
+/// with a button to show it), a button to take a row out, one to add a row, and, under a value that looks like a
+/// secret, one to write a reference to it instead, which says what to do next and can be undone.
+fn value_rows(
+    ui: &mut Ui,
+    pal: &Palette,
+    title: &str,
+    noun: &str,
+    label_width: f32,
+    rows: &mut Vec<(String, String)>,
+    state: &mut RowsState,
+) {
+    let RowsState { shown, replaced } = state;
+    let mut remove = None;
+    for (i, (name, value)) in rows.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(label_width, 30.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(label_width, 30.0));
+                    ui.label(RichText::new(if i == 0 { title } else { "" }).color(pal.text_muted));
+                },
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut *name)
+                    .hint_text("Name")
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(170.0),
+            );
+            let visible = shown.contains(&i);
+            ui.add(
+                egui::TextEdit::singleline(&mut *value)
+                    .id(value_id(noun, i))
+                    .hint_text("Value")
+                    .password(!visible)
+                    .desired_width(ui.available_width() - 72.0),
+            );
+            let what = if name.is_empty() { noun } else { name.as_str() };
+            let (glyph, verb) = if visible {
+                (icon::EYE_SLASH, "Hide")
+            } else {
+                (icon::EYE, "Show")
+            };
+            if icon_button(ui, glyph, &format!("{verb} {what}")) && !shown.remove(&i) {
+                shown.insert(i);
+            }
+            if icon_button(ui, icon::X, &format!("Remove {what}")) {
+                remove = Some(i);
+            }
+        });
+        let note = |ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)| {
+            ui.horizontal(|ui| {
+                ui.add_space(label_width + 8.0);
+                ui.vertical(|ui| add(ui));
+            });
+        };
+        if let Some(reference) = secret_reference(name, value) {
+            note(ui, &mut |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} looks like a secret.", name.trim()))
+                            .small()
+                            .color(pal.warn),
+                    )
+                    .wrap(),
+                );
+                if ui
+                    .small_button(format!("Use {reference} instead"))
+                    .on_hover_text(
+                        "Claude Code fills the variable in from its own environment, so the secret stays out of ~/.claude.json.",
+                    )
+                    .clicked()
+                {
+                    let variable = reference
+                        .split_once("${")
+                        .and_then(|(_, rest)| rest.split_once('}'))
+                        .map_or_else(String::new, |(v, _)| v.to_owned());
+                    let before = Secret::new(std::mem::replace(value, reference.clone()));
+                    *replaced = Some(Replaced {
+                        row: i,
+                        variable,
+                        before,
+                    });
+                }
+            });
+        } else if let Some(r) = replaced.as_mut().filter(|r| r.row == i) {
+            let mut undo = false;
+            note(ui, &mut |ui| {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "Set {} in the environment Claude Code starts from, or the server will not get it.",
+                            r.variable
+                        ))
+                        .small()
+                        .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+                undo = ui.small_button("Undo").clicked();
+            });
+            if undo {
+                *value = std::mem::take(r.before.edit());
+                *replaced = None;
+            }
+        }
+    }
+    if let Some(i) = remove {
+        rows.remove(i);
+        // The rows after it moved up: what was shown or replaced is no longer where it was.
+        shown.clear();
+        *replaced = None;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(label_width + 8.0);
+        if rows.is_empty() {
+            ui.label(RichText::new(format!("{title}: none")).color(pal.text_muted));
+        }
+        if ui.small_button(format!("Add {noun}")).clicked() {
+            rows.push((String::new(), String::new()));
+        }
+    });
 }
 
 /// A dialog is centred by the size it had on the previous frame. When its size changes (text pasted, a long plan
@@ -3198,9 +4115,14 @@ impl Places {
     /// review warns about.
     fn taken(&self, name: &str, servers: &[ServerRow]) -> Option<String> {
         let has = |scope: Scope, project: Option<&str>| {
-            servers
-                .iter()
-                .any(|s| s.name == name && s.scope == scope && s.project.as_deref() == project)
+            servers.iter().any(|s| {
+                s.name == name
+                    && s.scope == scope
+                    && match (s.project.as_deref(), project) {
+                        (Some(a), Some(b)) => same_project(a, b),
+                        (a, b) => a == b,
+                    }
+            })
         };
         let user = self.user && has(Scope::User, None);
         let folders: Vec<&str> = self
@@ -3689,7 +4611,7 @@ fn transport_name(t: TransportKind) -> &'static str {
     match t {
         TransportKind::Stdio => "Command (stdio)",
         TransportKind::Http => "HTTP",
-        TransportKind::Sse => "SSE",
+        TransportKind::Sse => "SSE (older servers)",
         TransportKind::Ws => "WebSocket",
         TransportKind::Invalid => "Unknown",
     }
@@ -6583,20 +7505,21 @@ mod tests {
         h.get_by_label(icon::PLUS).click();
         h.run();
         h.get_by_label_contains("Add servers");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
         let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
         paste(&mut h, text);
         h.get_by_label_contains("npx -y @x/fs /tmp");
         h.get_by_label_contains("Adds files for the user.");
         h.get_by_label("Review").click();
         h.run();
-        assert!(h.state().add.is_none());
+        assert!(waits_behind_review(&h));
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::Add {
                 name: "files".into(),
                 json: pasted_json(text, 0),
                 targets: vec![Target::User],
+                secret: None,
             }]
         );
     }
@@ -6641,11 +7564,13 @@ mod tests {
                     name: "one".into(),
                     json: pasted_json(text, 0),
                     targets: targets.clone(),
+                    secret: None,
                 },
                 Change::Add {
                     name: "two".into(),
                     json: pasted_json(text, 1),
                     targets,
+                    secret: None,
                 },
             ]
         );
@@ -6656,24 +7581,24 @@ mod tests {
         let (mut h, engine) = duplicate_harness();
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
-        let text = "claude mcp add --client-id x corp https://c.example/mcp\nclaude mcp add -s user ok node\nclaude mcp add -s user ok node";
+        let text = "claude mcp add --client-id x corp node\nclaude mcp add -s user ok node\nclaude mcp add -s user ok node";
         paste(&mut h, text);
         h.get_by_label_contains("OAuth");
         h.get_by_label_contains("twice");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
         h.state_mut().add.as_mut().unwrap().names[2] = "ok2".into();
         h.run();
-        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(ready(&mut h));
         h.get_by_label_contains("1 server cannot be added");
         // A name already used for the user, and one that is not a name.
         h.state_mut().add.as_mut().unwrap().names[1] = "alpha".into();
         h.run();
         h.get_by_label_contains("alpha already exists for the user");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
         h.state_mut().add.as_mut().unwrap().names[1] = "has space".into();
         h.run();
         h.get_by_label_contains("not allowed");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
         h.state_mut().add.as_mut().unwrap().names[1] = "ok".into();
         h.run();
         h.get_by_label("Review").click();
@@ -6699,14 +7624,14 @@ mod tests {
         );
         h.get_by_label_contains("http · https://x.example/mcp");
         h.get_by_label_contains("Give it a name");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
         h.state_mut().add.as_mut().unwrap().names[0] = "x".into();
         h.run();
-        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(ready(&mut h));
         h.get_by_label_contains("For the user").click();
         h.run();
         h.get_by_label_contains("Tick at least one place");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
         assert!(duplicate_requested(&engine).is_empty());
     }
 
@@ -6724,7 +7649,7 @@ mod tests {
         assert!(h.query_by_label_contains("ghp_abc").is_none());
         paste(&mut h, "npm install thing");
         h.get_by_label_contains("Nothing here adds a server");
-        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(!ready(&mut h));
     }
 
     #[test]
@@ -6742,7 +7667,765 @@ mod tests {
         assert!(duplicate_requested(&engine).is_empty());
     }
 
+    fn fill_in(h: &mut Harness<'static, ShellApp>) {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        h.get_by_label("Fill in").click();
+        h.run();
+        assert_eq!(h.state().add.as_ref().unwrap().mode, AddMode::Fill);
+    }
+
+    fn add_form<'a>(h: &'a mut Harness<'static, ShellApp>) -> &'a mut AddForm {
+        h.state_mut().add.as_mut().unwrap()
+    }
+
+    fn fields_json(fields: &ServerFields) -> String {
+        fields.read("x").json
+    }
+
+    /// Review would ask for a plan now: what used to enable the button, which is now always pressable.
+    fn ready(h: &mut Harness<'static, ShellApp>) -> bool {
+        let servers = h.state().snapshot.servers.clone();
+        h.state_mut()
+            .add
+            .as_mut()
+            .is_some_and(|f| f.changes(&servers).is_some())
+    }
+
+    const OAUTH_TOGGLE: &str = "Use OAuth client settings from the provider";
+
+    /// The Add dialog waits behind the review it asked for.
+    fn waits_behind_review(h: &Harness<'static, ShellApp>) -> bool {
+        h.state().add.as_ref().is_some_and(|f| f.reviewing)
+    }
+
+    /// Names the form's server, as typing into the name field does.
+    fn name_it(h: &mut Harness<'static, ShellApp>, name: &str) {
+        let f = add_form(h);
+        f.name = name.into();
+        f.name_edited = true;
+    }
+
+    #[test]
+    fn a_server_can_be_filled_in_part_by_part() {
+        let (mut h, engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.get_by_label_contains("Add a server");
+        assert!(!ready(&mut h));
+        // Nothing is marked wrong on a form just opened.
+        assert!(h.query_by_label_contains("Give it a name").is_none());
+        add_form(&mut h).fields.command = r#"npx -y @x/fs "C:\My files""#.into();
+        h.run();
+        // The name follows the command until one is typed.
+        assert_eq!(add_form(&mut h).name, "fs");
+        h.get_by_label_contains("Adds fs for the user.");
+        name_it(&mut h, "files");
+        add_form(&mut h).fields.command = r#"npx -y @x/fs "C:\My files""#.into();
+        h.run();
+        h.get_by_label_contains("Add variable").click();
+        h.run();
+        add_form(&mut h).fields.env[0] = ("ROOT".into(), "/srv".into());
+        h.run();
+        h.get_by_label_contains("Adds files for the user.");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(waits_behind_review(&h));
+        let mut fields = ServerFields {
+            command: r#"npx -y @x/fs "C:\My files""#.into(),
+            ..ServerFields::default()
+        };
+        fields.env.push(("ROOT".into(), "/srv".into()));
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Add {
+                name: "files".into(),
+                json: fields_json(&fields),
+                targets: vec![Target::User],
+                secret: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_oauth_server_is_added_with_its_client_secret_typed_hidden() {
+        let (mut h, engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        assert!(h.query_by_label_contains("Client ID").is_none());
+        h.get_by_label(OAUTH_TOGGLE).click();
+        h.run();
+        h.get_by_label_contains("Client secret");
+        name_it(&mut h, "sso");
+        let f = add_form(&mut h);
+        f.fields.url = "https://sso.example.com/mcp".into();
+        f.fields.client_id = "client-7".into();
+        f.fields.callback_port = "8123".into();
+        *f.secret.edit() = "Typed-S3cret".into();
+        h.run();
+        // The secret is never drawn.
+        assert!(h.query_by_label_contains("Typed-S3cret").is_none());
+        h.get_by_label("Review").click();
+        h.run();
+        let fields = ServerFields {
+            transport: TransportKind::Http,
+            url: "https://sso.example.com/mcp".into(),
+            oauth: true,
+            client_id: "client-7".into(),
+            callback_port: "8123".into(),
+            ..ServerFields::default()
+        };
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Add {
+                name: "sso".into(),
+                json: fields_json(&fields),
+                targets: vec![Target::User],
+                secret: Some(Secret::new("Typed-S3cret".into())),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_empty_client_secret_is_none_and_a_secret_is_only_sent_for_oauth() {
+        let (mut h, engine) = duplicate_harness();
+        fill_in(&mut h);
+        name_it(&mut h, "sso");
+        let f = add_form(&mut h);
+        f.fields.transport = TransportKind::Http;
+        f.fields.url = "https://sso.example.com/mcp".into();
+        f.fields.oauth = true;
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let secrets: Vec<Option<Secret>> = duplicate_requested(&engine)
+            .into_iter()
+            .map(|c| match c {
+                Change::Add { secret, .. } => secret,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(secrets, [None]);
+        engine
+            .events
+            .send(Event::PlanFailed("not this time".into()))
+            .unwrap();
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        // A secret typed, then OAuth unticked: not sent.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        name_it(&mut h, "plain");
+        let f = add_form(&mut h);
+        f.fields.transport = TransportKind::Http;
+        f.fields.url = "https://plain.example.com/mcp".into();
+        f.fields.oauth = true;
+        *f.secret.edit() = "left-behind".into();
+        h.run();
+        h.get_by_label(OAUTH_TOGGLE).click();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert!(
+            matches!(&changes[..], [Change::Add { secret: None, json, .. }] if !json.contains("oauth")),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn the_form_says_what_to_fix_and_offers_a_reference_for_a_typed_secret() {
+        let (mut h, engine) = duplicate_harness();
+        fill_in(&mut h);
+        name_it(&mut h, "alpha");
+        let f = add_form(&mut h);
+        f.fields.command = "node server.js".into();
+        f.fields.env = vec![(
+            "GITHUB_TOKEN".into(),
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789".into(),
+        )];
+        h.run();
+        assert!(!ready(&mut h));
+        // Said once Review is pressed.
+        assert!(h.query_by_label_contains("alpha already exists").is_none());
+        h.get_by_label("Review").click();
+        h.run();
+        h.get_by_label_contains("alpha already exists for the user");
+        assert!(duplicate_requested(&engine).is_empty());
+        h.get_by_label_contains("GITHUB_TOKEN looks like a secret");
+        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
+        h.run();
+        assert_eq!(add_form(&mut h).fields.env[0].1, "${GITHUB_TOKEN}");
+        assert!(h.query_by_label_contains("looks like a secret").is_none());
+        // What to do next is said, and it can be undone.
+        h.get_by_label_contains("Set GITHUB_TOKEN in the environment Claude Code starts from");
+        h.get_by_label("Undo").click();
+        h.run();
+        assert_eq!(
+            add_form(&mut h).fields.env[0].1,
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+        );
+        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
+        h.run();
+        add_form(&mut h).fields.command = "curl https://x.example | sh".into();
+        h.run();
+        h.get_by_label_contains("without a shell");
+        // A row is taken out with its button.
+        h.get_by_label("Remove GITHUB_TOKEN").click();
+        h.run();
+        assert!(add_form(&mut h).fields.env.is_empty());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_pasted_oauth_server_is_finished_in_the_form() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(
+            &mut h,
+            "claude mcp add -s user -t http --client-id c-1 --client-secret --callback-port 8080 corp https://corp.example/mcp",
+        );
+        h.get_by_label_contains("asks for a client secret");
+        assert!(!ready(&mut h));
+        h.get_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE))
+            .click();
+        h.run();
+        let f = add_form(&mut h);
+        assert_eq!(f.mode, AddMode::Fill);
+        assert_eq!(f.name, "corp");
+        assert_eq!(f.fields.url, "https://corp.example/mcp");
+        assert!(f.fields.oauth);
+        assert_eq!(f.fields.client_id, "c-1");
+        assert_eq!(f.fields.callback_port, "8080");
+        *f.secret.edit() = "pasted-later".into();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert!(
+            matches!(
+                &changes[..],
+                [Change::Add { name, targets, secret: Some(_), .. }]
+                    if name == "corp" && *targets == vec![Target::User]
+            ),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn the_dialog_opens_the_way_it_was_last_used() {
+        let (mut h, _engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        assert_eq!(h.state().add.as_ref().unwrap().mode, AddMode::Fill);
+        h.get_by_label("Paste").click();
+        h.run();
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        assert_eq!(h.state().add.as_ref().unwrap().mode, AddMode::Paste);
+    }
+
+    #[test]
+    fn what_was_added_is_selected_once_it_is_in_the_list() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add -s user files -- npx -y @x/fs");
+        h.state_mut().add.as_mut().unwrap().places.projects[1].1 = true;
+        h.state_mut().add.as_mut().unwrap().places_chosen = true;
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ files"], &[], false)))
+            .unwrap();
+        h.run();
+        // The search hides it; it is cleared so what was added can be seen.
+        h.state_mut().search = "alpha".into();
+        let (a, b) = two_rows();
+        let rows = vec![
+            a,
+            b,
+            live_row("files", Scope::User, None),
+            live_row("files", Scope::Local, Some("/home/me/notes")),
+            live_row("files", Scope::Local, Some("C:/Repos/WebApp")),
+        ];
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: rows,
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        // For the user and in notes, not the WebApp one that was there already.
+        assert_eq!(h.state().selected, BTreeSet::from([2, 3]));
+        assert_eq!(h.state().search, "");
+    }
+
+    #[test]
+    fn nothing_is_selected_for_an_add_that_was_cancelled() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label("beta").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add -s user alpha2 node");
+        h.get_by_label("Review").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ alpha2"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label("Cancel").click();
+        h.run();
+        // Another change, saved: the cancelled add selects nothing.
+        let (a, b) = two_rows();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, b, live_row("alpha2", Scope::User, None)],
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 8,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().selected, BTreeSet::from([1]));
+    }
+
     /// alpha (user) and beta (local in WebApp), and the forty-odd projects of a long-time Claude Code user.
+    /// The form for an OAuth server, filled in as far as Review, with a client secret typed.
+    fn sso_filled(h: &mut Harness<'static, ShellApp>) {
+        fill_in(h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        h.get_by_label(OAUTH_TOGGLE).click();
+        h.run();
+        name_it(h, "sso");
+        let f = add_form(h);
+        f.fields.url = "https://sso.example.com/mcp".into();
+        f.fields.headers = vec![("X-Team".into(), "eng".into())];
+        f.fields.client_id = "client-7".into();
+        *f.secret.edit() = "Typed-S3cret".into();
+        h.run();
+    }
+
+    /// What the form holds, to compare before and after a round trip through review.
+    fn form_state(h: &mut Harness<'static, ShellApp>) -> (String, ServerFields, Secret) {
+        let f = add_form(h);
+        (f.name.clone(), f.fields.clone(), f.secret.clone())
+    }
+
+    #[test]
+    fn a_review_that_fails_keeps_the_form_and_says_why_in_it() {
+        let (mut h, engine) = duplicate_harness();
+        sso_filled(&mut h);
+        let before = form_state(&mut h);
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(waits_behind_review(&h));
+        assert!(
+            h.query_by_label("Fill in").is_none(),
+            "hidden behind the review"
+        );
+        drain(&engine);
+        engine
+            .events
+            .send(Event::PlanFailed(
+                "The system's secret store is not available (no Secret Service).".into(),
+            ))
+            .unwrap();
+        h.run();
+        // The dialog is back as it was, saying why, and no toast says it elsewhere.
+        assert_eq!(form_state(&mut h), before);
+        assert!(!waits_behind_review(&h));
+        h.get_by_label_contains("secret store is not available");
+        assert!(h.state().outcome.is_none());
+        // Fixed and sent again: the message goes.
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(duplicate_requested(&engine).len(), 1);
+        assert!(add_form(&mut h).failed.is_none());
+        // Claude Code refusing the add, after review, also comes back to the form.
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ sso"], &[], false)))
+            .unwrap();
+        h.run();
+        engine
+            .events
+            .send(Event::ApplyFailed {
+                plan: 7,
+                error: "sso was not added for the user. Claude Code said: no".into(),
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(form_state(&mut h), before);
+        h.get_by_label_contains("Claude Code said: no");
+    }
+
+    #[test]
+    fn the_review_of_an_add_goes_back_to_the_form_as_it_was() {
+        let (mut h, engine) = duplicate_harness();
+        sso_filled(&mut h);
+        let before = form_state(&mut h);
+        h.get_by_label("Review").click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ sso"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label(&format!("{} Back", icon::ARROW_LEFT))
+            .click();
+        h.run();
+        assert!(h.state().plan.is_none());
+        assert!(matches!(&drain(&engine)[..], [Command::Discard(7)]));
+        assert_eq!(form_state(&mut h), before);
+        h.get_by_label("Fill in");
+        // Cancel in the review drops the add as a whole.
+        h.get_by_label("Review").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(8, &["+ sso"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(h.state().add.is_none());
+        // Other reviews have no Back.
+        h.get_by_label("beta").click();
+        h.run();
+        h.key_press(egui::Key::Delete);
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(9, &["- beta"], &[], true)))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label(&format!("{} Back", icon::ARROW_LEFT))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn review_pressed_too_soon_says_what_is_missing_under_each_field_and_goes_there() {
+        let (mut h, engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        let f = add_form(&mut h);
+        f.fields.headers = vec![(String::new(), "1".into())];
+        h.run();
+        assert!(
+            h.query_by_label_contains("Type the server's address")
+                .is_none()
+        );
+        h.get_by_label("Review").click();
+        h.run();
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+        // Each under its field, all at once.
+        h.get_by_label_contains("Type the server's address");
+        h.get_by_label_contains("Give it a name");
+        h.get_by_label_contains("A header has a value but no name");
+        h.get_by_label_contains("Fix what is marked above");
+        assert_eq!(
+            h.ctx.memory(|m| m.focused()),
+            Some(field_id(Field::Part(Part::Address)))
+        );
+        // A message goes as soon as what it says is fixed.
+        add_form(&mut h).fields.headers.clear();
+        h.run();
+        assert!(h.query_by_label_contains("A header has a value").is_none());
+    }
+
+    #[test]
+    fn an_address_is_checked_when_it_is_left_and_https_is_added_for_the_user() {
+        let (mut h, _engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        let address = field_id(Field::Part(Part::Address));
+        h.ctx.memory_mut(|m| m.request_focus(address));
+        h.run();
+        add_form(&mut h).fields.url = "not a".into();
+        h.run();
+        // Still typing: not wrong yet.
+        assert!(h.query_by_label_contains("Start the address").is_none());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.get_by_label_contains("Start the address with https://");
+        // Typed without the scheme, it is completed when left, as a browser does.
+        h.ctx.memory_mut(|m| m.request_focus(address));
+        h.run();
+        add_form(&mut h).fields.url = "mcp.linear.app/mcp".into();
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        let f = add_form(&mut h);
+        assert_eq!(f.fields.url, "https://mcp.linear.app/mcp");
+        assert_eq!(f.name, "linear");
+        h.run();
+        assert!(h.query_by_label_contains("Start the address").is_none());
+    }
+
+    #[test]
+    fn a_pasted_oauth_server_without_a_client_secret_is_added_as_pasted() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text = "claude mcp add -s user -t http --client-id c-1 corp https://corp.example/mcp";
+        paste(&mut h, text);
+        assert!(
+            h.query_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE))
+                .is_none()
+        );
+        h.get_by_label_contains("Adds corp for the user.");
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Add {
+                name: "corp".into(),
+                json: pasted_json(text, 0),
+                targets: vec![Target::User],
+                secret: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pasted_server_asking_for_a_secret_is_finished_in_the_form_or_said_why_not() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        // The sign-in metadata address is a field of the form too.
+        paste(
+            &mut h,
+            r#"claude mcp add-json -s user m --client-secret '{"type":"http","url":"https://m.example/mcp","oauth":{"authServerMetadataUrl":"https://id.example/meta"}}'"#,
+        );
+        h.get_by_label_contains("1 needs finishing in the form");
+        h.get_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE))
+            .click();
+        h.run();
+        let f = add_form(&mut h);
+        assert_eq!(f.mode, AddMode::Fill);
+        assert_eq!(f.fields.metadata_url, "https://id.example/meta");
+        h.run();
+        h.get_by_label_contains("Metadata URL");
+        // What the form cannot hold is not offered to it.
+        h.get_by_label("Paste").click();
+        h.run();
+        paste(
+            &mut h,
+            r#"claude mcp add-json -s user m --client-secret '{"type":"http","url":"https://m.example/mcp","headersHelper":"get-token"}'"#,
+        );
+        assert!(
+            h.query_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE))
+                .is_none()
+        );
+        h.get_by_label_contains("Add it with Claude Code's own command");
+        h.get_by_label_contains("1 server cannot be added");
+    }
+
+    #[test]
+    fn the_client_secret_can_be_shown_and_is_forgotten_with_the_dialog() {
+        let (mut h, _engine) = duplicate_harness();
+        sso_filled(&mut h);
+        assert!(!add_form(&mut h).show_secret);
+        h.get_by_label("Show the client secret").click();
+        h.run();
+        assert!(add_form(&mut h).show_secret);
+        h.get_by_label("Hide the client secret").click();
+        h.run();
+        // Typed for real, so egui keeps undo steps of it.
+        h.ctx.memory_mut(|m| m.request_focus(secret_id()));
+        h.run();
+        h.event(egui::Event::Text("x".into()));
+        h.run();
+        assert!(add_form(&mut h).secret.edit().ends_with('x'));
+        let remembered = |h: &Harness<'static, ShellApp>| {
+            h.ctx.data_mut(|d| {
+                d.get_persisted::<egui::text_edit::TextEditState>(secret_id())
+                    .is_some()
+            })
+        };
+        assert!(remembered(&h));
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(h.state().add.is_none());
+        assert!(!remembered(&h));
+    }
+
+    #[test]
+    fn a_value_can_be_shown_to_check_it() {
+        let (mut h, _engine) = duplicate_harness();
+        fill_in(&mut h);
+        add_form(&mut h).fields.env = vec![("TEAM".into(), "engineering".into())];
+        h.run();
+        h.get_by_label("Show TEAM").click();
+        h.run();
+        assert!(add_form(&mut h).rows.shown.contains(&0));
+        h.get_by_label("Hide TEAM").click();
+        h.run();
+        assert!(add_form(&mut h).rows.shown.is_empty());
+    }
+
+    #[test]
+    fn what_was_added_is_selected_however_its_project_is_spelled() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add files -- npx -y @x/fs");
+        let f = add_form(&mut h);
+        f.places.user = false;
+        f.places.projects[0].1 = true;
+        f.places_chosen = true;
+        h.run();
+        h.get_by_label_contains("Adds files in WebApp.");
+        h.get_by_label("Review").click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ files"], &[], false)))
+            .unwrap();
+        h.run();
+        let (a, b) = two_rows();
+        // Claude Code wrote the key with a small drive letter and backslashes.
+        let rows = vec![
+            a,
+            b,
+            live_row("files", Scope::Local, Some(r"c:\Repos\WebApp")),
+        ];
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: rows,
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().selected, BTreeSet::from([2]));
+        h.get_by_label("Added files in WebApp.");
+        // And a name taken under another spelling is taken.
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add files -- npx -y @x/fs");
+        let f = add_form(&mut h);
+        f.places.user = false;
+        f.places.projects[0].1 = true;
+        f.places_chosen = true;
+        h.run();
+        h.get_by_label_contains("files already exists in WebApp");
+    }
+
+    #[test]
+    fn an_oauth_add_says_to_sign_in_once_it_is_added() {
+        let (mut h, engine) = duplicate_harness();
+        sso_filled(&mut h);
+        h.get_by_label("Review").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ sso"], &[], false)))
+            .unwrap();
+        h.run();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        assert!(h.state().add.is_none());
+        h.get_by_label("Added sso for the user. Sign in to it from Claude Code (/mcp).");
+    }
+
+    #[test]
+    fn the_oauth_settings_come_into_view_in_a_small_window() {
+        let (mut h, _engine) = duplicate_harness();
+        h.set_size(egui::vec2(960.0, 600.0));
+        h.run();
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        h.get_by_label(OAUTH_TOGGLE).click();
+        for _ in 0..4 {
+            h.run();
+        }
+        // In the part of the body in view: between the tabs and the line above the buttons.
+        let top = h.get_by_label("Paste").rect().bottom();
+        let bottom = h.get_by_label("Review").rect().top();
+        for label in ["Client ID", "Client secret", "Callback port"] {
+            let r = h.get_by_label(label).rect();
+            assert!(
+                r.top() >= top && r.bottom() <= bottom,
+                "{label} at {r:?}, view {top}..{bottom}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tabs_stay_under_the_pointer_as_the_dialog_changes() {
+        let (mut h, _engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.run();
+        let tabs = h.get_by_label("Paste").rect();
+        h.get_by_label("HTTP").click();
+        h.run();
+        h.get_by_label(OAUTH_TOGGLE).click();
+        h.run();
+        h.run();
+        assert_eq!(h.get_by_label("Paste").rect(), tabs);
+        h.get_by_label("Paste").click();
+        h.run();
+        h.run();
+        assert_eq!(h.get_by_label("Paste").rect(), tabs);
+    }
+
     fn duplicate_harness_with_many_projects()
     -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         let (mut h, engine) = live_harness();
