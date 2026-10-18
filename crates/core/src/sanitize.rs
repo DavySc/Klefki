@@ -27,6 +27,16 @@ pub(crate) fn sanitize(input: &str) -> String {
     out
 }
 
+/// Like [`sanitize`], for text shown on one line, such as a name or a command read from a file: line breaks, tabs
+/// and the Unicode line and paragraph separators become spaces, so the text cannot draw a line of its own.
+pub(crate) fn sanitize_line(input: &str) -> String {
+    let mut out = sanitize(input);
+    if out.contains(['\n', '\t', '\u{2028}', '\u{2029}']) {
+        out = out.replace(['\n', '\t', '\u{2028}', '\u{2029}'], " ");
+    }
+    out
+}
+
 fn is_plain(b: u8) -> bool {
     (b' '..=b'~').contains(&b) || b == b'\n' || b == b'\t'
 }
@@ -63,14 +73,19 @@ pub(crate) fn clip(s: &str, max: usize) -> String {
 
 fn skip_escape(chars: &mut std::str::Chars<'_>) {
     match chars.next() {
-        // CSI: parameters/intermediates, then a final byte 0x40..=0x7E.
-        Some('[') => {
-            for c in chars.by_ref() {
-                if ('\u{40}'..='\u{7e}').contains(&c) {
+        // CSI: parameters and intermediates (0x20..=0x3F), then a final byte (0x40..=0x7E). Anything else ends it
+        // there and is text again, so a sequence that never was one cannot hide what follows.
+        Some('[') => loop {
+            let mut ahead = chars.clone();
+            match ahead.next() {
+                Some('\u{20}'..='\u{3f}') => *chars = ahead,
+                Some('\u{40}'..='\u{7e}') => {
+                    *chars = ahead;
                     break;
                 }
+                _ => break,
             }
-        }
+        },
         // OSC: terminated by BEL or ST (ESC \).
         Some(']') => {
             while let Some(c) = chars.next() {
@@ -117,6 +132,22 @@ mod tests {
     #[test]
     fn keeps_newline_tab_and_unicode() {
         assert_eq!(sanitize("a\tb\nc é 日本"), "a\tb\nc é 日本");
+    }
+
+    #[test]
+    fn a_csi_ends_where_its_text_starts() {
+        assert_eq!(sanitize("a\u{1b}[31;1mb"), "ab");
+        assert_eq!(sanitize("a\u{1b}[日本hello"), "a日本hello");
+        assert_eq!(sanitize("a\u{1b}[\nb"), "a\nb");
+    }
+
+    #[test]
+    fn one_line_text_keeps_no_line_breaks() {
+        assert_eq!(
+            super::sanitize_line("a\nb\tc\u{2028}d\u{2029}e\r\n"),
+            "a b c d e "
+        );
+        assert_eq!(super::sanitize_line("plain"), "plain");
     }
 
     #[test]
