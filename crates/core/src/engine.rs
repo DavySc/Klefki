@@ -14,6 +14,7 @@ use crate::diagnose::report;
 use crate::model::ServerName;
 use crate::ops;
 use crate::sanitize::{clip, sanitize};
+use crate::secrets::{Secret, SecretStore};
 use crate::watch::{self, Watch};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
@@ -44,6 +45,15 @@ pub enum Command {
     Discard(u64),
     /// Send the server's definition, for viewing and editing (see [`Event::Entry`]).
     Inspect(ServerId),
+    /// Whether a client secret is stored for this OAuth server (see [`Event::SecretStatus`]).
+    SecretStatus(ServerId),
+    /// Keep this client secret for the OAuth server, in the system's secret store.
+    StoreSecret {
+        id: ServerId,
+        secret: crate::secrets::Secret,
+    },
+    /// Remove the server's client secret from the system's secret store.
+    ForgetSecret(ServerId),
 }
 
 /// Something the user wants changed. Targets are rows of the current inventory; project scope cannot be
@@ -188,6 +198,12 @@ pub enum Event {
     CliVersion(Option<String>),
     /// The CLI could not be found or used; live checks are unavailable.
     CliProblem(String),
+    /// Whether a client secret is stored for the server, after asking or after storing or forgetting one; `Err` says
+    /// why the store could not answer or the change was refused. Never carries the secret.
+    SecretStatus {
+        id: ServerId,
+        stored: Result<bool, String>,
+    },
     Status {
         id: ServerId,
         status: Status,
@@ -281,6 +297,9 @@ pub(crate) struct EngineConfig {
     pub watch_interval: Option<Duration>,
     /// How long changed files must hold still before they are read again.
     pub watch_settle: Duration,
+    /// Where client secrets are kept: `None` for the system's own store, opened when first needed (so starting
+    /// never waits on it); tests give an in-memory one.
+    pub secrets: Option<Arc<dyn SecretStore>>,
 }
 
 const MAX_CHECK_OUTPUT: usize = 64 * 1024;
@@ -384,6 +403,8 @@ struct Shared {
     /// The CLI's version, for the program file it was read from. Asking costs a process start (Claude Code is a
     /// large Node program), so it is only asked again when the file changes.
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
+    /// The secret store once opened. Not kept when opening failed, so a store unlocked later is found.
+    secret_store: Mutex<Option<Arc<dyn SecretStore>>>,
     /// Per file, the redo log of klefki's changes whose check is still due.
     journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
@@ -425,6 +446,7 @@ fn engine_main(
         claude: RwLock::new(None),
         version: Mutex::new(None),
         journals: Arc::default(),
+        secret_store: Mutex::new(None),
         emitter,
         input: input_tx.clone(),
     });
@@ -463,11 +485,75 @@ fn engine_main(
             Command::Check(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Check),
             Command::Diagnose(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Diagnose),
             Command::Inspect(id) => inspect(&shared, id),
+            Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
+            Command::StoreSecret { id, secret: value } => {
+                secret(&shared, &state.snapshot, id, SecretOp::Store(value));
+            }
+            Command::ForgetSecret(id) => secret(&shared, &state.snapshot, id, SecretOp::Forget),
         }
     }
     // The UI is gone: let the workers finish what they are doing and stop.
     lock(&shared.queue).shutdown = true;
     shared.wake_workers.notify_all();
+}
+
+enum SecretOp {
+    Status,
+    Store(Secret),
+    Forget,
+}
+
+/// Looks up, stores or forgets a server's client secret, on a thread of its own: a store may be slow, or ask the
+/// user (macOS shows a keychain prompt). Only servers that sign in with OAuth have one.
+fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
+    let answer = |stored: Result<bool, String>| {
+        shared.emitter.emit(Event::SecretStatus {
+            id: id.clone(),
+            stored,
+        });
+    };
+    let Some(row) = snapshot.servers.iter().find(|r| r.is(&id)) else {
+        return answer(Err(format!(
+            "{} is no longer in the configuration.",
+            sanitize(&id.name)
+        )));
+    };
+    if row.oauth.is_none() {
+        return answer(Err(format!(
+            "{} does not sign in with OAuth, so it has no client secret.",
+            sanitize(&id.name)
+        )));
+    }
+    if matches!(&op, SecretOp::Store(s) if s.is_empty()) {
+        return answer(Err("The client secret is empty.".to_owned()));
+    }
+    let store = {
+        let mut held = lock(&shared.secret_store);
+        match (&*held, &shared.config.secrets) {
+            (Some(store), _) | (None, Some(store)) => Arc::clone(store),
+            (None, None) => match crate::secrets::Keyring::platform() {
+                Ok(store) => {
+                    let store: Arc<dyn SecretStore> = Arc::new(store);
+                    *held = Some(Arc::clone(&store));
+                    store
+                }
+                Err(e) => return answer(Err(e.to_string())),
+            },
+        }
+    };
+    let connection = row.connection.clone();
+    let emitter = shared.emitter.clone();
+    std::thread::spawn(move || {
+        let stored = match op {
+            SecretOp::Status => store.get(&connection).map(|s| s.is_some()),
+            SecretOp::Store(value) => store.set(&connection, &value).map(|()| true),
+            SecretOp::Forget => store.delete(&connection).map(|_| false),
+        };
+        emitter.emit(Event::SecretStatus {
+            id,
+            stored: stored.map_err(|e| e.to_string()),
+        });
+    });
 }
 
 fn inspect(shared: &Shared, id: ServerId) {
@@ -1239,6 +1325,8 @@ mod tests {
                 check_timeout: Duration::from_secs(10),
                 watch_interval: Some(Duration::from_millis(40)),
                 watch_settle: Duration::from_millis(120),
+                // Never the real keychain in tests.
+                secrets: Some(Arc::new(crate::secrets::MemoryStore::default())),
             }
         }
 
@@ -2592,6 +2680,136 @@ mod tests {
             .filter_map(|v| v.as_str())
             .collect();
         assert!(names.contains(&"loc") && names.contains(&"gw"), "{names:?}");
+    }
+
+    // ---- client secrets in the system's store (an in-memory one here: tests never touch the real keychain)
+
+    fn oauth_env() -> Env {
+        quiet_env(&serde_json::json!({
+            "mcpServers": {
+                "sso": {"type": "http", "url": "https://sso.example.com/mcp", "oauth": {"clientId": "klefki-1"}},
+                "plain": {"type": "http", "url": "https://plain.example.com/mcp"}
+            },
+            "projects": {"/work/a": {}}
+        }))
+    }
+
+    fn with_store(env: &Env, store: Arc<crate::secrets::MemoryStore>) -> Core {
+        let mut config = env.config();
+        config.secrets = Some(store);
+        start_with(config, || {})
+    }
+
+    fn secret_status(core: &Core, id: &ServerId) -> Result<bool, String> {
+        collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::SecretStatus { id: i, .. } if i == id))
+        })
+        .into_iter()
+        .rev()
+        .find_map(|e| match e {
+            Event::SecretStatus { id: i, stored } if i == *id => Some(stored),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_client_secret_is_stored_read_and_forgotten_under_its_connection() {
+        let env = oauth_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let sso = user_id("sso");
+        core.send(Command::SecretStatus(sso.clone()));
+        assert_eq!(secret_status(&core, &sso), Ok(false));
+        core.send(Command::StoreSecret {
+            id: sso.clone(),
+            secret: crate::secrets::Secret::new("s3cret-value".into()),
+        });
+        assert_eq!(secret_status(&core, &sso), Ok(true));
+        let key = format!(
+            "conn:{}",
+            crate::model::ConnectionId::new(Scope::User, None, "sso").as_str()
+        );
+        assert_eq!(
+            store.values.lock().unwrap().get(&key).map(String::as_str),
+            Some("s3cret-value"),
+            "keyed like v1, under dev.klefki"
+        );
+        core.send(Command::ForgetSecret(sso.clone()));
+        assert_eq!(secret_status(&core, &sso), Ok(false));
+        assert!(store.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn secrets_are_refused_where_they_do_not_belong_and_the_value_never_travels_back() {
+        let env = oauth_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        for (id, why) in [(user_id("plain"), "OAuth"), (user_id("ghost"), "no longer")] {
+            core.send(Command::StoreSecret {
+                id: id.clone(),
+                secret: crate::secrets::Secret::new("s3cret-value".into()),
+            });
+            let err = secret_status(&core, &id).unwrap_err();
+            assert!(err.contains(why), "{err}");
+        }
+        assert!(store.values.lock().unwrap().is_empty());
+        // An empty secret is not a secret.
+        core.send(Command::StoreSecret {
+            id: user_id("sso"),
+            secret: crate::secrets::Secret::new(String::new()),
+        });
+        assert!(
+            secret_status(&core, &user_id("sso"))
+                .unwrap_err()
+                .contains("empty")
+        );
+        core.send(Command::StoreSecret {
+            id: user_id("sso"),
+            secret: crate::secrets::Secret::new("s3cret-value".into()),
+        });
+        assert_eq!(secret_status(&core, &user_id("sso")), Ok(true));
+        let everything = format!("{:?}", events_for(&core, Duration::from_millis(200)));
+        assert!(!everything.contains("s3cret"), "{everything}");
+    }
+
+    #[test]
+    fn without_a_secret_store_nothing_is_kept_anywhere() {
+        let env = oauth_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        *store.fail.lock().unwrap() = Some(crate::secrets::SecretError::Unavailable(
+            "no Secret Service".into(),
+        ));
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        core.send(Command::StoreSecret {
+            id: user_id("sso"),
+            secret: crate::secrets::Secret::new("s3cret-value".into()),
+        });
+        let err = secret_status(&core, &user_id("sso")).unwrap_err();
+        assert!(err.contains("no plaintext copy"), "{err}");
+        // Not written next to the configuration either.
+        let dump = walk(env.dir.path());
+        assert!(!dump.contains("s3cret"), "{dump}");
+    }
+
+    /// Every file's text under `dir`, to look for a value that must not be there.
+    fn walk(dir: &Path) -> String {
+        let mut out = String::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.push_str(&walk(&path));
+            } else {
+                out.push_str(&String::from_utf8_lossy(
+                    &std::fs::read(&path).unwrap_or_default(),
+                ));
+            }
+        }
+        out
     }
 
     // ---- approving a project server

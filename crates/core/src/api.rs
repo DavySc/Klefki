@@ -6,7 +6,8 @@ pub use crate::config::definition::Definition;
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
 };
-pub use crate::model::{NameError, ServerName, Target};
+pub use crate::model::{ConnectionId, NameError, ServerName, Target};
+pub use crate::secrets::{Secret, SecretError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
@@ -123,6 +124,9 @@ pub struct ServerRow {
     pub approval: Option<Approval>,
     pub shadowed: bool,
     pub casing_collision: bool,
+    /// Which connection this is, from its scope, project key and name as the file has them (the same id as v1's):
+    /// the key its secret is stored under.
+    pub connection: crate::model::ConnectionId,
     /// Signs in with OAuth: the client id and scopes from its entry (not secrets; the client secret lives in the
     /// keyring and is never read into a row). `None` for a server without an `oauth` entry.
     pub oauth: Option<OAuthInfo>,
@@ -179,6 +183,7 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
             check_timeout: std::time::Duration::from_secs(30),
             watch_interval: Some(std::time::Duration::from_secs(1)),
             watch_settle: std::time::Duration::from_millis(300),
+            secrets: None,
         },
         wake,
     )

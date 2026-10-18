@@ -14,6 +14,18 @@ regex = "1"
 tempfile = "3"
 sha2 = "0.10"
 memchr = "2"
+keyring-core = "1"
+zeroize = "1"
+
+# The OS's own secret store, one per platform; there is no plaintext fallback.
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { version = "1", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
 
 [dev-dependencies]
 filetime = "0.2"

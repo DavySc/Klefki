@@ -7,8 +7,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, Core, Definition, Diagnosis, Event, Hint, PlanView, Scope, ServerId,
-    ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
+    Approval, Change, Command, Core, Definition, Diagnosis, Event, Hint, PlanView, Scope, Secret,
+    ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -215,6 +215,10 @@ pub struct ShellApp {
     command: CommandPalette,
     /// The Duplicate dialog, while open.
     duplicate: Option<DuplicateForm>,
+    /// What is known about the shown OAuth server's client secret.
+    secret: Option<SecretView>,
+    /// A client secret being typed. Wiped from memory when dropped; handed to the engine, never copied.
+    secret_input: Option<Secret>,
     /// The outcome of the last change, shown until dismissed.
     outcome: Option<Outcome>,
     pub page: Page,
@@ -242,6 +246,8 @@ impl ShellApp {
             editor: None,
             command: CommandPalette::default(),
             duplicate: None,
+            secret: None,
+            secret_input: None,
             outcome: None,
             snapshot,
             page: Page::Connections,
@@ -404,6 +410,14 @@ impl ShellApp {
                         Ok(text) => EditorState::ready(text, editable),
                         Err(why) => EditorState::Failed(why),
                     };
+                }
+            }
+            Event::SecretStatus { id, stored } => {
+                if let Some(view) = &mut self.secret
+                    && view.id == id
+                {
+                    view.known = Some(stored);
+                    view.busy = None;
                 }
             }
             Event::CliVersion(version) => self.cli_version = version,
@@ -1819,6 +1833,10 @@ impl ShellApp {
                                 ui.end_row();
                             });
                         ui.add_space(8.0);
+                        if self.core.is_some() {
+                            self.client_secret(ui, s);
+                            ui.add_space(8.0);
+                        }
                         muted(
                             ui,
                             "Signing in again and changing the client arrive with the add wizard; Claude Code keeps the sign-in itself.",
@@ -1925,6 +1943,106 @@ impl ShellApp {
         }
         if let Some(json) = review {
             self.prepare(vec![Change::Replace { id: s.id(), json }]);
+        }
+    }
+
+    /// The OAuth client secret of `s`: whether the system's secret store holds one, and setting, replacing or
+    /// forgetting it. Asked for once per server shown.
+    fn client_secret(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        if !self.secret.as_ref().is_some_and(|v| s.is(&v.id)) {
+            self.secret = Some(SecretView {
+                id: s.id(),
+                known: None,
+                busy: Some("Checking…"),
+                confirm_forget: false,
+            });
+            self.secret_input = None;
+            self.send(Command::SecretStatus(s.id()));
+        }
+        let Some(view) = &mut self.secret else {
+            return;
+        };
+        let mut send = None;
+        ui.label(RichText::new("Client secret").color(pal.text_muted));
+        if let Some(busy) = view.busy {
+            ui.label(RichText::new(busy).color(pal.text_muted));
+        } else {
+            match &view.known {
+                Some(Ok(true)) => {
+                    ui.label("Stored in your system's secret store.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Replace…").clicked() {
+                            self.secret_input = Some(Secret::new(String::new()));
+                        }
+                        if ui.button("Forget…").clicked() {
+                            view.confirm_forget = true;
+                        }
+                    });
+                }
+                Some(Ok(false)) => {
+                    ui.label(RichText::new("Not stored.").color(pal.text_muted));
+                    if self.secret_input.is_none() && ui.button("Set client secret…").clicked() {
+                        self.secret_input = Some(Secret::new(String::new()));
+                    }
+                }
+                Some(Err(why)) => {
+                    ui.add(egui::Label::new(RichText::new(why.as_str()).color(pal.danger)).wrap());
+                    if ui.button("Try again").clicked() {
+                        send = Some(Command::SecretStatus(s.id()));
+                        view.busy = Some("Checking…");
+                    }
+                }
+                None => {}
+            }
+        }
+        if view.confirm_forget && view.busy.is_none() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Forget the client secret? This cannot be undone; you would have to type it again.")
+                        .color(pal.warn),
+                )
+                .wrap(),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Forget it").clicked() {
+                    send = Some(Command::ForgetSecret(s.id()));
+                    view.busy = Some("Forgetting…");
+                    view.confirm_forget = false;
+                }
+                if ui.button("Keep").clicked() {
+                    view.confirm_forget = false;
+                }
+            });
+        }
+        if view.busy.is_none()
+            && let Some(input) = &mut self.secret_input
+        {
+            let (mut save, mut cancel) = (false, false);
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(input.edit())
+                        .password(true)
+                        .hint_text("Client secret")
+                        .desired_width(220.0),
+                );
+                save = ui
+                    .add_enabled(!input.is_empty(), egui::Button::new("Save"))
+                    .clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+            if save {
+                // Moved, not copied: the field's value goes to the engine and the app keeps nothing.
+                if let Some(secret) = self.secret_input.take() {
+                    send = Some(Command::StoreSecret { id: s.id(), secret });
+                    view.busy = Some("Saving…");
+                }
+            } else if cancel {
+                self.secret_input = None;
+            }
+        }
+        if let Some(command) = send {
+            self.send(command);
         }
     }
 
@@ -2715,6 +2833,17 @@ fn transport_name(t: TransportKind) -> &'static str {
     }
 }
 
+/// What the Auth tab knows about one server's client secret.
+struct SecretView {
+    id: ServerId,
+    /// The store's last answer: stored or not, or why it could not say.
+    known: Option<Result<bool, String>>,
+    /// Waiting for the store: what to say meanwhile.
+    busy: Option<&'static str>,
+    /// Forget… was pressed; asking before doing it.
+    confirm_forget: bool,
+}
+
 /// The row and the `live_gen` an explanation was built for.
 type ExplainedFor = (usize, u64);
 
@@ -2850,6 +2979,7 @@ mod tests {
     fn grid_renders_any_snapshot_not_just_the_fixture() {
         // Loading from a real config is tested in klefki-core; the UI only renders what it is given.
         let row = |name: &str| ServerRow {
+            connection: klefki_core::api::ConnectionId::new(Scope::User, None, name),
             name: name.to_owned(),
             scope: Scope::User,
             project: None,
@@ -2973,6 +3103,7 @@ mod tests {
 
     fn live_row(name: &str, scope: Scope, project: Option<&str>) -> ServerRow {
         ServerRow {
+            connection: klefki_core::api::ConnectionId::new(scope, project, name),
             name: name.to_owned(),
             scope,
             project: project.map(str::to_owned),
@@ -4461,6 +4592,121 @@ mod tests {
         h.get_by_label_contains("registers itself");
         open(&mut h, "plain");
         h.get_by_label_contains("does not sign in with OAuth");
+    }
+
+    // ---- the client secret, in the system's secret store
+
+    fn oauth_harness() -> (
+        Harness<'static, ShellApp>,
+        klefki_core::api::Detached,
+        ServerRow,
+    ) {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let mut sso = live_row("sso", Scope::User, None);
+        sso.oauth = Some(klefki_core::api::OAuthInfo {
+            client_id: Some("klefki-1".into()),
+            scopes: Vec::new(),
+        });
+        engine
+            .events
+            .send(snapshot_of(vec![
+                sso.clone(),
+                live_row("plain", Scope::User, None),
+            ]))
+            .unwrap();
+        h.run();
+        h.get_by_label("sso").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Auth").click();
+        h.run();
+        (h, engine, sso)
+    }
+
+    fn secret_event(row: &ServerRow, stored: Result<bool, String>) -> Event {
+        Event::SecretStatus {
+            id: row.id(),
+            stored,
+        }
+    }
+
+    #[test]
+    fn the_auth_tab_asks_once_whether_a_client_secret_is_stored() {
+        let (mut h, engine, sso) = oauth_harness();
+        assert_eq!(drain(&engine), vec![Command::SecretStatus(sso.id())]);
+        h.get_by_label_contains("Checking");
+        h.run();
+        assert!(drain(&engine).is_empty(), "asked once, not every frame");
+        engine.events.send(secret_event(&sso, Ok(true))).unwrap();
+        h.run();
+        h.get_by_label_contains("Stored in your system's secret store");
+        // A server that does not sign in with OAuth has no client secret to ask about.
+        h.get_by_label("plain").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_client_secret_is_typed_hidden_and_handed_over_once() {
+        let (mut h, engine, sso) = oauth_harness();
+        engine.events.send(secret_event(&sso, Ok(false))).unwrap();
+        h.run();
+        drain(&engine);
+        h.get_by_label_contains("Not stored");
+        h.get_by_label("Set client secret…").click();
+        h.run();
+        h.state_mut()
+            .secret_input
+            .as_mut()
+            .unwrap()
+            .edit()
+            .push_str("s3cret-value");
+        h.run();
+        assert!(
+            h.query_by_value("s3cret-value").is_none(),
+            "not shown, not even to assistive technology"
+        );
+        h.get_by_label("Save").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::StoreSecret {
+                id: sso.id(),
+                secret: klefki_core::api::Secret::new("s3cret-value".into()),
+            }]
+        );
+        assert!(h.state().secret_input.is_none(), "the app keeps no copy");
+        h.get_by_label_contains("Saving");
+    }
+
+    #[test]
+    fn forgetting_a_client_secret_asks_first() {
+        let (mut h, engine, sso) = oauth_harness();
+        engine.events.send(secret_event(&sso, Ok(true))).unwrap();
+        h.run();
+        drain(&engine);
+        h.get_by_label("Forget…").click();
+        h.run();
+        assert!(drain(&engine).is_empty(), "not yet");
+        h.get_by_label_contains("cannot be undone");
+        h.get_by_label("Forget it").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::ForgetSecret(sso.id())]);
+    }
+
+    #[test]
+    fn a_secret_store_problem_is_shown_and_can_be_retried() {
+        let (mut h, engine, sso) = oauth_harness();
+        drain(&engine);
+        engine
+            .events
+            .send(secret_event(&sso, Err("The system's secret store is not available (no Secret Service). Klefki keeps no plaintext copy of secrets anywhere else.".into())))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("no plaintext copy");
+        h.get_by_label("Try again").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::SecretStatus(sso.id())]);
     }
 
     #[test]
