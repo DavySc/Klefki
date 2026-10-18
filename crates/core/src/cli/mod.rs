@@ -5,3 +5,4 @@ pub(crate) mod parse;
 pub(crate) mod runner;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub(crate) mod tree;
