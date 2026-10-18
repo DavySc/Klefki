@@ -37,3 +37,4 @@ auth) kept that answer, however old, until F5. The row looked like a fresh answe
   rows in view first) fits on top: it only changes the queue order and limit.
 - Claude's health cache may carry a timestamp per entry; if it does, the tooltip could say how old it is. Not checked.
 - Not verified on Windows/macOS.
+- After merging main (#17 paste to add, `3321582`): full verify exit 0, 361 core + 161 app tests passed. Merged on Davy's go.
