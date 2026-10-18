@@ -28,9 +28,11 @@ pub(crate) fn suggestion(name: &str, value: &str) -> Option<String> {
 }
 
 const SCHEMES: [&str; 3] = ["Bearer", "Basic", "Token"];
-const PREFIXES: [&str; 14] = [
+const PREFIXES: [&str; 16] = [
     "sk-",
     "sk_live_",
+    "sk_test_",
+    "rk_live_",
     "pk_live_",
     "ghp_",
     "gho_",
@@ -306,6 +308,9 @@ mod tests {
             "AKIAIOSFODNN7EXAMPLE",
             "glpat-abcdefghij0123456789",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.c2lnbmF0dXJl",
+            // Review of #27: Stripe's test and restricted keys, as Diagnose masks them.
+            "sk_test_51ABCDEFGHIJKL",
+            "rk_live_51ABCDEFGHIJKL",
         ] {
             assert_eq!(suggests("X", value).as_deref(), Some("${X}"), "{value}");
         }
