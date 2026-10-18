@@ -271,7 +271,7 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - **Locking** (`docs/decisions/001-claude-json-locking.md`): Claude takes a `<claude.json>.lock` directory (proper-lockfile, stale 10 s), re-reads under the lock and preserves unknown keys and order (observed). It waits only about 1.5 s for someone else's lock, then writes **without** the lock, so klefki must hold the lock briefly, abort rather than write unlocked, and re-read about 1 s after writing.
 - **Disabled servers** (`docs/decisions/002-disabled-servers.md`): the real `/mcp disable` writes `projects[<key>].disabledMcpServers` in `~/.claude.json`, per project, for user, local **and** `.mcp.json` servers. Approval of `.mcp.json` servers is separate (`enabledMcpjsonServers`, now in `<project>/.claude/settings.local.json`). This contradicts PLAN.md and a CLAUDE.md invariant: proposals in `docs/proposals/spike-findings.md`, awaiting review.
 - Evidence: reproducible scripts and a PTY driver in `docs/decisions/spikes/`; both reproducer scripts were re-run from the repo and gave the same results. All experiments used a throwaway `CLAUDE_CONFIG_DIR`.
-- Found by the spikes: the inventory code is wrong for enabled/disabled (project rows use `disabledMcpjsonServers`; user rows always enabled; approval state not shown). Not fixed yet.
+- Found by the spikes: the inventory code is wrong for enabled/disabled (project rows use `disabledMcpjsonServers`; user rows always enabled; approval state not shown). Fixed in the later "Enabled/disabled and approval" and "Approval writes" slices.
 
 ## Done before the spikes (nothing committed since e422f56 except what is listed here)
 - Workspace `klefki` (renamed from klefki): `crates/core` (`klefki-core`), `crates/app` (`klefki`), `crates/cli` (`klefki-cli`, stub).
@@ -286,16 +286,16 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 - `.github/workflows/ci.yml` (fmt, clippy, test on win/mac/linux). Not run yet (never pushed).
 
 ## Checks run
+Re-run on 2026-10-18 at `37b148d` (Linux container):
+
 | Command | Result |
 |---|---|
 | `cargo fmt --check` | exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0 |
-| `cargo test --workspace` | 176 passed (125 core, 51 app incl. egui_kittest), 0 failed |
-| grep for `std::fs`, `process::Command`, `std::net`, `open::` in `crates/app/src` | 0 matches |
-| `target/debug/klefki.exe` against the real `~/.claude.json`, screenshot | lists `REMOTE_1`, `REMOTE_2` (Connected, from Claude's health cache) and `azure-devops` |
-| `target/debug/klefki.exe --demo`, screenshot | all scopes, badges, group headers render in full |
-| `klefki.exe --demo --theme light`, dropdown opened, screenshot | dropdown shows current choice, lists System, Light, Dark with icons, current one highlighted |
-| `klefki.exe --demo --theme light` and `--theme dark`, clicking a row, screenshots | both themes render nav, toolbar, grid, badges, selection and detail panel legibly |
+| `cargo test --workspace` | 304 core + 143 app passed, 0 failed |
+| `cargo deny check` | not run: `cargo-deny` is not installed in this container (last recorded exit 0, in the slices above) |
+
+Earlier results (Windows, real window, screenshots) are in the slices above; the first check table (176 tests) was replaced by this one.
 
 ## Findings fixed along the way
 - The plan's name regex allows a leading `-`; passed as `claude mcp get <name>` it would be read as an option. Rejected in `ServerName` (test first).
@@ -315,22 +315,19 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 ## Not done / unverified
 - Diagnose output formats are from Claude Code 2.1.302 only; the hints match short stable fragments and say nothing rather than guess when the text changes.
 - The debug file did not repeat a configured header or env secret in two tests, but that is not a guarantee; redaction is the safeguard, with tests.
-- The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.
-- A refresh that arrives while checks run drops their answers by generation; this is covered by reading the code and by the UI test for cut-off checks, not by an engine test with a real race.
-- Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server in the home folder could shadow it. Not seen in practice.
-- `cargo deny` runs now; advisories fail (see Docstore section).
-- Theme persistence goes through eframe's storage (written by the framework to the app data folder); the app crate itself still has no fs calls. Not tested across a real restart, and flagged for review against the no-IO invariant.
+- The runner kills only the `claude` process on a timeout, not grandchildren (for example `npx` and node for a stdio server). A Windows job object would fix it; not done.
+- A refresh that arrives while checks run drops their answers by generation; covered by reading the code and a UI test for cut-off checks, not by an engine test with a real race.
+- Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server there could shadow it. Not seen in practice.
+- Theme persistence goes through eframe's storage; the app crate has no fs calls, but this is flagged for review against the no-IO invariant. Not tested across a real restart.
 - System theme follows the OS setting; only checked that it is selectable, not against a real OS theme change.
-- Hover colours were only seen on one row in each theme.
-- Status is only Claude's cached hint, not a live `claude mcp get` check.
-- The CLI version in the top bar is not detected yet (hidden unless known).
-- CI untested on macOS/Linux. Spike findings are for Claude Code 2.1.302 on Windows only; a live interactive session was not tested for outside-edit survival.
-- `ConnectionId` (v1-compatible) not implemented: needs the v1 source to confirm the encoding.
-- Protected files not created, proposals in `docs/proposals/`: `crates/app/clippy.toml`, `deny.toml`, `crates/fake-claude/`, `fixtures/malicious/`. `cargo deny` not run.
-- Acceptance tests were written together with the code, not seen failing first.
-- Only 3 user-scope servers exist in the real config; local and project listing is tested on temp configs only.
+- The CLI version in the top bar is not detected yet (`cli_version` stays `None`; hidden unless known).
+- CI (`.github/workflows/ci.yml`) has not been seen running on macOS or Linux. Spike findings are for Claude Code 2.1.302 on Windows only; a live interactive session was not tested for outside-edit survival.
+- Protected files: `crates/app/clippy.toml`, `deny.toml` and `crates/fake-claude/` exist; `fixtures/malicious/` does not. Proposals are in `docs/proposals/`; review status is not recorded here.
+- Acceptance tests were mostly written together with the code, not seen failing first (later slices record failing-first tests and mutation checks).
+- `cargo deny check` was not re-run in this container (tool missing).
 
 ## Next
-1. Review the look; tune `theme.rs`.
-2. Approve the protected-file proposals.
-3. M1 day-1 spikes (lock experiment, disabled-servers location), recorded in `docs/decisions/`, then the CLI locator/runner and live status.
+1. M1 remainder: v1 meta compatibility (read v1's `connections-meta.json` by `ConnectionId`) and the keyboard shortcuts not yet built.
+2. Detect and show the CLI version in the top bar.
+3. Review the protected-file proposals and `fixtures/malicious/`.
+4. M2: add wizard, PTY login and re-authorize, move/copy, transactional upsert with rollback; spike `--no-browser` callback handling first.
