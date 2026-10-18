@@ -1,4 +1,5 @@
 //! Locating and reading Claude Code's configuration. Read-only for now.
+pub mod definition;
 pub(crate) mod docstore;
 pub(crate) mod entry;
 pub(crate) mod fsx;
