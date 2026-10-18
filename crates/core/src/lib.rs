@@ -7,6 +7,7 @@ mod engine;
 mod fixtures;
 mod model;
 mod ops;
+mod paste;
 mod sanitize;
 mod secrets;
 mod watch;
