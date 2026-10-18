@@ -31,6 +31,9 @@ pub struct PastedServer {
     pub problem: Option<String>,
     /// Values that look like secrets, and the `${VAR}` reference to write instead. Never the value itself.
     pub hints: Vec<String>,
+    /// It signs in with OAuth (its definition has `oauth` settings), and may need a client secret, which is never
+    /// pasted: the dialog has it finished in the form, where the secret is typed.
+    pub oauth: bool,
 }
 
 /// Pasted text larger than this is refused: a few servers are a few KiB.
@@ -38,6 +41,7 @@ const MAX_PASTE_BYTES: usize = 256 * 1024;
 const MAX_SERVERS: usize = 100;
 /// A summary longer than this is cut; the review shows everything in full.
 const MAX_SUMMARY_CHARS: usize = 300;
+const SECRET_AFTER_OPTION: &str = "--client-secret takes no value: Claude Code asks for the secret. Paste the command without it, and type the secret in the form.";
 const PROJECT_SCOPE: &str = "Klefki does not add project servers: they live in the repository's .mcp.json. Choose the user or a project's own list instead.";
 
 impl Pasted {
@@ -83,10 +87,11 @@ impl PastedServer {
             scope: None,
             problem: None,
             hints: Vec::new(),
+            oauth: false,
         }
     }
 
-    fn refused(name: &str, problem: String) -> Self {
+    pub(crate) fn refused(name: &str, problem: String) -> Self {
         Self {
             problem: Some(problem),
             ..Self::new(name)
@@ -94,12 +99,13 @@ impl PastedServer {
     }
 
     /// Checks a definition as the engine will, and says what it runs; `entry` is written as given.
-    fn with_entry(name: &str, mut entry: Value, notes: &mut Vec<String>) -> Self {
+    pub(crate) fn with_entry(name: &str, mut entry: Value, notes: &mut Vec<String>) -> Self {
         undo_git_bash_drive(&mut entry, notes);
         let mut server = Self::new(name);
-        if let Err(why) = crate::config::entry::validate(&entry) {
+        if let Err(why) = crate::config::entry::validate_new(&entry) {
             server.problem = Some(capitalised(&why));
         }
+        server.oauth = entry.get("oauth").is_some();
         server.summary = summary(&entry);
         server.hints = hints(&entry);
         server.json = serde_json::to_string_pretty(&entry).unwrap_or_default();
@@ -300,7 +306,8 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     let mut env: Vec<(String, String)> = Vec::new();
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut positional: Vec<&str> = Vec::new();
-    let mut oauth = false;
+    let mut oauth: Option<Map<String, Value>> = None;
+    let mut asks_secret = false;
     let mut problem: Option<String> = None;
     let mut i = 0;
     let mut rest_are_args = false;
@@ -387,11 +394,33 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                     }
                 }
             }
-            "--client-id" | "--callback-port" => {
-                value(&mut i);
-                oauth = true;
+            "--client-id" => {
+                let id = value(&mut i).unwrap_or_default();
+                oauth
+                    .get_or_insert_default()
+                    .insert("clientId".into(), id.into());
             }
-            "--client-secret" => oauth = true,
+            "--callback-port" => {
+                let port = value(&mut i).unwrap_or_default();
+                match port.parse::<u16>() {
+                    Ok(p) if p > 0 => {
+                        oauth
+                            .get_or_insert_default()
+                            .insert("callbackPort".into(), p.into());
+                    }
+                    _ => {
+                        problem.get_or_insert(format!(
+                            "--callback-port takes a port from 1 to 65535, not {:?}.",
+                            sanitize(port)
+                        ));
+                    }
+                }
+            }
+            // Claude Code asks for the secret itself; the option takes no value.
+            "--client-secret" => {
+                oauth.get_or_insert_default();
+                asks_secret = true;
+            }
             _ => {
                 problem.get_or_insert(format!(
                     "Claude Code's mcp add has no option {}.",
@@ -400,12 +429,9 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             }
         }
     }
-    if oauth {
-        // Nothing of it is kept: a secret may have been typed among the words.
-        return PastedServer::refused(
-            "",
-            "This server signs in with OAuth (--client-id, --client-secret), which Klefki cannot add from a paste yet. Add it with Claude Code for now.".to_owned(),
-        );
+    if asks_secret && positional.len() != 2 {
+        // Nothing of it is shown: a secret may have been typed after --client-secret, among the words.
+        return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
     }
     let name = positional.first().copied().unwrap_or_default();
     let mut server = match (positional.get(1), problem) {
@@ -432,6 +458,10 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 None => "stdio",
             };
             match kind {
+                "stdio" if oauth.is_some() => PastedServer::refused(
+                    name,
+                    "Only a server with an address signs in with OAuth (--client-id, --client-secret, --callback-port).".to_owned(),
+                ),
                 "stdio" => {
                     let mut entry = Map::new();
                     entry.insert("type".into(), "stdio".into());
@@ -469,6 +499,9 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                     if !headers.is_empty() {
                         entry.insert("headers".into(), pairs(&headers));
                     }
+                    if let Some(oauth) = oauth {
+                        entry.insert("oauth".into(), Value::Object(oauth));
+                    }
                     PastedServer::with_entry(name, Value::Object(entry), notes)
                 }
                 other => PastedServer::refused(
@@ -489,6 +522,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
 fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     let mut scope = None;
     let mut positional = Vec::new();
+    let mut asks_secret = false;
     let mut i = 0;
     while i < words.len() {
         let word = words[i];
@@ -499,12 +533,7 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 scope = words.get(i).copied();
                 i += 1;
             }
-            _ if word == "--client-secret" => {
-                return PastedServer::refused(
-                    "",
-                    "This server signs in with OAuth (--client-secret), which Klefki cannot add from a paste yet. Add it with Claude Code for now.".to_owned(),
-                );
-            }
+            _ if word == "--client-secret" => asks_secret = true,
             _ => positional.push(word),
         }
     }
@@ -525,9 +554,17 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             );
         }
     };
+    if asks_secret && positional.len() != 2 {
+        return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+    }
     let mut server = match positional.as_slice() {
         [name, json] => match serde_json::from_str::<Value>(json) {
-            Ok(entry @ Value::Object(_)) => PastedServer::with_entry(name, entry, notes),
+            Ok(Value::Object(mut entry)) => {
+                if asks_secret && !entry.contains_key("oauth") {
+                    entry.insert("oauth".into(), Value::Object(Map::new()));
+                }
+                PastedServer::with_entry(name, Value::Object(entry), notes)
+            }
             _ => PastedServer::refused(
                 name,
                 "The definition after the name is not a JSON object.".to_owned(),
@@ -644,6 +681,27 @@ fn quoted(word: &str) -> String {
 /// One line per environment or header value that looks like a secret, and per `~` path (only a shell turns `~` into
 /// the home folder, and Claude Code starts a server without one).
 fn hints(entry: &Value) -> Vec<String> {
+    let mut out = path_hints(entry);
+    for key in ["env", "headers"] {
+        if let Some(Value::Object(values)) = entry.get(key) {
+            for (name, value) in values {
+                if let Some(instead) = value
+                    .as_str()
+                    .and_then(|v| crate::config::secretlike::suggestion(name, v))
+                {
+                    out.push(format!(
+                        "{} looks like a secret. Claude Code can fill it in from your environment: write {instead} instead.",
+                        sanitize(name)
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One line per `~` path in the command or its arguments.
+pub(crate) fn path_hints(entry: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let tilde = |s: &str| s == "~" || s.starts_with("~/") || s.starts_with("~\\");
     if entry
@@ -663,46 +721,31 @@ fn hints(entry: &Value) -> Vec<String> {
             }
         }
     }
-    for key in ["env", "headers"] {
-        if let Some(Value::Object(values)) = entry.get(key) {
-            for (name, value) in values {
-                if let Some(instead) = value
-                    .as_str()
-                    .and_then(|v| crate::config::secretlike::suggestion(name, v))
-                {
-                    out.push(format!(
-                        "{} looks like a secret. Claude Code can fill it in from your environment: write {instead} instead.",
-                        sanitize(name)
-                    ));
-                }
-            }
-        }
-    }
     out
 }
 
 // --- Words -----------------------------------------------------------------------------------------------------
 
-struct Lexed {
-    commands: Vec<Words>,
+pub(crate) struct Lexed {
+    pub commands: Vec<Words>,
     /// Shell variables turned into `${NAME}`, each once.
-    variables: Vec<String>,
+    pub variables: Vec<String>,
 }
 
 /// One command's words, after quotes and escapes.
 #[derive(Default)]
-struct Words {
-    words: Vec<String>,
+pub(crate) struct Words {
+    pub words: Vec<String>,
     /// What in it needs a shell to run (a pipe, a redirect, a substitution, an open quote): the rest of its line was
     /// not read.
-    shell: Option<&'static str>,
+    pub shell: Option<&'static str>,
 }
 
 /// Splits pasted shell text into commands and words the way a POSIX shell would, plus the line continuations of
 /// PowerShell (`` ` ``) and cmd (`^`). A backslash only escapes what a shell would need escaping, so a Windows path
 /// keeps its backslashes. A command that needs a shell to run (pipes, redirects, substitutions) is marked, and the
 /// rest of its line skipped; the other lines are still read.
-fn lex(text: &str) -> Lexed {
+pub(crate) fn lex(text: &str) -> Lexed {
     let mut commands: Vec<Words> = Vec::new();
     let mut variables: Vec<String> = Vec::new();
     let mut current = Words::default();
@@ -1078,16 +1121,57 @@ mod tests {
     }
 
     #[test]
-    fn what_klefki_cannot_add_is_explained_not_dropped() {
+    fn a_server_that_signs_in_with_oauth_is_read_to_be_finished_in_the_form() {
         let s = one(
             "claude mcp add --transport http --client-id abc123 --client-secret --callback-port 8080 corp https://corp.example/mcp",
         );
-        assert!(s.problem.as_deref().unwrap().contains("OAuth"), "{s:?}");
-        assert!(s.json.is_empty());
+        assert_eq!(s.problem, None, "{s:?}");
+        assert!(s.oauth);
+        assert_eq!(
+            json_of(&s),
+            json!({"type": "http", "url": "https://corp.example/mcp", "oauth": {"clientId": "abc123", "callbackPort": 8080}})
+        );
         let s = one(
             r#"{"o": {"type": "http", "url": "https://o.example", "oauth": {"clientId": "x"}}}"#,
         );
-        assert!(s.problem.as_deref().unwrap().contains("OAuth"), "{s:?}");
+        assert!(s.oauth && s.problem.is_none(), "{s:?}");
+        let s = one(
+            r#"claude mcp add-json --client-secret -s user o '{"type":"sse","url":"https://o.example"}'"#,
+        );
+        assert_eq!(json_of(&s)["oauth"], json!({}));
+        assert!(s.oauth && s.problem.is_none(), "{s:?}");
+        assert!(!one("claude mcp add -s user plain node").oauth);
+        // A secret typed after --client-secret (it takes none) is never shown, not even as the name.
+        for text in [
+            "claude mcp add -t http --client-secret Sup3rSecret corp https://corp.example/mcp",
+            r#"claude mcp add-json --client-secret Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
+        ] {
+            let s = one(text);
+            assert!(
+                s.problem.as_deref().unwrap().contains("takes no value"),
+                "{s:?}"
+            );
+            assert!(!format!("{s:?}").contains("Sup3rSecret"), "{s:?}");
+        }
+        for (text, why) in [
+            ("claude mcp add --client-id x corp node", "address"),
+            (
+                "claude mcp add -t http --callback-port 0 corp https://c.example",
+                "port",
+            ),
+            (
+                r#"{"o": {"type": "http", "url": "https://o.example", "oauth": {"clientSecret": "inline"}}}"#,
+                "on its own",
+            ),
+        ] {
+            let s = one(text);
+            let problem = s.problem.unwrap_or_default();
+            assert!(problem.contains(why), "{text}: {problem}");
+        }
+    }
+
+    #[test]
+    fn what_klefki_cannot_add_is_explained_not_dropped() {
         let pasted = Pasted::parse("claude mcp add -s project p node").unwrap();
         assert_eq!(pasted.servers[0].scope, None);
         assert!(

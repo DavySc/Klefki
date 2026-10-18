@@ -5,6 +5,7 @@ mod config;
 mod diagnose;
 mod engine;
 mod fixtures;
+mod form;
 mod model;
 mod ops;
 mod paste;
