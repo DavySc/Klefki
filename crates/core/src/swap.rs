@@ -1,5 +1,5 @@
 //! Changes made by removing a server and adding it again, so that one signing in with OAuth can be edited, moved or
-//! copied (decision 006). Claude Code has no command that changes a server, and klefki writes no server with `oauth`
+//! copied (decision 007). Claude Code has no command that changes a server, and klefki writes no server with `oauth`
 //! settings itself: such a server is removed with `claude mcp remove` and added with `claude mcp add-json`. Claude's
 //! remove also forgets the client secret it keeps for the server, so the add hands it back, from klefki's own copy.
 //!
@@ -385,14 +385,34 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
                     "{shown} was not {verb}: {why}\nIt was put back, but Claude Code left out {}; Klefki kept the whole definition, so you can put that back from the Connections page.",
                     left_out.join(", ")
                 )),
-                Err(again) => Err(format!(
-                    "{shown} was not {verb}: {why}\nPutting it back failed too: {again}\nKlefki kept its definition{}, so you can put it back from the Connections page once Claude Code works again.",
-                    if back.is_some() {
-                        " and its client secret"
+                Err(again) => {
+                    // Claude Code's remove took the client secret of a server sharing this sign-in too; putting this
+                    // one back hands it over again.
+                    let also = if back.is_some() {
+                        let others = read_root(ctx.claude_json)
+                            .map(|root| sharing(&root, &swap.from, &old))
+                            .unwrap_or_default();
+                        if others.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                "\n{} {} shares its sign-in, so it has no client secret in Claude Code until then.",
+                                sanitize(&swap.from.name),
+                                others.join(" and ")
+                            )
+                        }
                     } else {
-                        ""
-                    }
-                )),
+                        String::new()
+                    };
+                    Err(format!(
+                        "{shown} was not {verb}: {why}\nPutting it back failed too: {again}\nKlefki kept its definition{}, so you can put it back from the Connections page once Claude Code works again.{also}",
+                        if back.is_some() {
+                            " and its client secret"
+                        } else {
+                            ""
+                        }
+                    ))
+                }
             };
         }
     }
@@ -411,8 +431,12 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             match handed {
                 Some(secret) => match store.set(&to, secret) {
                     Err(e) => {
-                        // Better none than a stale one.
+                        // Better none than a stale one, here or where it was: a server added there later would
+                        // claim it. Claude Code has the secret.
                         let _ = store.delete(&to);
+                        if swap.remove {
+                            let _ = store.delete(&from);
+                        }
                         done.notes.push(note(e));
                     }
                     Ok(()) if swap.remove => {
@@ -491,16 +515,7 @@ pub(crate) fn review(root: &Value, swap: &Swap, has_copy: bool) -> Result<Said, 
         }
     }
     if removes_sign_in {
-        let sharing: Vec<String> = spots_in(root)
-            .into_iter()
-            .filter(|(spot, e)| {
-                spot.name == swap.from.name
-                    && !spot.same_place(&swap.from)
-                    && signs_in(e)
-                    && sign_in_key(e) == sign_in_key(&old)
-            })
-            .map(|(spot, _)| place(spot.project.as_deref()))
-            .collect();
+        let sharing = sharing(root, &swap.from, &old);
         let keeps_key = swap.to.name == swap.from.name
             && signs_in(&new)
             && sign_in_key(&new) == sign_in_key(&old);
@@ -752,16 +767,34 @@ pub(crate) fn signs_in(entry: &Value) -> bool {
 
 /// The definition at `spot`, read fresh from the file; `None` when there is none.
 pub(crate) fn read_entry(claude_json: &Path, spot: &Spot) -> Result<Option<Value>, String> {
+    Ok(entry_in(&read_root(claude_json)?, spot))
+}
+
+fn read_root(claude_json: &Path) -> Result<Value, String> {
     let text = fsx::read_limited(claude_json, inventory::MAX_CLAUDE_JSON)
         .map_err(|e| sanitize(&e.to_string()))?
         .unwrap_or_default();
-    let root: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| {
+    serde_json::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| {
         format!(
             "the configuration is not valid JSON ({})",
             sanitize(&e.to_string())
         )
-    })?;
-    Ok(entry_in(&root, spot))
+    })
+}
+
+/// Where else in `root` a server shares the sign-in of `entry` at `spot` (same name, address and headers): Claude
+/// Code keeps one client secret and one sign-in for them, which removing one takes from both.
+fn sharing(root: &Value, spot: &Spot, entry: &Value) -> Vec<String> {
+    spots_in(root)
+        .into_iter()
+        .filter(|(other, e)| {
+            other.name == spot.name
+                && !other.same_place(spot)
+                && signs_in(e)
+                && sign_in_key(e) == sign_in_key(entry)
+        })
+        .map(|(other, _)| place(other.project.as_deref()))
+        .collect()
 }
 
 /// What Claude Code said, briefly, when it said anything.

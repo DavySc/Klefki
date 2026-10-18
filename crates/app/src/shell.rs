@@ -549,6 +549,14 @@ impl ShellApp {
                     };
                 }
             }
+            Event::CallbackPort { port, warning } => {
+                if let Some(form) = &mut self.add {
+                    if form.port_pending == Some(port) {
+                        form.port_pending = None;
+                    }
+                    form.port_checked = Some((port, warning));
+                }
+            }
             Event::SecretStatus { id, stored } => {
                 if let Some(view) = &mut self.secret
                     && view.id == id
@@ -2018,6 +2026,10 @@ impl ShellApp {
         if changes.is_none() && review {
             let checked = form.check(&self.snapshot.servers);
             form.show_what_stops_review(&checked);
+        }
+        if let Some(port) = form.port_wanted.take() {
+            form.port_pending = Some(port);
+            self.send(Command::CheckCallbackPort(port));
         }
         if let Some(changes) = changes {
             if self.can_prepare() {
@@ -3688,6 +3700,13 @@ struct AddForm {
     failed: Option<String>,
     /// Bring the OAuth settings into view on the next frame.
     reveal_oauth: bool,
+    /// The callback port to check, sent to the engine after this frame: when the field is left or Review is
+    /// pressed, not while it is typed in.
+    port_wanted: Option<u16>,
+    /// The callback port sent to be checked, until its answer comes: it is asked once.
+    port_pending: Option<u16>,
+    /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`]).
+    port_checked: Option<(u16, Option<String>)>,
 }
 
 struct Filled {
@@ -3733,6 +3752,9 @@ impl AddForm {
             reviewing: false,
             failed: None,
             reveal_oauth: false,
+            port_wanted: None,
+            port_pending: None,
+            port_checked: None,
         }
     }
 
@@ -3941,6 +3963,8 @@ impl AddForm {
         if self.mode != AddMode::Fill {
             return;
         }
+        // It may have been taken, or let go, since the field was left.
+        self.check_port();
         let name = matches!(checked.first(), Some(Check::Name(_))).then_some(Field::Name);
         let part = self
             .filled
@@ -4083,6 +4107,37 @@ impl AddForm {
             // Optional, and anything typed is kept as it is.
             Field::Secret => None,
         }
+    }
+
+    /// The callback port as typed, when it is one.
+    fn typed_port(&self) -> Option<u16> {
+        self.fields
+            .callback_port
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+    }
+
+    /// Asks whether a sign-in could come back to the callback port as typed now. The engine answers, off the UI
+    /// thread.
+    fn check_port(&mut self) {
+        if self.fields.oauth && self.typed_port() != self.port_pending {
+            self.port_wanted = self.typed_port();
+        }
+    }
+
+    /// Why a sign-in could not come back to the callback port, as last checked: only while the port is still the
+    /// one checked, and nothing is wrong with it.
+    fn port_warning(&self) -> Option<&str> {
+        let (port, warning) = self.port_checked.as_ref()?;
+        let wrong = self
+            .filled
+            .as_ref()
+            .is_some_and(|f| f.problems.iter().any(|(p, _)| *p == Part::CallbackPort));
+        (self.fields.oauth && self.typed_port() == Some(*port) && !wrong)
+            .then_some(warning.as_deref())
+            .flatten()
     }
 
     /// Draws a text field for `field`: gives it the keyboard when asked, and notes when the keyboard leaves it.
@@ -4263,7 +4318,15 @@ impl AddForm {
                     )
                 });
                 self.track(field, &response);
+                if part == Part::CallbackPort && response.lost_focus() {
+                    self.check_port();
+                }
                 field_note(ui, pal, label_width, self.message(field, None), "");
+                if part == Part::CallbackPort
+                    && let Some(warning) = self.port_warning()
+                {
+                    field_warning(ui, pal, label_width, warning);
+                }
             }
             field_note(
                 ui,
@@ -4362,6 +4425,21 @@ fn field_note(ui: &mut Ui, pal: &Palette, label_width: f32, problem: Option<&str
     ui.horizontal(|ui| {
         ui.add_space(label_width + 8.0);
         ui.add(egui::Label::new(RichText::new(text).small().color(color)).wrap());
+    });
+}
+
+/// Under a field, in its column: what may go wrong later with what it holds, though it can be added as it is.
+fn field_warning(ui: &mut Ui, pal: &Palette, label_width: f32, warning: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(label_width + 8.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} {warning}", icon::WARNING))
+                    .small()
+                    .color(pal.warn),
+            )
+            .wrap(),
+        );
     });
 }
 
@@ -8847,6 +8925,97 @@ mod tests {
         assert_eq!(f.name, "linear");
         h.run();
         assert!(h.query_by_label_contains("Start the address").is_none());
+    }
+
+    #[test]
+    fn a_callback_port_another_program_holds_is_warned_about_once_left_and_does_not_stop_review() {
+        let (mut h, engine) = duplicate_harness();
+        // The engine checks the port, off the UI thread; here the test answers for it.
+        let answer = |h: &mut Harness<'static, ShellApp>, port: u16, held: bool| {
+            engine
+                .events
+                .send(klefki_core::api::Event::CallbackPort {
+                    port,
+                    warning: held.then(|| format!("Port {port} is in use by another program.")),
+                })
+                .unwrap();
+            h.run();
+        };
+        let asked = |engine: &klefki_core::api::Detached| -> Vec<u16> {
+            drain(engine)
+                .into_iter()
+                .filter_map(|c| match c {
+                    Command::CheckCallbackPort(port) => Some(port),
+                    _ => None,
+                })
+                .collect()
+        };
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        let f = add_form(&mut h);
+        f.fields.url = "https://sso.example.com/mcp".into();
+        f.fields.oauth = true;
+        h.run();
+        let port = field_id(Field::Part(Part::CallbackPort));
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        add_form(&mut h).fields.callback_port = "8766".into();
+        h.run();
+        // Not checked while it is typed in.
+        assert_eq!(asked(&engine), Vec::<u16>::new());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert_eq!(asked(&engine), [8766]);
+        answer(&mut h, 8766, true);
+        h.get_by_label_contains("Port 8766 is in use by another program.");
+        // A warning, not a problem: the port is the one the provider registered, and it may be free by sign-in.
+        assert!(ready(&mut h));
+        // Changed, the old answer is not shown; a free port says nothing, and a late answer for another port is not
+        // taken for this one.
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        add_form(&mut h).fields.callback_port = "8767".into();
+        h.run();
+        assert!(
+            h.query_by_label_contains("in use by another program")
+                .is_none()
+        );
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert_eq!(asked(&engine), [8767]);
+        answer(&mut h, 8766, true);
+        assert!(
+            h.query_by_label_contains("in use by another program")
+                .is_none()
+        );
+        answer(&mut h, 8767, false);
+        assert!(
+            h.query_by_label_contains("in use by another program")
+                .is_none()
+        );
+        // Pressing Review checks again: the port may have been taken since.
+        name_it(&mut h, "");
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        h.get_by_label_contains("Give it a name");
+        assert_eq!(asked(&engine), [8767]);
+        answer(&mut h, 8767, true);
+        h.get_by_label_contains("Port 8767 is in use by another program.");
+        // A wrong port is a problem, said instead, and not checked.
+        add_form(&mut h).fields.callback_port = "99999".into();
+        h.run();
+        h.get_by_label_contains("must be a number from 1 to 65535");
+        assert!(
+            h.query_by_label_contains("in use by another program")
+                .is_none()
+        );
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert_eq!(asked(&engine), Vec::<u16>::new());
     }
 
     #[test]

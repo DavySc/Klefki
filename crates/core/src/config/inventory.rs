@@ -336,15 +336,16 @@ fn classify(entry: &Value) -> (TransportKind, String) {
         None | Some("stdio") => match obj.get("command").and_then(Value::as_str) {
             Some(cmd) if !cmd.trim().is_empty() => {
                 let mut line = cmd.to_owned();
-                for arg in obj
-                    .get("args")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                {
+                // Shown in the app, and printed by `klefki-cli` into scrollback and logs: no secrets (CWE-532).
+                for arg in super::secretlike::shown_args(
+                    obj.get("args")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                ) {
                     line.push(' ');
-                    line.push_str(arg);
+                    line.push_str(&arg);
                 }
                 (TransportKind::Stdio, clip(&sanitize(&line)))
             }

@@ -444,6 +444,7 @@ fn start_checking_after(delay: Duration) -> Rig {
             cli_env: Vec::new(),
             max_checks: 1,
             check_timeout: Duration::from_secs(5),
+            background_checks: true,
             watch_interval: None,
             watch_settle: Duration::from_millis(50),
             secrets: Some(store.clone()),
@@ -637,8 +638,14 @@ fn copy_secret(
         (Some(secret), StoreFault::DeleteFails) => {
             klefki.insert(to, secret.clone());
         }
-        // Not taken; whatever was there is deleted.
-        (Some(_), StoreFault::SetFails) | (None, StoreFault::Works | StoreFault::SetFails) => {
+        // Not taken; whatever was there is deleted, and so is the one left behind.
+        (Some(_), StoreFault::SetFails) => {
+            klefki.remove(&to);
+            if moved {
+                klefki.remove(&from);
+            }
+        }
+        (None, StoreFault::Works | StoreFault::SetFails) => {
             klefki.remove(&to);
         }
         (None, StoreFault::DeleteFails) => {}
@@ -893,9 +900,28 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 prop_assert_eq!(&after.klefki, &before.klefki, "{}", said);
             }
         }
-        // Every server that signs in, with a secret in Klefki's store, has the same one in Claude Code's.
+        // Every server that signs in, with a secret in Klefki's store, has the same one in Claude Code's. Except
+        // while a kept definition shares its sign-in: Claude Code's remove of that one took the secret of both, and
+        // only Claude Code can hand it back, which putting it back does. The failure must have said so.
+        let newly_kept = after.kept.len() > before.kept.len();
         for (key, entry) in &after.servers {
             if entry.get("oauth").is_none() {
+                continue;
+            }
+            let shared_with_kept = after.kept.values().any(|(p, n, e)| {
+                e.get("oauth").is_some()
+                    && !same_place(p, &key.0)
+                    && sign_in_key(n, e) == sign_in_key(&key.1, entry)
+            });
+            if shared_with_kept && !after.creds.contains_key(&sign_in_key(&key.1, entry)) {
+                if newly_kept {
+                    prop_assert!(
+                        matches!(&outcome, Outcome::Failed(why) if why.contains("shares its sign-in")),
+                        "{:?} lost its sign-in unsaid; {}",
+                        key,
+                        said
+                    );
+                }
                 continue;
             }
             if let Some(secret) = after.klefki.get(&connection(key)) {
@@ -992,6 +1018,42 @@ fn an_earlier_deletes_check_does_not_touch_a_server_claude_code_adds_under_that_
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     quiet_for(&rig, Duration::from_millis(1200));
     assert_eq!(rig.world().servers[&q], oauth);
+}
+
+#[test]
+fn a_kept_definition_says_which_server_lost_its_shared_sign_in_and_putting_it_back_restores_it() {
+    // Found by the model-based test. Copied under the same name, two servers share one sign-in in Claude Code;
+    // removing one for an edit takes the client secret of both. When the add and putting it back both fail, the
+    // copy is left without one until it is put back, which is said.
+    let rig = start();
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let pa = rig.projects[0].clone();
+    let a = (None, "a".to_owned());
+    let copy = (Some(pa.clone()), "a".to_owned());
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(pa.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let shared = sign_in_key("a", &rig.world().servers[&copy]);
+    *lock(&rig.sim.faults) = [Fault::Works, Fault::FailsBefore, Fault::FailsBefore].into();
+    let outcome = rig.run(vec![Change::Replace {
+        id: rig.id(&a),
+        json: definition(true, 0, 1).to_string(),
+    }]);
+    let Outcome::Failed(why) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(why.contains("a in pa shares its sign-in"), "{why}");
+    assert!(!rig.world().creds.contains_key(&shared));
+    // The variant: with Claude Code working again, putting it back restores both.
+    let kept = rig.world().kept.into_keys().next().unwrap();
+    let outcome = rig.run(vec![Change::PutBack { kept }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert_eq!(world.creds.get(&shared).map(String::as_str), Some("sec-a"));
+    assert!(world.kept.is_empty());
 }
 
 #[test]
@@ -1115,4 +1177,38 @@ fn an_earlier_deletes_check_does_not_undo_a_copy_back_into_its_place() {
     let world = rig.world();
     assert_eq!(world.servers.get(&in_pa), world.servers.get(&p));
     assert!(world.servers.contains_key(&p));
+}
+#[test]
+fn a_secret_klefki_could_not_move_is_not_left_where_the_server_was() {
+    // Found by the model-based test. Moving a with Klefki's store refusing the new copy left the old one where a
+    // was; the copy brought back there later claimed a secret Claude Code no longer had.
+    let cases = [
+        (Step::Move { pick: 0, to: 1 }, vec![], StoreFault::SetFails),
+        (
+            Step::Copy {
+                pick: 0,
+                to: 1,
+                rename: false,
+            },
+            vec![],
+            StoreFault::Works,
+        ),
+        (
+            Step::Move { pick: 7, to: 0 },
+            vec![],
+            StoreFault::DeleteFails,
+        ),
+    ];
+    check(&cases).unwrap();
+    // The variant: the move alone.
+    let rig = start();
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let a = (None, "a".to_owned());
+    *lock(&rig.store.fault) = Some(StoreFault::SetFails);
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&a),
+        to: Target::Local(rig.projects[0].clone()),
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    assert!(!rig.world().klefki.contains_key(&connection(&a)));
 }

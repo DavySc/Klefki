@@ -256,26 +256,41 @@ pub struct LegacyDisabled {
 /// `claude`, and runs live status checks in the background. `wake` is called whenever events are waiting, so the
 /// UI can repaint.
 pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
-    crate::engine::start_with(
-        crate::engine::EngineConfig {
-            paths: ConfigPaths::discover(),
-            claude: None,
-            home: directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
-            backup_dir: default_backup_dir(),
-            verify_delay: std::time::Duration::from_secs(1),
-            path_var: std::env::var_os("PATH"),
-            cli_env: Vec::new(),
-            max_checks: 3,
-            check_timeout: std::time::Duration::from_secs(30),
-            watch_interval: Some(std::time::Duration::from_secs(1)),
-            watch_settle: std::time::Duration::from_millis(300),
-            secrets: None,
-            open_url: std::sync::Arc::new(open_https),
-            sign_in_timeout: std::time::Duration::from_secs(5 * 60),
-            changer: None,
-        },
-        wake,
-    )
+    crate::engine::start_with(real_config(None), wake)
+}
+
+/// Starts the engine for a command-line run: like [`start`], but with the Claude CLI at `claude` when given (it must
+/// be a real executable; a script shim is refused as always), and without watching the files for changes, so the
+/// snapshot stays the one first read, and without background checks: only what [`Command::Check`] asks for runs.
+pub fn start_headless(
+    claude: Option<std::path::PathBuf>,
+    wake: impl Fn() + Send + Sync + 'static,
+) -> Core {
+    let mut config = real_config(claude);
+    config.watch_interval = None;
+    config.background_checks = false;
+    crate::engine::start_with(config, wake)
+}
+
+fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfig {
+    crate::engine::EngineConfig {
+        paths: ConfigPaths::discover(),
+        claude,
+        home: directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()),
+        backup_dir: default_backup_dir(),
+        verify_delay: std::time::Duration::from_secs(1),
+        path_var: std::env::var_os("PATH"),
+        cli_env: Vec::new(),
+        max_checks: 3,
+        check_timeout: std::time::Duration::from_secs(30),
+        background_checks: true,
+        watch_interval: Some(std::time::Duration::from_secs(1)),
+        watch_settle: std::time::Duration::from_millis(300),
+        secrets: None,
+        open_url: std::sync::Arc::new(open_https),
+        sign_in_timeout: std::time::Duration::from_secs(5 * 60),
+        changer: None,
+    }
 }
 
 /// Opens `link` in the user's browser, if it is https (CLAUDE.md: URLs opened are https only). No shell is involved.

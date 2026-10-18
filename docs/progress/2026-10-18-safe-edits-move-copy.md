@@ -1,6 +1,6 @@
 # Safe edits, move and copy (2026-10-18)
 M2 slice: rollback-safe remove-then-add so servers that sign in with OAuth can be edited, moved and copied, plus Move
-between the user and local scope. Acceptance: PLAN's model-based test. Design and spike findings: decision 006.
+between the user and local scope. Acceptance: PLAN's model-based test. Design and spike findings: decision 007.
 
 - **Core:** `swap.rs` (new). A swap removes and adds one server through Claude Code's `mcp remove` and
   `mcp add-json --client-secret` (secret only in `MCP_CLIENT_SECRET`), behind the `swap::Claude` trait (`Program` over
@@ -36,11 +36,11 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
 - **Changed tests (behaviour changed on purpose):** `definition.rs` OAuth definitions now have no problem (they are
   saved through Claude Code); the app test that OAuth servers are not edited in the form is split into one for
   project servers (unchanged) and one that an OAuth server is edited and says it signs in again.
-- Checks after cross-review round 1 (before merging the free-port check): `cargo fmt --check` 0, clippy workspace
-  and `-p klefki` 0, `cargo test --workspace` 475 core + 222 app passed, `cargo deny check` 0, no IO in
+- Checks after cross-review round 1 and the main merge: `cargo fmt --check` 0, clippy workspace
+  and `-p klefki` 0, `cargo test --workspace` 481 core + 223 app + 32 cli passed (after the main merge), `cargo deny check` 0, no IO in
   `crates/app/src`.
 - **Open / for human review:** OAuth servers are now removed through `claude mcp remove` (invariant area). A move or
-  edit of an OAuth server signs it out (Claude deletes its credentials). Proposals in decision 006: letting the
+  edit of an OAuth server signs it out (Claude deletes its credentials). Proposals in decision 007: letting the
   docstore remove OAuth entries (keeps the sign-in), and a fake-claude mode that writes the config. The OAuth move
   was not tried in the real app (no keyring here).
 - **Cross-review round 1** (PR comment 6255733102, head d9d9ed4), each with a reproducer that failed before its fix:
@@ -60,7 +60,7 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
   - S6 Undo after a plain move, warning tone that stays when settings were dropped (app test); S7 OAuth warning by
     the places in warning colour.
   - Polish 1–7 and 9 folded in (wording, full stops and line breaks in errors, kept notice name first, diff scroll per
-    plan, clearer icon plus Ctrl+Shift+M, faded disabled radio, "In a project, just for you", decision 006 line on
+    plan, clearer icon plus Ctrl+Shift+M, faded disabled radio, "In a project, just for you", decision 007 line on
     `.credentials.json`). Polish 8 (backup path behind a link) left: the path is the way back, and a warning toast
     no longer fades.
   - Found by a 3000-case soak: a delete's journal replay undid a later move back into that place (pre-existing on
@@ -70,6 +70,16 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
     deleted or renamed by a later one as it ended (`as_they_ended`): docstore
     `an_earlier_moves_check_does_not_add_back_a_server_renamed_since` (+ edit between), `…_deleted_since` (+ rename
     into the name), machine `an_earlier_moves_check_…`; each failed before the fix.
-  - Soak after both: 3 × 4000 cases passed (~112 s each).
-- **Next:** re-review round; merge main after the free-port check lands and re-verify. Not merged by this session:
+  - Found by the soak after the main merge: (1) when Klefki's store refused the moved copy, the old copy stayed
+    where the server was, and a server put there later claimed it; it is now deleted too (Claude Code has the
+    secret; the note says to type it in) (`a_secret_klefki_could_not_move_is_not_left_where_the_server_was`, failed
+    before). (2) Two servers that share one sign-in (a copy under the same name): when an edit of one fails twice,
+    Claude Code's remove has taken the other's client secret, and only Claude Code can hand it back. The failure now
+    says so, and Put back restores it (`a_kept_definition_says_which_server_lost_its_shared_sign_in_…`). **For human
+    review:** the model test's "every OAuth server with a Klefki secret has it in Claude Code" check now allows this
+    one state (a kept definition sharing the sign-in), and requires the failure to have said it.
+  - Soak after all fixes: 3 × 4000 cases passed (~110 s each), twice (before and after the main merge).
+- **Merged main** with the free-port check (#23) and the CLI (#25): one conflict in `api.rs` (`real_config` from
+  main, plus `changer: None`). Decision renumbered to 007: main has its own 006 (CLI output).
+- **Next:** re-review round. Not merged by this session:
   the merge is left for Davy.

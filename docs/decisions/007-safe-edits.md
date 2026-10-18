@@ -1,4 +1,4 @@
-# 006: Safe edits, move and copy of servers that sign in (2026-10-18)
+# 007: Safe edits, move and copy of servers that sign in (2026-10-18)
 
 ## Context
 Klefki's docstore refuses to write any entry with `oauth`: Claude Code keeps such a server's client secret and tokens
@@ -77,6 +77,9 @@ Why not as PLAN wrote it:
 - No `get` faults: Klefki no longer runs `mcp get` to check a change.
 
 ## For human review
+- The model test allows one state it otherwise forbids: a server sharing its sign-in with a kept definition (a copy
+  under the same name) has no client secret in Claude Code until that definition is put back, because Claude Code's
+  remove took both and only its add hands it back. The failure says so; the test requires that.
 - Invariant touched: OAuth entries are now *removed* through `claude mcp remove` (before, Klefki never removed them).
   They are still written only through `add-json --client-secret`.
 - Alternative not taken: letting the docstore remove OAuth entries would keep Claude's credentials (no sign-in again
