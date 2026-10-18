@@ -1058,20 +1058,6 @@ impl ShellApp {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        // Only what works today: a button that can never be pressed is noise (Export and Import arrive with M3).
-        const ACTIONS: [(&str, &str); 8] = [
-            (icon::PLUS, "Add (Ctrl+N)"),
-            (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
-            (icon::COPY, "Duplicate (Ctrl+D)"),
-            (
-                icon::ARROWS_LEFT_RIGHT,
-                "Move to another project or the user",
-            ),
-            (icon::SIGN_IN, "Sign in"),
-            (icon::TOGGLE_RIGHT, "Turn on"),
-            (icon::TOGGLE_LEFT, "Turn off"),
-            (icon::TRASH, "Delete (Del)"),
-        ];
         let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.can_prepare();
         let can_edit = self.core.is_some() && self.selected.len() == 1;
         let can_duplicate = self.duplicable().is_some();
@@ -1093,7 +1079,7 @@ impl ShellApp {
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
                     }
-                    g if g == icon::COPY || g == icon::ARROWS_LEFT_RIGHT => {
+                    g if g == icon::COPY || g == icon::ARROW_BEND_UP_RIGHT => {
                         (can_duplicate, "select one user or local server")
                     }
                     g if g == icon::SIGN_IN => {
@@ -1113,7 +1099,7 @@ impl ShellApp {
                         g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
                         g if g == icon::TRASH => self.prepare_delete(),
                         g if g == icon::COPY => self.open_duplicate(),
-                        g if g == icon::ARROWS_LEFT_RIGHT => self.open_move(),
+                        g if g == icon::ARROW_BEND_UP_RIGHT => self.open_move(),
                         g if g == icon::PLUS => self.open_add(),
                         g if g == icon::SIGN_IN => {
                             if let Some(s) = self.single_selected().cloned() {
@@ -1199,7 +1185,7 @@ impl ShellApp {
                         command::Action::Duplicate,
                     );
                     add(
-                        icon::ARROWS_LEFT_RIGHT,
+                        icon::ARROW_BEND_UP_RIGHT,
                         format!("Move {}", s.name),
                         "To another project or the user".into(),
                         None,
@@ -2147,8 +2133,13 @@ impl ShellApp {
                 Target::User => None,
             })
             .collect();
-        let places = places_in_words(user, &folders).unwrap_or_default();
         let verb = self.adding_verb;
+        // A move goes to one place: "to webapp", "to the user".
+        let places = match (verb, user, &folders[..]) {
+            ("Moved", true, []) => "to the user".to_owned(),
+            ("Moved", false, [folder]) => format!("to {folder}"),
+            _ => places_in_words(user, &folders).unwrap_or_default(),
+        };
         Some(format!(
             "{verb} {} {places}.",
             list_in_words(&names, "server")
@@ -4445,6 +4436,22 @@ struct DuplicateForm {
     /// Give the name field the keyboard on the first frame.
     focus: bool,
 }
+
+/// The toolbar's buttons: icon and hover text. Only what works today: a button that can never be pressed is noise
+/// (Export and Import arrive with M3).
+const ACTIONS: [(&str, &str); 8] = [
+    (icon::PLUS, "Add (Ctrl+N)"),
+    (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
+    (icon::COPY, "Duplicate (Ctrl+D)"),
+    (
+        icon::ARROW_BEND_UP_RIGHT,
+        "Move to another project or the user",
+    ),
+    (icon::SIGN_IN, "Sign in"),
+    (icon::TOGGLE_RIGHT, "Turn on"),
+    (icon::TOGGLE_LEFT, "Turn off"),
+    (icon::TRASH, "Delete (Del)"),
+];
 
 /// What the Move dialog holds: the one place the server goes.
 struct MoveForm {
@@ -7603,7 +7610,7 @@ mod tests {
         for glyph in [
             icon::PENCIL_SIMPLE,
             icon::COPY,
-            icon::ARROWS_LEFT_RIGHT,
+            icon::ARROW_BEND_UP_RIGHT,
             icon::TOGGLE_RIGHT,
             icon::TOGGLE_LEFT,
             icon::TRASH,
@@ -10156,7 +10163,7 @@ mod tests {
     fn open_move_of(h: &mut Harness<'static, ShellApp>, name: &str) {
         h.get_by_label(name).click();
         h.run();
-        h.get_by_label(icon::ARROWS_LEFT_RIGHT).click();
+        h.get_by_label(icon::ARROW_BEND_UP_RIGHT).click();
         h.run();
         assert!(h.state().moving.is_some());
         h.get_by_label(&format!("Move {name}"));
@@ -10242,7 +10249,7 @@ mod tests {
         h.run();
         h.state_mut().selected = BTreeSet::from([0]);
         h.run();
-        h.get_by_label(icon::ARROWS_LEFT_RIGHT).click();
+        h.get_by_label(icon::ARROW_BEND_UP_RIGHT).click();
         h.run();
         h.get_by_label("notes").click();
         h.run();
@@ -10263,7 +10270,7 @@ mod tests {
         h.get_by_label("gamma").click();
         h.run();
         assert!(
-            h.get_by_label(icon::ARROWS_LEFT_RIGHT)
+            h.get_by_label(icon::ARROW_BEND_UP_RIGHT)
                 .accesskit_node()
                 .is_disabled()
         );
@@ -10321,7 +10328,7 @@ mod tests {
             .unwrap();
         h.run();
         assert_eq!(h.state().selected, BTreeSet::from([1]));
-        h.get_by_label("Moved beta in notes. Claude Code left out alwaysAllow.");
+        h.get_by_label("Moved beta to notes. Claude Code left out alwaysAllow.");
     }
 
     #[test]
@@ -10387,7 +10394,7 @@ mod tests {
             })
             .unwrap();
         h.run();
-        h.get_by_label("Moved sso in WebApp. Sign in now, or later from its Status tab.");
+        h.get_by_label("Moved sso to WebApp. Sign in now, or later from its Status tab.");
     }
 
     // ---- kept
@@ -10479,5 +10486,33 @@ mod tests {
         h.run();
         assert_eq!(h.state().selected, BTreeSet::from([3]));
         h.get_by_label("Copied beta_copy in WebApp.");
+    }
+
+    #[test]
+    fn every_toolbar_and_nav_icon_is_drawn_by_the_icon_font() {
+        // Found trying Move in the real app: the arrows icon is at U+E0A0, where JetBrains Mono, first in every
+        // font family, has its own branch symbol, so the button showed a branch. These are the private-use
+        // characters JetBrains Mono draws itself (its Powerline symbols).
+        const MONO_SYMBOLS: [std::ops::RangeInclusive<char>; 2] =
+            ['\u{E0A0}'..='\u{E0A2}', '\u{E0B0}'..='\u{E0B3}'];
+        let glyphs = ACTIONS
+            .iter()
+            .map(|(g, _)| *g)
+            .chain(Page::ALL.iter().map(|(_, g, _)| *g));
+        for glyph in glyphs {
+            for c in glyph.chars() {
+                assert!(
+                    !MONO_SYMBOLS.iter().any(|r| r.contains(&c)),
+                    "U+{:04X} is drawn by JetBrains Mono, not the icon font",
+                    c as u32
+                );
+            }
+        }
+        // And the near variant: the icon once used for Move.
+        assert!(
+            MONO_SYMBOLS
+                .iter()
+                .any(|r| r.contains(&icon::ARROWS_LEFT_RIGHT.chars().next().unwrap()))
+        );
     }
 }

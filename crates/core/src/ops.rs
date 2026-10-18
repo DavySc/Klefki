@@ -222,7 +222,11 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             return format!("Add {}{}", sanitize(name), places(targets));
         }
         Change::Move { id, to } => {
-            return format!("Move {}{}", shown(id).2, places(std::slice::from_ref(to)));
+            let to = match to {
+                Target::User => "the user".to_owned(),
+                Target::Local(p) => sanitize(&folder_name(p)),
+            };
+            return format!("Move {} to {to}", shown(id).2);
         }
         Change::PutBack { kept } | Change::ForgetKept { kept } => {
             let verb = if matches!(change, Change::PutBack { .. }) {
@@ -493,6 +497,7 @@ fn move_server(
         &file.name,
         std::slice::from_ref(to),
         "it",
+        Some(&row.connection),
         snapshot,
         keys,
         out,
@@ -693,7 +698,7 @@ fn duplicate(
     if targets.is_empty() {
         return Err("Choose where the copy goes.".to_owned());
     }
-    for to in new_places(name, targets, "this copy", snapshot, keys, out)? {
+    for to in new_places(name, targets, "this copy", None, snapshot, keys, out)? {
         let op = Op::CopyServer {
             from: from.clone(),
             name: file.name.clone(),
@@ -728,10 +733,12 @@ fn duplicate(
 /// Where a new server called `name` goes, as the file spells each project: refused when a target is unknown or
 /// already has a server by that name (the docstore refuses one added twice in a plan), with a warning wherever
 /// Claude Code would use another server of that name instead. `what` names the new server in those warnings.
+/// `leaving` is the server a move takes away in the same plan, which is not another server.
 fn new_places(
     name: &str,
     targets: &[Target],
     what: &str,
+    leaving: Option<&crate::model::ConnectionId>,
     snapshot: &Snapshot,
     keys: &FileKeys,
     out: &mut Resolved,
@@ -742,6 +749,7 @@ fn new_places(
     let others: Vec<(&ServerRow, &FileKey)> = snapshot
         .servers
         .iter()
+        .filter(|r| Some(&r.connection) != leaving)
         .filter_map(|r| Some((r, keys.get(&r.connection)?)))
         .filter(|(_, k)| k.name == name)
         .collect();
@@ -863,7 +871,7 @@ fn add(
     // Typed-in values are not shown (they may be secrets); which of the user's variables are read still is.
     let lines = describe(&shown_values(&value))
         .map_err(|why| format!("{new} cannot be reviewed safely, so it is not added: {why}."))?;
-    for to in new_places(name, targets, "this server", snapshot, keys, out)? {
+    for to in new_places(name, targets, "this server", None, snapshot, keys, out)? {
         let op = Op::AddServer {
             project: to.clone(),
             name: name.to_owned(),

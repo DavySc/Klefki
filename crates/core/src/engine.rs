@@ -4569,6 +4569,67 @@ mod tests {
     }
 
     #[test]
+    fn moving_a_server_does_not_warn_about_itself() {
+        // Found trying Move in the real app: moving plain from the user to a project warned that in that project
+        // it "is used instead of the user server plain", the very server being moved.
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("gw"),
+                to: Target::Local("/work/b".into()),
+            }],
+        );
+        assert_eq!(plan.summary, ["Move gw to b"]);
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        let gw = two_projects("end")["mcpServers"]["gw"].clone();
+        assert_eq!(now["projects"]["/work/b"]["mcpServers"]["gw"], gw);
+        assert!(now["mcpServers"].get("gw").is_none(), "{now}");
+        assert_eq!(now["tail"], "end");
+        verify_passes(&core);
+        // The nearby variant: from a project to the user.
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: local_id("loc", "/work/a"),
+                to: Target::User,
+            }],
+        );
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("on in every project")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn moving_still_warns_about_another_server_of_that_name() {
+        let mut config = two_projects("end");
+        config["projects"]["/work/b"]["mcpServers"] =
+            serde_json::json!({"loc": {"type": "stdio", "command": "y"}});
+        let env = quiet_env(&config);
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: local_id("loc", "/work/a"),
+                to: Target::User,
+            }],
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("In b") && w.contains("local")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
     fn a_copy_under_a_name_used_elsewhere_warns_which_one_claude_uses() {
         let env = quiet_env(&two_projects("end"));
         let core = env.start();
