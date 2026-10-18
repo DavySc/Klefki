@@ -240,11 +240,11 @@ pub(crate) fn start(spec: &LoginSpec<'_>, tx: Sender<Message>) -> io::Result<Pty
     cmd.args(["mcp", "login", spec.name.as_str(), "--no-browser"]);
     cmd.cwd(spec.cwd);
     cmd.env("NO_COLOR", "1");
-    // A secret in Klefki's own environment must not reach a child that was not given it on purpose.
-    cmd.env_remove("MCP_CLIENT_SECRET");
     for (key, value) in spec.env {
         cmd.env(key, value);
     }
+    // Last, so no secret reaches it: not from Klefki's own environment, nor from the one it was given.
+    cmd.env_remove("MCP_CLIENT_SECRET");
     let child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
     // Only the child holds the terminal's other end now, so its output ends when it does (on Unix).
     drop(pair.slave);
@@ -912,6 +912,8 @@ mod tests {
             let env: Vec<(&str, &OsStr)> = vec![
                 ("FAKE_CLAUDE_SCENARIO", self.scenario.as_os_str()),
                 ("FAKE_CLAUDE_LOG", self.log.as_os_str()),
+                // Never passed on: every run checks it does not arrive.
+                ("MCP_CLIENT_SECRET", OsStr::new("s3cr3t")),
             ];
             let mut pty = start(
                 &LoginSpec {
