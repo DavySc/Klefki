@@ -1,7 +1,8 @@
 # Progress
 
-## Current slice
-Review of "Writes use the keys as the file spells them" (2026-10-18). Done; see below. Main merged in (#10, fields first with JSON as the fallback: no conflict in code, only this file). Next: the rest of M1 in PLAN.md (legacy `mcpServersDisabled` shown read-only with a migrate action; secret-looking values masked with a `${VAR}` suggestion; the casing fix action), then M2.
+Since 2026-10-18 each slice has its own file in `docs/progress/` (see CLAUDE.md, "Progress" and "Parallel sessions"): sessions working at once no longer edit the same lines. This file is the log before that, newest first; it is not added to, but its open items still stand until struck.
+
+Next, as of the move: the rest of M1 in PLAN.md (legacy `mcpServersDisabled` shown read-only with a migrate action; secret-looking values masked with a `${VAR}` suggestion; the casing fix action), then M2.
 
 Decided, not done now: reading v1's `connections-meta.json`. Its fields (`clientType`, `excludedScopes`, `drift`, `lastVerified`) are used by M2 (re-authorize, OAuth edit) and M3 (drift, refresh scopes), and PLAN.md puts reading v1's files in M3 (`legacy.rs`). M1's part, ids that match v1's, is done (`ConnectionId`); reading the file now would add code and reads nothing uses yet.
 
