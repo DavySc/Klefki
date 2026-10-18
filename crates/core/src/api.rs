@@ -97,12 +97,27 @@ impl Approval {
     }
 }
 
-/// Identifies a row across snapshots, so live results can be matched back to it.
+/// Identifies a row across snapshots, so live results can be matched back to it. `scope`, `project` and `name`
+/// are as shown (cleaned, cut); `connection` is made from the keys as the file spells them and is what tells two
+/// servers apart: two names can look the same once cleaned.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerId {
     pub scope: Scope,
     pub project: Option<String>,
     pub name: String,
+    pub connection: crate::model::ConnectionId,
+}
+
+impl ServerId {
+    /// The id of a server whose project and name are spelled in the file exactly as given.
+    pub fn new(scope: Scope, project: Option<&str>, name: &str) -> Self {
+        Self {
+            scope,
+            project: project.map(str::to_owned),
+            name: name.to_owned(),
+            connection: crate::model::ConnectionId::new(scope, project, name),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,12 +160,13 @@ impl ServerRow {
             scope: self.scope,
             project: self.project.clone(),
             name: self.name.clone(),
+            connection: self.connection.clone(),
         }
     }
 
     /// Whether this row is the server `id` names. Compares in place, without building an id.
     pub fn is(&self, id: &ServerId) -> bool {
-        self.scope == id.scope && self.name == id.name && self.project == id.project
+        self.connection == id.connection
     }
 }
 

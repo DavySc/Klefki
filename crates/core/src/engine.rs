@@ -484,7 +484,7 @@ fn engine_main(
             Command::Refresh { live_all } => refresh(&shared, &mut state, live_all),
             Command::Check(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Check),
             Command::Diagnose(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Diagnose),
-            Command::Inspect(id) => inspect(&shared, id),
+            Command::Inspect(id) => inspect(&shared, &state.snapshot, id),
             Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
             Command::StoreSecret { id, secret: value } => {
                 secret(&shared, &state.snapshot, id, SecretOp::Store(value));
@@ -556,12 +556,21 @@ fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
     });
 }
 
-fn inspect(shared: &Shared, id: ServerId) {
+fn inspect(shared: &Shared, snapshot: &Snapshot, id: ServerId) {
     let in_repository = id.scope == Scope::Project;
-    let json = match &shared.config.paths {
-        None => Err("Could not determine where Claude Code keeps its configuration.".to_owned()),
-        Some(paths) => {
-            inventory::server_entry(paths, id.project.as_deref(), &id.name, in_repository).and_then(
+    // Looked up under the name and project as the file spells them, not as shown (cleaned, cut).
+    let on_disk = snapshot
+        .servers
+        .iter()
+        .find(|r| r.is(&id))
+        .and_then(|r| crate::model::ConnectionId::parse(r.connection.as_str()));
+    let json = match (&shared.config.paths, on_disk) {
+        (None, _) => {
+            Err("Could not determine where Claude Code keeps its configuration.".to_owned())
+        }
+        (Some(_), None) => Err("the server is no longer in the configuration".to_owned()),
+        (Some(paths), Some((_, project, name))) => {
+            inventory::server_entry(paths, project.as_deref(), &name, in_repository).and_then(
                 |entry| {
                     serde_json::to_string_pretty(&entry::masked(&entry)).map_err(|e| e.to_string())
                 },
@@ -2137,19 +2146,11 @@ mod tests {
     }
 
     fn user_id(name: &str) -> ServerId {
-        ServerId {
-            scope: Scope::User,
-            project: None,
-            name: name.to_owned(),
-        }
+        ServerId::new(Scope::User, None, name)
     }
 
     fn local_id(name: &str, project: &str) -> ServerId {
-        ServerId {
-            scope: Scope::Local,
-            project: Some(project.to_owned()),
-            name: name.to_owned(),
-        }
+        ServerId::new(Scope::Local, Some(project), name)
     }
 
     fn plan_for(core: &Core, changes: Vec<Change>) -> PlanView {
@@ -2416,11 +2417,11 @@ mod tests {
         let key = repo.to_string_lossy().replace('\\', "/");
         write_config(&env, &serde_json::json!({"projects": {key.clone(): {}}}));
         let core = env.start();
-        let id = ServerId {
-            scope: Scope::Project,
-            project: Some(inventory::normalise_project(&key)),
-            name: "ps".to_owned(),
-        };
+        let id = ServerId::new(
+            Scope::Project,
+            Some(&inventory::normalise_project(&key)),
+            "ps",
+        );
         let plan = plan_for(
             &core,
             vec![Change::SetEnabled {
@@ -2833,11 +2834,7 @@ mod tests {
     }
 
     fn project_id(key: &str, name: &str) -> ServerId {
-        ServerId {
-            scope: Scope::Project,
-            project: Some(key.to_owned()),
-            name: name.to_owned(),
-        }
+        ServerId::new(Scope::Project, Some(key), name)
     }
 
     fn approve(key: &str) -> Vec<Change> {
@@ -3610,6 +3607,106 @@ mod tests {
             vec![duplicate(project_id(&key, "ps"), "ps2", vec![Target::User])],
         );
         assert!(refused.contains(".mcp.json"), "{refused}");
+    }
+
+    // ---- writes use the keys as the file spells them, not the cleaned text shown
+
+    /// "ab", and a different server whose name hides a right-to-left override and so shows as "ab" too; and one
+    /// whose name is cut for display.
+    fn lookalike_env() -> (Env, String, String) {
+        let hidden = "a\u{202e}b".to_owned();
+        let long = format!("srv-{}", "x".repeat(600));
+        let env = quiet_env(&serde_json::json!({
+            "mcpServers": {"ab": {"command": "x"}, hidden.clone(): {"command": "y"}, long.clone(): {"command": "z"}},
+            "projects": {"/work/a": {"disabledMcpServers": []}}
+        }));
+        (env, hidden, long)
+    }
+
+    /// The row whose connection is `name` as written in the file.
+    fn row_on_disk(core: &Core, name: &str) -> ServerRow {
+        let id = crate::model::ConnectionId::new(Scope::User, None, name);
+        let events = collect(core, |e| !snapshots(e).is_empty());
+        snapshots(&events)
+            .last()
+            .unwrap()
+            .servers
+            .iter()
+            .find(|r| r.connection == id)
+            .cloned()
+            .expect("the row")
+    }
+
+    #[test]
+    fn switching_off_a_server_writes_its_own_name_not_the_one_shown() {
+        // Found reviewing #1 (open item): ops took the cleaned, cut name shown on the row. Turning off the hidden
+        // look-alike wrote "ab" and switched off the other server, reporting success.
+        let (env, hidden, long) = lookalike_env();
+        let core = env.start();
+        let lookalike = row_on_disk(&core, &hidden);
+        assert_eq!(lookalike.name, "ab", "shown cleaned");
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: lookalike.id(),
+                enabled: false,
+            }],
+        );
+        apply_and_wait(&core, &plan);
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!([hidden]));
+        // The variant: a name cut for display is written whole.
+        let core = env.start();
+        let cut = row_on_disk(&core, &long);
+        assert!(cut.name.ends_with('…'));
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: cut.id(),
+                enabled: false,
+            }],
+        );
+        apply_and_wait(&core, &plan);
+        assert_eq!(
+            disabled_list(&env, "/work/a"),
+            serde_json::json!([hidden, long])
+        );
+    }
+
+    #[test]
+    fn deleting_and_editing_reach_the_server_whatever_its_name_shows() {
+        let (env, hidden, long) = lookalike_env();
+        let core = env.start();
+        let events = collect(&core, |e| !snapshots(e).is_empty());
+        let rows = &snapshots(&events).last().unwrap().servers;
+        let pick = |name: &str| {
+            let id = crate::model::ConnectionId::new(Scope::User, None, name);
+            rows.iter().find(|r| r.connection == id).cloned().unwrap()
+        };
+        let (cut, lookalike) = (pick(&long), pick(&hidden));
+        // Shown as JSON under the name in the file, not "no longer in the configuration".
+        let (json, _) = entry_of(&core, cut.id());
+        assert!(json.unwrap().contains("\"z\""));
+        let plan = plan_for(&core, vec![Change::Delete { id: cut.id() }]);
+        apply_and_wait(&core, &plan);
+        let plan = plan_for(
+            &core,
+            vec![Change::Replace {
+                id: lookalike.id(),
+                json: "{\n  \"command\": \"y2\"\n}".into(),
+            }],
+        );
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        assert_eq!(
+            now["mcpServers"][&hidden],
+            serde_json::json!({"command": "y2"})
+        );
+        assert_eq!(
+            now["mcpServers"]["ab"],
+            serde_json::json!({"command": "x"}),
+            "the other one untouched"
+        );
+        assert!(now["mcpServers"].get(&long).is_none());
     }
 
     #[test]

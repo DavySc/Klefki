@@ -1,7 +1,16 @@
 # Progress
 
 ## Current slice
-Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done; committed as `6e43626` on branch `form-first-json-fallback`, PR #10, with main (#9 OAuth on rows, #11 keyring secrets) merged in; see below. Next: M1's remaining "v1 meta compatibility" (reading v1's `connections-meta.json` by these ids), then M2.
+Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done; committed as `6e43626` on branch `form-first-json-fallback`, PR #10, with main (#9 OAuth on rows, #11 keyring secrets) merged in; see below. Next: M1's remaining "v1 meta compatibility" (reading v1's `connections-meta.json` by these ids), then M2. Merged `claude/dazzling-lamport-zo0aud` (0f9a7ac, writes use the file's own keys) into this branch; the casing fix action builds on its `ServerId`.
+
+Decided, not done now: reading v1's `connections-meta.json`. Its fields (`clientType`, `excludedScopes`, `drift`, `lastVerified`) are used by M2 (re-authorize, OAuth edit) and M3 (drift, refresh scopes), and PLAN.md puts reading v1's files in M3 (`legacy.rs`). M1's part, ids that match v1's, is done (`ConnectionId`); reading the file now would add code and reads nothing uses yet.
+
+## Writes use the keys as the file spells them (2026-10-18)
+The open item from the Windows review of #1: ops were written with the row's name and project as shown, which are cleaned (control and bidi characters removed) and cut at 512 characters.
+- Reproduced: with servers `ab` and `a\u{202e}b` (shown as `ab` too), turning off the second wrote `ab` to `disabledMcpServers`, switching off the other server, and reported success; editing or deleting a server whose name is cut said it was "no longer in the configuration". Worse than the item said: the two had the same `ServerId`, so the look-alike could not even be told apart.
+- `ServerId` now carries the row's `ConnectionId` (made from the keys as the file spells them) and identity compares that; `ServerId::new` builds one from file spellings. Every op (`SetEnabled`, `Delete`, `Replace`, `Duplicate`, `Approve` and its guard) and the definition shown for editing take the project and name decoded from the `ConnectionId`, not the display text.
+- Tests: `switching_off_a_server_writes_its_own_name_not_the_one_shown` (look-alike, and a 600-character name), `deleting_and_editing_reach_the_server_whatever_its_name_shows`; both failed before. Mutation: the toggle op written with the shown name fails the first. The engine tests' id helpers now use `ServerId::new` (same ids).
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 306 core + 140 app passed; `cargo deny check` 0.
 
 ## Secret-looking values: suggest `${VAR}` (2026-10-18)
 Picked as an M1 item that does not touch the identity work on `claude/dazzling-lamport-zo0aud` (v1 meta is deferred to M3 there).
@@ -130,7 +139,7 @@ Checks after the fixes: `cargo fmt --check` 0; `cargo clippy --workspace --all-t
 
 Open, for the owner (not changed):
 - `crates/fake-claude/` and `deny.toml` changed in #1; progress records approval of both. `unmaintained = "workspace"` accepts every unmaintained transitive crate, and `[licenses.private] ignore = true` works like an ignore list: confirm both are intended.
-- Writes use the sanitised, clipped row name and project (`ops` from `ServerRow`). A name with stripped characters or over 512 characters writes the wrong name to `disabledMcpServers` and reports success (approval fails closed instead: `.mcp.json` is matched exactly). Needs the raw keys carried for writes.
+- ~~Writes use the sanitised, clipped row name and project.~~ Fixed: see "Writes use the keys as the file spells them".
 - Lock: never refreshed while held (Claude's rule is stale after 10 s); `Drop` removes the folder without checking it is still ours; two waiters can both take over one stale lock; on Windows a delete-pending lock folder gives `PermissionDenied`, treated as fatal.
 - ~~A Claude write without the lock, landing between our read and our rename, is overwritten.~~ Narrowed to the moment between the stamp check and the rename (see "Write path" above).
 - Windows: backups get no owner-only ACL (they rely on the profile folder's ACL). (The rename is now retried on a transient sharing violation: `a7b9cf9`.)
