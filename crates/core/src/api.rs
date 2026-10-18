@@ -5,7 +5,7 @@ pub use crate::config::ConfigPaths;
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Hint, PlanView, Review,
 };
-pub use crate::model::{NameError, ServerName};
+pub use crate::model::{NameError, ServerName, Target};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {

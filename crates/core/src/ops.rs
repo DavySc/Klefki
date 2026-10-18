@@ -1,5 +1,5 @@
 //! Turns what the user asked for into document edits. Needs the current inventory to know which projects exist.
-use crate::api::{Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot};
+use crate::api::{Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot, Target};
 use crate::config::docstore::Op;
 use crate::config::{entry, fsx, inventory};
 use crate::sanitize::sanitize;
@@ -64,6 +64,7 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
             Change::Approve { .. } => "Approve",
             Change::Delete { .. } => "Delete",
             Change::Replace { .. } => "Save",
+            Change::Duplicate { .. } => "Duplicate",
         };
         if !verbs.contains(&verb) {
             verbs.push(verb);
@@ -75,6 +76,9 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
             Change::Approve { id } => approve(id, snapshot, &mut out)?,
             Change::Delete { id } => delete(id, snapshot, &mut out)?,
             Change::Replace { id, json } => replace(id, json, snapshot, &mut out)?,
+            Change::Duplicate { id, name, targets } => {
+                duplicate(id, name, targets, snapshot, &mut out)?;
+            }
         }
     }
     out.action = match verbs.as_slice() {
@@ -97,6 +101,26 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         Change::Approve { id } => (id, "Approve"),
         Change::Delete { id } => (id, "Delete"),
         Change::Replace { id, .. } => (id, "Save changes to"),
+        Change::Duplicate { id, name, targets } => {
+            let user = targets.contains(&Target::User);
+            let folders: Vec<String> = targets
+                .iter()
+                .filter_map(|t| match t {
+                    Target::Local(p) => Some(sanitize(&folder_name(p))),
+                    Target::User => None,
+                })
+                .collect();
+            let place = match (user, folders.is_empty()) {
+                (true, true) => " for the user".to_owned(),
+                (true, false) => format!(" for the user and in {}", and_list(&folders)),
+                (false, _) => format!(" in {}", and_list(&folders)),
+            };
+            return format!(
+                "Duplicate {} as {}{place}",
+                sanitize(&id.name),
+                sanitize(name)
+            );
+        }
     };
     let name = sanitize(&id.name);
     let place = match (id.scope, id.project.as_deref()) {
@@ -110,6 +134,15 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         (_, None) => String::new(),
     };
     format!("{verb} {name}{place}")
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// `1 project`, `3 projects`.
@@ -245,6 +278,118 @@ fn replace(
         name: id.name.clone(),
         entry: value,
     });
+    Ok(())
+}
+
+fn duplicate(
+    id: &ServerId,
+    name: &str,
+    targets: &[Target],
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let row = find(id, snapshot)?;
+    let shown = sanitize(&id.name);
+    let from = match row.scope {
+        Scope::User => None,
+        Scope::Local => Some(
+            row.project
+                .clone()
+                .ok_or_else(|| format!("{shown} has no project"))?,
+        ),
+        Scope::Project => {
+            return Err(format!(
+                "{shown} is defined in the repository's .mcp.json; Klefki cannot duplicate project servers yet."
+            ));
+        }
+    };
+    crate::model::ServerName::parse(name)
+        .map_err(|e| format!("{:?} cannot be used as a server name: {e}.", sanitize(name)))?;
+    if targets.is_empty() {
+        return Err("Choose where the copy goes.".to_owned());
+    }
+    let new = sanitize(name);
+    for target in targets {
+        let to = match target {
+            Target::User => None,
+            Target::Local(project) => {
+                let known = snapshot
+                    .projects
+                    .iter()
+                    .find(|p| {
+                        inventory::normalise_project(p) == inventory::normalise_project(project)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "{} is not a project Claude Code knows about.",
+                            sanitize(project)
+                        )
+                    })?;
+                Some(known.clone())
+            }
+        };
+        let same_place = |r: &&ServerRow| match &to {
+            None => r.scope == Scope::User,
+            Some(p) => {
+                r.scope == Scope::Local
+                    && r.project.as_deref().is_some_and(|q| {
+                        inventory::normalise_project(q) == inventory::normalise_project(p)
+                    })
+            }
+        };
+        let others: Vec<&ServerRow> = snapshot.servers.iter().filter(|r| r.name == name).collect();
+        if others.iter().any(same_place) {
+            return Err(format!(
+                "There is already a server called {new} {}.",
+                match &to {
+                    None => "for the user".to_owned(),
+                    Some(p) => format!("in {}", sanitize(&folder_name(p))),
+                }
+            ));
+        }
+        // Claude Code uses one server per name: local before project before user.
+        for other in others.iter().filter(|r| !same_place(r)) {
+            let folder = other
+                .project
+                .as_deref()
+                .map(|p| sanitize(&folder_name(p)))
+                .unwrap_or_default();
+            let scope = match other.scope {
+                Scope::User => "user",
+                Scope::Local => "local",
+                Scope::Project => "project",
+            };
+            match (&to, other.scope) {
+                (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
+                    "In {folder}, the {scope} server {new} is used instead of this copy."
+                )),
+                (Some(p), Scope::User) => out.warnings.push(format!(
+                    "In {}, this copy is used instead of the user server {new}.",
+                    sanitize(&folder_name(p))
+                )),
+                (Some(p), Scope::Project)
+                    if other.project.as_deref().is_some_and(|q| {
+                        inventory::normalise_project(q) == inventory::normalise_project(p)
+                    }) =>
+                {
+                    out.warnings.push(format!(
+                        "In {folder}, this copy is used instead of the project server {new}."
+                    ));
+                }
+                _ => {}
+            }
+        }
+        out.claude.push(Op::CopyServer {
+            from: from.clone(),
+            name: row.name.clone(),
+            to,
+            new_name: name.to_owned(),
+        });
+    }
+    out.notes.push(
+        "The copy keeps the original's environment and header values; it does not share a sign-in."
+            .to_owned(),
+    );
     Ok(())
 }
 

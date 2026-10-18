@@ -6,8 +6,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, Core, Diagnosis, Event, PlanView, Scope, ServerId, ServerRow,
-    Snapshot, Status, TransportKind,
+    Approval, Change, Command, Core, Diagnosis, Event, PlanView, Scope, ServerId, ServerName,
+    ServerRow, Snapshot, Status, Target, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -153,6 +153,8 @@ pub struct ShellApp {
     editor: Option<Editor>,
     /// Ctrl+K / ⌘K.
     command: CommandPalette,
+    /// The Duplicate dialog, while open.
+    duplicate: Option<DuplicateForm>,
     /// The outcome of the last change, shown until dismissed.
     outcome: Option<Outcome>,
     pub page: Page,
@@ -176,6 +178,7 @@ impl ShellApp {
             applying: false,
             editor: None,
             command: CommandPalette::default(),
+            duplicate: None,
             outcome: None,
             snapshot,
             page: Page::Connections,
@@ -417,7 +420,9 @@ impl ShellApp {
             self.refresh();
         }
         let ctx = ui.ctx().clone();
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) && self.plan.is_none()
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
+            && self.plan.is_none()
+            && self.duplicate.is_none()
         {
             if self.command.is_open() {
                 self.command.close();
@@ -428,8 +433,10 @@ impl ShellApp {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
             ctx.memory_mut(|m| m.request_focus(search_id()));
         }
-        let idle =
-            !ctx.egui_wants_keyboard_input() && self.plan.is_none() && !self.command.is_open();
+        let idle = !ctx.egui_wants_keyboard_input()
+            && self.plan.is_none()
+            && !self.command.is_open()
+            && self.duplicate.is_none();
         // Up and down walk the list, like any list.
         if idle && self.page == Page::Connections {
             let step = ctx.input(|i| {
@@ -449,6 +456,9 @@ impl ShellApp {
                 && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E))
             {
                 self.tab = DetailTab::RawJson;
+            }
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+                self.open_duplicate();
             }
         }
         let pal = theme::palette(ui.ctx());
@@ -473,6 +483,7 @@ impl ShellApp {
                 .show(ui, |ui| self.detail(ui));
         }
         self.plan_dialog(&ctx);
+        self.duplicate_dialog(&ctx);
         self.outcome_toast(&ctx);
         let mut command = std::mem::take(&mut self.command);
         let chosen = command.show(&ctx, || self.commands());
@@ -668,16 +679,18 @@ impl ShellApp {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        // Only what works today: a button that can never be pressed is noise (Add, Duplicate, Move, Re-authorize,
-        // Export and Import arrive with M2 and M3).
-        const ACTIONS: [(&str, &str); 4] = [
+        // Only what works today: a button that can never be pressed is noise (Add, Move, Re-authorize, Export and
+        // Import arrive with M2 and M3).
+        const ACTIONS: [(&str, &str); 5] = [
             (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
+            (icon::COPY, "Duplicate (Ctrl+D)"),
             (icon::TOGGLE_RIGHT, "Turn on"),
             (icon::TOGGLE_LEFT, "Turn off"),
             (icon::TRASH, "Delete (Del)"),
         ];
         let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.plan.is_none();
         let can_edit = self.core.is_some() && self.selected.len() == 1;
+        let can_duplicate = self.duplicable().is_some();
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
             for (glyph, tip) in ACTIONS {
@@ -687,6 +700,7 @@ impl ShellApp {
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
                     }
+                    g if g == icon::COPY => (can_duplicate, "select one user or local server"),
                     _ => (can_edit, "select one server"),
                 };
                 let clicked = ui
@@ -699,6 +713,7 @@ impl ShellApp {
                         g if g == icon::TOGGLE_RIGHT => self.prepare_toggle(true),
                         g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
                         g if g == icon::TRASH => self.prepare_delete(),
+                        g if g == icon::COPY => self.open_duplicate(),
                         _ => self.tab = DetailTab::RawJson,
                     }
                 }
@@ -769,6 +784,15 @@ impl ShellApp {
                     Some(shortcut("E")),
                     command::Action::Edit,
                 );
+                if s.scope != Scope::Project {
+                    add(
+                        icon::COPY,
+                        format!("Duplicate {}", s.name),
+                        "To another project or the user".into(),
+                        Some(shortcut("D")),
+                        command::Action::Duplicate,
+                    );
+                }
                 add(
                     icon::PULSE,
                     format!("Check {} now", s.name),
@@ -895,6 +919,119 @@ impl ShellApp {
                 theme::set_tone(ctx, tone);
             }
             A::Settings => self.page = Page::Settings,
+            A::Duplicate => self.open_duplicate(),
+        }
+    }
+
+    /// The one selected server, if it can be duplicated (project servers cannot yet).
+    fn duplicable(&self) -> Option<&ServerRow> {
+        self.core.as_ref()?;
+        if self.plan.is_some() {
+            return None;
+        }
+        self.single_selected().filter(|s| s.scope != Scope::Project)
+    }
+
+    /// Opens the Duplicate dialog for the selected server: named `<name>_copy`, in the place it is now.
+    fn open_duplicate(&mut self) {
+        let Some(row) = self.duplicable() else {
+            return;
+        };
+        let here = row.project.as_deref();
+        self.duplicate = Some(DuplicateForm {
+            source: row.id(),
+            name: format!("{}_copy", row.name),
+            user: row.scope == Scope::User,
+            projects: self
+                .snapshot
+                .projects
+                .iter()
+                .map(|p| (p.clone(), Some(p.as_str()) == here))
+                .collect(),
+            focus: true,
+        });
+    }
+
+    fn duplicate_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let Some(form) = &mut self.duplicate else {
+            return;
+        };
+        let problem = ServerName::parse(&form.name).err().map(|e| {
+            let e = e.to_string();
+            let mut c = e.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect::<String>())
+                .unwrap_or(e)
+        });
+        let placed = form.user || form.projects.iter().any(|(_, on)| *on);
+        let ready = problem.is_none() && placed;
+        let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("duplicate_dialog")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.heading(format!("Duplicate {}", form.source.name));
+            ui.add_space(8.0);
+            ui.label(RichText::new("Name").color(pal.text_muted));
+            let field =
+                ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(f32::INFINITY));
+            if std::mem::take(&mut form.focus) {
+                field.request_focus();
+            }
+            if let Some(problem) = &problem {
+                ui.label(RichText::new(problem).small().color(pal.danger));
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Where").color(pal.text_muted));
+            ui.checkbox(&mut form.user, "For the user (every project)");
+            for (path, on) in &mut form.projects {
+                ui.checkbox(on, format!("In {}", folder_name(path)))
+                    .on_hover_text(path.as_str());
+            }
+            if !placed {
+                ui.label(
+                    RichText::new("Tick at least one place.")
+                        .small()
+                        .color(pal.text_muted),
+                );
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("The copy keeps the original's environment and header values.")
+                    .small()
+                    .color(pal.text_muted),
+            );
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                review |= ui
+                    .add_enabled(ready, egui::Button::new("Review"))
+                    .on_disabled_hover_text("Give it a usable name and tick a place")
+                    .clicked();
+                cancel |= ui.button("Cancel").clicked();
+            });
+        });
+        if review {
+            let targets = form
+                .user
+                .then_some(Target::User)
+                .into_iter()
+                .chain(
+                    form.projects
+                        .iter()
+                        .filter(|(_, on)| *on)
+                        .map(|(p, _)| Target::Local(p.clone())),
+                )
+                .collect();
+            let change = Change::Duplicate {
+                id: form.source.clone(),
+                name: form.name.clone(),
+                targets,
+            };
+            self.duplicate = None;
+            self.outcome = None;
+            self.send(Command::Prepare(vec![change]));
+        } else if cancel || modal.should_close() {
+            self.duplicate = None;
         }
     }
 
@@ -1686,6 +1823,26 @@ fn search_id() -> egui::Id {
     egui::Id::new("search")
 }
 
+/// What the Duplicate dialog holds: the copy's name and where it goes.
+struct DuplicateForm {
+    source: ServerId,
+    name: String,
+    user: bool,
+    /// Every project Claude Code knows, and whether the copy goes there.
+    projects: Vec<(String, bool)>,
+    /// Give the name field the keyboard on the first frame.
+    focus: bool,
+}
+
+/// The last part of a project path: `C:/work/app` -> `app`.
+fn folder_name(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(cut) if cut + 1 < trimmed.len() => &trimmed[cut + 1..],
+        _ => trimmed,
+    }
+}
+
 fn group_of(s: &ServerRow) -> Group {
     match (&s.scope, &s.project) {
         (scope, Some(p)) => {
@@ -1837,7 +1994,7 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32) {
 mod tests {
     use super::*;
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable;
+    use egui_kittest::kittest::{NodeT, Queryable};
     use klefki_core::api::fixture_snapshot;
 
     /// Mirrors the app: the theme is applied once in the creation callback, before the first frame.
@@ -2505,7 +2662,6 @@ mod tests {
 
     #[test]
     fn diagnose_asks_the_engine_and_waits_while_a_check_runs() {
-        use egui_kittest::kittest::NodeT;
         let (mut h, engine) = live_harness();
         let row = live_row("bad-stdio", Scope::User, None);
         engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
@@ -3277,6 +3433,7 @@ mod tests {
         // (Add and Import were in this list; they are no longer shown until they work.)
         for glyph in [
             icon::PENCIL_SIMPLE,
+            icon::COPY,
             icon::TOGGLE_RIGHT,
             icon::TOGGLE_LEFT,
             icon::TRASH,
@@ -3287,6 +3444,139 @@ mod tests {
                 "{glyph:?} at {r:?}, detail panel from x={detail_left}"
             );
         }
+    }
+
+    // ---- duplicate
+
+    /// alpha (user), beta (local in WebApp), gamma (project in WebApp); Claude knows two projects.
+    fn duplicate_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        let mut c = live_row("gamma", Scope::Project, Some("C:/Repos/WebApp"));
+        c.approval = Some(Approval::Approved);
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, b, c],
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    fn duplicate_requested(engine: &klefki_core::api::Detached) -> Vec<Change> {
+        drain(engine)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::Prepare(changes) => Some(changes),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn duplicate_suggests_a_name_and_the_same_place() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label("beta").click();
+        h.run();
+        h.get_by_label(icon::COPY).click();
+        h.run();
+        h.get_by_label_contains("Duplicate beta");
+        assert_eq!(h.state().duplicate.as_ref().unwrap().name, "beta_copy");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(h.state().duplicate.is_none());
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Duplicate {
+                id: h.state().snapshot.servers[1].id(),
+                name: "beta_copy".into(),
+                targets: vec![Target::Local("C:/Repos/WebApp".into())],
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_goes_wherever_it_is_ticked_under_the_name_typed() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run();
+        // User is ticked for a user server; add both projects, untick the user.
+        h.get_by_label_contains("For the user").click();
+        h.get_by_label("In WebApp").click();
+        h.get_by_label("In notes").click();
+        h.run();
+        h.state_mut().duplicate.as_mut().unwrap().name = "alpha-2".into();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Duplicate {
+                id: h.state().snapshot.servers[0].id(),
+                name: "alpha-2".into(),
+                targets: vec![
+                    Target::Local("C:/Repos/WebApp".into()),
+                    Target::Local("/home/me/notes".into()),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_needs_a_usable_name_and_a_place() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::COPY).click();
+        h.run();
+        h.state_mut().duplicate.as_mut().unwrap().name = "has space".into();
+        h.run();
+        h.get_by_label_contains("not allowed");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.state_mut().duplicate.as_mut().unwrap().name = "fine".into();
+        h.run();
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        h.get_by_label_contains("For the user").click();
+        h.run();
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().duplicate.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_project_server_cannot_be_duplicated_yet() {
+        let (mut h, _engine) = duplicate_harness();
+        h.get_by_label("gamma").click();
+        h.run();
+        assert!(h.get_by_label(icon::COPY).accesskit_node().is_disabled());
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run();
+        assert!(h.state().duplicate.is_none());
+    }
+
+    #[test]
+    fn the_palette_offers_duplicate() {
+        let (mut h, _engine) = duplicate_harness();
+        h.get_by_label("alpha").click();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "dup");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().duplicate.as_ref().unwrap().name, "alpha_copy");
     }
 
     // ---- keyboard-first: command palette and arrow keys
@@ -3531,9 +3821,10 @@ mod tests {
     fn the_toolbar_shows_only_what_works() {
         let (mut h, _engine) = live_harness();
         h.run();
+        // Duplicate (icon::COPY) was in this list until it was built; it is shown now.
+        h.get_by_label(icon::COPY);
         for gone in [
             icon::PLUS,
-            icon::COPY,
             icon::SWAP,
             icon::SIGN_IN,
             icon::EXPORT,

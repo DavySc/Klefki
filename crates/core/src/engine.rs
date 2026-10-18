@@ -59,6 +59,12 @@ pub enum Change {
     /// Replace the definition of a user or local server with `json`, as edited from [`Event::Entry`]: values shown
     /// as `<hidden>` keep the value they had.
     Replace { id: ServerId, json: String },
+    /// Copy a user or local server, definition and secrets included, to each of `targets` as `name`.
+    Duplicate {
+        id: ServerId,
+        name: String,
+        targets: Vec<crate::model::Target>,
+    },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -1043,6 +1049,7 @@ fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
 mod tests {
     use super::*;
     use crate::cli::testutil::{fake_claude, write_scenario};
+    use crate::model::Target;
     use std::time::Instant;
 
     const WAIT: Duration = Duration::from_secs(15);
@@ -2133,6 +2140,19 @@ mod tests {
         })
     }
 
+    /// The verify that runs shortly after a write (50 ms in tests) reports no failure.
+    fn verify_passes(core: &Core) {
+        std::thread::sleep(Duration::from_millis(400));
+        let mut late = Vec::new();
+        while let Some(e) = core.try_recv() {
+            late.push(e);
+        }
+        assert!(
+            !late.iter().any(|e| matches!(e, Event::ApplyFailed { .. })),
+            "{late:#?}"
+        );
+    }
+
     #[test]
     fn the_plan_shows_everything_the_server_would_run_and_writes_nothing_yet() {
         let (env, key, repo) = repo_env(serde_json::json!({}));
@@ -2713,6 +2733,147 @@ mod tests {
                 .iter()
                 .all(|r| r.name != "gw")
         );
+        verify_passes(&core);
+    }
+
+    fn duplicate(id: ServerId, name: &str, targets: Vec<Target>) -> Change {
+        Change::Duplicate {
+            id,
+            name: name.to_owned(),
+            targets,
+        }
+    }
+
+    #[test]
+    fn duplicating_a_user_server_into_projects_copies_it_secrets_and_all() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![duplicate(
+                user_id("gw"),
+                "gw_copy",
+                vec![
+                    Target::Local("/work/a".into()),
+                    Target::Local("/work/b".into()),
+                ],
+            )],
+        );
+        assert_eq!(plan.summary, ["Duplicate gw as gw_copy in a and b"]);
+        assert_eq!(plan.action, "Duplicate");
+        assert!(!plan.destructive);
+        let shown = format!("{plan:?}");
+        assert!(!shown.contains("s3cret-value"), "{shown}");
+        assert!(shown.contains("+ gw_copy"), "{shown}");
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. }))
+        );
+        let now = config_json(&env);
+        let gw = two_projects("end")["mcpServers"]["gw"].clone();
+        assert_eq!(now["projects"]["/work/a"]["mcpServers"]["gw_copy"], gw);
+        assert_eq!(now["projects"]["/work/b"]["mcpServers"]["gw_copy"], gw);
+        assert_eq!(now["mcpServers"], two_projects("end")["mcpServers"]);
+        let rows = &snapshots(&events).last().unwrap().servers;
+        assert_eq!(rows.iter().filter(|r| r.name == "gw_copy").count(), 2);
+        verify_passes(&core);
+    }
+
+    #[test]
+    fn duplicating_a_local_server_to_the_user_and_its_own_project() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![duplicate(
+                local_id("loc", "/work/a"),
+                "loc2",
+                vec![Target::User, Target::Local("/work/a".into())],
+            )],
+        );
+        assert_eq!(
+            plan.summary,
+            ["Duplicate loc as loc2 for the user and in a"]
+        );
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        let loc = serde_json::json!({"type": "stdio", "command": "x"});
+        assert_eq!(now["mcpServers"]["loc2"], loc);
+        assert_eq!(now["projects"]["/work/a"]["mcpServers"]["loc2"], loc);
+        assert_eq!(now["projects"]["/work/a"]["mcpServers"]["loc"], loc);
+    }
+
+    #[test]
+    fn a_copy_under_a_name_used_elsewhere_warns_which_one_claude_uses() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        // A user server called loc: in /work/a the local loc wins.
+        let plan = plan_for(
+            &core,
+            vec![duplicate(
+                local_id("loc", "/work/a"),
+                "loc",
+                vec![Target::User],
+            )],
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("local") && w.contains("a")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn duplicates_that_cannot_be_made_say_why() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        for (change, why) in [
+            (
+                duplicate(user_id("gw"), "gw", vec![Target::User]),
+                "already",
+            ),
+            (
+                duplicate(user_id("gw"), "loc", vec![Target::Local("/work/a".into())]),
+                "already",
+            ),
+            (
+                duplicate(user_id("gw"), "bad name", vec![Target::User]),
+                "name",
+            ),
+            (duplicate(user_id("gw"), "-x", vec![Target::User]), "name"),
+            (duplicate(user_id("gw"), "ok", vec![]), "where"),
+            (
+                duplicate(
+                    user_id("gw"),
+                    "ok",
+                    vec![Target::Local("/elsewhere".into())],
+                ),
+                "project",
+            ),
+            (
+                duplicate(user_id("ghost"), "ok", vec![Target::User]),
+                "no longer",
+            ),
+        ] {
+            let refused = plan_failure(&core, vec![change.clone()]);
+            assert!(refused.contains(why), "{change:?}: {refused}");
+        }
+        assert_eq!(config_json(&env), two_projects("end"));
+    }
+
+    #[test]
+    fn a_project_server_is_not_duplicated_yet() {
+        let (env, key, _repo) = repo_env(serde_json::json!({}));
+        let core = env.start();
+        let refused = plan_failure(
+            &core,
+            vec![duplicate(project_id(&key, "ps"), "ps2", vec![Target::User])],
+        );
+        assert!(refused.contains(".mcp.json"), "{refused}");
     }
 
     #[test]
@@ -2730,6 +2891,7 @@ mod tests {
             config_json(&env)["projects"]["/work/a"]["mcpServers"],
             serde_json::json!({})
         );
+        verify_passes(&core);
     }
 
     #[test]
