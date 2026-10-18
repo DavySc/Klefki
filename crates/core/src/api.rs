@@ -7,7 +7,7 @@ pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
     SignInFailure, SignInStep,
 };
-pub use crate::form::{Part, ServerFields, callback_port_warning, secret_reference};
+pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::secrets::{Secret, SecretError};

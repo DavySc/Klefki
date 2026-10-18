@@ -71,6 +71,8 @@ pub enum Command {
     KeepWaitingForSignIn(ServerId),
     /// Stop the running sign-in.
     CancelSignIn(ServerId),
+    /// Whether a sign-in could come back to this OAuth callback port now (see [`Event::CallbackPort`]).
+    CheckCallbackPort(u16),
 }
 
 /// Where a sign-in is ([`Event::SignIn`]). Text is sanitised.
@@ -318,6 +320,11 @@ pub enum Event {
     SignIn {
         id: ServerId,
         step: SignInStep,
+    },
+    /// Why a sign-in could not come back to `port` now, or `None` when it could ([`Command::CheckCallbackPort`]).
+    CallbackPort {
+        port: u16,
+        warning: Option<String>,
     },
 }
 
@@ -663,6 +670,10 @@ fn engine_main(
             Command::OpenSignInPage(id) => sign_in::open_again(&shared, &state, &id),
             Command::KeepWaitingForSignIn(id) => sign_in::keep_waiting(&state, &id),
             Command::CancelSignIn(id) => sign_in::cancel(&state, &id),
+            Command::CheckCallbackPort(port) => shared.emitter.emit(Event::CallbackPort {
+                port,
+                warning: crate::form::callback_port_warning(port),
+            }),
         }
     }
     // The UI is gone: a sign-in still running is stopped, so no `claude` keeps listening after Klefki closes.
@@ -5586,7 +5597,7 @@ mod tests {
         let said = |plan: &PlanView| {
             plan.warnings
                 .iter()
-                .filter(|w| w.contains(&format!("port {port}")))
+                .filter(|w| w.contains(&format!("Port {port} ")))
                 .cloned()
                 .collect::<Vec<_>>()
         };
@@ -5596,7 +5607,7 @@ mod tests {
         let warned = said(&plan);
         assert_eq!(warned.len(), 1, "{:?}", plan.warnings);
         assert!(
-            warned[0].starts_with(&format!("sso2: Another program is using port {port}")),
+            warned[0].starts_with(&format!("sso2: Port {port} is in use by another program.")),
             "{warned:?}"
         );
         // A port let go is not warned about, and neither is a server that leaves the port to Claude Code.

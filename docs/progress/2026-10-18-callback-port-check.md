@@ -27,10 +27,21 @@ Branch `claude/callback-port-check-eaow5h`, from main `86f2ad7`.
   - Fill in, HTTP, OAuth ticked, 8766 typed, Tab: the warning is under the field. Holder stopped, field left again: the warning is gone.
 
 ## Open / known limits
-- Only IPv4 loopback is checked, as Claude Code listens there. A program on `::1` alone is not seen, though a browser may resolve `localhost` to it.
 - The wildcard case (`0.0.0.0`) is asserted on Linux only; macOS lets a 127.0.0.1 listener sit beside it (for Claude Code too), and Windows is not verified.
 - Not tried on Windows or macOS by hand.
 - Re-authorize and sign-in from the Auth tab do not check the port first; Claude Code's own message ("OAuth callback port N is already in use") is shown there.
 
+## Review round 1 (cross-review of `87d7805`: 2 blocking, 3 polish)
+- **B1, no IO on the UI thread:** the form no longer calls the check. Leaving the port field (or a stopped Review) sets `port_wanted`; after the frame the app sends `Command::CheckCallbackPort(port)`, and the engine answers with `Event::CallbackPort { port, warning }`. The answer is shown only while the field still holds that port, so a late answer for another port is ignored. A port already asked about is not asked again until answered (egui reports a lost focus in both passes of a discarded frame). `callback_port_warning` is now `pub(crate)` and no longer in `api`.
+- **B2, `::1`:** the check also binds `[::1]:<port>`, since the browser is sent to `localhost` and may try `::1` first; a program there would take the sign-in while Claude Code waits. Any error other than in-use or denied (e.g. no IPv6) says nothing. The core test holds `::1` too whenever this computer can bind it.
+- **P1/P2:** "Port N is in use by another program. Signing in will fail until that program is closed, or register a different port with the provider." Denied: "Port N is reserved on this computer, so signing in would fail…".
+- **P3:** the doc comment says Rust matches Node on Unix only; the native Claude Code's Windows bind options are unverified.
+- **For Davy (protected file, not edited):** add `std::net::TcpListener::bind` to `disallowed-methods` in `crates/app/clippy.toml`.
+- Tests: the app test now asserts the commands sent and answers with events: not asked while typing, asked once on Tab, warning shown, ready stays true, late answer for another port ignored, asked again on a stopped Review, a wrong port not asked. Fails with port matching removed, and with the ask-once guard removed. The `::1` holder could not be seen failing here: this container has no IPv6 (`EAFNOSUPPORT`); CI runners do.
+- Checks: full verify exit 0, 448 core + 210 app tests; `cargo clippy -p klefki -- -D warnings` clean; no IO calls in `crates/app/src`.
+- Real window again (127.0.0.1:8766 held): Fill in, port 8766, Tab: the engine's answer shows under the field (`reviews/2026-10-18-callback-port/r2-field-warning-from-engine.png`).
+
 ## Next
-Cross-review, then merge before the "Safe edits and move or copy" slice.
+- Merge before the "Safe edits and move or copy" slice.
+- Open for Davy's Windows machine: hold `0.0.0.0:<port>` and check the warning appears (the native `claude.exe` may use `SO_EXCLUSIVEADDRUSE`).
+- F1: check the port again when Sign in is pressed, before `claude mcp login` starts. F2: name the program holding the port (`/proc/net/tcp`, `GetExtendedTcpTable`).
