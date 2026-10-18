@@ -22,6 +22,8 @@ pub enum Action {
     Settings,
     Duplicate,
     FixCasing,
+    /// Move every old switch-off list (`mcpServersDisabled`) into the one Claude Code reads.
+    MigrateLegacy,
 }
 
 pub struct Entry {

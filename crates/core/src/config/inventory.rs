@@ -1,8 +1,10 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
+use super::docstore::LEGACY;
 use super::{ConfigPaths, fsx};
 use crate::api::{
-    Approval, OAuthInfo, Scope, ServerId, ServerRow, Snapshot, Status, TransportKind,
+    Approval, LegacyDisabled, OAuthInfo, Scope, ServerId, ServerRow, Snapshot, Status,
+    TransportKind,
 };
 use crate::model::ConnectionId;
 use crate::sanitize::{self, sanitize};
@@ -103,6 +105,10 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             let names = string_set(project.values.iter().map(|v| v.get("disabledMcpServers")));
             (key, names)
         })
+        .collect();
+    snap.legacy_disabled = projects
+        .iter()
+        .filter_map(|(key, project)| legacy_disabled(key, project, &disabled_by_project[key]))
         .collect();
 
     if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
@@ -217,6 +223,48 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
 
     mark_casing_collisions(&mut snap.servers);
     snap
+}
+
+/// The old toggle list of a project, from every spelling of it, when any has one.
+fn legacy_disabled(
+    key: &str,
+    project: &Project<'_>,
+    disabled: &BTreeSet<String>,
+) -> Option<LegacyDisabled> {
+    let lists: Vec<&Value> = project
+        .values
+        .iter()
+        .filter_map(|v| v.get(LEGACY))
+        .collect();
+    if lists.is_empty() {
+        return None;
+    }
+    let mut malformed = false;
+    let mut names: Vec<&str> = Vec::new();
+    for list in lists {
+        let Some(items) = list.as_array() else {
+            malformed = true;
+            continue;
+        };
+        for item in items {
+            match item.as_str() {
+                Some(name) if !names.contains(&name) => names.push(name),
+                Some(_) => {}
+                None => malformed = true,
+            }
+        }
+    }
+    Some(LegacyDisabled {
+        project: key.to_owned(),
+        shown: clip(&sanitize(&project.display)),
+        turns_off: names
+            .iter()
+            .filter(|n| !disabled.contains(**n))
+            .map(|n| clip(&sanitize(n)))
+            .collect(),
+        names: names.iter().map(|n| clip(&sanitize(n))).collect(),
+        malformed,
+    })
 }
 
 // ---------------------------------------------------------------- rows
@@ -647,6 +695,7 @@ impl Hints {
 const ENTRY_KEYS: &[&str] = &[
     "mcpServers",
     "disabledMcpServers",
+    LEGACY,
     "enabledMcpjsonServers",
     "disabledMcpjsonServers",
     "enableAllProjectMcpServers",
@@ -1418,6 +1467,86 @@ mod tests {
         let s = e.load();
         assert_eq!(s.project_count, 1);
         assert_eq!(find(&s, Scope::User, "u").disabled_in, 1);
+    }
+
+    #[test]
+    fn the_old_switch_off_list_is_shown_and_does_not_switch_anything_off() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"u": {"command": "x"}, "v": {"command": "y"}},
+                "projects": {
+                    "/p": {
+                        "mcpServers": {"l": {"command": "z"}},
+                        "mcpServersDisabled": ["u", "l", "gone", "u"],
+                        "disabledMcpServers": ["v", "gone"]
+                    },
+                    "/q": {"disabledMcpServers": []}
+                }
+            }),
+        );
+        let s = e.load();
+        assert_eq!(
+            s.legacy_disabled,
+            [LegacyDisabled {
+                project: "/p".to_owned(),
+                shown: "/p".to_owned(),
+                names: vec!["u".into(), "l".into(), "gone".into()],
+                turns_off: vec!["u".into(), "l".into()],
+                malformed: false,
+            }]
+        );
+        // Claude Code reads only disabledMcpServers: u and l are on.
+        assert!(find(&s, Scope::Local, "l").enabled);
+        assert_eq!(find(&s, Scope::User, "u").disabled_in, 0);
+        assert_eq!(find(&s, Scope::User, "v").disabled_in, 1);
+    }
+
+    #[test]
+    fn the_old_list_merges_spellings_and_flags_what_is_not_a_name() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({
+                "projects": {
+                    "c:\\w\\p": {"mcpServersDisabled": ["a", 7]},
+                    "C:/w/p/": {"mcpServersDisabled": ["b\u{202e}x", "a"]},
+                    "/r": {"mcpServersDisabled": "a"},
+                    "/s": {"mcpServersDisabled": []}
+                }
+            }),
+        );
+        let s = e.load();
+        let by: Vec<(&str, &[String], bool)> = s
+            .legacy_disabled
+            .iter()
+            .map(|l| (l.shown.as_str(), l.names.as_slice(), l.malformed))
+            .collect();
+        assert_eq!(
+            by,
+            [
+                ("/r", &[][..], true),
+                ("/s", &[][..], false),
+                ("C:/w/p", &["a".to_owned(), "bx".to_owned()][..], true),
+            ]
+        );
+        // Identified by the spelling the changes use, like `projects`.
+        assert!(
+            s.legacy_disabled
+                .iter()
+                .all(|l| s.projects.contains(&l.project))
+        );
+    }
+
+    #[test]
+    fn a_config_without_the_old_list_has_none() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"projects": {"/p": {"disabledMcpServers": ["a"]}}}),
+        );
+        assert!(e.load().legacy_disabled.is_empty());
     }
 
     #[test]

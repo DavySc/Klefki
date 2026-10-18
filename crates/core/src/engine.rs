@@ -80,6 +80,9 @@ pub enum Change {
         name: String,
         targets: Vec<crate::model::Target>,
     },
+    /// Move the old `mcpServersDisabled` list of `project` (a [`crate::api::LegacyDisabled::project`]) into the list
+    /// Claude Code reads, so the servers on it are off again, and remove the old list.
+    MigrateLegacyDisabled { project: String },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -3576,6 +3579,136 @@ mod tests {
             "{:?}",
             plan.warnings
         );
+    }
+
+    #[test]
+    fn a_point_raised_by_two_changes_apart_is_said_once() {
+        // Variant of the migration's repeated note: two deletes with another change between them.
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![
+                Change::Delete {
+                    id: local_id("loc", "/work/a"),
+                },
+                // Warns that a user server is switched per project.
+                Change::SetEnabled {
+                    id: user_id("gw"),
+                    enabled: false,
+                },
+                Change::Delete { id: user_id("gw") },
+            ],
+        );
+        let deleting = plan
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("Deleting"))
+            .count();
+        assert_eq!(deleting, 1, "{:?}", plan.warnings);
+    }
+
+    fn migrate(project: &str) -> Change {
+        Change::MigrateLegacyDisabled {
+            project: project.to_owned(),
+        }
+    }
+
+    /// /work/a has an old switch-off list naming the user server gw, its local loc and a name already off.
+    fn legacy_config() -> serde_json::Value {
+        serde_json::json!({
+            "numStartups": 3,
+            "mcpServers": {"gw": {"type": "stdio", "command": "node", "env": {"TOKEN": "s3cret-value"}}},
+            "projects": {
+                "/work/a": {
+                    "mcpServers": {"loc": {"type": "stdio", "command": "x"}},
+                    "mcpServersDisabled": ["gw", "loc", "old"],
+                    "disabledMcpServers": ["old"],
+                    "allowedTools": []
+                },
+                "/work/b": {"mcpServersDisabled": ["gw"]},
+                "/work/c": {"mcpServersDisabled": [1]}
+            }
+        })
+    }
+
+    #[test]
+    fn migrating_the_old_list_switches_its_servers_off_and_removes_it() {
+        let env = quiet_env(&legacy_config());
+        let core = env.start();
+        let plan = plan_for(&core, vec![migrate("/work/a"), migrate("/work/b")]);
+        assert_eq!(
+            plan.summary,
+            [
+                "Turn off gw and loc in a, as the old switch-off list says",
+                "Turn off gw in b, as the old switch-off list says"
+            ]
+        );
+        assert_eq!(plan.action, "Migrate");
+        assert!(!plan.destructive);
+        assert!(!plan.nothing_to_do);
+        // Said once, however many lists move (it was said once per list).
+        let ignored: Vec<&String> = plan.notes.iter().filter(|n| n.contains("ignore")).collect();
+        assert_eq!(ignored.len(), 1, "{:?}", plan.notes);
+        let shown = format!("{plan:?}");
+        assert!(!shown.contains("s3cret-value"), "{shown}");
+        let events = apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        let was = legacy_config();
+        assert_eq!(
+            now["projects"]["/work/a"],
+            serde_json::json!({
+                "mcpServers": {"loc": {"type": "stdio", "command": "x"}},
+                "disabledMcpServers": ["old", "gw", "loc"],
+                "allowedTools": []
+            })
+        );
+        assert_eq!(
+            now["projects"]["/work/b"],
+            serde_json::json!({"disabledMcpServers": ["gw"]})
+        );
+        assert_eq!(now["projects"]["/work/c"], was["projects"]["/work/c"]);
+        assert_eq!(now["mcpServers"], was["mcpServers"]);
+        let snap = *snapshots(&events).last().unwrap();
+        let left: Vec<&str> = snap
+            .legacy_disabled
+            .iter()
+            .map(|l| l.project.as_str())
+            .collect();
+        assert_eq!(left, ["/work/c"]);
+        let loc = snap.servers.iter().find(|r| r.name == "loc").unwrap();
+        assert!(!loc.enabled);
+        let gw = snap.servers.iter().find(|r| r.name == "gw").unwrap();
+        assert_eq!(gw.disabled_in, 2);
+        verify_passes(&core);
+    }
+
+    #[test]
+    fn migrating_a_list_whose_servers_are_already_off_only_removes_it() {
+        let mut config = legacy_config();
+        config["projects"]["/work/b"]["disabledMcpServers"] = serde_json::json!(["gw"]);
+        let env = quiet_env(&config);
+        let core = env.start();
+        let plan = plan_for(&core, vec![migrate("/work/b")]);
+        assert_eq!(plan.summary, ["Remove the old switch-off list in b"]);
+        assert!(!plan.nothing_to_do);
+        apply_and_wait(&core, &plan);
+        assert_eq!(
+            config_json(&env)["projects"]["/work/b"],
+            serde_json::json!({"disabledMcpServers": ["gw"]})
+        );
+    }
+
+    #[test]
+    fn a_migration_is_refused_for_a_list_of_the_wrong_shape_or_one_that_is_gone() {
+        let env = quiet_env(&legacy_config());
+        let core = env.start();
+        let why = plan_failure(&core, vec![migrate("/work/c")]);
+        assert!(why.contains("other than server names"), "{why}");
+        let why = plan_failure(&core, vec![migrate("/work/none")]);
+        assert!(why.contains("no old switch-off list"), "{why}");
+        // Nothing was written.
+        assert_eq!(config_json(&env), legacy_config());
     }
 
     fn rename(id: ServerId, name: &str) -> Change {

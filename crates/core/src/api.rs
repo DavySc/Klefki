@@ -207,6 +207,25 @@ pub struct Snapshot {
     pub servers: Vec<ServerRow>,
     /// Problems found while reading the configuration. Already sanitised.
     pub warnings: Vec<String>,
+    /// Projects whose entry still has the switch-off list of older Claude Code versions.
+    pub legacy_disabled: Vec<LegacyDisabled>,
+}
+
+/// A project entry with the old `mcpServersDisabled` list. Claude Code no longer reads it, so the servers it names
+/// are not switched off by it. Shown read-only; [`Change::MigrateLegacyDisabled`] moves the names into the list
+/// Claude Code reads today (`disabledMcpServers`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyDisabled {
+    /// The project, spelled as in [`Snapshot::projects`]: what the change names.
+    pub project: String,
+    /// The project path, cleaned for showing.
+    pub shown: String,
+    /// The names on the old list, cleaned for showing, in file order and once each.
+    pub names: Vec<String>,
+    /// Those of `names` that are not switched off today: migrating switches them off.
+    pub turns_off: Vec<String>,
+    /// The old list holds something other than names. Removing it would lose that, so migrating is refused.
+    pub malformed: bool,
 }
 
 /// Starts the engine against the real Claude Code configuration and the real CLI. It loads the snapshot, finds

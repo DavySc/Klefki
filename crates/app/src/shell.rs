@@ -615,6 +615,7 @@ impl ShellApp {
             .show(ui, |ui| match self.page {
                 Page::Connections => {
                     self.warnings(ui);
+                    self.legacy_notice(ui);
                     self.toolbar(ui);
                     ui.add_space(6.0);
                     self.grid(ui);
@@ -796,6 +797,81 @@ impl ShellApp {
         ui.add_space(6.0);
     }
 
+    /// Projects with the switch-off list of older Claude Code versions: what is on because Claude Code no longer
+    /// reads it, and a button that moves it into the list it does read. Read-only until the user reviews the plan.
+    fn legacy_notice(&mut self, ui: &mut Ui) {
+        let lists = &self.snapshot.legacy_disabled;
+        if lists.is_empty() {
+            return;
+        }
+        const SHOWN: usize = 4;
+        let pal = theme::palette(ui.ctx());
+        let can_migrate =
+            self.core.is_some() && self.can_prepare() && lists.iter().any(|l| !l.malformed);
+        let mut migrate = false;
+        Frame::new()
+            .stroke(egui::Stroke::new(1.0, pal.warn))
+            .corner_radius(6)
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let title = if lists.len() == 1 {
+                    "Old switch-off list in 1 project".to_owned()
+                } else {
+                    format!("Old switch-off lists in {} projects", lists.len())
+                };
+                ui.label(
+                    RichText::new(format!("{} {title}", icon::CLOCK_COUNTER_CLOCKWISE))
+                        .color(pal.warn),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Older Claude Code versions kept switched-off servers in mcpServersDisabled. Claude Code no longer reads that list, so servers on it can be on again. Migrating moves them to the list it reads now.",
+                        )
+                        .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+                for l in lists.iter().take(SHOWN) {
+                    let folder = folder_name(&l.shown);
+                    let line = if l.malformed {
+                        format!("{folder}: holds something other than server names; edit it in .claude.json by hand")
+                    } else {
+                        let state = match l.turns_off.as_slice() {
+                            [] => "already off".to_owned(),
+                            [one] => format!("{one} is on"),
+                            many => format!("{} are on", some_names(many)),
+                        };
+                        format!("{folder}: {} ({state})", some_names(&l.names))
+                    };
+                    ui.add(egui::Label::new(line).wrap())
+                        .on_hover_text(l.shown.as_str());
+                }
+                if lists.len() > SHOWN {
+                    ui.label(
+                        RichText::new(format!("… and {} more", lists.len() - SHOWN))
+                            .color(pal.text_muted),
+                    );
+                }
+                migrate = ui
+                    .add_enabled(can_migrate, egui::Button::new("Migrate…"))
+                    .on_hover_text("Review the change before anything is written")
+                    .on_disabled_hover_text(if self.core.is_none() {
+                        "Not connected to the configuration"
+                    } else if lists.iter().all(|l| l.malformed) {
+                        "Only lists of server names can be migrated"
+                    } else {
+                        "Finish the open review first"
+                    })
+                    .clicked();
+            });
+        ui.add_space(6.0);
+        if migrate {
+            self.migrate_legacy();
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
         // Only what works today: a button that can never be pressed is noise (Add, Move, Re-authorize, Export and
@@ -954,6 +1030,15 @@ impl ShellApp {
                 command::Action::Delete,
             );
         }
+        if live && self.snapshot.legacy_disabled.iter().any(|l| !l.malformed) {
+            add(
+                icon::CLOCK_COUNTER_CLOCKWISE,
+                "Migrate old switch-off lists".into(),
+                "Switch off what older Claude Code versions had off".into(),
+                None,
+                command::Action::MigrateLegacy,
+            );
+        }
         if live {
             add(
                 icon::ARROWS_CLOCKWISE,
@@ -1049,6 +1134,23 @@ impl ShellApp {
             A::Settings => self.page = Page::Settings,
             A::Duplicate => self.open_duplicate(),
             A::FixCasing => self.open_casing(),
+            A::MigrateLegacy => self.migrate_legacy(),
+        }
+    }
+
+    /// Asks for one plan that moves every old switch-off list that can be moved.
+    fn migrate_legacy(&mut self) {
+        let changes: Vec<Change> = self
+            .snapshot
+            .legacy_disabled
+            .iter()
+            .filter(|l| !l.malformed)
+            .map(|l| Change::MigrateLegacyDisabled {
+                project: l.project.clone(),
+            })
+            .collect();
+        if self.core.is_some() && !changes.is_empty() {
+            self.prepare(changes);
         }
     }
 
@@ -2862,6 +2964,19 @@ fn parent_folder(path: &str) -> &str {
     }
 }
 
+/// Names joined with commas; past the first few, only counted, so a long list stays readable.
+fn some_names(names: &[String]) -> String {
+    const NAMED: usize = 6;
+    if names.len() <= NAMED + 1 {
+        return names.join(", ");
+    }
+    format!(
+        "{} and {} more",
+        names[..NAMED].join(", "),
+        names.len() - NAMED
+    )
+}
+
 /// The last part of a project path: `C:/work/app` -> `app`.
 fn folder_name(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
@@ -3108,7 +3223,7 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
-    use klefki_core::api::{Definition, fixture_snapshot};
+    use klefki_core::api::{Definition, LegacyDisabled, fixture_snapshot};
 
     /// Mirrors the app: the theme is applied once in the creation callback, before the first frame.
     fn harness_with(snapshot: Snapshot) -> Harness<'static, ShellApp> {
@@ -5543,6 +5658,108 @@ mod tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         assert!(h.state().duplicate.is_none());
+    }
+
+    // ---- the old switch-off list
+
+    fn legacy(
+        project: &str,
+        names: &[&str],
+        turns_off: &[&str],
+        malformed: bool,
+    ) -> LegacyDisabled {
+        LegacyDisabled {
+            project: project.to_owned(),
+            shown: project.to_owned(),
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+            turns_off: turns_off.iter().map(|n| (*n).to_owned()).collect(),
+            malformed,
+        }
+    }
+
+    fn legacy_harness(
+        lists: Vec<LegacyDisabled>,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![live_row("gw", Scope::User, None)],
+                projects: lists.iter().map(|l| l.project.clone()).collect(),
+                legacy_disabled: lists,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    #[test]
+    fn no_old_list_shows_no_notice() {
+        let (h, _engine) = legacy_harness(vec![]);
+        assert!(h.query_by_label_contains("old switch-off list").is_none());
+        assert!(h.query_by_label("Migrate…").is_none());
+    }
+
+    #[test]
+    fn the_old_list_is_shown_with_what_is_on_because_of_it() {
+        let (h, _engine) = legacy_harness(vec![
+            legacy("C:/Repos/WebApp", &["gw", "old"], &["gw"], false),
+            legacy("/home/x/api", &["a"], &[], false),
+        ]);
+        h.get_by_label_contains("Old switch-off lists in 2 projects");
+        h.get_by_label_contains("Claude Code no longer reads");
+        h.get_by_label_contains("WebApp: gw, old (gw is on)");
+        h.get_by_label_contains("api: a (already off)");
+    }
+
+    #[test]
+    fn migrating_asks_for_one_plan_covering_every_list_that_can_move() {
+        let (mut h, engine) = legacy_harness(vec![
+            legacy("C:/Repos/WebApp", &["gw", "x"], &["gw", "x"], false),
+            legacy("/bad", &["a"], &["a"], true),
+            legacy("/home/x/api", &["a"], &[], false),
+        ]);
+        h.get_by_label_contains("bad: holds something other than server names");
+        h.get_by_label("Migrate…").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert_eq!(
+            changes,
+            vec![
+                Change::MigrateLegacyDisabled {
+                    project: "C:/Repos/WebApp".into()
+                },
+                Change::MigrateLegacyDisabled {
+                    project: "/home/x/api".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn only_malformed_lists_cannot_be_migrated() {
+        let (h, _engine) = legacy_harness(vec![legacy("/bad", &["a"], &["a"], true)]);
+        assert!(h.get_by_label("Migrate…").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn the_palette_offers_the_migration() {
+        let (mut h, engine) = legacy_harness(vec![legacy("/p", &["gw"], &["gw"], false)]);
+        let titles: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
+        assert!(
+            titles.iter().any(|t| t == "Migrate old switch-off lists"),
+            "{titles:?}"
+        );
+        h.state_mut()
+            .run(&egui::Context::default(), command::Action::MigrateLegacy);
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::MigrateLegacyDisabled {
+                project: "/p".into()
+            }]
+        );
+        h.run();
     }
 
     // ---- fix casing

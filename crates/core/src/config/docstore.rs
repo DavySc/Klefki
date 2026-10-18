@@ -54,6 +54,11 @@ pub(crate) enum Op {
         name: String,
         new_name: String,
     },
+    /// Move the names in `projects[<project>].mcpServersDisabled`, a list Claude Code no longer reads, into
+    /// `disabledMcpServers` (those not there yet, in order) and remove the old key, for every spelling of the
+    /// project. Where there is no `disabledMcpServers`, the old key is renamed to it in place. Refused when the old
+    /// list holds anything but names, which removing it would lose.
+    MigrateLegacyDisabled { project: String },
     /// Take `name` out of `projects[<project>].disabledMcpjsonServers` (a rejection recorded in `.claude.json`),
     /// for every spelling of the project. Needed so that an approval is not overruled by an old rejection.
     ClearRejection { project: String, name: String },
@@ -103,7 +108,8 @@ impl Op {
         match self {
             Op::SetDisabled { project, .. }
             | Op::RenameDisabled { project, .. }
-            | Op::ClearRejection { project, .. } => Some(project),
+            | Op::ClearRejection { project, .. }
+            | Op::MigrateLegacyDisabled { project } => Some(project),
             Op::RemoveServer { project, .. }
             | Op::RenameServer { project, .. }
             | Op::ReplaceServer { project, .. }
@@ -134,6 +140,7 @@ impl Op {
             | Op::RenameDisabled { name, .. }
             | Op::ClearRejection { name, .. }
             | Op::Approve { name } => name,
+            Op::MigrateLegacyDisabled { .. } => LEGACY,
         }
     }
 }
@@ -768,6 +775,8 @@ type Splices = Vec<(std::ops::Range<usize>, String)>;
 /// The lists a [`Op`] on `.claude.json` changes, inside a project entry.
 const DISABLED: &str = "disabledMcpServers";
 const REJECTED: &str = "disabledMcpjsonServers";
+/// The toggle list of older Claude Code versions; 2.1.302 no longer reads it.
+pub(crate) const LEGACY: &str = "mcpServersDisabled";
 
 /// Applies `ops` to the text of `.claude.json` by replacing only the bytes of the lists they change. One pass over
 /// the projects, however many ops (switching a user server touches every project). Returns the new text, or `None`
@@ -984,14 +993,34 @@ fn edit_valid_claude_json(
                 }
             }
         }
+        // The old list, when this spelling has one and a migration asks for it: its member and its names.
+        let legacy = if here
+            .iter()
+            .any(|op| matches!(op, Op::MigrateLegacyDisabled { .. }))
+        {
+            legacy_names(text, entry, &member.key)?
+        } else {
+            None
+        };
+        if let Some((_, names)) = &legacy {
+            out.lines
+                .push(format!("  projects[\"{shown_key}\"].{LEGACY}"));
+            for name in names {
+                out.lines.push(format!("- {}", sanitize(name)));
+            }
+        }
         for list in [DISABLED, REJECTED] {
             let list_ops: Vec<&&Op> = here
                 .iter()
                 .filter(|op| {
                     matches!(
                         (op, list),
-                        (Op::SetDisabled { .. } | Op::RenameDisabled { .. }, DISABLED)
-                            | (Op::ClearRejection { .. }, REJECTED)
+                        (
+                            Op::SetDisabled { .. }
+                                | Op::RenameDisabled { .. }
+                                | Op::MigrateLegacyDisabled { .. },
+                            DISABLED
+                        ) | (Op::ClearRejection { .. }, REJECTED)
                     )
                 })
                 .collect();
@@ -1060,6 +1089,17 @@ fn edit_valid_claude_json(
                             changed = true;
                         }
                     }
+                    Op::MigrateLegacyDisabled { .. } => {
+                        for name in legacy.iter().flat_map(|(_, names)| names) {
+                            let list = items.get_or_insert_with(Vec::new);
+                            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                                list.push(Value::String(name.clone()));
+                                out.lines.push(header.clone());
+                                out.lines.push(format!("+ {}", sanitize(name)));
+                                changed = true;
+                            }
+                        }
+                    }
                     Op::ClearRejection { name, .. } => {
                         if let Some(list) = &mut items {
                             let before = list.len();
@@ -1079,17 +1119,44 @@ fn edit_valid_claude_json(
                     | Op::CopyServer { .. } => {}
                 }
             }
-            if !changed {
+            // The old list goes in the same pass: removed, or, with no toggle list to merge into, renamed to it
+            // where it is (so an entry that holds nothing else never has to be rewritten whole).
+            let legacy = if list == DISABLED {
+                legacy.as_ref().map(|(at, _)| *at)
+            } else {
+                None
+            };
+            if !changed && legacy.is_none() {
                 continue;
             }
             let items = items.unwrap_or_default();
-            out.splices.push(match existing {
-                Some(m) => {
-                    let indent = jsonspan::line_indent(text, m.key_start);
-                    (m.value.clone(), render_list(&items, indent, out.nl)?)
+            match (existing, legacy) {
+                (Some(m), legacy) => {
+                    if changed {
+                        let indent = jsonspan::line_indent(text, m.key_start);
+                        out.splices
+                            .push((m.value.clone(), render_list(&items, indent, out.nl)?));
+                    }
+                    if let Some(at) = legacy {
+                        out.splices.extend(remove_members(entry, &[at]));
+                    }
                 }
-                None => add_member(text, member, entry, list, &items, out.nl)?,
-            });
+                (None, Some(at)) => {
+                    // The key and the value are replaced; the colon and spacing between them stay as they were.
+                    let old = &entry.members[at];
+                    let key_end = jsonspan::key_end(text, old)
+                        .map_err(|e| StoreError::Invalid(sanitize(&e)))?;
+                    let indent = jsonspan::line_indent(text, old.key_start);
+                    out.splices
+                        .push((old.key_start..key_end, format!("\"{list}\"")));
+                    out.splices
+                        .push((old.value.clone(), render_list(&items, indent, out.nl)?));
+                }
+                (None, None) => {
+                    out.splices
+                        .push(add_member(text, member, entry, list, &items, out.nl)?);
+                }
+            }
         }
     }
     if let Some(i) = (0..ops.len()).find(|&i| {
@@ -1104,6 +1171,43 @@ fn edit_valid_claude_json(
         )));
     }
     out.finish()
+}
+
+/// Where the old toggle list is among `entry`'s members, and its names; `None` when the entry has none. Refused
+/// when it is there twice or holds anything but names.
+fn legacy_names(
+    text: &str,
+    entry: &jsonspan::Object,
+    project: &str,
+) -> Result<Option<(usize, Vec<String>)>, StoreError> {
+    let owner = format!("the entry for {}", sanitize(project));
+    if single(entry, LEGACY, &owner)?.is_none() {
+        return Ok(None);
+    }
+    let at = entry
+        .members
+        .iter()
+        .position(|m| m.key == LEGACY)
+        .expect("found above");
+    let refused = || {
+        StoreError::Invalid(format!(
+            "{LEGACY} of {} is not a list of server names; refusing to change it",
+            sanitize(project)
+        ))
+    };
+    let value: Value = serde_json::from_str(&text[entry.members[at].value.clone()])
+        .map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))?;
+    let Value::Array(items) = value else {
+        return Err(refused());
+    };
+    let names = items
+        .into_iter()
+        .map(|v| match v {
+            Value::String(name) => Ok(name),
+            _ => Err(refused()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some((at, names)))
 }
 
 /// A delete being checked whose server is already gone: that is the delete in place.
@@ -1711,6 +1815,83 @@ mod tests {
                 "{} is not a project Claude Code knows about",
                 sanitize(&wanted)
             )))
+        }
+    }
+
+    /// The migration of the old list, on the parsed document. `original` is the file before the plan: where its entry
+    /// had no toggle list, the toggle list sits where the old list was, even if an earlier op in the plan created it.
+    fn migrate_legacy(
+        doc: &mut Value,
+        original: &Value,
+        project: &str,
+        lines: &mut Vec<String>,
+    ) -> Result<(), super::StoreError> {
+        let wanted = normalise_project(project);
+        let invalid = |why: &str| super::StoreError::Invalid(why.to_owned());
+        let projects = doc
+            .get_mut("projects")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| invalid("no projects"))?;
+        let mut found = false;
+        for (key, entry) in projects.iter_mut() {
+            if normalise_project(key) != wanted {
+                continue;
+            }
+            found = true;
+            let Some(legacy) = entry.get(LEGACY) else {
+                continue;
+            };
+            let names: Vec<String> = legacy
+                .as_array()
+                .ok_or_else(|| invalid("not a list"))?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| invalid("not a name"))
+                })
+                .collect::<Result<_, _>>()?;
+            let shown = sanitize(&key.replace('"', "\\\""));
+            lines.push(format!("  projects[\"{shown}\"].{LEGACY}"));
+            for name in &names {
+                lines.push(format!("- {}", sanitize(name)));
+            }
+            let had_list = original["projects"][key.as_str()].get(DISABLED).is_some();
+            let object = entry.as_object_mut().unwrap();
+            let mut items = object
+                .get(DISABLED)
+                .map(|v| v.as_array().cloned().ok_or_else(|| invalid("not a list")))
+                .transpose()?
+                .unwrap_or_default();
+            for name in names {
+                if !items.iter().any(|v| v.as_str() == Some(&name)) {
+                    lines.push(format!("  projects[\"{shown}\"].{DISABLED}"));
+                    lines.push(format!("+ {}", sanitize(&name)));
+                    items.push(Value::String(name));
+                }
+            }
+            let mut out = serde_json::Map::new();
+            for (k, v) in std::mem::take(object) {
+                match k.as_str() {
+                    LEGACY if !had_list => {
+                        out.insert(DISABLED.to_owned(), Value::Array(items.clone()));
+                    }
+                    LEGACY => {}
+                    DISABLED if !had_list => {}
+                    DISABLED => {
+                        out.insert(k, Value::Array(items.clone()));
+                    }
+                    _ => {
+                        out.insert(k, v);
+                    }
+                }
+            }
+            *object = out;
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(invalid("unknown project"))
         }
     }
 
@@ -3019,7 +3200,7 @@ mod tests {
         };
         let names = ["a", "b", "gw", "x y", "\u{e9}"];
         let spellings = ["C:/w/p", "c:\\w\\p", "C:/w/p/", "/q", "/r"];
-        for round in 0..400 {
+        for round in 0..600 {
             let mut projects = serde_json::Map::new();
             for key in spellings {
                 if next(4) == 0 {
@@ -3029,7 +3210,13 @@ mod tests {
                 if next(2) == 0 {
                     entry.insert("allowedTools".into(), json!(["Bash"]));
                 }
-                for list in ["disabledMcpServers", "disabledMcpjsonServers"] {
+                // The old list goes before or after the others, so a migration meets it in every place.
+                let lists = if next(2) == 0 {
+                    [LEGACY, DISABLED, REJECTED]
+                } else {
+                    [DISABLED, REJECTED, LEGACY]
+                };
+                for list in lists {
                     match next(4) {
                         0 => {}
                         1 => {
@@ -3066,14 +3253,14 @@ mod tests {
                 .map(|_| {
                     let project = keys[next(keys.len() as u64) as usize].clone();
                     let name = names[next(names.len() as u64) as usize].to_owned();
-                    if next(3) == 0 {
-                        Op::ClearRejection { project, name }
-                    } else {
-                        Op::SetDisabled {
+                    match next(4) {
+                        0 => Op::ClearRejection { project, name },
+                        1 => Op::MigrateLegacyDisabled { project },
+                        _ => Op::SetDisabled {
                             project,
                             name,
                             disabled: next(2) == 0,
-                        }
+                        },
                     }
                 })
                 .collect();
@@ -3100,6 +3287,9 @@ mod tests {
                         ),
                         Op::ClearRejection { project, name } => {
                             clear_rejection(&mut expected, project, name, &mut expected_lines)
+                        }
+                        Op::MigrateLegacyDisabled { project } => {
+                            migrate_legacy(&mut expected, &doc, project, &mut expected_lines)
                         }
                         Op::Approve { .. }
                         | Op::RenameDisabled { .. }
@@ -3788,5 +3978,260 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- the old `mcpServersDisabled` list
+
+    fn migrate(project: &str) -> Op {
+        Op::MigrateLegacyDisabled {
+            project: project.to_owned(),
+        }
+    }
+
+    /// `entry` with the legacy list's names added to `disabledMcpServers` (missing ones, in order) and the legacy
+    /// key gone; where there was no `disabledMcpServers`, it takes the legacy key's place.
+    fn migrated(entry: &Value) -> Value {
+        let mut out = serde_json::Map::new();
+        let legacy: Vec<Value> = entry
+            .get("mcpServersDisabled")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let has_list = entry.get("disabledMcpServers").is_some();
+        let merge = |list: &Value| {
+            let mut items = list.as_array().cloned().unwrap_or_default();
+            for name in &legacy {
+                if !items.contains(name) {
+                    items.push(name.clone());
+                }
+            }
+            Value::Array(items)
+        };
+        for (k, v) in entry.as_object().unwrap() {
+            match k.as_str() {
+                "mcpServersDisabled" if has_list => {}
+                "mcpServersDisabled" => {
+                    out.insert("disabledMcpServers".to_owned(), merge(&json!([])));
+                }
+                "disabledMcpServers" => {
+                    out.insert(k.clone(), merge(v));
+                }
+                _ => {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Value::Object(out)
+    }
+
+    #[test]
+    fn migrating_moves_the_old_list_into_the_toggle_list_wherever_the_keys_are() {
+        // Every place of the legacy key among the entry's members, with the toggle list before it, after it or
+        // missing, written pretty and on one line: only those two members change.
+        let others = ["allowedTools", "history", "zz"];
+        for n in 0..=others.len() {
+            for at in 0..=n {
+                for list_at in [None, Some(0), Some(n + 1)] {
+                    for compact in [false, true] {
+                        let mut members: Vec<(String, Value)> = others[..n]
+                            .iter()
+                            .map(|k| ((*k).to_owned(), json!({"keep": 1.50})))
+                            .collect();
+                        members.insert(
+                            at,
+                            ("mcpServersDisabled".to_owned(), json!(["a", "b", "c"])),
+                        );
+                        if let Some(list_at) = list_at {
+                            let list_at = list_at.min(members.len());
+                            members.insert(
+                                list_at,
+                                ("disabledMcpServers".to_owned(), json!(["b", "x"])),
+                            );
+                        }
+                        let entry = Value::Object(members.into_iter().collect());
+                        let doc = json!({"projects": {"/p": entry, "/q": {"mcpServersDisabled": ["a"]}}, "z": 1});
+                        let text = if compact {
+                            serde_json::to_string(&doc).unwrap()
+                        } else {
+                            pretty(&doc)
+                        };
+                        let f = Fixture::new(&text);
+                        apply_ops(&f, vec![migrate("/p")]);
+                        let mut expected = doc.clone();
+                        expected["projects"]["/p"] = migrated(&doc["projects"]["/p"]);
+                        let want = if compact {
+                            serde_json::to_string(&expected).unwrap()
+                        } else {
+                            pretty(&expected)
+                        };
+                        assert_eq!(
+                            f.text(),
+                            want,
+                            "n {n}, at {at}, list {list_at:?}, compact {compact}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migrating_an_entry_that_holds_only_the_old_list() {
+        for compact in [false, true] {
+            let doc = json!({"projects": {"/p": {"mcpServersDisabled": ["a", "a", "b"]}}});
+            let text = if compact {
+                serde_json::to_string(&doc).unwrap()
+            } else {
+                pretty(&doc)
+            };
+            let f = Fixture::new(&text);
+            apply_ops(&f, vec![migrate("/p")]);
+            let expected = json!({"projects": {"/p": {"disabledMcpServers": ["a", "b"]}}});
+            let want = if compact {
+                serde_json::to_string(&expected).unwrap()
+            } else {
+                pretty(&expected)
+            };
+            assert_eq!(f.text(), want, "compact {compact}");
+        }
+    }
+
+    #[test]
+    fn migrating_keeps_the_spacing_around_the_colon_of_the_renamed_list() {
+        // Seen in the real app: the old list's `": "` became `":"` on a one-line entry.
+        let text = "{\"projects\": {\"/p\": {\"mcpServersDisabled\": [\"a\"]}, \"/q\": {\"x\": 1, \"mcpServersDisabled\" :[\"b\"]}}}";
+        let f = Fixture::new(text);
+        apply_ops(&f, vec![migrate("/p"), migrate("/q")]);
+        assert_eq!(
+            f.text(),
+            "{\"projects\": {\"/p\": {\"disabledMcpServers\": [\"a\"]}, \"/q\": {\"x\": 1, \"disabledMcpServers\" :[\"b\"]}}}"
+        );
+    }
+
+    #[test]
+    fn migrating_covers_every_spelling_of_the_project() {
+        let doc = json!({"projects": {
+            "c:\\work\\app": {"mcpServersDisabled": ["a"]},
+            "C:/work/app/": {"disabledMcpServers": [], "mcpServersDisabled": ["b"]},
+            "C:/work/other": {"mcpServersDisabled": ["c"]}
+        }});
+        let f = Fixture::new(&pretty(&doc));
+        apply_ops(&f, vec![migrate("C:/work/app")]);
+        let after = f.json();
+        assert_eq!(
+            after["projects"]["c:\\work\\app"],
+            json!({"disabledMcpServers": ["a"]})
+        );
+        assert_eq!(
+            after["projects"]["C:/work/app/"],
+            json!({"disabledMcpServers": ["b"]})
+        );
+        // Another project is left alone.
+        assert_eq!(
+            after["projects"]["C:/work/other"],
+            json!({"mcpServersDisabled": ["c"]})
+        );
+    }
+
+    #[test]
+    fn migrating_shows_both_lists_in_the_plan_with_names_cleaned() {
+        let doc = json!({"projects": {"/p": {"disabledMcpServers": ["a"], "mcpServersDisabled": ["a", "b\u{1b}[31m"]}}});
+        let f = Fixture::new(&pretty(&doc));
+        let plan = f.store.prepare(vec![migrate("/p")]).unwrap();
+        let lines = &plan.changes()[0].lines;
+        assert_eq!(
+            lines,
+            &[
+                "  projects[\"/p\"].mcpServersDisabled",
+                "- a",
+                "- b",
+                "  projects[\"/p\"].disabledMcpServers",
+                "+ b",
+            ]
+        );
+        assert!(!lines.iter().any(|l| l.contains('\u{1b}')));
+    }
+
+    #[test]
+    fn migrating_with_another_toggle_in_the_same_plan_does_both() {
+        let doc = json!({"projects": {"/p": {"disabledMcpServers": ["x"], "mcpServersDisabled": ["a"], "k": 1}}});
+        let f = Fixture::new(&pretty(&doc));
+        apply_ops(
+            &f,
+            vec![enable("/p", "x"), migrate("/p"), disable("/p", "y")],
+        );
+        assert_eq!(
+            f.json()["projects"]["/p"],
+            json!({"disabledMcpServers": ["a", "y"], "k": 1})
+        );
+        // And the other way round: a toggle after the migration sees the migrated names.
+        let f = Fixture::new(&pretty(&doc));
+        apply_ops(&f, vec![migrate("/p"), enable("/p", "a")]);
+        assert_eq!(
+            f.json()["projects"]["/p"],
+            json!({"disabledMcpServers": ["x"], "k": 1})
+        );
+    }
+
+    #[test]
+    fn migrating_without_an_old_list_changes_nothing_and_an_unknown_project_is_refused() {
+        let f = Fixture::new(&pretty(&sample()));
+        let before = f.text();
+        let plan = f.store.prepare(vec![migrate("C:/work/app")]).unwrap();
+        assert!(plan.is_empty());
+        f.store.apply(&plan).unwrap();
+        assert_eq!(f.text(), before);
+        assert!(f.backups().is_empty());
+        assert!(matches!(
+            f.store.prepare(vec![migrate("C:/work/none")]),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn an_old_list_of_the_wrong_shape_is_refused_and_the_file_is_untouched() {
+        // Removing the key would lose what is in it, so anything but a list of names is left for the user.
+        for legacy in [
+            json!("a"),
+            json!(["a", 1]),
+            json!(["a", null]),
+            json!({"a": true}),
+        ] {
+            let doc = json!({"projects": {"/p": {"mcpServersDisabled": legacy}}});
+            let f = Fixture::new(&pretty(&doc));
+            let before = f.text();
+            assert!(
+                matches!(
+                    f.store.prepare(vec![migrate("/p")]),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{legacy}"
+            );
+            assert_eq!(f.text(), before);
+        }
+        let text = "{\"projects\": {\"/p\": {\"mcpServersDisabled\": [], \"mcpServersDisabled\": [\"y\"]}}}";
+        let f = Fixture::new(text);
+        assert!(f.store.prepare(vec![migrate("/p")]).is_err());
+    }
+
+    #[test]
+    fn verify_after_a_migration_finds_it_in_place_and_puts_it_back_if_overwritten() {
+        let doc =
+            json!({"projects": {"/p": {"disabledMcpServers": ["x"], "mcpServersDisabled": ["a"]}}});
+        let f = Fixture::new(&pretty(&doc));
+        let plan = apply_ops(&f, vec![migrate("/p")]);
+        let done = f.text();
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
+        assert_eq!(f.text(), done);
+        // Claude writes its own older copy back.
+        std::fs::write(&f.store.path, pretty(&doc)).unwrap();
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(true)
+        );
+        assert_eq!(f.text(), done);
     }
 }
