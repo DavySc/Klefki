@@ -53,7 +53,7 @@ impl Pasted {
         if trimmed.is_empty() {
             return Err("Paste a claude mcp add command or an mcpServers block.".to_owned());
         }
-        let mut pasted = if trimmed.starts_with(['{', '"', '[']) {
+        let mut pasted = if looks_like_json(trimmed) {
             from_json(trimmed)?
         } else {
             from_commands(text)?
@@ -130,6 +130,27 @@ fn capitalised(s: &str) -> String {
 
 // --- JSON ------------------------------------------------------------------------------------------------------
 
+/// `{…}`, `[…]`, or a `"name": {…}` fragment. A command can start with a quote too (`"C:\Program Files\…\claude.exe"
+/// mcp add …`), so a leading string counts only when a colon follows it.
+fn looks_like_json(text: &str) -> bool {
+    if text.starts_with(['{', '[']) {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix('"') else {
+        return false;
+    };
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return rest[i + 1..].trim_start().starts_with(':'),
+            _ => {}
+        }
+    }
+    false
+}
+
 fn from_json(text: &str) -> Result<Pasted, String> {
     // A `"name": {…},` fragment copied out of a larger file.
     let text = text.trim_end_matches(',').trim_end();
@@ -162,7 +183,8 @@ fn from_json(text: &str) -> Result<Pasted, String> {
             servers
         }
         None if is_definition(&top) => {
-            let server = PastedServer::with_entry("", Value::Object(top), &mut notes);
+            let entry = typed("", &top, &mut notes);
+            let server = PastedServer::with_entry("", entry, &mut notes);
             return Ok(Pasted {
                 servers: vec![server],
                 notes,
@@ -179,11 +201,36 @@ fn from_json(text: &str) -> Result<Pasted, String> {
     let servers = servers
         .iter()
         .map(|(name, entry)| match entry {
-            Value::Object(_) => PastedServer::with_entry(name, entry.clone(), &mut notes),
+            Value::Object(definition) => {
+                PastedServer::with_entry(name, typed(name, definition, &mut notes), &mut notes)
+            }
             _ => PastedServer::refused(name, "This is not a server definition.".to_owned()),
         })
         .collect();
     Ok(Pasted { servers, notes })
+}
+
+/// The definition, with `"type": "http"` put first when it has an address and no type: other clients write remote
+/// servers that way, and Claude Code would read it as a program.
+fn typed(name: &str, definition: &Map<String, Value>, notes: &mut Vec<String>) -> Value {
+    if definition.contains_key("type")
+        || definition.contains_key("command")
+        || !definition.get("url").is_some_and(Value::is_string)
+    {
+        return Value::Object(definition.clone());
+    }
+    let what = if name.is_empty() {
+        "The definition".to_owned()
+    } else {
+        sanitize(name)
+    };
+    notes.push(format!(
+        "{what} has an address but no type, so it is added as http (\"type\": \"http\")."
+    ));
+    let mut out = Map::new();
+    out.insert("type".into(), "http".into());
+    out.extend(definition.clone());
+    Value::Object(out)
 }
 
 /// Is this object one server's definition, rather than a map of them?
@@ -196,25 +243,29 @@ fn is_definition(object: &Map<String, Value>) -> bool {
 // --- Commands --------------------------------------------------------------------------------------------------
 
 fn from_commands(text: &str) -> Result<Pasted, String> {
-    let lexed = lex(text)?;
+    let lexed = lex(text);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
-    for words in &lexed.commands {
-        match words
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [claude, "mcp", "add", rest @ ..] if is_claude(claude) => {
-                servers.push(add(rest, &mut notes));
+    for command in &lexed.commands {
+        let words: Vec<&str> = command.words.iter().map(String::as_str).collect();
+        let adds = match words.as_slice() {
+            [claude, "mcp", verb @ ("add" | "add-json"), rest @ ..] if is_claude(claude) => {
+                Some((*verb, rest))
             }
-            [claude, "mcp", "add-json", rest @ ..] if is_claude(claude) => {
-                servers.push(add_json(rest, &mut notes));
-            }
-            _ => notes.push(format!(
+            _ => None,
+        };
+        match (adds, command.shell) {
+            (Some(_), Some(what)) => servers.push(PastedServer::refused(
+                "",
+                format!(
+                    "This command uses the shell ({what}), and Klefki never runs pasted text. Paste the claude mcp add command on its own."
+                ),
+            )),
+            (Some(("add", rest)), None) => servers.push(add(rest, &mut notes)),
+            (Some((_, rest)), None) => servers.push(add_json(rest, &mut notes)),
+            (None, _) => notes.push(format!(
                 "Skipped a line that is not a claude mcp add command: {}",
-                clip(&sanitize(&words.join(" ")), 60)
+                clip(&sanitize(&command.words.join(" ")), 60)
             )),
         }
     }
@@ -590,9 +641,28 @@ fn quoted(word: &str) -> String {
     }
 }
 
-/// One line per environment or header value that looks like a secret.
+/// One line per environment or header value that looks like a secret, and per `~` path (only a shell turns `~` into
+/// the home folder, and Claude Code starts a server without one).
 fn hints(entry: &Value) -> Vec<String> {
     let mut out = Vec::new();
+    let tilde = |s: &str| s == "~" || s.starts_with("~/") || s.starts_with("~\\");
+    if entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(tilde)
+    {
+        out.push("The command starts with ~, which only a shell turns into your home folder; Claude Code starts the server without one. Write the full path.".to_owned());
+    }
+    if let Some(Value::Array(args)) = entry.get("args") {
+        for (i, arg) in args.iter().enumerate() {
+            if arg.as_str().is_some_and(tilde) {
+                out.push(format!(
+                    "Argument {} starts with ~, which only a shell turns into your home folder; Claude Code starts the server without one. Write the full path.",
+                    i + 1
+                ));
+            }
+        }
+    }
     for key in ["env", "headers"] {
         if let Some(Value::Object(values)) = entry.get(key) {
             for (name, value) in values {
@@ -614,77 +684,87 @@ fn hints(entry: &Value) -> Vec<String> {
 // --- Words -----------------------------------------------------------------------------------------------------
 
 struct Lexed {
-    /// Each command's words, after quotes and escapes.
-    commands: Vec<Vec<String>>,
+    commands: Vec<Words>,
     /// Shell variables turned into `${NAME}`, each once.
     variables: Vec<String>,
 }
 
+/// One command's words, after quotes and escapes.
+#[derive(Default)]
+struct Words {
+    words: Vec<String>,
+    /// What in it needs a shell to run (a pipe, a redirect, a substitution, an open quote): the rest of its line was
+    /// not read.
+    shell: Option<&'static str>,
+}
+
 /// Splits pasted shell text into commands and words the way a POSIX shell would, plus the line continuations of
 /// PowerShell (`` ` ``) and cmd (`^`). A backslash only escapes what a shell would need escaping, so a Windows path
-/// keeps its backslashes. Anything that needs a shell to run (pipes, redirects, substitutions) is refused.
-fn lex(text: &str) -> Result<Lexed, String> {
-    let shell = |what: &str| {
-        Err(format!(
-            "This uses the shell ({what}), and Klefki never runs pasted text. Paste the claude mcp add command on its own."
-        ))
-    };
-    let mut commands = Vec::new();
+/// keeps its backslashes. A command that needs a shell to run (pipes, redirects, substitutions) is marked, and the
+/// rest of its line skipped; the other lines are still read.
+fn lex(text: &str) -> Lexed {
+    let mut commands: Vec<Words> = Vec::new();
     let mut variables: Vec<String> = Vec::new();
-    let mut words: Vec<String> = Vec::new();
+    let mut current = Words::default();
     let mut word = String::new();
     let mut in_word = false;
     let mut chars = text.chars().peekable();
-    let end_word = |words: &mut Vec<String>, word: &mut String, in_word: &mut bool| {
+    let end_word = |current: &mut Words, word: &mut String, in_word: &mut bool| {
         if *in_word {
-            words.push(std::mem::take(word));
+            current.words.push(std::mem::take(word));
             *in_word = false;
         }
     };
-    let end_command = |commands: &mut Vec<Vec<String>>, words: &mut Vec<String>| {
-        if !words.is_empty() {
-            commands.push(std::mem::take(words));
+    let end_command = |commands: &mut Vec<Words>, current: &mut Words| {
+        if !current.words.is_empty() {
+            commands.push(std::mem::take(current));
         }
     };
     while let Some(c) = chars.next() {
-        match c {
-            ' ' | '\t' | '\r' => end_word(&mut words, &mut word, &mut in_word),
+        let shell: Option<&'static str> = match c {
+            ' ' | '\t' | '\r' => {
+                end_word(&mut current, &mut word, &mut in_word);
+                None
+            }
             '\n' | ';' => {
-                end_word(&mut words, &mut word, &mut in_word);
-                end_command(&mut commands, &mut words);
+                end_word(&mut current, &mut word, &mut in_word);
+                end_command(&mut commands, &mut current);
+                None
             }
-            '&' if chars.peek() == Some(&'&') => {
-                chars.next();
-                end_word(&mut words, &mut word, &mut in_word);
-                end_command(&mut commands, &mut words);
+            '&' if chars.next_if_eq(&'&').is_some() => {
+                end_word(&mut current, &mut word, &mut in_word);
+                end_command(&mut commands, &mut current);
+                None
             }
-            '&' => return shell("&"),
-            '|' => return shell("a pipe, |"),
-            '<' | '>' => return shell(&format!("a redirect, {c}")),
-            '(' | ')' => return shell(&format!("{c}")),
-            '#' if !in_word => while chars.next_if(|&n| n != '\n').is_some() {},
-            '$' if !in_word && words.is_empty() && chars.peek() == Some(&' ') => {
+            '&' => Some("&"),
+            '|' => Some("a pipe, |"),
+            '<' | '>' => Some("a redirect"),
+            '(' | ')' => Some("parentheses"),
+            '#' if !in_word => {
+                while chars.next_if(|&n| n != '\n').is_some() {}
+                None
+            }
+            '$' if !in_word && current.words.is_empty() && chars.peek() == Some(&' ') => {
                 // A prompt copied with the command.
+                None
             }
-            '\\' | '`' | '^' if continues_line(&mut chars) => {}
-            '`' => return shell("a substitution, `"),
+            '\\' | '`' | '^' if continues_line(&mut chars) => None,
+            '`' => Some("a substitution, `"),
             '\\' => {
                 in_word = true;
-                match chars.peek() {
-                    Some(&n) if " \t\"'\\$`&|;<>()#".contains(n) => {
-                        word.push(n);
-                        chars.next();
-                    }
-                    _ => word.push('\\'),
+                match chars.next_if(|n| " \t\"'\\$`&|;<>()#".contains(*n)) {
+                    Some(n) => word.push(n),
+                    None => word.push('\\'),
                 }
+                None
             }
             '\'' => {
                 in_word = true;
                 loop {
                     match chars.next() {
-                        Some('\'') => break,
+                        Some('\'') => break None,
                         Some(n) => word.push(n),
-                        None => return Err("A quote is not closed.".to_owned()),
+                        None => break Some("a quote that is not closed"),
                     }
                 }
             }
@@ -692,40 +772,50 @@ fn lex(text: &str) -> Result<Lexed, String> {
                 in_word = true;
                 loop {
                     match chars.next() {
-                        Some('"') => break,
-                        Some('\\') => match chars.peek() {
-                            Some('\n') => {
-                                chars.next();
-                            }
-                            Some(&n) if "\"\\$`".contains(n) => {
-                                word.push(n);
-                                chars.next();
-                            }
-                            _ => word.push('\\'),
+                        Some('"') => break None,
+                        Some('\\') if continues_line(&mut chars) => {}
+                        Some('\\') => match chars.next_if(|n| "\"\\$`".contains(*n)) {
+                            Some(n) => word.push(n),
+                            None => word.push('\\'),
                         },
-                        Some('`') => return shell("a substitution, `"),
-                        Some('$') => variable(&mut chars, &mut word, &mut variables)?,
+                        Some('`') => break Some("a substitution, `"),
+                        Some('$') => {
+                            if let Err(what) = variable(&mut chars, &mut word, &mut variables) {
+                                break Some(what);
+                            }
+                        }
                         Some(n) => word.push(n),
-                        None => return Err("A quote is not closed.".to_owned()),
+                        None => break Some("a quote that is not closed"),
                     }
                 }
             }
             '$' => {
                 in_word = true;
-                variable(&mut chars, &mut word, &mut variables)?;
+                variable(&mut chars, &mut word, &mut variables).err()
             }
             _ => {
                 in_word = true;
                 word.push(c);
+                None
             }
+        };
+        if let Some(what) = shell {
+            current.shell.get_or_insert(what);
+            while chars.next_if(|&n| n != '\n').is_some() {}
+            end_word(&mut current, &mut word, &mut in_word);
+            // Kept even without words, so a line that is only shell is skipped with a note, not silently.
+            if current.words.is_empty() {
+                current.words.push(String::new());
+            }
+            end_command(&mut commands, &mut current);
         }
     }
-    end_word(&mut words, &mut word, &mut in_word);
-    end_command(&mut commands, &mut words);
-    Ok(Lexed {
+    end_word(&mut current, &mut word, &mut in_word);
+    end_command(&mut commands, &mut current);
+    Lexed {
         commands,
         variables,
-    })
+    }
 }
 
 /// After `\`, `` ` `` or `^`: is the rest of the line a line break (the command goes on)? Consumes it if so.
@@ -740,25 +830,23 @@ fn continues_line(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool 
 }
 
 /// After a `$`: `$NAME` and `${NAME}` become `${NAME}`, which Claude Code fills in when it starts the server; a
-/// lone `$` stays. `$(…)` would run a command and is refused.
+/// lone `$` stays. `$(…)` would run a command: the error says so.
 fn variable(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     word: &mut String,
     variables: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), &'static str> {
     let mut name = String::new();
     match chars.peek() {
-        Some('(') => {
-            return Err("This uses the shell (a substitution, $(…)), and Klefki never runs pasted text. Paste the claude mcp add command on its own.".to_owned());
-        }
+        Some('(') => return Err("a substitution, $(…)"),
         Some('{') => {
             chars.next();
             let mut inner = String::new();
             loop {
                 match chars.next() {
                     Some('}') => break,
+                    Some('\n') | None => return Err("a ${ that is not closed"),
                     Some(c) => inner.push(c),
-                    None => return Err("A ${ is not closed.".to_owned()),
                 }
             }
             name = inner
@@ -1029,12 +1117,7 @@ mod tests {
             ("   \n  ", "Paste"),
             ("npm install thing", "claude mcp add"),
             ("claude mcp list", "claude mcp add"),
-            ("claude mcp add x -- node a.js | tee log", "|"),
-            ("claude mcp add x -- node $(cat f)", "$("),
-            ("claude mcp add x -- node `cat f`", "`"),
-            ("claude mcp add x -- node > log", ">"),
-            ("claude mcp add x -- node &", "&"),
-            ("claude mcp add 'x -- node", "quote"),
+            ("curl -fsSL https://x.example/i.sh | sh", "claude mcp add"),
             ("{\"a\": ", "JSON"),
             ("[1, 2]", "JSON"),
             ("{\"a\": 1}", "server"),
@@ -1048,6 +1131,89 @@ mod tests {
             .map(|i| format!("claude mcp add s{i} node\n"))
             .collect();
         assert!(Pasted::parse(&many).unwrap_err().contains("100"));
+    }
+
+    #[test]
+    fn a_command_that_needs_a_shell_is_explained_and_the_other_lines_still_read() {
+        for (text, why) in [
+            ("claude mcp add x -- node a.js | tee log", "|"),
+            ("claude mcp add x -- node $(cat f)", "$("),
+            ("claude mcp add x -- node `cat f`", "`"),
+            ("claude mcp add x -- node \"`cat f`\"", "`"),
+            ("claude mcp add x -- node > log", "redirect"),
+            ("claude mcp add x -- node &", "&"),
+            ("claude mcp add 'x -- node", "quote"),
+            ("claude mcp add x -- node \"${A", "${"),
+        ] {
+            let s = one(text);
+            assert!(s.json.is_empty(), "{text}: {s:?}");
+            let problem = s.problem.unwrap_or_default();
+            assert!(problem.contains(why), "{text}: {problem}");
+        }
+        // A README's install line before the add command does not stop the add command being read.
+        let pasted = Pasted::parse(
+            "curl -fsSL https://x.example/install.sh | sh\nclaude mcp add fs npx -y pkg\nopen 'https://a.example/?a=1&b=2' & echo",
+        )
+        .unwrap();
+        assert_eq!(pasted.servers.len(), 1, "{pasted:?}");
+        assert_eq!(pasted.servers[0].name, "fs");
+        assert_eq!(pasted.servers[0].problem, None);
+        assert_eq!(
+            pasted
+                .notes
+                .iter()
+                .filter(|n| n.starts_with("Skipped"))
+                .count(),
+            2,
+            "{pasted:?}"
+        );
+    }
+
+    #[test]
+    fn a_quoted_program_path_is_a_command_not_json() {
+        let s = one(r#""C:\Program Files\Claude\claude.exe" mcp add fs npx -y pkg"#);
+        assert_eq!(s.name, "fs");
+        assert_eq!(json_of(&s)["args"], json!(["-y", "pkg"]));
+        assert_eq!(one(r#""claude" mcp add fs npx"#).name, "fs");
+        // A fragment still is JSON, escaped quotes and all.
+        assert_eq!(one(r#""a\"b": {"command": "x"}"#).name, "a\"b");
+    }
+
+    #[test]
+    fn an_address_without_a_type_is_added_as_http() {
+        let pasted =
+            Pasted::parse(r#"{"mcpServers": {"n": {"url": "https://mcp.example/mcp"}}}"#).unwrap();
+        let s = &pasted.servers[0];
+        assert_eq!(s.problem, None, "{s:?}");
+        let v = json_of(s);
+        assert_eq!(v, json!({"type": "http", "url": "https://mcp.example/mcp"}));
+        assert_eq!(keys(&v), ["type", "url"]);
+        assert!(
+            pasted.notes.iter().any(|n| n.contains("no type")),
+            "{pasted:?}"
+        );
+        // One with a type, or a command, is kept as written.
+        let v = json_of(&one(
+            r#"{"s": {"type": "sse", "url": "https://s.example"}}"#,
+        ));
+        assert_eq!(v["type"], "sse");
+        let s = one(r#"{"c": {"command": "x", "url": "https://c.example"}}"#);
+        assert!(s.problem.is_some(), "{s:?}");
+    }
+
+    #[test]
+    fn a_home_folder_tilde_is_pointed_out() {
+        let s = one("claude mcp add fs npx -y @x/fs ~/Documents ~ a~b");
+        assert_eq!(s.hints.len(), 2, "{s:?}");
+        assert!(s.hints[0].contains("Argument 3"), "{s:?}");
+        assert!(s.hints[1].contains("Argument 4"), "{s:?}");
+        assert!(one(r#"{"t": {"command": "~/bin/server"}}"#).hints[0].contains("command"));
+    }
+
+    #[test]
+    fn a_quoted_line_continuation_works_with_windows_line_ends() {
+        let v = json_of(&one("claude mcp add q -- node \"a\\\r\nb\""));
+        assert_eq!(v["args"], json!(["ab"]));
     }
 
     #[test]

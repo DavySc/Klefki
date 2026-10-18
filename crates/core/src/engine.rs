@@ -3593,7 +3593,7 @@ mod tests {
         }
     }
 
-    const PASTED_FS: &str = r#"{"type": "stdio", "command": "npx", "args": ["-y", "@x/fs", "/tmp"], "env": {"API_KEY": "pasted-secret", "HOME_DIR": "${HOME}"}}"#;
+    const PASTED_FS: &str = r#"{"type": "stdio", "command": "npx", "args": ["-y", "@x/fs", "/tmp"], "env": {"API_KEY": "pasted-secret", "HOME_DIR": "${HOME}", "MIXED": "sk-live-123${SUFFIX}", "DEFAULTED": "${TOK:-ghp_realsecret}"}}"#;
 
     #[test]
     fn adding_a_server_writes_it_where_asked_and_shows_everything_it_runs() {
@@ -3620,15 +3620,29 @@ mod tests {
         ] {
             assert!(review.lines.iter().any(|l| l == line), "{line}: {review:?}");
         }
-        // The variable it reads is named; the value typed in is not shown anywhere.
+        // The variables it reads are named; what was typed in is not shown anywhere, even next to a reference.
+        for name in ["HOME", "SUFFIX", "TOK"] {
+            assert!(
+                review
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(&format!("variable {name}"))),
+                "{name}: {review:?}"
+            );
+        }
         assert!(
-            review.lines.iter().any(|l| l.contains("HOME")),
+            review
+                .lines
+                .iter()
+                .any(|l| l == "Environment: HOME_DIR=${HOME}"),
             "{review:?}"
         );
         let shown = format!("{plan:?}");
-        assert!(!shown.contains("pasted-secret"), "{shown}");
+        for secret in ["pasted-secret", "sk-live-123", "ghp_realsecret"] {
+            assert!(!shown.contains(secret), "{secret}: {shown}");
+        }
         assert!(
-            plan.notes.iter().any(|n| n.contains("starts")),
+            plan.notes.iter().any(|n| n.contains("starts its command")),
             "{:?}",
             plan.notes
         );

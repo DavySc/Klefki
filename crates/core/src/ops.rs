@@ -617,8 +617,9 @@ fn add(
     Ok(())
 }
 
-/// `entry` with every environment and header value hidden, except those that refer to the user's variables
-/// (`Bearer ${TOKEN}`): what they read is what the review is for.
+/// `entry` with every environment and header value hidden. A value that reads the user's variables shows only
+/// those (`<hidden> ${SUFFIX}`), so the review still says which are read; one made of nothing but references, after
+/// an auth scheme (`Bearer ${TOKEN}`), is shown as it is.
 fn shown_values(entry: &Value) -> Value {
     let mut out = entry::masked(entry);
     for key in ["env", "headers"] {
@@ -626,16 +627,50 @@ fn shown_values(entry: &Value) -> Value {
             (out.get_mut(key), entry.get(key))
         {
             for (name, value) in values.iter_mut() {
-                if let Some(original) = was
-                    .get(name)
-                    .filter(|v| v.as_str().is_some_and(|s| !env_references(s).is_empty()))
-                {
-                    *value = original.clone();
+                let Some(original) = was.get(name).and_then(Value::as_str) else {
+                    continue;
+                };
+                let names = env_references(original);
+                if names.is_empty() {
+                    continue;
                 }
+                *value = Value::String(if only_references(original) {
+                    original.to_owned()
+                } else {
+                    let refs: Vec<String> = names.iter().map(|n| format!("${{{n}}}")).collect();
+                    format!("{} {}", entry::MASK, refs.join(" "))
+                });
             }
         }
     }
     out
+}
+
+/// `${A}`, `${A}${B}`, `Bearer ${TOKEN}`: nothing typed in that could be a secret (no default value either).
+fn only_references(value: &str) -> bool {
+    let mut rest = ["Bearer ", "Basic ", "Token "]
+        .iter()
+        .find_map(|scheme| value.strip_prefix(scheme))
+        .unwrap_or(value);
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(inner) = rest.strip_prefix("${") else {
+            return false;
+        };
+        let Some(end) = inner.find('}') else {
+            return false;
+        };
+        let name = &inner[..end];
+        let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return false;
+        }
+        rest = &inner[end + 1..];
+    }
+    true
 }
 
 fn approve(

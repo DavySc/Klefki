@@ -1469,7 +1469,7 @@ impl ShellApp {
                 }
                 Some(places) if ready => {
                     let names: Vec<&str> = addable.iter().map(|&i| form.names[i].as_str()).collect();
-                    ui.add(egui::Label::new(format!("Adds {} {places}.", and_list(&names))).wrap());
+                    ui.add(egui::Label::new(format!("Adds {} {places}.", list_in_words(&names, "server"))).wrap());
                 }
                 Some(_) => {}
             }
@@ -1491,18 +1491,11 @@ impl ShellApp {
             });
         });
         settle(ctx, &modal.response);
-        if review {
-            let changes = match &form.read {
-                Ok(read) => addable
-                    .iter()
-                    .map(|&i| Change::Add {
-                        name: form.names[i].clone(),
-                        json: read.servers[i].json.clone(),
-                        targets: form.places.targets(),
-                    })
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
+        // The text and names may have changed in this frame: what is sent is checked again as it is now.
+        let changes = review
+            .then(|| form.changes(&self.snapshot.servers))
+            .flatten();
+        if let Some(changes) = changes {
             self.add = None;
             self.prepare(changes);
         } else if cancel || modal.should_close() {
@@ -2898,6 +2891,26 @@ impl AddForm {
         self.read_for.clone_from(&self.text);
     }
 
+    /// What Review sends, read and checked as the dialog is now; `None` while something stops it.
+    fn changes(&mut self, servers: &[ServerRow]) -> Option<Vec<Change>> {
+        self.reread();
+        let checked = self.check(servers);
+        let targets = self.places.targets();
+        let read = self.read.as_ref().ok()?;
+        if targets.is_empty() || checked.iter().any(|c| matches!(c, Check::Name(_))) {
+            return None;
+        }
+        let changes: Vec<Change> = (0..checked.len())
+            .filter(|&i| checked[i] == Check::Ready)
+            .map(|i| Change::Add {
+                name: self.names[i].clone(),
+                json: read.servers[i].json.clone(),
+                targets: targets.clone(),
+            })
+            .collect();
+        (!changes.is_empty()).then_some(changes)
+    }
+
     /// Each server read, in order: ready, left out, or waiting for a better name.
     fn check(&self, servers: &[ServerRow]) -> Vec<Check> {
         let Ok(read) = &self.read else {
@@ -2955,12 +2968,13 @@ fn name_problem(name: &str) -> Option<String> {
     })
 }
 
-/// `a`, `a and b`, `a, b and c`.
-fn and_list(items: &[&str]) -> String {
+/// `a`, `a and b`, `a, b and c`; more than three are counted: `5 projects`.
+fn list_in_words(items: &[&str], noun: &str) -> String {
     match items {
         [] => String::new(),
         [one] => (*one).to_owned(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+        [rest @ .., last] if items.len() <= 3 => format!("{} and {last}", rest.join(", ")),
+        _ => format!("{} {noun}s", items.len()),
     }
 }
 
@@ -3136,14 +3150,8 @@ impl Places {
 
 /// `for the user`, `in a and b`, `for the user and in 5 projects`; None for nowhere.
 fn places_in_words(user: bool, folders: &[&str]) -> Option<String> {
-    let projects = match folders {
-        [] => None,
-        [one] => Some(format!("in {one}")),
-        [rest @ .., last] if folders.len() <= 3 => {
-            Some(format!("in {} and {last}", rest.join(", ")))
-        }
-        _ => Some(format!("in {} projects", folders.len())),
-    };
+    let projects =
+        (!folders.is_empty()).then(|| format!("in {}", list_in_words(folders, "project")));
     match (user, projects) {
         (false, None) => None,
         (true, None) => Some("for the user".to_owned()),
@@ -6142,6 +6150,18 @@ mod tests {
                 targets: vec![Target::User],
             }]
         );
+    }
+
+    #[test]
+    fn many_servers_are_counted_not_listed() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text: String = (0..5)
+            .map(|i| format!("claude mcp add -s user s{i} node\n"))
+            .collect();
+        paste(&mut h, &text);
+        h.get_by_label_contains("Adds 5 servers for the user.");
     }
 
     #[test]
