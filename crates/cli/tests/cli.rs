@@ -24,6 +24,11 @@ fn fake_claude() -> &'static Path {
     })
 }
 
+// Secrets typed into a stdio server's arguments, in the three ways they turn up. None may be printed.
+const API_KEY: &str = "sk-live-ARGSECRET123456";
+const TOKEN_FLAG: &str = "--token=tok-SECRET-98765";
+const GHP: &str = "ghp_abcdefghijklmnop1234";
+
 fn get_output(name: &str, status: &str, extra: &str) -> String {
     format!(
         "{name}:\n  Scope: User config (available in all your projects)\n  Status: {status}\n{extra}  Type: stdio\n  Command: npx\n\nTo remove this server, run: claude mcp remove {name} -s user\n"
@@ -47,7 +52,7 @@ impl Env {
         let key = project.to_string_lossy().replace('\\', "/");
         let claude_json = serde_json::json!({
             "mcpServers": {
-                "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-mcp"]},
+                "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-mcp", "--api-key", API_KEY, TOKEN_FLAG, GHP]},
                 "beta": {"type": "http", "url": "http://127.0.0.1:9/mcp"},
                 "delta": {"type": "sse", "url": "https://delta.example.com/sse"},
             },
@@ -197,7 +202,7 @@ fn list_shows_every_server_grouped_by_scope_and_project_without_running_anything
     let alpha = line_of(&stdout, "alpha");
     assert!(alpha.contains(" on "), "{alpha}");
     assert!(
-        alpha.contains("stdio") && alpha.contains("npx -y alpha-mcp"),
+        alpha.contains("stdio") && alpha.contains("npx -y alpha-mcp --api-key …"),
         "{alpha}"
     );
     assert!(line_of(&stdout, "delta").contains(" off "), "{stdout}");
@@ -225,6 +230,7 @@ fn list_json_has_one_object_per_server_with_stable_fields() {
     let out = env.run(&["list", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(v["schema"], 1);
     let servers = v["servers"].as_array().unwrap();
     assert_eq!(servers.len(), 5, "{v:#}");
     let find = |name: &str| servers.iter().find(|s| s["name"] == name).unwrap();
@@ -263,6 +269,10 @@ fn list_with_names_shows_only_those() {
 fn an_unknown_name_is_a_usage_error_that_suggests_a_case_match() {
     let env = Env::new();
     for cmd in ["list", "status"] {
+        let out = env.run(&[cmd, "gama"]);
+        assert_eq!(out.status.code(), Some(2), "{cmd}");
+        let err = text(&out.stderr);
+        assert!(err.contains("did you mean \"gamma\""), "{err}");
         let out = env.run(&[cmd, "Gamma"]);
         assert_eq!(out.status.code(), Some(2), "{cmd}");
         let err = text(&out.stderr);
@@ -301,7 +311,7 @@ fn status_checks_user_and_local_servers_that_are_on_and_reports_failures() {
         .nth(1)
         .unwrap_or("");
     assert!(
-        under_beta.starts_with("    ") && !under_beta.trim().is_empty(),
+        under_beta.starts_with("    ") && under_beta.trim().starts_with("beta: "),
         "no hint under beta:\n{stdout}"
     );
     // Off: shown, not checked.
@@ -312,6 +322,10 @@ fn status_checks_user_and_local_servers_that_are_on_and_reports_failures() {
     // A project server runs the repository's command: not checked unless named, and the output says how.
     let docs = line_of(&stdout, "docs");
     assert!(docs.contains("klefki-cli status docs"), "{stdout}");
+    assert!(
+        docs.contains("node tools/docs-mcp.js"),
+        "the command it would run: {stdout}"
+    );
     let mut gets = env.gets();
     gets.sort();
     gets.dedup();
@@ -332,6 +346,12 @@ fn status_checks_a_named_project_server_and_exits_zero_when_it_connects() {
     );
     assert!(line_of(&stdout, "docs").contains("Connected"), "{stdout}");
     assert!(!stdout.contains("alpha"), "{stdout}");
+    // What it runs is said before it runs.
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("docs (from ") && err.contains("runs: node tools/docs-mcp.js"),
+        "{err}"
+    );
     // Only what was asked runs: no background check of the other servers.
     assert_eq!(env.gets(), ["docs"]);
 }
@@ -342,7 +362,8 @@ fn status_json_marks_what_was_checked_and_why_not() {
     let out = env.status(&["--json"]);
     assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    assert_eq!(v["cli_version"], "2.1.302");
+    assert_eq!(v["schema"], 1);
+    assert_eq!(v["claude_version"], "2.1.302");
     let servers = v["servers"].as_array().unwrap();
     let find = |name: &str| servers.iter().find(|s| s["name"] == name).unwrap();
     assert_eq!(find("alpha")["status"], "connected");
@@ -356,11 +377,15 @@ fn status_json_marks_what_was_checked_and_why_not() {
     );
     assert!(find("beta")["hint"]["title"].is_string(), "{v:#}");
     assert_eq!(find("gamma")["status"], "needs_auth");
+    assert_eq!(find("alpha")["skipped"], serde_json::Value::Null);
     assert_eq!(find("delta")["checked"], false);
     assert_eq!(find("delta")["skipped"], "off");
+    // Only what this run found is a status: `select(.status == "connected")` never counts an unchecked server.
+    assert_eq!(find("delta")["status"], serde_json::Value::Null);
     assert_eq!(find("docs")["checked"], false);
     assert_eq!(find("docs")["skipped"], "project_server");
-    assert_eq!(find("docs")["status"], "pending_approval");
+    assert_eq!(find("docs")["status"], serde_json::Value::Null);
+    assert_eq!(find("docs")["last_known"], "pending_approval");
 }
 
 #[test]
@@ -368,7 +393,8 @@ fn status_without_a_usable_claude_cli_says_so_and_fails() {
     let env = Env::new();
     let missing = env.root().join("no-such-claude");
     let out = env.run(&["status", "--claude", &missing.to_string_lossy()]);
-    assert_eq!(out.status.code(), Some(1));
+    // Not 1: a script must tell "a server is down" from "the tool cannot work".
+    assert_eq!(out.status.code(), Some(3));
     let err = text(&out.stderr);
     assert!(err.to_lowercase().contains("claude"), "{err}");
     assert!(out.stdout.is_empty(), "{}", text(&out.stdout));
@@ -376,7 +402,7 @@ fn status_without_a_usable_claude_cli_says_so_and_fails() {
     let shim = env.root().join("claude.cmd");
     std::fs::write(&shim, "@echo off\n").unwrap();
     let out = env.run(&["status", "--claude", &shim.to_string_lossy()]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(3));
     assert!(env.gets().is_empty());
 }
 
@@ -498,5 +524,109 @@ fn no_configuration_at_all_is_not_an_error() {
         text(&out.stdout).contains("No MCP servers"),
         "{}",
         text(&out.stdout)
+    );
+}
+
+#[test]
+fn secrets_in_a_stdio_servers_arguments_are_never_printed() {
+    // Review of #25: `--api-key sk-live-…` was printed as written, into scrollback, logs and files.
+    let env = Env::new();
+    let claude = fake_claude().to_string_lossy().into_owned();
+    for args in [
+        &["list"][..],
+        &["list", "--json"],
+        &["status", "alpha", "--claude", &claude],
+        &["status", "--json", "--claude", &claude],
+    ] {
+        let out = env.run(args);
+        let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+        for secret in [API_KEY, "tok-SECRET-98765", GHP] {
+            assert!(!all.contains(secret), "{args:?} printed {secret}:\n{all}");
+        }
+        assert!(all.contains("alpha"), "{args:?}: {all}");
+    }
+}
+
+#[test]
+fn a_named_server_that_is_off_is_not_checked() {
+    // Review of #25: `status delta` checked a server Claude Code does not start, and said "Connected".
+    let env = Env::new();
+    let out = env.status(&["delta"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let delta = line_of(&stdout, "delta");
+    assert!(
+        delta.contains("Off") && delta.contains("turn it on first"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Connected"), "{stdout}");
+    let out = env.status(&["delta", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["servers"][0]["skipped"], "off");
+    assert_eq!(v["servers"][0]["checked"], false);
+    assert!(env.gets().is_empty(), "{:?}", env.gets());
+}
+
+#[test]
+fn a_rejected_project_server_is_not_checked_even_when_named() {
+    let env = Env::new();
+    let settings = env.root().join("repo").join(".claude");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(
+        settings.join("settings.local.json"),
+        r#"{"disabledMcpjsonServers": ["docs"]}"#,
+    )
+    .unwrap();
+    let out = env.status(&["docs"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    let docs = line_of(&stdout, "docs");
+    assert!(
+        docs.contains("Rejected") && !docs.contains("klefki-cli status"),
+        "{stdout}"
+    );
+    assert!(
+        !text(&out.stderr).contains("runs:"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(env.gets().is_empty());
+}
+
+#[test]
+fn when_every_check_breaks_down_the_tool_is_the_problem() {
+    // Claude Code ran but said nothing understandable for any server: exit 3, like a missing CLI, not 1.
+    let env = Env::new();
+    std::fs::write(env.root().join("garbage.txt"), "nothing useful\n").unwrap();
+    std::fs::write(
+        env.root().join("scenario.json"),
+        r#"{"rules":[{"args":["--version"],"stdout_file":"version.txt"},
+            {"args":["mcp","get"],"stdout_file":"garbage.txt"}]}"#,
+    )
+    .unwrap();
+    let out = env.status(&[]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    let alpha = line_of(&stdout, "alpha");
+    assert!(
+        alpha.contains("Check failed") && !alpha.contains("Not checked"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn a_mistyped_command_gets_a_suggestion_and_no_command_gets_the_help() {
+    let env = Env::new();
+    let out = env.run(&["lst"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(err.contains("did you mean \"list\""), "{err}");
+    let out = env.run(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains("Examples:") && err.contains("--claude"),
+        "{err}"
     );
 }

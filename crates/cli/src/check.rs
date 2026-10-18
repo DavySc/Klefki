@@ -20,11 +20,12 @@ const CHECKS_AT_ONCE: u32 = 3;
 const PER_CHECK: Duration = Duration::from_secs(35);
 
 /// Starts the engine, waits for its snapshot, asks for every server `pick` chooses, and collects the answers.
-/// `progress` is told how many of how many have answered. `Err` when the Claude CLI cannot be used.
+/// `progress` is told how many of how many have answered, and the first one still waited on. `Err` when the
+/// Claude CLI cannot be used.
 pub fn run(
     claude: Option<PathBuf>,
     pick: impl FnOnce(&Snapshot) -> Vec<ServerId>,
-    mut progress: impl FnMut(usize, usize),
+    mut progress: impl FnMut(usize, usize, Option<&str>),
 ) -> Result<Answers, String> {
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     let core = api::start_headless(claude, move || {
@@ -54,7 +55,13 @@ pub fn run(
     let mut checked = HashMap::new();
     let rounds = (total as u32).div_ceil(CHECKS_AT_ONCE) + 1;
     let deadline = Instant::now() + PER_CHECK * rounds;
-    progress(0, total);
+    let waited_on = |waiting: &HashSet<ConnectionId>| {
+        wanted
+            .iter()
+            .find(|id| waiting.contains(&id.connection))
+            .map(|id| id.name.as_str())
+    };
+    progress(0, total, waited_on(&waiting));
     while !waiting.is_empty() {
         let Some(event) = next(&core, &wake_rx, Some(deadline)) else {
             break;
@@ -76,7 +83,7 @@ pub fn run(
                     hint,
                 },
             );
-            progress(checked.len(), total);
+            progress(checked.len(), total, waited_on(&waiting));
         }
     }
     Ok(Answers {

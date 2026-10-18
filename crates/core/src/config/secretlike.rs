@@ -117,6 +117,46 @@ fn sounds_secret(name: &str) -> bool {
             .any(|w| WORDS.contains(&w))
 }
 
+/// What a command line's arguments show: each argument as written, except one that looks like a secret, which reads
+/// `…`. That is a value after a flag that sounds secret (`--api-key X`, `--token=X`, `API_KEY=X`), unless it is a
+/// path or a `${VAR}` reference, and any argument shaped like a known credential (`sk-…`, `ghp_…`) or a URL with a
+/// password. Only for showing: the definition itself is never changed.
+pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    const HIDDEN: &str = "…";
+    let mut out = Vec::new();
+    let mut after_secret_flag = false;
+    for arg in args {
+        let shown = if after_secret_flag && !arg.starts_with('-') && hideable(arg) {
+            HIDDEN.to_owned()
+        } else if let Some((name, value)) = arg.split_once('=')
+            && !name.is_empty()
+            && !value.is_empty()
+            && ((sounds_secret(name) && hideable(value)) || looks_secret(name, value))
+        {
+            format!("{name}={HIDDEN}")
+        } else if looks_secret("", arg) {
+            HIDDEN.to_owned()
+        } else {
+            arg.to_owned()
+        };
+        after_secret_flag = arg.starts_with('-') && !arg.contains('=') && sounds_secret(arg);
+        out.push(shown);
+    }
+    out
+}
+
+/// A value after a secret-sounding name that is worth hiding: not a reference, not a path, not a plain word such
+/// as `true`.
+fn hideable(value: &str) -> bool {
+    !(value.contains("${")
+        || value.starts_with(['/', '~', '.'])
+        || value.contains('\\')
+        || value.get(1..3) == Some(":/")
+        || ["true", "false", "yes", "no", "none"]
+            .iter()
+            .any(|w| value.eq_ignore_ascii_case(w)))
+}
+
 /// `name` as an environment variable name: upper case letters, digits and `_`, not starting with a digit.
 fn variable(name: &str) -> String {
     if name.eq_ignore_ascii_case("authorization")
@@ -143,6 +183,42 @@ fn variable(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_looking_arguments_are_hidden_from_a_shown_command_line() {
+        let shown = |args: &[&str]| shown_args(args.iter().copied()).join(" ");
+        // Review of #25: `--api-key sk-live-…` was printed as written.
+        assert_eq!(
+            shown(&["-y", "alpha-mcp", "--api-key", "sk-live-ARGSECRET123456"]),
+            "-y alpha-mcp --api-key …"
+        );
+        assert_eq!(shown(&["--token=abc12345"]), "--token=…");
+        assert_eq!(shown(&["--password", "hunter2"]), "--password …");
+        assert_eq!(shown(&["--secret", "x"]), "--secret …");
+        assert_eq!(shown(&["API_KEY=0a1b2c3d4e"]), "API_KEY=…");
+        // A credential's shape alone gives it away, wherever it is.
+        assert_eq!(shown(&["serve", "ghp_abcdefghijklmnop1234"]), "serve …");
+        assert_eq!(
+            shown(&["--db", "postgres://me:pw123@db.example.com/x"]),
+            "--db …"
+        );
+        // Not secrets: paths, references, settings, the flag after a secret flag, ordinary words.
+        assert_eq!(
+            shown(&["--token-file", "/run/secrets/token"]),
+            "--token-file /run/secrets/token"
+        );
+        assert_eq!(shown(&["--token", "${GH_TOKEN}"]), "--token ${GH_TOKEN}");
+        assert_eq!(shown(&["--auth", "--verbose"]), "--auth --verbose");
+        assert_eq!(shown(&["--use-auth=true"]), "--use-auth=true");
+        assert_eq!(
+            shown(&["-y", "@modelcontextprotocol/server-filesystem", "C:/Repos"]),
+            "-y @modelcontextprotocol/server-filesystem C:/Repos"
+        );
+        assert_eq!(
+            shown(&["--key", "C:\\keys\\a.pem"]),
+            "--key C:\\keys\\a.pem"
+        );
+    }
 
     fn suggests(name: &str, value: &str) -> Option<String> {
         suggestion(name, value)

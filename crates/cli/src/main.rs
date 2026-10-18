@@ -3,6 +3,7 @@
 mod args;
 mod check;
 mod render;
+mod suggest;
 
 use args::{Cmd, Usage};
 use klefki_core::api::{self, Scope, ServerRow, Snapshot};
@@ -11,8 +12,14 @@ use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
 const OK: u8 = 0;
+/// A server checked is not connected.
 const PROBLEM: u8 = 1;
 const USAGE: u8 = 2;
+/// Claude Code could not be used, so nothing is known about the servers: a broken tool, not a broken server.
+const UNAVAILABLE: u8 = 3;
+
+const SHORT_USAGE: &str =
+    "Usage: klefki-cli list|status [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 
 fn main() -> ExitCode {
     let code = match args::parse(std::env::args_os().skip(1)) {
@@ -24,9 +31,18 @@ fn main() -> ExitCode {
             json,
             claude,
         }) => status(&names, json, claude),
-        Err(Usage(why)) => usage(&why),
+        Err(Usage::NoCommand) => {
+            eprint!("{}", args::HELP);
+            USAGE
+        }
+        Err(Usage::Bad(why)) => usage(&why),
     };
     ExitCode::from(code)
+}
+
+/// The home folder as text, for shortening paths in headings.
+fn home() -> Option<String> {
+    std::env::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 fn list(names: &[String], json: bool) -> u8 {
@@ -39,7 +55,7 @@ fn list(names: &[String], json: bool) -> u8 {
     let text = if json {
         render::list_json(&snapshot, &rows)
     } else {
-        render::list_text(&snapshot, &rows)
+        render::list_text(&snapshot, &rows, home().as_deref())
     };
     out(&text)
 }
@@ -49,91 +65,108 @@ fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u
     if let Err(why) = select(&api::load_snapshot(), names) {
         return usage(&why);
     }
+    let named = !names.is_empty();
     let live = std::io::stderr().is_terminal();
+    let mut shown = 0;
     let answers = check::run(
         claude,
         |snapshot| {
-            select(snapshot, names)
+            let rows: Vec<&ServerRow> = select(snapshot, names)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|row| to_check(row, names))
-                .map(ServerRow::id)
-                .collect()
-        },
-        |done, total| {
-            if live && total > 0 {
-                let mut err = std::io::stderr().lock();
-                let _ = if done == 0 {
-                    write!(err, "Checking {total} server{}…", plural(total))
-                } else {
-                    write!(err, "\rChecked {done} of {total}…        ")
-                };
-                let _ = err.flush();
+                .filter(|row| render::skip(row, named).is_none())
+                .collect();
+            // A project server's check may run the repository's own command: say which before it runs, as the
+            // app shows the command next to its Check button.
+            for row in rows.iter().filter(|r| r.scope == Scope::Project) {
+                eprintln!(
+                    "{} (from {}/.mcp.json) runs: {}",
+                    row.name,
+                    row.project.as_deref().unwrap_or("?"),
+                    row.target
+                );
             }
+            rows.into_iter().map(ServerRow::id).collect()
+        },
+        |done, total, waiting| {
+            if !live || total == 0 {
+                return;
+            }
+            let line = match (done, waiting) {
+                (0, Some(name)) => {
+                    format!(
+                        "Checking {total} server{}, waiting for {name}…",
+                        plural(total)
+                    )
+                }
+                (_, Some(name)) => format!("Checked {done} of {total}, waiting for {name}…"),
+                (_, None) => format!("Checked {done} of {total}."),
+            };
+            let len = line.chars().count();
+            let mut err = std::io::stderr().lock();
+            let _ = write!(err, "\r{line}{:pad$}", "", pad = shown.max(len) - len);
+            let _ = err.flush();
+            shown = shown.max(len);
         },
     );
-    if live {
+    if live && shown > 0 {
         // The progress line goes away once the answers are in, so only the table stays on screen.
-        eprint!("\r{:40}\r", "");
+        eprint!("\r{:shown$}\r", "");
     }
     let answers = match answers {
         Ok(answers) => answers,
         Err(problem) => {
             eprintln!("klefki-cli: {problem}");
             eprintln!("Name the Claude CLI with --claude PATH if it is installed somewhere else.");
-            return PROBLEM;
+            return UNAVAILABLE;
         }
     };
     warn(&answers.snapshot);
-    let rows = select(&answers.snapshot, names).unwrap_or_default();
-    let rows: Vec<(&ServerRow, Outcome)> = rows
+    let rows: Vec<(&ServerRow, Outcome)> = select(&answers.snapshot, names)
+        .unwrap_or_default()
         .into_iter()
         .map(|row| {
-            let outcome = if !to_check(row, names) {
-                if row.scope == Scope::Project && row.enabled {
-                    Outcome::ProjectServer
-                } else {
-                    Outcome::Off
-                }
-            } else {
+            let outcome = render::skip(row, named).unwrap_or_else(|| {
                 match answers.checked.get(&row.connection) {
                     Some(c) => Outcome::Checked(c.clone()),
                     None => Outcome::NoAnswer,
                 }
-            };
+            });
             (row, outcome)
         })
         .collect();
-    let problem = rows.iter().any(|(_, o)| o.is_problem());
+    let checked: Vec<&Outcome> = rows
+        .iter()
+        .map(|(_, o)| o)
+        .filter(|o| o.was_checked())
+        .collect();
+    let code = if !checked.is_empty() && checked.iter().all(|o| o.tool_failed()) {
+        UNAVAILABLE
+    } else if checked.iter().any(|o| o.is_problem()) {
+        PROBLEM
+    } else {
+        OK
+    };
     let text = if json {
         render::status_json(&answers.snapshot, answers.cli_version.as_deref(), &rows)
     } else {
-        render::status_text(&rows)
+        render::status_text(&rows, home().as_deref())
     };
     match out(&text) {
-        OK if problem => PROBLEM,
-        code => code,
+        OK => code,
+        failed => failed,
     }
 }
 
-/// Whether `status` checks this row: a server named on the command line always; otherwise one that is on and not a
-/// project server (checking that runs the repository's own command, so only on request, as in the app).
-fn to_check(row: &ServerRow, names: &[String]) -> bool {
-    !names.is_empty() || (row.enabled && row.scope != Scope::Project)
-}
-
 /// The rows named (all when none are), in the order they are shown. A name that matches nothing is an error that
-/// points at a name differing only in case.
+/// suggests the closest name.
 fn select<'a>(snapshot: &'a Snapshot, names: &[String]) -> Result<Vec<&'a ServerRow>, String> {
     let mut missing = Vec::new();
     for name in names {
         if !snapshot.servers.iter().any(|r| r.name == *name) {
-            let close = snapshot
-                .servers
-                .iter()
-                .find(|r| r.name.to_lowercase() == name.to_lowercase());
+            let close = suggest::closest(name, snapshot.servers.iter().map(|r| r.name.as_str()));
             missing.push(match close {
-                Some(r) => format!("no server is named {name:?}; did you mean {:?}?", r.name),
+                Some(meant) => format!("no server is named {name:?}; did you mean {meant:?}?"),
                 None => format!("no server is named {name:?}"),
             });
         }
@@ -164,7 +197,7 @@ fn warn(snapshot: &Snapshot) {
 
 fn usage(why: &str) -> u8 {
     eprintln!("klefki-cli: {why}");
-    eprintln!("Usage: klefki-cli list|status [NAME...] [--json]. See `klefki-cli help`.");
+    eprintln!("{SHORT_USAGE}");
     USAGE
 }
 

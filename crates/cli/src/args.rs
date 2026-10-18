@@ -18,12 +18,26 @@ pub enum Cmd {
     Version,
 }
 
-/// What was wrong with the command line, said as a sentence.
+/// What was wrong with the command line.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Usage(pub String);
+pub enum Usage {
+    /// Nothing at all: the help is the answer.
+    NoCommand,
+    /// Said as a sentence.
+    Bad(String),
+}
+
+fn bad(why: String) -> Usage {
+    Usage::Bad(why)
+}
 
 pub const HELP: &str = "\
 klefki-cli: list Claude Code's MCP servers and check whether they connect.
+
+Examples:
+  klefki-cli status                 check every server that is on
+  klefki-cli status docs            check one server, a project server too
+  klefki-cli status --json | jq '.servers[] | select(.status == \"failed\") | .name'
 
 Usage:
   klefki-cli list   [NAME...] [--json]
@@ -45,10 +59,13 @@ Options:
   -h, --help     Show this help.
   -V, --version  Show the version.
 
+  Servers that are off, or rejected for their project, are never checked.
+
 Exit status:
   0  Done; for status, every server checked is connected.
-  1  status found a server that is not connected, or could not run Claude Code.
+  1  status found a server that is not connected.
   2  The command line was wrong, or a NAME matches no server.
+  3  Claude Code could not be used: not found, or no check got an answer.
 
 Reads CLAUDE_CONFIG_DIR like Claude Code does.
 ";
@@ -56,7 +73,7 @@ Reads CLAUDE_CONFIG_DIR like Claude Code does.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
     let mut args = args.into_iter();
     let command = match args.next() {
-        None => return Err(Usage("no command given".to_owned())),
+        None => return Err(Usage::NoCommand),
         Some(c) => text(c)?,
     };
     let status = match command.as_str() {
@@ -64,8 +81,15 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
         "status" => true,
         "help" | "-h" | "--help" => return Ok(Cmd::Help),
         "-V" | "--version" => return Ok(Cmd::Version),
-        other if other.starts_with('-') => return Err(Usage(format!("unknown option {other}"))),
-        other => return Err(Usage(format!("unknown command {other:?}"))),
+        other if other.starts_with('-') => return Err(bad(format!("unknown option {other}"))),
+        other => {
+            return Err(bad(
+                match crate::suggest::closest(other, ["list", "status", "help"]) {
+                    Some(meant) => format!("unknown command {other:?}; did you mean {meant:?}?"),
+                    None => format!("unknown command {other:?}"),
+                },
+            ));
+        }
     };
     let mut names = Vec::new();
     let mut json = false;
@@ -88,12 +112,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             "-h" | "--help" => return Ok(Cmd::Help),
             "--claude" if status => claude = Some(claude_path(args.next())?),
             "--claude" => {
-                return Err(Usage(
-                    "--claude is only for status: list starts no program".to_owned(),
+                return Err(bad(
+                    "--claude is only for status: list starts no program".to_owned()
                 ));
             }
             option if option.starts_with('-') && option.len() > 1 => {
-                return Err(Usage(format!("unknown option {option}")));
+                return Err(bad(format!("unknown option {option}")));
             }
             _ => names.push(arg),
         }
@@ -112,15 +136,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
 fn claude_path(value: Option<OsString>) -> Result<PathBuf, Usage> {
     match value {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
-        _ => Err(Usage(
-            "--claude needs the path of the Claude CLI".to_owned(),
-        )),
+        _ => Err(bad("--claude needs the path of the Claude CLI".to_owned())),
     }
 }
 
 fn text(arg: OsString) -> Result<String, Usage> {
     arg.into_string()
-        .map_err(|a| Usage(format!("{} is not valid text", a.to_string_lossy())))
+        .map_err(|a| bad(format!("{} is not valid text", a.to_string_lossy())))
 }
 
 #[cfg(test)]

@@ -3,7 +3,11 @@
 //! and in the engine's answers is already sanitised by core.
 use klefki_core::api::{Approval, Hint, Scope, ServerRow, Snapshot, Status, TransportKind};
 use serde_json::{Value, json};
+use std::cmp::Ordering;
 use std::fmt::Write as _;
+
+/// The version of the JSON's shape. Raised when a field changes meaning or goes away; new fields keep it.
+const SCHEMA: u32 = 1;
 
 /// The live answer for one server.
 #[derive(Debug, Clone)]
@@ -13,13 +17,31 @@ pub struct Checked {
     pub hint: Option<Hint>,
 }
 
+impl Checked {
+    /// The engine did not run the check at all, and says why as "not checked: <why>" (a project folder that is gone,
+    /// a name that is not safe to pass on).
+    fn refused(&self) -> Option<&str> {
+        match self.status {
+            Status::Unknown => self.detail.as_deref()?.strip_prefix("not checked: "),
+            _ => None,
+        }
+    }
+
+    /// The check ran, but brought no status back: it timed out, or Claude's output was not understood.
+    fn failed(&self) -> bool {
+        matches!(self.status, Status::Unknown | Status::Checking) && self.refused().is_none()
+    }
+}
+
 /// What `status` has to say about one server.
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Checked(Checked),
-    /// Switched off: Claude Code does not start it, so it is not checked.
+    /// Switched off: Claude Code does not start it, so it is not checked, even when named.
     Off,
-    /// A project server not named on the command line: checking it would run the repository's command.
+    /// A project server the user rejected: Claude Code does not run it.
+    Rejected,
+    /// A project server not named on the command line: checking it may run the repository's command.
     ProjectServer,
     /// Asked, but no answer came in time.
     NoAnswer,
@@ -31,9 +53,63 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.status != Status::Connected,
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::ProjectServer => false,
+            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => false,
         }
     }
+
+    /// Whether the check itself broke down, saying nothing about the server.
+    pub fn tool_failed(&self) -> bool {
+        match self {
+            Outcome::Checked(c) => c.failed(),
+            Outcome::NoAnswer => true,
+            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => false,
+        }
+    }
+
+    pub fn was_checked(&self) -> bool {
+        matches!(self, Outcome::Checked(_) | Outcome::NoAnswer)
+    }
+}
+
+/// Why `status` leaves this row out, if it does. Named servers are checked unless Claude Code would not run them.
+pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
+    if !row.enabled {
+        Some(Outcome::Off)
+    } else if row.approval == Some(Approval::Rejected) {
+        Some(Outcome::Rejected)
+    } else if row.scope == Scope::Project && !named {
+        Some(Outcome::ProjectServer)
+    } else {
+        None
+    }
+}
+
+/// Orders names as people count: `server-9` before `server-10`. Case is ignored first, then decides a tie.
+fn natural(a: &str, b: &str) -> Ordering {
+    fn chunks(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for c in s.chars() {
+            let digit = c.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, text)) if *d == digit => text.push(c),
+                _ => out.push((digit, c.to_string())),
+            }
+        }
+        out
+    }
+    let (x, y) = (chunks(&a.to_lowercase()), chunks(&b.to_lowercase()));
+    for ((xd, xs), (yd, ys)) in x.iter().zip(&y) {
+        let order = if *xd && *yd {
+            let (xt, yt) = (xs.trim_start_matches('0'), ys.trim_start_matches('0'));
+            xt.len().cmp(&yt.len()).then_with(|| xt.cmp(yt))
+        } else {
+            xs.cmp(ys)
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    x.len().cmp(&y.len()).then_with(|| a.cmp(b))
 }
 
 /// The rows to show, in the order they are shown: user servers, then per project its local and project servers;
@@ -44,25 +120,53 @@ pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a Ser
         let group = |r: &ServerRow| (r.scope != Scope::User, r.project.clone(), r.scope);
         group(a)
             .cmp(&group(b))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| natural(&a.name, &b.name))
     });
     rows
 }
 
-fn heading(row: &ServerRow) -> String {
+/// A path as shown in a heading: `~/…` under the home folder, which keeps lines short. JSON keeps the full path.
+pub fn short_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_owned();
+    };
+    let home = home.replace('\\', "/");
+    let home = home.trim_end_matches('/');
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) || cfg!(target_os = "macos") {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    match path.get(..home.len()) {
+        Some(head) if !home.is_empty() && same(head, home) => match &path[home.len()..] {
+            "" => "~".to_owned(),
+            rest if rest.starts_with('/') => format!("~{rest}"),
+            _ => path.to_owned(),
+        },
+        _ => path.to_owned(),
+    }
+}
+
+fn heading(row: &ServerRow, home: Option<&str>) -> String {
     match (row.scope, &row.project) {
         (Scope::User, _) => "User".to_owned(),
-        (scope, Some(project)) => format!("{} in {project}", scope.label()),
+        (scope, Some(project)) => format!("{} in {}", scope.label(), short_path(project, home)),
         (scope, None) => scope.label().to_owned(),
     }
 }
 
 /// Writes `rows` under their group headings; `line` writes one row's columns after the indentation.
-fn grouped(out: &mut String, rows: &[&ServerRow], mut line: impl FnMut(&mut String, &ServerRow)) {
+fn grouped(
+    out: &mut String,
+    rows: &[&ServerRow],
+    home: Option<&str>,
+    mut line: impl FnMut(&mut String, &ServerRow),
+) {
     let mut last: Option<String> = None;
     for row in rows {
-        let head = heading(row);
+        let head = heading(row, home);
         if last.as_deref() != Some(head.as_str()) {
             if last.is_some() {
                 out.push('\n');
@@ -86,6 +190,11 @@ fn pad(out: &mut String, text: &str, width: usize) {
     for _ in text.chars().count()..width {
         out.push(' ');
     }
+}
+
+fn trim_end(out: &mut String) {
+    let end = out.trim_end_matches(' ').len();
+    out.truncate(end);
 }
 
 fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
@@ -115,14 +224,14 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
 
 pub const NOTHING: &str = "No MCP servers are configured.\n";
 
-pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow]) -> String {
+pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -> String {
     if rows.is_empty() {
         return NOTHING.to_owned();
     }
     let name_w = width(rows.iter().map(|r| r.name.as_str()));
     let kind_w = width(rows.iter().map(|r| r.transport.label()));
     let mut out = String::new();
-    grouped(&mut out, rows, |out, row| {
+    grouped(&mut out, rows, home, |out, row| {
         pad(out, &row.name, name_w);
         out.push_str("  ");
         pad(out, if row.enabled { "on" } else { "off" }, 3);
@@ -134,8 +243,7 @@ pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow]) -> String {
         if !notes.is_empty() {
             let _ = write!(out, "  ({})", notes.join("; "));
         }
-        let end = out.trim_end_matches(' ').len();
-        out.truncate(end);
+        trim_end(out);
     });
     out
 }
@@ -196,7 +304,7 @@ pub fn list_json(snapshot: &Snapshot, rows: &[&ServerRow]) -> String {
         .iter()
         .map(|r| Value::Object(row_json(r, snapshot.project_count)))
         .collect();
-    to_text(&json!({"servers": servers, "warnings": snapshot.warnings}))
+    to_text(&json!({"schema": SCHEMA, "servers": servers, "warnings": snapshot.warnings}))
 }
 
 fn to_text(value: &Value) -> String {
@@ -211,48 +319,11 @@ fn one_line(text: &str) -> String {
 }
 
 const NOT_CHECKED: &str = "Not checked";
-
-/// The status column and the message after it.
-fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
-    match outcome {
-        Outcome::Checked(c) => {
-            let detail = c.detail.as_deref().map(one_line).unwrap_or_default();
-            match c.status {
-                // The engine says why it did not run the check as "not checked: <why>".
-                Status::Unknown | Status::Checking => (
-                    NOT_CHECKED.to_owned(),
-                    detail
-                        .strip_prefix("not checked: ")
-                        .map(str::to_owned)
-                        .unwrap_or(detail),
-                ),
-                status => (status.label().to_owned(), detail),
-            }
-        }
-        Outcome::Off => ("Off".to_owned(), "not checked".to_owned()),
-        Outcome::ProjectServer => {
-            let label = match row.status {
-                Status::Unknown | Status::Checking => NOT_CHECKED,
-                status => status.label(),
-            };
-            (
-                label.to_owned(),
-                format!(
-                    "not checked: it runs the repository's command; check it with klefki-cli status {}",
-                    command_word(&row.name)
-                ),
-            )
-        }
-        Outcome::NoAnswer => (
-            NOT_CHECKED.to_owned(),
-            "Claude Code did not answer in time".to_owned(),
-        ),
-    }
-}
+const NO_ANSWER: &str = "Claude Code did not answer in time";
 
 /// A name as it would be typed: quoted when a shell would split or expand it (names are checked to be
 /// `[A-Za-z0-9_-]` before they are passed to Claude, but a configuration can hold anything).
-fn command_word(name: &str) -> String {
+pub fn command_word(name: &str) -> String {
     let plain = !name.is_empty()
         && !name.starts_with('-')
         && name
@@ -267,7 +338,46 @@ fn command_word(name: &str) -> String {
     }
 }
 
-pub fn status_text(rows: &[(&ServerRow, Outcome)]) -> String {
+/// The status column and the message after it.
+fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
+    match outcome {
+        Outcome::Checked(c) => {
+            let detail = c.detail.as_deref().map(one_line).unwrap_or_default();
+            if let Some(why) = c.refused() {
+                (NOT_CHECKED.to_owned(), one_line(why))
+            } else if c.failed() {
+                ("Check failed".to_owned(), detail)
+            } else {
+                (c.status.label().to_owned(), detail)
+            }
+        }
+        Outcome::Off => (
+            "Off".to_owned(),
+            "not checked: it is off; turn it on first".to_owned(),
+        ),
+        Outcome::Rejected => (
+            "Rejected".to_owned(),
+            "not checked: rejected for this project, so Claude Code does not run it".to_owned(),
+        ),
+        Outcome::ProjectServer => {
+            let label = match row.status {
+                Status::Unknown | Status::Checking => NOT_CHECKED,
+                status => status.label(),
+            };
+            (
+                label.to_owned(),
+                format!(
+                    "not checked: it may run the repository's own command ({}); to check it: klefki-cli status {}",
+                    row.target,
+                    command_word(&row.name)
+                ),
+            )
+        }
+        Outcome::NoAnswer => ("No answer".to_owned(), NO_ANSWER.to_owned()),
+    }
+}
+
+pub fn status_text(rows: &[(&ServerRow, Outcome)], home: Option<&str>) -> String {
     if rows.is_empty() {
         return NOTHING.to_owned();
     }
@@ -277,22 +387,22 @@ pub fn status_text(rows: &[(&ServerRow, Outcome)]) -> String {
     let only_rows: Vec<&ServerRow> = rows.iter().map(|(r, _)| *r).collect();
     let mut out = String::new();
     let mut at = 0;
-    grouped(&mut out, &only_rows, |out, row| {
+    grouped(&mut out, &only_rows, home, |out, row| {
         let (label, detail) = &cells[at];
         pad(out, &row.name, name_w);
         out.push_str("  ");
         pad(out, label, label_w);
         out.push_str("  ");
         out.push_str(detail);
-        let end = out.trim_end_matches(' ').len();
-        out.truncate(end);
+        trim_end(out);
         if let Outcome::Checked(Checked {
             hint: Some(hint), ..
         }) = &rows[at].1
         {
-            // Under the status column, like the app's hint under a failed row.
+            // Under the status column, like the app's hint under a failed row. The first line names the server, so
+            // it reads on its own when a screen reader goes line by line.
             let indent = " ".repeat(2 + name_w + 2);
-            let _ = write!(out, "\n{indent}{}", one_line(&hint.title));
+            let _ = write!(out, "\n{indent}{}: {}", row.name, one_line(&hint.title));
             for step in &hint.help {
                 let _ = write!(out, "\n{indent}- {}", one_line(step));
             }
@@ -305,37 +415,37 @@ pub fn status_text(rows: &[(&ServerRow, Outcome)]) -> String {
 }
 
 fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
-    let mut counts: Vec<(Status, usize)> = Vec::new();
+    let mut counts: Vec<(&'static str, usize)> = Vec::new();
     let mut skipped = 0;
     for (_, outcome) in rows {
-        let status = match outcome {
-            Outcome::Checked(c) if c.status == Status::Checking => Status::Unknown,
-            Outcome::Checked(c) => c.status,
-            Outcome::NoAnswer => Status::Unknown,
-            Outcome::Off | Outcome::ProjectServer => {
+        let label = match outcome {
+            Outcome::Checked(c) if c.refused().is_some() => "could not be checked",
+            Outcome::Checked(c) if c.failed() => "check failed",
+            Outcome::Checked(c) => match c.status {
+                Status::Connected => "connected",
+                Status::Degraded => "connected with failing tools",
+                Status::NeedsAuth => "needs auth",
+                Status::Failed => "failed",
+                Status::PendingApproval => "pending approval",
+                Status::NotConfigured => "not configured",
+                Status::Checking | Status::Unknown => "check failed",
+            },
+            Outcome::NoAnswer => "no answer",
+            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => {
                 skipped += 1;
                 continue;
             }
         };
-        match counts.iter_mut().find(|(s, _)| *s == status) {
+        match counts.iter_mut().find(|(l, _)| *l == label) {
             Some((_, n)) => *n += 1,
-            None => counts.push((status, 1)),
+            None => counts.push((label, 1)),
         }
     }
     let mut parts: Vec<String> = counts
         .iter()
-        .map(|&(status, n)| {
-            let label = match status {
-                Status::Connected => "connected",
-                Status::Degraded => "connected with failing tools",
-                Status::NeedsAuth if n == 1 => "needs auth",
-                Status::NeedsAuth => "need auth",
-                Status::Failed => "failed",
-                Status::PendingApproval => "pending approval",
-                Status::NotConfigured => "not configured",
-                Status::Checking | Status::Unknown => "could not be checked",
-            };
-            format!("{n} {label}")
+        .map(|&(label, n)| match label {
+            "needs auth" if n > 1 => format!("{n} need auth"),
+            _ => format!("{n} {label}"),
         })
         .collect();
     if skipped > 0 {
@@ -350,30 +460,41 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
 
 pub fn status_json(
     snapshot: &Snapshot,
-    cli_version: Option<&str>,
+    claude_version: Option<&str>,
     rows: &[(&ServerRow, Outcome)],
 ) -> String {
     let servers: Vec<Value> = rows
         .iter()
         .map(|(row, outcome)| {
             let mut o = row_json(row, snapshot.project_count);
-            let (checked, skipped, status, detail, hint) = match outcome {
-                Outcome::Checked(c) => (true, None, c.status, c.detail.clone(), c.hint.as_ref()),
-                Outcome::Off => (false, Some("off"), row.status, None, None),
-                Outcome::ProjectServer => (false, Some("project_server"), row.status, None, None),
-                Outcome::NoAnswer => (
-                    true,
-                    None,
-                    Status::Unknown,
-                    Some("Claude Code did not answer in time".to_owned()),
-                    None,
-                ),
+            let skipped = match outcome {
+                Outcome::Off => Some("off"),
+                Outcome::Rejected => Some("rejected"),
+                Outcome::ProjectServer => Some("project_server"),
+                Outcome::Checked(_) | Outcome::NoAnswer => None,
             };
-            o.insert("checked".into(), json!(checked));
-            if let Some(skipped) = skipped {
-                o.insert("skipped".into(), json!(skipped));
+            let (status, detail, hint) = match outcome {
+                Outcome::Checked(c) => (
+                    Some(if c.refused().is_some() {
+                        "not_checked"
+                    } else if c.failed() {
+                        "check_failed"
+                    } else {
+                        status_key(c.status)
+                    }),
+                    c.detail.clone(),
+                    c.hint.as_ref(),
+                ),
+                Outcome::NoAnswer => (Some("no_answer"), Some(NO_ANSWER.to_owned()), None),
+                Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => (None, None, None),
+            };
+            o.insert("checked".into(), json!(outcome.was_checked()));
+            o.insert("skipped".into(), json!(skipped));
+            // Only what this run found; a row that was not checked has what was known before in `last_known`.
+            o.insert("status".into(), json!(status));
+            if skipped.is_some() {
+                o.insert("last_known".into(), json!(status_key(row.status)));
             }
-            o.insert("status".into(), json!(status_key(status)));
             o.insert("detail".into(), json!(detail));
             o.insert(
                 "hint".into(),
@@ -386,7 +507,8 @@ pub fn status_json(
         })
         .collect();
     to_text(&json!({
-        "cli_version": cli_version,
+        "schema": SCHEMA,
+        "claude_version": claude_version,
         "servers": servers,
         "warnings": snapshot.warnings,
     }))
@@ -401,7 +523,7 @@ mod tests {
     fn groups_come_user_first_then_each_project_local_before_project() {
         let s = fixture_snapshot();
         let rows = ordered(&s.servers);
-        let heads: Vec<String> = rows.iter().map(|r| heading(r)).collect();
+        let heads: Vec<String> = rows.iter().map(|r| heading(r, None)).collect();
         let mut seen: Vec<&String> = Vec::new();
         for h in &heads {
             if seen.last() != Some(&h) {
@@ -421,13 +543,53 @@ mod tests {
     }
 
     #[test]
+    fn names_sort_as_people_count() {
+        let mut names = vec![
+            "server-10",
+            "Server-2",
+            "server-9",
+            "alpha",
+            "server-02b",
+            "Alpha",
+        ];
+        names.sort_by(|a, b| natural(a, b));
+        assert_eq!(
+            names,
+            [
+                "Alpha",
+                "alpha",
+                "Server-2",
+                "server-02b",
+                "server-9",
+                "server-10"
+            ]
+        );
+    }
+
+    #[test]
     fn every_row_of_the_fixture_is_listed_once() {
         let s = fixture_snapshot();
         let rows = ordered(&s.servers);
-        let text = list_text(&s, &rows);
+        let text = list_text(&s, &rows, None);
         let lines = text.lines().filter(|l| l.starts_with("  ")).count();
         assert_eq!(lines, s.servers.len(), "{text}");
         assert!(!text.lines().any(|l| l.ends_with(' ')), "{text:?}");
+    }
+
+    #[test]
+    fn paths_under_home_are_shortened() {
+        assert_eq!(short_path("/home/d/repo", Some("/home/d")), "~/repo");
+        assert_eq!(short_path("/home/d", Some("/home/d/")), "~");
+        assert_eq!(
+            short_path("/home/dx/repo", Some("/home/d")),
+            "/home/dx/repo"
+        );
+        assert_eq!(short_path("/srv/repo", Some("/home/d")), "/srv/repo");
+        assert_eq!(short_path("/srv/repo", None), "/srv/repo");
+        assert_eq!(
+            short_path("C:/Users/d/Repos/x", Some("C:\\Users\\d")),
+            "~/Repos/x"
+        );
     }
 
     #[test]
@@ -439,17 +601,23 @@ mod tests {
         assert_eq!(command_word(""), "\"\"");
     }
 
+    fn checked(status: Status, detail: &str) -> Outcome {
+        Outcome::Checked(Checked {
+            status,
+            detail: Some(detail.to_owned()),
+            hint: None,
+        })
+    }
+
     #[test]
     fn a_refused_check_reads_as_not_checked_with_its_reason() {
         let s = fixture_snapshot();
-        let row = &s.servers[0];
-        let outcome = Outcome::Checked(Checked {
-            status: Status::Unknown,
-            detail: Some("not checked: the project folder was not found".to_owned()),
-            hint: None,
-        });
-        assert!(outcome.is_problem());
-        let text = status_text(&[(row, outcome)]);
+        let outcome = checked(
+            Status::Unknown,
+            "not checked: the project folder was not found",
+        );
+        assert!(outcome.is_problem() && !outcome.tool_failed());
+        let text = status_text(&[(&s.servers[0], outcome)], None);
         assert!(
             text.contains("Not checked  the project folder was not found"),
             "{text}"
@@ -458,9 +626,27 @@ mod tests {
     }
 
     #[test]
+    fn a_check_that_ran_without_an_answer_is_not_called_not_checked() {
+        // Review of #25: a timeout read "Not checked", which sent people looking for why it was skipped.
+        let s = fixture_snapshot();
+        for (outcome, label) in [
+            (
+                checked(Status::Unknown, "check timed out after 30.0s"),
+                "Check failed",
+            ),
+            (Outcome::NoAnswer, "No answer"),
+        ] {
+            assert!(outcome.is_problem() && outcome.tool_failed());
+            let text = status_text(&[(&s.servers[0], outcome)], None);
+            assert!(text.contains(label), "{text}");
+            assert!(!text.contains(NOT_CHECKED), "{text}");
+        }
+    }
+
+    #[test]
     fn skipped_servers_are_not_problems() {
-        assert!(!Outcome::Off.is_problem());
-        assert!(!Outcome::ProjectServer.is_problem());
-        assert!(Outcome::NoAnswer.is_problem());
+        for o in [Outcome::Off, Outcome::Rejected, Outcome::ProjectServer] {
+            assert!(!o.is_problem() && !o.tool_failed() && !o.was_checked());
+        }
     }
 }

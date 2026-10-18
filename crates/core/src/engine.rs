@@ -1313,7 +1313,8 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
         .servers
         .iter()
         .filter(|row| {
-            row.scope != Scope::Project
+            shared.config.background_checks
+                && row.scope != Scope::Project
                 && row.enabled
                 && needs_check(row)
                 && !before
