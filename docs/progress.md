@@ -1,7 +1,14 @@
 # Progress
 
 ## Current slice
-Write path as a redo log, after merging main (#4) into the duplicate branch (2026-10-18). Done; see below. Next: the edit form, then keyring secrets.
+Review findings on main (2026-10-18). Done; see below. Next: the edit form (it adds the OAuth client id and scopes per row), then keyring secrets.
+
+## Review findings on main (2026-10-18)
+- **Approval review names every `${VAR}`**, not only those in header values: the address ("sends"), the command, each argument, each environment value and the header command ("uses"). A variable inside a default (`${A:-${B}}`) is named too; an unclosed `${X` is not (it is not expanded). Tests: `every_place_that_fills_in_your_environment_says_which_variables`, `a_variable_inside_a_default_is_named_too`. **Test changed, for review:** `a_stdio_server_is_shown_command_arguments_and_environment_in_full` compares the exact lines and its fixture has `TOKEN=${TOKEN}`; its expected list gained "Environment TOKEN uses your environment variable TOKEN" (nothing removed).
+- **The symlink check now covers the file actually opened** (`fsx`): the path was checked, then opened, and a symlink swapped in between (to `.credentials.json`, say) was followed. The opened handle must be the checked file: same device and inode on Unix, same size and times elsewhere. A writer replacing the file in that moment is looked at again (3 attempts). Test: `a_file_swapped_in_after_the_check_is_not_read` (fails when the comparison always agrees).
+- **The Status tab's explanation is built once per status**, kept for (row, generation of the live results), not every frame. Test: `the_explanation_follows_each_new_status` (fails when a new status does not invalidate it).
+- Not changed: markers under text with characters wider than one column (CJK, emoji) still shift; that needs a width table, which is a dependency.
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 287 core + 120 app passed; `cargo deny check` 0.
 
 ## Write path: redo log and validation before the rename (2026-10-18)
 Found reviewing main after #4: the fix "an older verify no longer undoes a newer change" made the older check stand down, but the newer check only put back its own change. Two quick changes, then Claude saving a copy it read before both, lost the first change without a word. Reproduced on main (`["gw"]` left of `["loc", "gw"]`), and again when the second change wrote nothing (it still numbered last on the file). Rebuilt after two database techniques:

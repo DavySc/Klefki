@@ -28,28 +28,47 @@ pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option
             "reading credential files is not allowed",
         ));
     }
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+    // A writer that replaces the file (Claude, klefki) can land between the look and the open; that is looked at
+    // again rather than reported.
+    let mut attempts = 0;
+    let (meta, file) = loop {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_symlink() {
+            return Err(io::Error::other("refusing to follow a symlink"));
+        }
+        if !meta.is_file() {
+            return Err(io::Error::other("not a regular file"));
+        }
+        if meta.len() > max_bytes {
+            return Err(io::Error::other(format!(
+                "file is larger than the {max_bytes} byte limit"
+            )));
+        }
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // The checks above looked at the path; this is what was opened. A symlink swapped in between (to
+        // `.credentials.json`, say) leads to another file, which is not read.
+        if is_what_was_checked(&meta, &file.metadata()?) {
+            break (meta, file);
+        }
+        attempts += 1;
+        if attempts == 3 {
+            return Err(io::Error::other(
+                "the file kept being replaced while it was being opened",
+            ));
+        }
     };
-    if meta.file_type().is_symlink() {
-        return Err(io::Error::other("refusing to follow a symlink"));
-    }
-    if !meta.is_file() {
-        return Err(io::Error::other("not a regular file"));
-    }
-    if meta.len() > max_bytes {
-        return Err(io::Error::other(format!(
-            "file is larger than the {max_bytes} byte limit"
-        )));
-    }
     // Sized from the metadata (plus one byte, to notice a file that grew meanwhile), so a large file is read
     // into one allocation rather than a series of growing ones.
     let mut buf = Vec::with_capacity(meta.len() as usize + 1);
-    File::open(path)?
-        .take(max_bytes + 1)
-        .read_to_end(&mut buf)?;
+    file.take(max_bytes + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > max_bytes {
         return Err(io::Error::other(
             "file grew past the size limit while reading",
@@ -60,6 +79,26 @@ pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option
         Some(rest) => (rest.to_owned(), true),
         None => (text, false),
     }))
+}
+
+/// Is the opened file (`opened`, from its handle) the regular file the path named when it was checked
+/// (`checked`)? On Unix by device and inode; elsewhere by size and times, which a different file all but never
+/// shares.
+fn is_what_was_checked(checked: &std::fs::Metadata, opened: &std::fs::Metadata) -> bool {
+    if !opened.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        checked.dev() == opened.dev() && checked.ino() == opened.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        checked.len() == opened.len()
+            && checked.modified().ok() == opened.modified().ok()
+            && checked.created().ok() == opened.created().ok()
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +152,30 @@ mod tests {
             read_limited(&missing, 10).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn a_file_swapped_in_after_the_check_is_not_read() {
+        // Found reviewing main: the symlink check looked at the path, then the open followed whatever was there by
+        // then. The opened file must be the one that was checked.
+        let dir = tempfile::tempdir().unwrap();
+        let (checked, swapped) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        std::fs::write(&checked, "{}").unwrap();
+        std::fs::write(&swapped, "{}").unwrap();
+        let before = std::fs::symlink_metadata(&checked).unwrap();
+        let same = File::open(&checked).unwrap().metadata().unwrap();
+        assert!(is_what_was_checked(&before, &same));
+        // Another file: on Windows it differs in its times (set apart here so the test does not depend on the
+        // clock's resolution).
+        filetime::set_file_mtime(&swapped, filetime::FileTime::from_unix_time(1_000_000, 0))
+            .unwrap();
+        let other = File::open(&swapped).unwrap().metadata().unwrap();
+        assert!(!is_what_was_checked(&before, &other));
+        // A folder opened in its place is not a regular file either.
+        let folder = File::open(dir.path()).and_then(|f| f.metadata());
+        if let Ok(folder) = folder {
+            assert!(!is_what_was_checked(&before, &folder));
+        }
     }
 
     #[test]
