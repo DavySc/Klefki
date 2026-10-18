@@ -7,8 +7,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, Core, Diagnosis, Event, Hint, PlanView, Scope, ServerId, ServerName,
-    ServerRow, Snapshot, Status, Target, TransportKind,
+    Approval, Change, Command, Core, Definition, Diagnosis, Event, Hint, PlanView, Scope, ServerId,
+    ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -100,10 +100,63 @@ enum EditorState {
     Ready {
         /// As the engine sent it, to tell whether anything was edited.
         original: String,
+        /// The draft, as JSON: what the JSON tab edits and what is sent for review.
         text: String,
         /// Project servers are shown but not edited (they live in the repository).
         editable: bool,
+        /// The same draft as the form shows it, or why the form cannot. Boxed, like `synced_form`: a definition is
+        /// large next to the other states.
+        form: Box<Result<Definition, String>>,
+        /// What stops the form's draft from being saved.
+        problem: Option<String>,
+        /// `text` and `form` as they were when last brought in line, to tell which one was edited since.
+        synced_text: String,
+        synced_form: Option<Box<Definition>>,
     },
+}
+
+impl EditorState {
+    fn ready(text: String, editable: bool) -> Self {
+        let mut state = Self::Ready {
+            original: text.clone(),
+            text,
+            editable,
+            form: Box::new(Err(String::new())),
+            problem: None,
+            synced_text: String::new(),
+            synced_form: None,
+        };
+        state.sync();
+        state
+    }
+
+    /// Brings the form and the JSON in line after either was edited: an edited JSON text is read into the form,
+    /// an edited form is written out as JSON. Comparisons only, unless something changed.
+    fn sync(&mut self) {
+        let Self::Ready {
+            text,
+            form,
+            problem,
+            synced_text,
+            synced_form,
+            ..
+        } = self
+        else {
+            return;
+        };
+        if *text != *synced_text {
+            **form = Definition::from_json(text);
+        } else if let Ok(f) = form.as_ref()
+            && Some(f) != synced_form.as_deref()
+        {
+            *text = f.to_json();
+        } else {
+            return;
+        }
+        *synced_text = text.clone();
+        *synced_form = form.as_ref().as_ref().ok().cloned().map(Box::new);
+        *problem = form.as_ref().as_ref().ok().and_then(Definition::problem);
+    }
 }
 
 /// What happened to the last change, for the banner.
@@ -140,6 +193,10 @@ pub struct ShellApp {
     /// Live results from the engine, which take precedence over the snapshot's hints. One slot per row of the
     /// snapshot, by position, so drawing a row looks its status up without building a key.
     live: Vec<Option<Live>>,
+    /// Bumped whenever `live` or the snapshot changes, so what is built from them can be kept until then.
+    live_gen: u64,
+    /// The selected row's explanation, for (row, `live_gen`): built once per status, not every frame.
+    explained: Option<(ExplainedFor, Option<Arc<Explanation>>)>,
     /// The grid's rows for the current snapshot and search, built when either changes rather than every frame.
     grid_cache: Option<(String, Arc<[GridRow]>)>,
     /// The latest explanation per server, from the Diagnose action.
@@ -174,6 +231,8 @@ impl ShellApp {
             core: None,
             live: vec![None; snapshot.servers.len()],
             grid_cache: None,
+            live_gen: 0,
+            explained: None,
             diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
@@ -250,6 +309,7 @@ impl ShellApp {
                         live[new] = Some(r);
                     }
                 }
+                self.live_gen += 1;
                 self.diagnoses.retain(|id, _| {
                     new_index.contains_key(&(id.scope, id.project.as_deref(), id.name.as_str()))
                 });
@@ -341,11 +401,7 @@ impl ShellApp {
                     && matches!(editor.state, EditorState::Loading)
                 {
                     editor.state = match json {
-                        Ok(text) => EditorState::Ready {
-                            original: text.clone(),
-                            text,
-                            editable,
-                        },
+                        Ok(text) => EditorState::ready(text, editable),
                         Err(why) => EditorState::Failed(why),
                     };
                 }
@@ -364,6 +420,7 @@ impl ShellApp {
                         detail,
                         hint,
                     });
+                    self.live_gen += 1;
                 }
             }
         }
@@ -1595,11 +1652,24 @@ impl ShellApp {
         // mutably below, without copying its strings every frame.
         let snapshot = Arc::clone(&self.snapshot);
         let s = &snapshot.servers[i];
+        if let Some(editor) = &mut self.editor
+            && s.is(&editor.id)
+        {
+            editor.state.sync();
+        }
         let (status, detail) = {
             let (status, detail) = self.effective(i);
             (status, detail.map(str::to_owned))
         };
-        let explanation = Explanation::for_status(s, status, detail.as_deref(), self.hint(i));
+        let explanation = match &self.explained {
+            Some((key, built)) if *key == (i, self.live_gen) => built.clone(),
+            _ => {
+                let built = Explanation::for_status(s, status, detail.as_deref(), self.hint(i))
+                    .map(Arc::new);
+                self.explained = Some(((i, self.live_gen), built.clone()));
+                built
+            }
+        };
         ui.label(RichText::new(&s.name).heading());
         ui.horizontal(|ui| {
             flat_items(ui);
@@ -1657,6 +1727,10 @@ impl ShellApp {
                     {
                         self.prepare(vec![Change::Approve { id: s.id() }]);
                     }
+                }
+                if self.core.is_some() {
+                    ui.add_space(12.0);
+                    self.definition_form(ui, s);
                 }
             }
             DetailTab::Status => {
@@ -1721,16 +1795,11 @@ impl ShellApp {
                 );
             }
             DetailTab::HeadersEnv => {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "Environment and header values are hidden. Change them in the JSON tab ({}).",
-                            shortcut("E")
-                        ))
-                        .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
+                if self.core.is_some() {
+                    self.values_form(ui, s);
+                } else {
+                    ui.label(RichText::new("Not available for sample data.").color(pal.text_muted));
+                }
             }
         }
     }
@@ -1749,7 +1818,7 @@ impl ShellApp {
             });
             self.send(Command::Inspect(s.id()));
         }
-        let can_review = self.plan.is_none();
+        let can_review = self.can_prepare();
         let Some(editor) = &mut self.editor else {
             return;
         };
@@ -1784,6 +1853,7 @@ impl ShellApp {
                 original,
                 text,
                 editable: true,
+                ..
             } => {
                 ui.add(
                     egui::Label::new(
@@ -1818,8 +1888,269 @@ impl ShellApp {
             }
         }
         if let Some(json) = review {
-            self.outcome = None;
-            self.send(Command::Prepare(vec![Change::Replace { id: s.id(), json }]));
+            self.prepare(vec![Change::Replace { id: s.id(), json }]);
+        }
+    }
+
+    /// Asks the engine for `s`'s definition, for the form and the JSON tab.
+    fn open_editor(&mut self, s: &ServerRow) {
+        self.editor = Some(Editor {
+            id: s.id(),
+            state: EditorState::Loading,
+        });
+        self.send(Command::Inspect(s.id()));
+    }
+
+    /// The editor's state for `s`, if its definition was asked for.
+    fn editor_for(&mut self, s: &ServerRow) -> Option<&mut EditorState> {
+        self.editor
+            .as_mut()
+            .filter(|e| s.is(&e.id))
+            .map(|e| &mut e.state)
+    }
+
+    /// Why the form is not shown for `s`, or `None` when it can be edited. Draws that reason.
+    fn form_unavailable(&mut self, ui: &mut Ui, s: &ServerRow) -> bool {
+        let pal = theme::palette(ui.ctx());
+        let muted = |ui: &mut Ui, text: &str, color: Color32| {
+            ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+        };
+        let Some(state) = self.editor_for(s) else {
+            // The definition is read only when asked for: `.claude.json` can be tens of megabytes.
+            if ui
+                .button("Edit definition")
+                .on_hover_text("Change the command, address, arguments, environment or headers")
+                .clicked()
+            {
+                self.open_editor(s);
+            }
+            return true;
+        };
+        match state {
+            EditorState::Loading => muted(ui, "Loading…", pal.text_muted),
+            EditorState::Failed(why) => muted(ui, why, pal.danger),
+            EditorState::Ready {
+                editable: false, ..
+            } => muted(
+                ui,
+                "Defined in the repository's .mcp.json. Klefki shows it but does not edit files in a repository.",
+                pal.text_muted,
+            ),
+            EditorState::Ready { form, .. } if form.is_err() => {
+                let why = form.as_ref().as_ref().err().cloned().unwrap_or_default();
+                muted(ui, &why, pal.text_muted);
+                self.save_bar(ui, s);
+            }
+            EditorState::Ready { form, .. }
+                if form
+                    .as_ref()
+                    .as_ref()
+                    .is_ok_and(Definition::signs_in_with_oauth) =>
+            {
+                muted(
+                    ui,
+                    "Signs in with OAuth: it is changed through Claude Code's own command, which Klefki does not run yet.",
+                    pal.text_muted,
+                )
+            }
+            EditorState::Ready { .. } => return false,
+        }
+        true
+    }
+
+    /// The General tab's form: type, then command and arguments, or address and header command.
+    fn definition_form(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        ui.label(RichText::new("Definition").color(pal.text_muted));
+        ui.add_space(4.0);
+        if self.form_unavailable(ui, s) {
+            return;
+        }
+        let Some(EditorState::Ready { form, .. }) = self.editor_for(s) else {
+            return;
+        };
+        let Ok(f) = form.as_mut() else {
+            return;
+        };
+        let width = ui.available_width();
+        egui::Grid::new("definition")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Type").color(pal.text_muted));
+                egui::ComboBox::from_id_salt("definition-type")
+                    .selected_text(transport_name(f.transport))
+                    .show_ui(ui, |ui| {
+                        for t in [
+                            TransportKind::Stdio,
+                            TransportKind::Http,
+                            TransportKind::Sse,
+                            TransportKind::Ws,
+                        ] {
+                            ui.selectable_value(&mut f.transport, t, transport_name(t));
+                        }
+                    });
+                ui.end_row();
+                let field = |ui: &mut Ui, label: &str, value: &mut String| {
+                    let l = ui.label(RichText::new(label).color(pal.text_muted));
+                    ui.add(
+                        egui::TextEdit::singleline(value)
+                            .desired_width((width - 120.0).max(120.0))
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .labelled_by(l.id);
+                    ui.end_row();
+                };
+                if f.transport == TransportKind::Stdio {
+                    field(ui, "Command", &mut f.command);
+                } else {
+                    field(ui, "Address", &mut f.url);
+                    field(ui, "Header command", &mut f.headers_helper);
+                }
+            });
+        // Arguments under their own heading rather than in the grid, which would centre the label beside the list.
+        if f.transport == TransportKind::Stdio {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Arguments").color(pal.text_muted));
+            let mut remove = None;
+            for (i, arg) in f.args.iter_mut().enumerate() {
+                // Right to left: the button takes its room first and the field exactly what is left, so the row
+                // never asks for more than the panel has (a resizable panel would grow to fit, frame after frame).
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                    Layout::right_to_left(Align::Center),
+                    |ui| {
+                        if icon_button(ui, icon::X, &format!("Remove argument {}", i + 1)) {
+                            remove = Some(i);
+                        }
+                        ui.add(
+                            egui::TextEdit::singleline(arg)
+                                .desired_width(ui.available_width())
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    },
+                );
+            }
+            if let Some(i) = remove {
+                f.args.remove(i);
+            }
+            if ui.small_button("Add argument").clicked() {
+                f.args.push(String::new());
+            }
+        }
+        ui.add_space(8.0);
+        self.save_bar(ui, s);
+    }
+
+    /// The Env tab's form: environment variables for a command, headers for an address. Values that are there
+    /// stay hidden; a new one is typed without being shown.
+    fn values_form(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        if self.form_unavailable(ui, s) {
+            return;
+        }
+        let Some(EditorState::Ready { form, .. }) = self.editor_for(s) else {
+            return;
+        };
+        let Ok(f) = form.as_mut() else {
+            return;
+        };
+        let (pairs, title, noun) = if f.transport == TransportKind::Stdio {
+            (&mut f.env, "Environment", "variable")
+        } else {
+            (&mut f.headers, "Headers", "header")
+        };
+        ui.label(RichText::new(title).color(pal.text_muted));
+        ui.add_space(4.0);
+        let mut remove = None;
+        for (i, (name, value)) in pairs.iter_mut().enumerate() {
+            // Right to left, as for arguments: the buttons first, then name and value share what is left.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    if icon_button(ui, icon::X, &format!("Remove {name}")) {
+                        remove = Some(i);
+                    }
+                    let hidden = value == Definition::HIDDEN;
+                    if hidden && icon_button(ui, icon::PENCIL_SIMPLE, &format!("Change {name}")) {
+                        value.clear();
+                    }
+                    let half =
+                        ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(40.0);
+                    if hidden {
+                        ui.add_sized(
+                            [half, ui.spacing().interact_size.y],
+                            egui::Label::new(RichText::new("hidden").color(pal.text_muted)),
+                        )
+                        .on_hover_text("Kept as it is. Change it to type a new value.");
+                    } else {
+                        ui.add(
+                            egui::TextEdit::singleline(value)
+                                .desired_width(half)
+                                .hint_text("Value")
+                                .password(true),
+                        );
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(name)
+                            .desired_width(ui.available_width())
+                            .hint_text("Name")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                },
+            );
+        }
+        if let Some(i) = remove {
+            pairs.remove(i);
+        }
+        if ui.small_button(format!("Add {noun}")).clicked() {
+            pairs.push((String::new(), String::new()));
+        }
+        ui.add_space(8.0);
+        self.save_bar(ui, s);
+    }
+
+    /// What stops saving, then Review and save… and Revert, for the form.
+    fn save_bar(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        let can_prepare = self.can_prepare();
+        let Some(EditorState::Ready {
+            original,
+            text,
+            problem,
+            ..
+        }) = self.editor_for(s)
+        else {
+            return;
+        };
+        if let Some(problem) = problem {
+            let mut c = problem.chars();
+            let shown: String = c
+                .next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default();
+            ui.add(egui::Label::new(RichText::new(shown).color(pal.danger)).wrap());
+        }
+        let edited = text != original;
+        let ready = edited && problem.is_none() && can_prepare;
+        let mut review = None;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(ready, egui::Button::new("Review and save…"))
+                .clicked()
+            {
+                review = Some(text.clone());
+            }
+            if ui
+                .add_enabled(edited, egui::Button::new("Revert"))
+                .clicked()
+            {
+                *text = original.clone();
+            }
+        });
+        if let Some(json) = review {
+            self.prepare(vec![Change::Replace { id: s.id(), json }]);
         }
     }
 }
@@ -2331,6 +2662,26 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32) {
         });
 }
 
+/// A small icon button that reads as `label` to assistive technology.
+fn icon_button(ui: &mut Ui, glyph: &str, label: &str) -> bool {
+    let response = ui.small_button(glyph).on_hover_text(label);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.clicked()
+}
+
+fn transport_name(t: TransportKind) -> &'static str {
+    match t {
+        TransportKind::Stdio => "Command (stdio)",
+        TransportKind::Http => "HTTP",
+        TransportKind::Sse => "SSE",
+        TransportKind::Ws => "WebSocket",
+        TransportKind::Invalid => "Unknown",
+    }
+}
+
+/// The row and the `live_gen` an explanation was built for.
+type ExplainedFor = (usize, u64);
+
 /// The engine's latest answer for one row.
 #[derive(Clone)]
 struct Live {
@@ -2344,7 +2695,7 @@ mod tests {
     use super::*;
     use egui_kittest::Harness;
     use egui_kittest::kittest::{NodeT, Queryable};
-    use klefki_core::api::fixture_snapshot;
+    use klefki_core::api::{Definition, fixture_snapshot};
 
     /// Mirrors the app: the theme is applied once in the creation callback, before the first frame.
     fn harness_with(snapshot: Snapshot) -> Harness<'static, ShellApp> {
@@ -2676,6 +3027,35 @@ mod tests {
         h.get_by_label_contains("Can't reach the server's host");
         h.get_by_label_contains("not connected to your VPN");
         h.get_by_label_contains("getaddrinfo ENOTFOUND acme-prod.example.com");
+    }
+
+    #[test]
+    fn the_explanation_follows_each_new_status() {
+        // It is built once per status, not every frame; a new status must still replace it.
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let row = live_row("acme-prod", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        h.get_by_label("acme-prod").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Can't reach the server's host");
+        engine
+            .events
+            .send(status_event(&row, Status::Connected, None))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Can't reach").is_none());
+        engine
+            .events
+            .send(status_event(&row, Status::Failed, Some("boom")))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("could not connect");
+        h.get_by_label_contains("Claude Code said: boom");
     }
 
     #[test]
@@ -3958,6 +4338,219 @@ mod tests {
             }) => assert_eq!(text, original),
             _ => panic!("editor gone"),
         }
+    }
+
+    // ---- the edit form
+
+    const FORM_ORIGINAL: &str = "{\n  \"cwd\": \"/w\",\n  \"command\": \"node\",\n  \"args\": [\n    \"a.js\"\n  ],\n  \"env\": {\n    \"TOKEN\": \"<hidden>\"\n  }\n}";
+
+    /// alpha selected, its General tab's Edit pressed, and its definition arrived.
+    fn form_harness(
+        json: &str,
+        editable: bool,
+    ) -> (
+        Harness<'static, ShellApp>,
+        klefki_core::api::Detached,
+        ServerRow,
+    ) {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label("Edit definition").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+        engine.events.send(entry_event(&a, json, editable)).unwrap();
+        h.run();
+        (h, engine, a)
+    }
+
+    fn form<'a>(h: &'a mut Harness<'static, ShellApp>) -> &'a mut Definition {
+        match &mut h.state_mut().editor {
+            Some(Editor {
+                state: EditorState::Ready { form, .. },
+                ..
+            }) => form
+                .as_mut()
+                .as_mut()
+                .expect("the form reads the definition"),
+            _ => panic!("no form"),
+        }
+    }
+
+    fn json_text(h: &Harness<'static, ShellApp>) -> String {
+        match &h.state().editor {
+            Some(Editor {
+                state: EditorState::Ready { text, .. },
+                ..
+            }) => text.clone(),
+            _ => panic!("no editor"),
+        }
+    }
+
+    #[test]
+    fn the_form_edits_the_same_definition_as_the_json_tab() {
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        assert_eq!(form(&mut h).command, "node");
+        // Nothing edited yet: nothing to review.
+        assert!(
+            h.get_by_label("Review and save…")
+                .accesskit_node()
+                .is_disabled()
+        );
+        form(&mut h).command = "node22".into();
+        form(&mut h).args.push("--x".into());
+        h.run();
+        let text = json_text(&h);
+        assert_eq!(
+            text,
+            "{\n  \"cwd\": \"/w\",\n  \"command\": \"node22\",\n  \"args\": [\n    \"a.js\",\n    \"--x\"\n  ],\n  \"env\": {\n    \"TOKEN\": \"<hidden>\"\n  }\n}",
+            "the key the form does not show and the hidden value stay as they were"
+        );
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Replace {
+                id: a.id(),
+                json: text
+            }])]
+        );
+        // The JSON tab shows the same draft.
+        h.get_by_label("JSON").click();
+        h.run();
+        h.get_by_value(&json_text(&h));
+    }
+
+    #[test]
+    fn editing_the_json_updates_the_form() {
+        let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
+        if let Some(Editor {
+            state: EditorState::Ready { text, .. },
+            ..
+        }) = &mut h.state_mut().editor
+        {
+            *text = text.replace("\"node\"", "\"deno\"");
+        }
+        h.run();
+        assert_eq!(form(&mut h).command, "deno");
+        // JSON the form cannot read: the form says so instead of guessing.
+        if let Some(Editor {
+            state: EditorState::Ready { text, .. },
+            ..
+        }) = &mut h.state_mut().editor
+        {
+            *text = "{ \"command\": ".into();
+        }
+        h.run();
+        h.get_by_label_contains("fix it in the JSON tab");
+        // Revert brings the form back.
+        h.get_by_label("Revert").click();
+        h.run();
+        assert_eq!(form(&mut h).command, "node");
+    }
+
+    #[test]
+    fn values_stay_hidden_until_changed_and_new_ones_can_be_added() {
+        let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
+        h.get_by_label("Env").click();
+        h.run();
+        h.get_by_label("hidden");
+        h.get_by_label("Change TOKEN").click();
+        h.run();
+        assert_eq!(form(&mut h).env, [("TOKEN".to_owned(), String::new())]);
+        h.get_by_label("Add variable").click();
+        h.run();
+        assert_eq!(form(&mut h).env.len(), 2);
+        form(&mut h).env[1] = ("MODE".into(), "dev".into());
+        form(&mut h).env[0].1 = "n3w".into();
+        h.run();
+        assert!(
+            json_text(&h).contains("\"MODE\": \"dev\""),
+            "{}",
+            json_text(&h)
+        );
+        // Typed values are not shown in the clear, to the eye or to assistive technology.
+        assert!(h.query_by_value("n3w").is_none());
+        assert!(h.query_by_value("dev").is_none());
+        assert!(
+            h.query_all_by_value("MODE").next().is_some(),
+            "names are shown"
+        );
+        h.get_by_label("Remove MODE").click();
+        h.run();
+        assert!(!json_text(&h).contains("MODE"));
+    }
+
+    #[test]
+    fn the_form_does_not_widen_the_detail_panel() {
+        // Seen in the real window: rows that asked for the panel's whole width plus a button made the resizable
+        // panel grow a little every frame, until it reached its largest size.
+        let long = "{\n  \"command\": \"npx\",\n  \"args\": [\n    \"-y\",\n    \"@modelcontextprotocol/server-github-with-a-long-name\"\n  ],\n  \"env\": {\n    \"GITHUB_PERSONAL_ACCESS_TOKEN\": \"<hidden>\"\n  }\n}";
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        let before = detail_left_edge(&h, "General");
+        h.get_by_label("Edit definition").click();
+        h.run();
+        engine.events.send(entry_event(&a, long, true)).unwrap();
+        h.run();
+        assert_eq!(detail_left_edge(&h, "General"), before, "General");
+        h.get_by_label("Env").click();
+        h.run();
+        assert_eq!(detail_left_edge(&h, "General"), before, "Env");
+    }
+
+    #[test]
+    fn a_problem_in_the_form_is_shown_and_blocks_review() {
+        let (mut h, engine, _a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "  ".into();
+        h.run();
+        h.get_by_label_contains("needs a command");
+        assert!(
+            h.get_by_label("Review and save…")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
+    fn the_form_asks_for_one_plan_at_a_time() {
+        let (mut h, engine, _a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        h.get_by_label("Review and save…").click();
+        h.run();
+        // The first is on its way: the button waits for its answer.
+        assert!(
+            h.get_by_label("Review and save…")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert_eq!(drain(&engine).len(), 1);
+    }
+
+    #[test]
+    fn project_and_oauth_servers_are_shown_but_not_edited_in_the_form() {
+        let (h, _engine, _a) = form_harness("{\n  \"command\": \"x\"\n}", false);
+        h.get_by_label_contains("does not edit files in a repository");
+        assert!(h.query_by_label("Review and save…").is_none());
+        let (h, _engine, _a) = form_harness(
+            "{\n  \"type\": \"http\",\n  \"url\": \"https://h.example/mcp\",\n  \"oauth\": {\n    \"clientId\": \"c\"\n  }\n}",
+            true,
+        );
+        h.get_by_label_contains("OAuth");
+        assert!(h.query_by_label("Review and save…").is_none());
     }
 
     #[test]
