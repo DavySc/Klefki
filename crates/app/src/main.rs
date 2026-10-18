@@ -18,6 +18,8 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             let choice = theme_flag().unwrap_or_else(|| theme::load_choice(cc.storage));
             theme::apply(&cc.egui_ctx, choice);
+            let tone = theme::load_tone(cc.storage);
+            theme::set_tone(&cc.egui_ctx, tone);
             let app = if demo() {
                 ShellApp::new(klefki_core::api::fixture_snapshot(), choice)
             } else {
@@ -29,6 +31,8 @@ fn main() -> eframe::Result {
                     choice,
                 )
             };
+            let mut app = app;
+            app.tone = tone;
             Ok(Box::new(app))
         }),
     )

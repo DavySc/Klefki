@@ -18,6 +18,8 @@ pub enum Action {
     Refresh,
     Search,
     Theme(crate::theme::ThemeChoice),
+    Tone(crate::theme::Tone),
+    Settings,
 }
 
 pub struct Entry {
@@ -134,7 +136,7 @@ impl CommandPalette {
                     egui::pos2(x, y),
                     egui::Align2::LEFT_CENTER,
                     entry.icon,
-                    egui::FontId::proportional(18.0),
+                    egui::FontId::proportional(15.0),
                     icon_color,
                 );
                 x = r.right() + 10.0;

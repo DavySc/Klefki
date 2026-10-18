@@ -1,7 +1,7 @@
 //! The desktop-style shell: left nav, top bar, icon toolbar, grid and detail panel.
 //! Pure UI over an immutable `Snapshot`; no IO.
 use crate::command::{self, CommandPalette, Entry, shortcut};
-use crate::theme::{self, Palette, ThemeChoice};
+use crate::theme::{self, Palette, ThemeChoice, Tone};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
@@ -46,7 +46,7 @@ impl Page {
 
     /// Pages that are not built yet say what they will do, so the menu is a map rather than a dead end.
     fn ready(self) -> bool {
-        self == Page::Connections
+        matches!(self, Page::Connections | Page::Settings)
     }
 
     fn promise(self) -> &'static str {
@@ -160,6 +160,7 @@ pub struct ShellApp {
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
     pub theme: ThemeChoice,
+    pub tone: Tone,
 }
 
 impl ShellApp {
@@ -182,6 +183,7 @@ impl ShellApp {
             selected: BTreeSet::new(),
             tab: DetailTab::General,
             theme,
+            tone: Tone::default(),
         }
     }
 
@@ -484,12 +486,13 @@ impl ShellApp {
                     ui.add_space(6.0);
                     self.grid(ui);
                 }
+                Page::Settings => self.settings(ui),
                 other => {
                     ui.add_space(48.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new(other.glyph())
-                                .size(40.0)
+                                .size(32.0)
                                 .color(pal.text_muted),
                         );
                         ui.add_space(8.0);
@@ -511,11 +514,11 @@ impl ShellApp {
     fn top_bar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
         ui.horizontal_centered(|ui| {
-            ui.label(RichText::new(icon::KEY).size(22.0).color(pal.key));
+            ui.label(RichText::new(icon::KEY).size(17.0).color(pal.key));
             ui.label(
                 RichText::new("Klefki")
                     .family(theme::bold_family())
-                    .size(20.0)
+                    .size(18.0)
                     .color(pal.primary),
             );
             ui.label(RichText::new(self.page.title()).color(pal.text_muted));
@@ -583,12 +586,13 @@ impl ShellApp {
             resp.widget_info(|| {
                 egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, active, title)
             });
+            // The menu orients; it should not compete with the list. Inactive items are dim, icons small and
+            // all one colour, and the active item is a quiet rounded fill rather than a coloured bar.
+            let pill = rect.shrink2(egui::vec2(8.0, 3.0));
             if active {
-                ui.painter().rect_filled(rect, 0.0, pal.panel);
-                let bar = egui::Rect::from_min_size(rect.min, egui::vec2(4.0, rect.height()));
-                ui.painter().rect_filled(bar, 0.0, pal.primary);
+                ui.painter().rect_filled(pill, 6.0, pal.hover);
             } else if resp.hovered() {
-                ui.painter().rect_filled(rect, 0.0, pal.row_alt);
+                ui.painter().rect_filled(pill, 6.0, pal.row_alt);
             }
             let color = if active {
                 pal.text
@@ -597,25 +601,18 @@ impl ShellApp {
             } else {
                 pal.disabled
             };
-            let glyph_color = if page == Page::Secrets {
-                pal.key
-            } else if active {
-                pal.primary
-            } else {
-                color
-            };
             ui.painter().text(
-                rect.left_center() + egui::vec2(18.0, 0.0),
+                rect.left_center() + egui::vec2(22.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 glyph,
-                egui::FontId::proportional(20.0),
-                glyph_color,
+                egui::FontId::proportional(16.0),
+                color,
             );
             let label = ui.painter().text(
-                rect.left_center() + egui::vec2(52.0, 0.0),
+                rect.left_center() + egui::vec2(48.0, 0.0),
                 egui::Align2::LEFT_CENTER,
                 title,
-                egui::FontId::proportional(16.0),
+                egui::FontId::proportional(15.0),
                 color,
             );
             if !page.ready() {
@@ -681,7 +678,7 @@ impl ShellApp {
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
             for (glyph, tip) in ACTIONS {
-                let button = egui::Button::new(RichText::new(glyph).size(20.0))
+                let button = egui::Button::new(RichText::new(glyph).size(16.0))
                     .min_size(egui::vec2(44.0, 38.0));
                 let (enabled, needs) = match glyph {
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
@@ -830,6 +827,22 @@ impl ShellApp {
                 command::Action::Theme(choice),
             );
         }
+        for tone in Tone::ALL {
+            add(
+                icon::PALETTE,
+                format!("Greys: {}", tone.label()),
+                String::new(),
+                None,
+                command::Action::Tone(tone),
+            );
+        }
+        add(
+            icon::GEAR,
+            "Settings".into(),
+            "Appearance".into(),
+            None,
+            command::Action::Settings,
+        );
         for i in self.visible() {
             let s = &self.snapshot.servers[i];
             add(
@@ -877,6 +890,11 @@ impl ShellApp {
                 self.theme = choice;
                 theme::set_choice(ctx, choice);
             }
+            A::Tone(tone) => {
+                self.tone = tone;
+                theme::set_tone(ctx, tone);
+            }
+            A::Settings => self.page = Page::Settings,
         }
     }
 
@@ -886,6 +904,49 @@ impl ShellApp {
             (Some(&i), None) => self.snapshot.servers.get(i),
             _ => None,
         }
+    }
+
+    /// Settings. For now, how Klefki looks: light or dark, and which family of greys.
+    fn settings(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        ui.add_space(8.0);
+        ui.label(RichText::new("Settings").heading());
+        ui.add_space(16.0);
+        ui.label(RichText::new("Appearance").strong());
+        ui.add_space(6.0);
+        egui::Grid::new("appearance")
+            .num_columns(2)
+            .spacing([24.0, 14.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Theme").color(pal.text_muted));
+                ui.horizontal(|ui| {
+                    for choice in ThemeChoice::ALL {
+                        let text = format!("{} {}", choice.icon(), choice.label());
+                        if ui.selectable_value(&mut self.theme, choice, text).changed() {
+                            theme::set_choice(ui.ctx(), choice);
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label(RichText::new("Greys").color(pal.text_muted));
+                ui.horizontal(|ui| {
+                    for tone in Tone::ALL {
+                        if ui
+                            .selectable_value(&mut self.tone, tone, tone.label())
+                            .changed()
+                        {
+                            theme::set_tone(ui.ctx(), tone);
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Both keep every text at a contrast of at least 4.5:1.")
+                .small()
+                .color(pal.text_muted),
+        );
     }
 
     /// Moves the selection `step` rows through the list as shown, starting at the top when nothing is selected.
@@ -982,7 +1043,7 @@ impl ShellApp {
                     .show(ui, |ui| {
                         ui.set_max_width(420.0);
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(glyph).size(18.0).color(color));
+                            ui.label(RichText::new(glyph).size(16.0).color(color));
                             ui.add(
                                 egui::Label::new(RichText::new(&outcome.text).color(pal.text))
                                     .wrap(),
@@ -1231,7 +1292,7 @@ impl ShellApp {
                 if self.selected.is_empty() {
                     ui.label(
                         RichText::new(icon::PLUGS_CONNECTED)
-                            .size(36.0)
+                            .size(28.0)
                             .color(pal.text_muted),
                     );
                     ui.add_space(6.0);
@@ -1273,8 +1334,11 @@ impl ShellApp {
         ui.label(RichText::new(&s.name).heading());
         ui.horizontal(|ui| {
             flat_items(ui);
+            // Compact pills: smaller text and padding, so the tabs sit on one line and do not shout.
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
             for (tab, title) in DetailTab::ALL {
-                ui.selectable_value(&mut self.tab, tab, title);
+                ui.selectable_value(&mut self.tab, tab, RichText::new(title).size(13.5));
             }
         });
         ui.separator();
@@ -1496,6 +1560,7 @@ impl eframe::App for ShellApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         theme::save_choice(storage, self.theme);
+        theme::save_tone(storage, self.tone);
     }
 }
 
@@ -1612,8 +1677,8 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
 
 fn bar_frame(pal: &Palette) -> Frame {
     Frame::new()
-        .fill(pal.panel_raised)
-        .stroke(egui::Stroke::new(1.0, pal.border))
+        .fill(pal.chrome)
+        .stroke(egui::Stroke::new(1.0, pal.divider))
         .inner_margin(Margin::symmetric(12, 6))
 }
 
@@ -3451,5 +3516,41 @@ mod tests {
             h.query_by_label_contains("selected").is_none(),
             "no count without a selection"
         );
+    }
+
+    // ---- settings: appearance
+
+    #[test]
+    fn settings_switch_the_greys_and_remember_them() {
+        let mut h = harness();
+        h.run();
+        h.get_by_label_contains("Settings").click();
+        h.run();
+        assert_eq!(h.state().page, Page::Settings);
+        h.get_by_label("Warm gray").click();
+        h.run();
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
+        h.get_by_label_contains("Light").click();
+        h.run();
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
+        let mut storage = theme::tests::MemoryStorage::default();
+        eframe::App::save(h.state_mut(), &mut storage);
+        assert_eq!(theme::load_tone(Some(&storage)), Tone::Warm);
+        assert_eq!(theme::load_choice(Some(&storage)), ThemeChoice::Light);
+        h.get_by_label("Cool (Catppuccin)").click();
+        h.run();
+        assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
+    }
+
+    #[test]
+    fn the_palette_changes_the_greys_too() {
+        let (mut h, _engine) = live_harness();
+        h.run();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "greys warm");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().tone, Tone::Warm);
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
     }
 }

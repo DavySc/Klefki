@@ -3,6 +3,17 @@
 ## Current slice
 UX pass (2026-10-18). Done; see below. Next: the edit form, duplicate, keyring secrets.
 
+## Quieter interface and appearance settings (2026-10-18)
+Following the owner's notes on Linear's refresh: structure without clutter, and nothing competing for attention it has not earned.
+- Softer dividers: a new `divider` token per palette, lower contrast than control outlines (tested: softer than the border, still visible), used for panel edges and separators; the top bar now sits on the chrome colour with a soft edge instead of a raised fill with a hard line.
+- The menu recedes: inactive items dimmer, icons 16 px and one colour (the gold Secrets key is gone), labels 15 px, the active item a quiet rounded fill instead of a coloured bar.
+- Compact tabs: smaller text and padding, rounded pills on one line.
+- Fewer, smaller icons: toolbar 20 → 16 px, palette 18 → 15 px, empty states smaller, the logo key 22 → 17 px.
+- Warm gray: a second family of greys (`Tone::Warm`, dark and light), warmer and less saturated than Catppuccin's blue-violet, same accents; tested warm (red ≥ blue) and calmer (smaller channel spread) than Catppuccin, and through every existing contrast test (text 4.5:1 on every surface, focus 3:1). Catppuccin stays the default, as chosen earlier.
+- Settings is a real page now (Appearance: theme and greys; remembered across restarts) and reachable from the palette ("Greys: Warm gray", "Settings"). In the spirit of Linear's theme builder, without the colour picker.
+- Real window, seen: cool dark, warm dark, warm light, the settings page.
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 250 core + 97 app passed; `cargo deny check` 0.
+
 ## UX pass (2026-10-18)
 First look at the real window: this container can run it now (`apt-get install libxkbcommon-x11-0 libegl1 libgl1-mesa-dri xdotool`, then `xvfb-run`), driven with `xdotool` against a throwaway `CLAUDE_CONFIG_DIR`. Screenshots before and after are in `docs/screenshots/`. The Linear article could not be fetched from here (network policy); the changes follow its spirit (calmer chrome, content first), Raycast (keyboard first, a command palette) and Excalidraw (friendly empty states).
 - Seen in the real window and fixed: 7 of 11 toolbar buttons did nothing ("not built yet"), and "0 selected" wrapped to its own line; the detail panel took half the window (five tabs did not fit) and squeezed out Status and Target; long project paths in group headers ran across the grid and into the detail panel; "Pending approval" was cut off; the review led with a raw JSON path, said "the 1 projects", shouted the restart hint in orange, and its button looked like any other; nothing was reachable by keyboard except F5, Del and Ctrl+E; unbuilt pages and tabs said "Not built yet".

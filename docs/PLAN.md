@@ -109,7 +109,7 @@ klefki/
 - **Legacy `mcpServersDisabled`**: shown read-only, with a migrate action.
 
 ## App (`crates/app/src`): Catppuccin Mocha / Latte with Klefki accents
-Changed from the original look at the owner's request. Dark (Mocha) is the default; a light (Latte) theme and a System option were added.
+Changed from the original look at the owner's request. Dark (Mocha) is the default; a light (Latte) theme and a System option were added. A warm-gray family (dark and light) can be chosen in Settings; panel edges use a soft divider colour.
 - **`theme.rs`**: one `Palette` per theme (`DARK`, `LIGHT`) mapped to `egui::Visuals`, 6 px rounding. A top-bar dropdown offers System, Light and Dark; the choice is remembered through eframe's storage, and `--theme light|dark|system` overrides it for one run. All colours in one place:
   - **Dark surfaces** (Mocha): field `#11111B`, chrome `#181825`, panel `#1E1E2E`, raised `#313244`, alternate row `#232334`, border `#45475A`, hover `#3B3D50`
   - **Dark text**: `#CDD6F4`, muted `#A6ADC8`
