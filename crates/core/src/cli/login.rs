@@ -4,6 +4,7 @@
 //! link only after checking it, and waits. If the browser cannot reach the callback, the user pastes the address it
 //! ends up on; Klefki checks that too before typing it into the terminal, and types nothing else.
 use super::locate;
+use super::tree::Tree;
 use crate::model::ServerName;
 use crate::sanitize::{clip, sanitize};
 use std::ffi::OsStr;
@@ -225,9 +226,24 @@ pub(crate) struct LoginSpec<'a> {
 /// Starts `claude mcp login <name> --no-browser` in a pseudo-terminal, with no shell. Its output is sent to `tx`
 /// as [`Message::Output`] from a thread of its own.
 pub(crate) fn start(spec: &LoginSpec<'_>, tx: Sender<Message>) -> io::Result<Pty> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::CommandBuilder;
     locate::check(spec.program)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let mut cmd = CommandBuilder::new(spec.program);
+    cmd.args(["mcp", "login", spec.name.as_str(), "--no-browser"]);
+    cmd.cwd(spec.cwd);
+    cmd.env("NO_COLOR", "1");
+    for (key, value) in spec.env {
+        cmd.env(key, value);
+    }
+    // Last, so no secret reaches it: not from Klefki's own environment, nor from the one it was given.
+    cmd.env_remove("MCP_CLIENT_SECRET");
+    launch(cmd, tx)
+}
+
+/// Starts `cmd` in a new pseudo-terminal; see [`start`].
+fn launch(cmd: portable_pty::CommandBuilder, tx: Sender<Message>) -> io::Result<Pty> {
+    use portable_pty::{PtySize, native_pty_system};
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -238,16 +254,8 @@ pub(crate) fn start(spec: &LoginSpec<'_>, tx: Sender<Message>) -> io::Result<Pty
             pixel_height: 0,
         })
         .map_err(io::Error::other)?;
-    let mut cmd = CommandBuilder::new(spec.program);
-    cmd.args(["mcp", "login", spec.name.as_str(), "--no-browser"]);
-    cmd.cwd(spec.cwd);
-    cmd.env("NO_COLOR", "1");
-    for (key, value) in spec.env {
-        cmd.env(key, value);
-    }
-    // Last, so no secret reaches it: not from Klefki's own environment, nor from the one it was given.
-    cmd.env_remove("MCP_CLIENT_SECRET");
     let child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
+    let tree = Tree::of_pty(child.as_ref());
     // Only the child holds the terminal's other end now, so its output ends when it does (on Unix).
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
@@ -265,14 +273,19 @@ pub(crate) fn start(spec: &LoginSpec<'_>, tx: Sender<Message>) -> io::Result<Pty
         })?;
     Ok(Pty {
         child,
+        tree,
+        ended: false,
         writer,
         _master: pair.master,
     })
 }
 
-/// A running `claude mcp login`. Dropping it kills the process and closes the terminal.
+/// A running `claude mcp login`. Dropping it kills the process, everything it started, and closes the terminal.
 pub(crate) struct Pty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    tree: Tree,
+    /// The process was seen to end (and was waited for), so its tree is no longer killed.
+    ended: bool,
     writer: Box<dyn Write + Send>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
@@ -285,10 +298,15 @@ impl Terminal for Pty {
 
     fn exit_code(&mut self) -> Option<i32> {
         let status = self.child.try_wait().ok()??;
+        self.ended = true;
         Some(i32::try_from(status.exit_code()).unwrap_or(i32::MAX))
     }
 
     fn kill(&mut self) {
+        // First: killing the process itself waits for it.
+        if !self.ended {
+            self.tree.kill();
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -1074,17 +1092,6 @@ mod tests {
         }
     }
 
-    fn gone_soon(pid: u32) -> bool {
-        let until = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < until {
-            if !crate::cli::testutil::pid_alive(pid) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        false
-    }
-
     #[test]
     fn claude_runs_in_a_real_terminal_with_no_shell_and_its_link_comes_through_whole() {
         let mut transcript = fixture("synthetic-waiting-https.txt");
@@ -1205,7 +1212,54 @@ mod tests {
                 Outcome::TimedOut
             };
             assert_eq!(seen, vec![Progress::Finished(want)]);
-            assert!(gone_soon(pid), "fake-claude {pid} still runs");
+            assert!(
+                crate::cli::testutil::gone_soon(pid),
+                "fake-claude {pid} still runs"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_and_timeout_end_everything_claude_started() {
+        // Regression: only `claude` was killed, so a process it started stayed behind.
+        for cancel in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let (program, args, env) = crate::cli::testutil::process_tree(&pids, 2);
+            let mut cmd = portable_pty::CommandBuilder::new(program);
+            cmd.args(args);
+            cmd.cwd(dir.path());
+            for (key, value) in env {
+                cmd.env(key, value);
+            }
+            let (tx, rx) = mpsc::channel();
+            let mut pty = launch(cmd, tx.clone()).unwrap();
+            // Driven from the start: a Windows pseudo-console holds its programs until its queries are answered.
+            let timeout = Duration::from_secs(if cancel { 60 } else { 10 });
+            let driving = std::thread::spawn(move || {
+                let mut seen = Vec::new();
+                drive(&mut pty, &rx, timeout, &mut |p| seen.push(p));
+                (pty, seen)
+            });
+            let started = crate::cli::testutil::tree_pids(&pids, 3);
+            if cancel {
+                tx.send(Message::Cancel).unwrap();
+            }
+            let (pty, seen) = driving.join().unwrap();
+            let want = if cancel {
+                Outcome::Cancelled
+            } else {
+                Outcome::TimedOut
+            };
+            assert_eq!(seen.last(), Some(&Progress::Finished(want)));
+            // While the terminal is still open: closing it is not what ends them.
+            for pid in started {
+                assert!(
+                    crate::cli::testutil::gone_soon(pid),
+                    "process {pid} still runs (cancel: {cancel})"
+                );
+            }
+            drop(pty);
         }
     }
 

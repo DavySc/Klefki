@@ -339,7 +339,7 @@ An outside brainstorm was compared with the plan and checked on this machine: `d
 ## Not done / unverified
 - Diagnose output formats are from Claude Code 2.1.302 only; the hints match short stable fragments and say nothing rather than guess when the text changes.
 - The debug file did not repeat a configured header or env secret in two tests, but that is not a guarantee; redaction is the safeguard, with tests.
-- The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.
+- ~~The runner kills only the `claude` process on a timeout, not any grandchildren it started (for example `npx` and node for a stdio server). A Windows job object would fix it; not done. Timeouts are rare (30 s) but could leave a server process behind.~~ Fixed 2026-10-18: a timeout or cancel ends the whole process tree (`docs/progress/2026-10-18-kill-process-tree.md`).
 - A refresh that arrives while checks run drops their answers by generation; this is covered by reading the code and by the UI test for cut-off checks, not by an engine test with a real race.
 - Live checks use the user's home folder as the working directory for user-scope servers; a local server named like a project server in the home folder could shadow it. Not seen in practice.
 - `cargo deny` runs now; advisories fail (see Docstore section).

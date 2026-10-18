@@ -1976,6 +1976,8 @@ name = "klefki-cli"
 version = "0.1.0"
 dependencies = [
  "klefki-core",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1986,6 +1988,7 @@ dependencies = [
  "directories",
  "filetime",
  "keyring-core",
+ "libc",
  "memchr",
  "open",
  "portable-pty",
@@ -1996,6 +1999,7 @@ dependencies = [
  "tempfile",
  "url",
  "windows-native-keyring-store",
+ "windows-sys 0.61.2",
  "zbus-secret-service-keyring-store",
  "zeroize",
 ]
