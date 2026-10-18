@@ -6,6 +6,7 @@ use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::ConfigPaths;
 use crate::config::docstore::{Docstore, Plan};
+use crate::config::entry;
 use crate::config::fsx;
 use crate::config::inventory;
 use crate::diagnose::report;
@@ -39,6 +40,8 @@ pub enum Command {
     Apply(u64),
     /// The user declined a plan.
     Discard(u64),
+    /// Send the server's definition, for viewing and editing (see [`Event::Entry`]).
+    Inspect(ServerId),
 }
 
 /// Something the user wants changed. Targets are rows of the current inventory; project scope cannot be
@@ -50,6 +53,12 @@ pub enum Change {
     /// Let Claude Code run a project (`.mcp.json`) server: the one thing written inside a repository. The plan
     /// shows everything the server would run first.
     Approve { id: ServerId },
+    /// Delete a user or local server. Project servers live in the repository's `.mcp.json`, which klefki does not
+    /// edit.
+    Delete { id: ServerId },
+    /// Replace the definition of a user or local server with `json`, as edited from [`Event::Entry`]: values shown
+    /// as `<hidden>` keep the value they had.
+    Replace { id: ServerId, json: String },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -132,6 +141,13 @@ pub enum Event {
     /// Claude Code overwrote the change right after it was written, and it was put back.
     Reapplied {
         plan: u64,
+    },
+    /// A server's definition as pretty JSON, environment and header values replaced by `<hidden>`, or why it could
+    /// not be read. `editable` is false for project servers (the repository's file).
+    Entry {
+        id: ServerId,
+        json: Result<String, String>,
+        editable: bool,
     },
 }
 
@@ -355,11 +371,32 @@ fn engine_main(
             Command::Refresh { live_all } => refresh(&shared, &mut state, live_all),
             Command::Check(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Check),
             Command::Diagnose(id) => enqueue_now(&shared, &state.snapshot, &id, JobKind::Diagnose),
+            Command::Inspect(id) => inspect(&shared, id),
         }
     }
     // The UI is gone: let the workers finish what they are doing and stop.
     lock(&shared.queue).shutdown = true;
     shared.wake_workers.notify_all();
+}
+
+fn inspect(shared: &Shared, id: ServerId) {
+    let in_repository = id.scope == Scope::Project;
+    let json = match &shared.config.paths {
+        None => Err("Could not determine where Claude Code keeps its configuration.".to_owned()),
+        Some(paths) => {
+            inventory::server_entry(paths, id.project.as_deref(), &id.name, in_repository).and_then(
+                |entry| {
+                    serde_json::to_string_pretty(&entry::masked(&entry)).map_err(|e| e.to_string())
+                },
+            )
+        }
+    };
+    shared.emitter.emit(Event::Entry {
+        id,
+        // Text from the files, shown in an editor: no control or bidi characters.
+        json: json.map(|j| sanitize(&j)).map_err(|e| sanitize(&e)),
+        editable: !in_repository,
+    });
 }
 
 /// A prepared change: one plan per file, written settings files first and `.claude.json` last.
@@ -2550,5 +2587,174 @@ mod tests {
             later.push(e);
         }
         assert!(snapshots(&later).is_empty(), "{later:#?}");
+    }
+
+    // ---- delete and edit
+
+    fn entry_of(core: &Core, id: ServerId) -> (Result<String, String>, bool) {
+        core.send(Command::Inspect(id.clone()));
+        let events = collect(core, |e| e.iter().any(|x| matches!(x, Event::Entry { .. })));
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Entry {
+                    id: got,
+                    json,
+                    editable,
+                } if got == id => Some((json, editable)),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn plan_failure(core: &Core, changes: Vec<Change>) -> String {
+        core.send(Command::Prepare(changes));
+        let events = collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::PlanFailed(_) | Event::PlanReady(_)))
+        });
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                Event::PlanFailed(m) => Some(m),
+                _ => None,
+            })
+            .expect("the plan was refused")
+    }
+
+    #[test]
+    fn a_definition_is_shown_with_secrets_hidden() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let (json, editable) = entry_of(&core, user_id("gw"));
+        let json = json.unwrap();
+        assert!(editable);
+        assert!(
+            json.contains("<hidden>") && !json.contains("s3cret-value"),
+            "{json}"
+        );
+        assert!(json.contains("\"command\": \"node\""), "{json}");
+        let (gone, _) = entry_of(&core, user_id("ghost"));
+        assert!(gone.is_err());
+    }
+
+    #[test]
+    fn a_project_server_is_shown_but_not_editable() {
+        let (env, key, _repo) = repo_env(serde_json::json!({}));
+        let core = env.start();
+        let (json, editable) = entry_of(&core, project_id(&key, "ps"));
+        assert!(!editable);
+        assert!(json.unwrap().contains("server.js"));
+        let refused = plan_failure(
+            &core,
+            vec![Change::Delete {
+                id: project_id(&key, "ps"),
+            }],
+        );
+        assert!(refused.contains("repository"), "{refused}");
+        let refused = plan_failure(
+            &core,
+            vec![Change::Replace {
+                id: project_id(&key, "ps"),
+                json: "{\"command\": \"x\"}".into(),
+            }],
+        );
+        assert!(refused.contains("repository"), "{refused}");
+    }
+
+    #[test]
+    fn deleting_a_user_server_removes_it_and_only_it() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(&core, vec![Change::Delete { id: user_id("gw") }]);
+        assert!(
+            plan.files[0].lines.contains(&"- gw".to_owned()),
+            "{:?}",
+            plan.files
+        );
+        assert!(plan.warnings.iter().any(|w| w.contains("sign-in")));
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. }))
+        );
+        let now = config_json(&env);
+        assert_eq!(now["mcpServers"], serde_json::json!({}));
+        assert_eq!(now["projects"], two_projects("end")["projects"]);
+        assert!(
+            snapshots(&events)
+                .last()
+                .unwrap()
+                .servers
+                .iter()
+                .all(|r| r.name != "gw")
+        );
+    }
+
+    #[test]
+    fn deleting_a_local_server() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Delete {
+                id: local_id("loc", "/work/a"),
+            }],
+        );
+        apply_and_wait(&core, &plan);
+        assert_eq!(
+            config_json(&env)["projects"]["/work/a"]["mcpServers"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn editing_round_trips_through_the_hidden_view_and_keeps_the_secret() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let (json, _) = entry_of(&core, user_id("gw"));
+        let edited = json.unwrap().replace("\"node\"", "\"node22\"");
+        let plan = plan_for(
+            &core,
+            vec![Change::Replace {
+                id: user_id("gw"),
+                json: edited,
+            }],
+        );
+        let shown = format!("{plan:?}");
+        assert!(
+            shown.contains("node22") && !shown.contains("s3cret-value"),
+            "{shown}"
+        );
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        assert_eq!(now["mcpServers"]["gw"]["command"], "node22");
+        assert_eq!(now["mcpServers"]["gw"]["env"]["TOKEN"], "s3cret-value");
+    }
+
+    #[test]
+    fn an_edit_that_is_not_valid_says_why_and_writes_nothing() {
+        let env = quiet_env(&two_projects("end"));
+        let before = config_json(&env);
+        let core = env.start();
+        for (json, why) in [
+            ("{not json", "not valid JSON"),
+            ("{\"type\": \"http\"}", "url"),
+            (
+                "{\"command\": \"x\", \"env\": {\"NEW\": \"<hidden>\"}}",
+                "no value before",
+            ),
+        ] {
+            let refused = plan_failure(
+                &core,
+                vec![Change::Replace {
+                    id: user_id("gw"),
+                    json: json.into(),
+                }],
+            );
+            assert!(refused.contains(why), "{json}: {refused}");
+        }
+        assert_eq!(config_json(&env), before);
     }
 }

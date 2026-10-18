@@ -17,7 +17,7 @@ impl std::fmt::Display for LocateError {
             Self::NotFound => write!(f, "the Claude CLI was not found"),
             Self::UnsupportedShim(p) => write!(
                 f,
-                "{} is a script shim, which klefki will not run; install the native Claude Code build",
+                "{} is a script shim, which Klefki will not run; install the native Claude Code build",
                 p.display()
             ),
             Self::NotExecutable(p) => write!(f, "{} is not an executable file", p.display()),

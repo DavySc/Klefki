@@ -7,7 +7,7 @@
 //! Claude may still write without the lock (it gives up waiting after about 1.5 s), so `verify` re-reads a moment
 //! later and re-applies if our change is gone.
 use super::inventory::{MAX_CLAUDE_JSON, normalise_project};
-use super::{fsx, jsonspan};
+use super::{entry, fsx, jsonspan};
 use crate::sanitize::sanitize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -39,6 +39,45 @@ pub(crate) enum Op {
     /// For the project's `.claude/settings.local.json`: add `name` to `enabledMcpjsonServers` and remove it from
     /// `disabledMcpjsonServers`. The only thing klefki ever writes inside a repository.
     Approve { name: String },
+    /// Delete the server `name`: from the top-level `mcpServers` (`project` is `None`), or from
+    /// `projects[<project>].mcpServers` in every spelling of the project that has it.
+    RemoveServer {
+        project: Option<String>,
+        name: String,
+    },
+    /// Replace the definition of server `name` (same places as [`Op::RemoveServer`]). Environment and header
+    /// values given as [`entry::MASK`] keep the value they had.
+    ReplaceServer {
+        project: Option<String>,
+        name: String,
+        entry: Value,
+    },
+}
+
+impl Op {
+    /// The project this op changes inside, if any.
+    fn project(&self) -> Option<&str> {
+        match self {
+            Op::SetDisabled { project, .. } | Op::ClearRejection { project, .. } => Some(project),
+            Op::RemoveServer { project, .. } | Op::ReplaceServer { project, .. } => {
+                project.as_deref()
+            }
+            Op::Approve { .. } => None,
+        }
+    }
+
+    fn is_server_op(&self) -> bool {
+        matches!(self, Op::RemoveServer { .. } | Op::ReplaceServer { .. })
+    }
+
+    fn server_name(&self) -> &str {
+        match self {
+            Op::RemoveServer { name, .. } | Op::ReplaceServer { name, .. } => name,
+            Op::SetDisabled { name, .. }
+            | Op::ClearRejection { name, .. }
+            | Op::Approve { name } => name,
+        }
+    }
 }
 
 /// Which file a [`Docstore`] writes, and so which ops it accepts.
@@ -634,22 +673,60 @@ fn edit_valid_claude_json(
     if ops.is_empty() {
         return Ok((None, Vec::new()));
     }
-    let mut targets = Vec::with_capacity(ops.len());
-    for op in ops {
-        match op {
-            Op::SetDisabled { project, .. } | Op::ClearRejection { project, .. } => {
-                targets.push(normalise_project(project))
-            }
-            Op::Approve { .. } => return Err(wrong_file()),
-        }
+    if ops.iter().any(|op| matches!(op, Op::Approve { .. })) {
+        return Err(wrong_file());
     }
-    // One pass: the root, `projects`, and only the entries the ops are about.
+    // `None` for an op on a user server (the top-level `mcpServers`).
+    let targets: Vec<Option<String>> = ops
+        .iter()
+        .map(|op| op.project().map(normalise_project))
+        .collect();
+    let user_servers = targets.iter().any(Option::is_none);
+    let local_servers = ops
+        .iter()
+        .any(|op| op.is_server_op() && op.project().is_some());
+    // One pass: the root, `projects` and `mcpServers` as needed, and only the entries the ops are about.
     let root = jsonspan::object_with(text, start, &mut |level, key| match level {
-        0 => key == "projects",
-        1 => targets.contains(&normalise_project(key)),
+        0 => {
+            (key == "projects" && targets.iter().any(Option::is_some))
+                || (key == "mcpServers" && user_servers)
+        }
+        1 => targets
+            .iter()
+            .flatten()
+            .any(|t| *t == normalise_project(key)),
+        2 => key == "mcpServers" && local_servers,
         _ => false,
     })
     .map_err(invalid)?;
+
+    let mut out = Edited {
+        nl: if text.contains("\r\n") { "\r\n" } else { "\n" },
+        splices: Vec::new(),
+        lines: Vec::new(),
+    };
+
+    if user_servers {
+        let here: Vec<&Op> = ops
+            .iter()
+            .zip(&targets)
+            .filter(|(_, t)| t.is_none())
+            .map(|(op, _)| op)
+            .collect();
+        let servers = single(&root, "mcpServers", "the configuration")?;
+        edit_servers(
+            text,
+            servers,
+            "  mcpServers".to_owned(),
+            &here,
+            true,
+            &mut out,
+        )?;
+    }
+    if targets.iter().all(Option::is_none) {
+        return Ok(out.finish());
+    }
+
     let projects = single(&root, "projects", "the configuration")?
         .and_then(|m| m.object.as_ref())
         .ok_or_else(|| invalid("the configuration has no projects".to_owned()))?;
@@ -666,21 +743,20 @@ fn edit_valid_claude_json(
             )));
         }
     }
-    if let Some(missing) = targets.iter().find(|t| !keys.contains(t)) {
+    if let Some(missing) = targets.iter().flatten().find(|t| !keys.contains(t)) {
         return Err(invalid(format!(
             "{} is not a project Claude Code knows about",
             sanitize(missing)
         )));
     }
 
-    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
-    let mut lines = Vec::new();
-    let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    // Servers to delete or replace in a project: an error if no spelling of the project has them.
+    let mut server_found = vec![false; ops.len()];
     for (member, key) in projects.members.iter().zip(&keys) {
         let here: Vec<&Op> = ops
             .iter()
             .zip(&targets)
-            .filter(|(_, t)| *t == key)
+            .filter(|(_, t)| t.as_deref() == Some(key.as_str()))
             .map(|(op, _)| op)
             .collect();
         if here.is_empty() {
@@ -693,6 +769,31 @@ fn edit_valid_claude_json(
             )));
         };
         let shown_key = sanitize(&member.key.replace('"', "\\\""));
+        let server_ops: Vec<&Op> = here
+            .iter()
+            .copied()
+            .filter(|op| op.is_server_op())
+            .collect();
+        if !server_ops.is_empty() {
+            let servers = single(
+                entry,
+                "mcpServers",
+                &format!("the entry for {}", sanitize(&member.key)),
+            )?;
+            let found = edit_servers(
+                text,
+                servers,
+                format!("  projects[\"{shown_key}\"].mcpServers"),
+                &server_ops,
+                false,
+                &mut out,
+            )?;
+            for (i, op) in ops.iter().enumerate() {
+                if found.iter().any(|f| std::ptr::eq(*f, op)) {
+                    server_found[i] = true;
+                }
+            }
+        }
         for list in [DISABLED, REJECTED] {
             let list_ops: Vec<&&Op> = here
                 .iter()
@@ -736,16 +837,16 @@ fn edit_valid_claude_json(
                             let list = items.get_or_insert_with(Vec::new);
                             if !list.iter().any(is_name) {
                                 list.push(Value::String(name.clone()));
-                                lines.push(header.clone());
-                                lines.push(format!("+ {}", sanitize(name)));
+                                out.lines.push(header.clone());
+                                out.lines.push(format!("+ {}", sanitize(name)));
                                 changed = true;
                             }
                         } else if let Some(list) = &mut items {
                             let before = list.len();
                             list.retain(|v| !is_name(v));
                             if list.len() != before {
-                                lines.push(header.clone());
-                                lines.push(format!("- {}", sanitize(name)));
+                                out.lines.push(header.clone());
+                                out.lines.push(format!("- {}", sanitize(name)));
                                 changed = true;
                             }
                         }
@@ -755,34 +856,194 @@ fn edit_valid_claude_json(
                             let before = list.len();
                             list.retain(|v| v.as_str() != Some(name.as_str()));
                             if list.len() != before {
-                                lines.push(header.clone());
-                                lines.push(format!("- {}", sanitize(name)));
+                                out.lines.push(header.clone());
+                                out.lines.push(format!("- {}", sanitize(name)));
                                 changed = true;
                             }
                         }
                     }
-                    Op::Approve { .. } => return Err(wrong_file()),
+                    Op::Approve { .. } | Op::RemoveServer { .. } | Op::ReplaceServer { .. } => {}
                 }
             }
             if !changed {
                 continue;
             }
             let items = items.unwrap_or_default();
-            splices.push(match existing {
+            out.splices.push(match existing {
                 Some(m) => {
                     let indent = jsonspan::line_indent(text, m.key_start);
-                    (m.value.clone(), render_list(&items, indent, nl)?)
+                    (m.value.clone(), render_list(&items, indent, out.nl)?)
                 }
-                None => add_member(text, member, entry, list, &items, nl)?,
+                None => add_member(text, member, entry, list, &items, out.nl)?,
             });
         }
     }
-    if splices.is_empty() {
-        return Ok((None, lines));
+    if let Some(i) =
+        (0..ops.len()).find(|&i| ops[i].is_server_op() && targets[i].is_some() && !server_found[i])
+    {
+        return Err(invalid(format!(
+            "{} is no longer in that project's configuration",
+            sanitize(ops[i].server_name())
+        )));
     }
-    // In file order; a stable sort keeps two insertions at the same place in the order they were made.
-    splices.sort_by_key(|(range, _)| range.start);
-    Ok((Some(splices), lines))
+    Ok(out.finish())
+}
+
+/// What an edit of `.claude.json` produces so far.
+struct Edited<'n> {
+    /// The file's newline, for new lines.
+    nl: &'n str,
+    splices: Splices,
+    lines: Vec<String>,
+}
+
+impl Edited<'_> {
+    fn finish(mut self) -> (Option<Splices>, Vec<String>) {
+        // In file order; a stable sort keeps two insertions at the same place in the order they were made.
+        self.splices.sort_by_key(|(range, _)| range.start);
+        (
+            (!self.splices.is_empty()).then_some(self.splices),
+            self.lines,
+        )
+    }
+}
+
+/// Deletes or replaces servers in one `mcpServers` object. Returns the ops that found their server. With
+/// `required`, an op whose server is missing is an error right away (user servers have one place only).
+fn edit_servers<'o>(
+    text: &str,
+    servers: Option<&jsonspan::Member>,
+    header: String,
+    ops: &[&'o Op],
+    required: bool,
+    out: &mut Edited<'_>,
+) -> Result<Vec<&'o Op>, StoreError> {
+    let (nl, splices, lines) = (out.nl, &mut out.splices, &mut out.lines);
+    let invalid = |why: String| StoreError::Invalid(why);
+    let object = match servers {
+        Some(m) => Some(
+            m.object
+                .as_ref()
+                .ok_or_else(|| invalid("mcpServers is not an object".to_owned()))?,
+        ),
+        None => None,
+    };
+    let mut found = Vec::new();
+    let mut removed = Vec::new();
+    for op in ops {
+        let name = op.server_name();
+        let index = object.and_then(|o| {
+            let mut hits = o.members.iter().enumerate().filter(|(_, m)| m.key == name);
+            let first = hits.next().map(|(i, _)| i);
+            hits.next().map_or(first, |_| Some(usize::MAX))
+        });
+        let index = match index {
+            Some(usize::MAX) => {
+                return Err(invalid(format!(
+                    "{} is defined twice; refusing to guess which one Claude Code uses",
+                    sanitize(name)
+                )));
+            }
+            Some(i) => i,
+            None if required => {
+                return Err(invalid(format!(
+                    "{} is no longer in the configuration",
+                    sanitize(name)
+                )));
+            }
+            None => continue,
+        };
+        let object = object.expect("found in it");
+        let member = &object.members[index];
+        let old: Value = serde_json::from_str(&text[member.value.clone()])
+            .map_err(|e| invalid(sanitize(&e.to_string())))?;
+        if old.get("oauth").is_some() {
+            return Err(invalid(format!(
+                "{} signs in with OAuth; it is changed through Claude Code's own command, which Klefki does not run yet",
+                sanitize(name)
+            )));
+        }
+        if removed.contains(&index) || splices.iter().any(|(r, _)| *r == member.value) {
+            return Err(invalid(format!(
+                "{} is changed twice in one plan",
+                sanitize(name)
+            )));
+        }
+        found.push(*op);
+        lines.push(header.clone());
+        match op {
+            Op::RemoveServer { .. } => {
+                lines.push(format!("- {}", sanitize(name)));
+                removed.push(index);
+            }
+            Op::ReplaceServer { entry: new, .. } => {
+                let new = entry::unmasked(new, &old).map_err(invalid)?;
+                entry::validate(&new).map_err(invalid)?;
+                let pretty =
+                    |v: &Value| serde_json::to_string_pretty(&entry::masked(v)).unwrap_or_default();
+                let diff = entry::diff_lines(&pretty(&old), &pretty(&new));
+                if old == new {
+                    // Nothing changes: no lines, no splice.
+                    lines.pop();
+                    continue;
+                }
+                lines.push(format!("~ {}", sanitize(name)));
+                lines.extend(diff.iter().map(|l| sanitize(l)));
+                if diff.iter().all(|l| l.starts_with("  ")) {
+                    lines.push("~ (a hidden environment or header value changes)".to_owned());
+                }
+                let indent = jsonspan::line_indent(text, member.key_start);
+                splices.push((member.value.clone(), render_value(&new, indent, nl)?));
+            }
+            _ => {}
+        }
+    }
+    if let (Some(object), false) = (object, removed.is_empty()) {
+        splices.extend(remove_members(object, &removed));
+    }
+    Ok(found)
+}
+
+/// The splices that delete the members at `removed` from `object`, commas included, without overlapping: a member
+/// with any member after it goes up to that member's key; a run of members at the end goes from the end of the last
+/// member kept; with nothing kept the object becomes `{}`.
+fn remove_members(object: &jsonspan::Object, removed: &[usize]) -> Splices {
+    let n = object.members.len();
+    if (0..n).all(|i| removed.contains(&i)) {
+        return vec![(object.open..object.close + 1, "{}".to_owned())];
+    }
+    // The first index of the run of removed members that reaches the end, if any.
+    let mut tail = n;
+    while tail > 0 && removed.contains(&(tail - 1)) {
+        tail -= 1;
+    }
+    let mut out = Vec::new();
+    for &i in removed {
+        if i < tail {
+            out.push((
+                object.members[i].key_start..object.members[i + 1].key_start,
+                String::new(),
+            ));
+        }
+    }
+    if tail < n {
+        out.push((
+            object.members[tail - 1].value.end..object.members[n - 1].value.end,
+            String::new(),
+        ));
+    }
+    out
+}
+
+/// A value written the way the surrounding file is (see [`render_list`]).
+fn render_value(value: &Value, indent: Option<&str>, nl: &str) -> Result<String, StoreError> {
+    let out = match indent {
+        Some(indent) => {
+            serde_json::to_string_pretty(value).map(|s| s.replace('\n', &format!("{nl}{indent}")))
+        }
+        None => serde_json::to_string(value),
+    };
+    out.map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))
 }
 
 /// The member called `key`, refusing a key that appears twice (a JSON reader would silently keep only one).
@@ -2042,7 +2303,9 @@ mod tests {
                         Op::ClearRejection { project, name } => {
                             clear_rejection(&mut expected, project, name, &mut expected_lines)
                         }
-                        Op::Approve { .. } => unreachable!(),
+                        Op::Approve { .. } | Op::RemoveServer { .. } | Op::ReplaceServer { .. } => {
+                            unreachable!("not generated")
+                        }
                     });
                 let got = edit_claude_json(&text, &ops);
                 match (oracle, got) {
@@ -2134,5 +2397,278 @@ mod tests {
             matches!(&err, StoreError::Invalid(m) if m.contains("not valid JSON")),
             "{err:?}"
         );
+    }
+
+    // ---- deleting and replacing servers
+
+    fn servers_doc() -> Value {
+        json!({
+            "numStartups": 2,
+            "mcpServers": {
+                "a": {"type": "stdio", "command": "node", "args": ["a.js"]},
+                "b": {"type": "http", "url": "https://b.example/mcp", "headers": {"Authorization": "Bearer s3cret"}},
+                "c": {"type": "stdio", "command": "c", "env": {"TOKEN": "t0ken", "MODE": "x"}}
+            },
+            "projects": {
+                "C:/w/p": {"mcpServers": {"loc": {"command": "x"}, "other": {"command": "y"}}},
+                "c:\\w\\p": {"mcpServers": {"loc": {"command": "x"}}},
+                "/q": {"mcpServers": {}}
+            },
+            "z": 1.5
+        })
+    }
+
+    fn remove(project: Option<&str>, name: &str) -> Op {
+        Op::RemoveServer {
+            project: project.map(str::to_owned),
+            name: name.to_owned(),
+        }
+    }
+
+    fn replace(project: Option<&str>, name: &str, entry: Value) -> Op {
+        Op::ReplaceServer {
+            project: project.map(str::to_owned),
+            name: name.to_owned(),
+            entry,
+        }
+    }
+
+    fn apply_ops(f: &Fixture, ops: Vec<Op>) -> Plan {
+        let plan = f.store.prepare(ops).unwrap();
+        f.store.apply(&plan).unwrap();
+        plan
+    }
+
+    #[test]
+    fn deleting_user_servers_leaves_everything_else_exactly() {
+        for victims in [
+            vec!["a"],
+            vec!["b"],
+            vec!["c"],
+            vec!["a", "b"],
+            vec!["b", "c"],
+            vec!["a", "c"],
+            vec!["a", "b", "c"],
+        ] {
+            let f = Fixture::new(&pretty(&servers_doc()));
+            let plan = apply_ops(&f, victims.iter().map(|n| remove(None, n)).collect());
+            let mut expected = servers_doc();
+            for v in &victims {
+                expected["mcpServers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .shift_remove(*v);
+            }
+            assert_eq!(f.text(), pretty(&expected), "{victims:?}");
+            for v in &victims {
+                assert!(plan.changes()[0].lines.contains(&format!("- {v}")));
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_from_a_one_line_file_keeps_it_on_one_line() {
+        let text = r#"{"mcpServers":{"a":{"command":"x"},"b":{"command":"y"},"c":{"command":"z"}},"k":1.50}"#;
+        for (victims, want) in [
+            (
+                vec!["a"],
+                r#"{"mcpServers":{"b":{"command":"y"},"c":{"command":"z"}},"k":1.50}"#,
+            ),
+            (
+                vec!["c"],
+                r#"{"mcpServers":{"a":{"command":"x"},"b":{"command":"y"}},"k":1.50}"#,
+            ),
+            (
+                vec!["b", "c"],
+                r#"{"mcpServers":{"a":{"command":"x"}},"k":1.50}"#,
+            ),
+            (vec!["a", "b", "c"], r#"{"mcpServers":{},"k":1.50}"#),
+        ] {
+            let f = Fixture::new(text);
+            apply_ops(&f, victims.iter().map(|n| remove(None, n)).collect());
+            assert_eq!(f.text(), want, "{victims:?}");
+        }
+    }
+
+    #[test]
+    fn deleting_a_local_server_covers_every_spelling_of_its_project() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        apply_ops(&f, vec![remove(Some("C:/w/p"), "loc")]);
+        let mut expected = servers_doc();
+        expected["projects"]["C:/w/p"]["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("loc");
+        expected["projects"]["c:\\w\\p"]["mcpServers"] = json!({});
+        assert_eq!(f.text(), pretty(&expected));
+    }
+
+    #[test]
+    fn deleting_a_server_that_is_not_there_is_refused() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        for op in [
+            remove(None, "nope"),
+            remove(Some("/q"), "loc"),
+            remove(Some("/nowhere"), "a"),
+        ] {
+            assert!(
+                matches!(
+                    f.store.prepare(vec![op.clone()]),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{op:?}"
+            );
+        }
+        assert_eq!(f.text(), pretty(&servers_doc()));
+    }
+
+    #[test]
+    fn a_server_defined_twice_is_not_guessed_at() {
+        let text = r#"{"mcpServers": {"a": {"command": "x"}, "a": {"command": "y"}}}"#;
+        let f = Fixture::new(text);
+        assert!(f.store.prepare(vec![remove(None, "a")]).is_err());
+        assert!(
+            f.store
+                .prepare(vec![replace(None, "a", json!({"command": "z"}))])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replacing_keeps_hidden_values_and_never_shows_them() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let edited = json!({"type": "stdio", "command": "c", "args": ["--fast"], "env": {"TOKEN": entry::MASK, "MODE": "y"}});
+        let plan = apply_ops(&f, vec![replace(None, "c", edited)]);
+        let mut expected = servers_doc();
+        expected["mcpServers"]["c"] = json!({"type": "stdio", "command": "c", "args": ["--fast"], "env": {"TOKEN": "t0ken", "MODE": "y"}});
+        assert_eq!(f.text(), pretty(&expected));
+        let shown = plan.changes()[0].lines.join("\n");
+        assert!(
+            !shown.contains("t0ken") && !shown.contains("s3cret"),
+            "{shown}"
+        );
+        assert!(shown.contains("~ c") && shown.contains("--fast"), "{shown}");
+    }
+
+    #[test]
+    fn a_changed_hidden_value_is_still_shown_as_a_change() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let edited = json!({"type": "http", "url": "https://b.example/mcp", "headers": {"Authorization": "Bearer new"}});
+        let plan = apply_ops(&f, vec![replace(None, "b", edited)]);
+        let shown = plan.changes()[0].lines.join("\n");
+        assert!(shown.contains("hidden"), "{shown}");
+        assert!(!shown.contains("Bearer"), "{shown}");
+        assert_eq!(
+            f.json()["mcpServers"]["b"]["headers"]["Authorization"],
+            "Bearer new"
+        );
+    }
+
+    #[test]
+    fn replacing_with_the_same_definition_changes_nothing() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let same = entry::masked(&servers_doc()["mcpServers"]["c"]);
+        let plan = f.store.prepare(vec![replace(None, "c", same)]).unwrap();
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn bad_replacements_are_refused_and_nothing_is_written() {
+        let text = pretty(&servers_doc());
+        let f = Fixture::new(&text);
+        for (name, edited) in [
+            ("c", json!({"command": "c", "env": {"NEW": entry::MASK}})),
+            ("a", json!({"type": "http"})),
+            ("a", json!({"command": "x", "oauth": {"clientId": "y"}})),
+            ("nope", json!({"command": "x"})),
+        ] {
+            assert!(
+                f.store
+                    .prepare(vec![replace(None, name, edited.clone())])
+                    .is_err(),
+                "{edited}"
+            );
+        }
+        assert_eq!(f.text(), text);
+    }
+
+    #[test]
+    fn oauth_servers_are_not_deleted_or_replaced_by_klefki() {
+        let text = r#"{"mcpServers": {"o": {"type": "http", "url": "https://o.example", "oauth": {"clientId": "c"}}}}"#;
+        let f = Fixture::new(text);
+        assert!(f.store.prepare(vec![remove(None, "o")]).is_err());
+        assert!(
+            f.store
+                .prepare(vec![replace(
+                    None,
+                    "o",
+                    json!({"type": "http", "url": "https://p.example"})
+                )])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn replacing_a_local_server_and_one_line_values() {
+        let f = Fixture::new(&pretty(&servers_doc()));
+        apply_ops(
+            &f,
+            vec![replace(
+                Some("C:/w/p"),
+                "other",
+                json!({"command": "z", "args": ["1"]}),
+            )],
+        );
+        let mut expected = servers_doc();
+        expected["projects"]["C:/w/p"]["mcpServers"]["other"] =
+            json!({"command": "z", "args": ["1"]});
+        assert_eq!(f.text(), pretty(&expected));
+        let f = Fixture::new(r#"{"mcpServers":{"a":{"command":"x"},"b":1}}"#);
+        apply_ops(&f, vec![replace(None, "a", json!({"command": "y"}))]);
+        assert_eq!(f.text(), r#"{"mcpServers":{"a":{"command":"y"},"b":1}}"#);
+    }
+
+    /// Any set of deletions from any object gives the same document as deleting from the parsed value, and the same
+    /// bytes as writing that value pretty.
+    #[test]
+    fn any_set_of_deletions_matches_the_parsed_result() {
+        for n in 1..=6usize {
+            for mask in 1u32..(1 << n) {
+                let servers: serde_json::Map<String, Value> = (0..n)
+                    .map(|i| (format!("s{i}"), json!({"command": format!("c{i}")})))
+                    .collect();
+                let doc = json!({"mcpServers": servers, "tail": true});
+                let victims: Vec<String> = (0..n)
+                    .filter(|i| mask & (1 << i) != 0)
+                    .map(|i| format!("s{i}"))
+                    .collect();
+                for compact in [false, true] {
+                    let text = if compact {
+                        serde_json::to_string(&doc).unwrap()
+                    } else {
+                        pretty(&doc)
+                    };
+                    let f = Fixture::new(&text);
+                    apply_ops(&f, victims.iter().map(|v| remove(None, v)).collect());
+                    let mut expected = doc.clone();
+                    for v in &victims {
+                        expected["mcpServers"]
+                            .as_object_mut()
+                            .unwrap()
+                            .shift_remove(v);
+                    }
+                    let want = if compact {
+                        serde_json::to_string(&expected).unwrap()
+                    } else {
+                        pretty(&expected)
+                    };
+                    assert_eq!(
+                        f.text(),
+                        want,
+                        "n {n}, victims {victims:?}, compact {compact}"
+                    );
+                }
+            }
+        }
     }
 }

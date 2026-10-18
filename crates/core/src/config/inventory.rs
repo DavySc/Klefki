@@ -334,6 +334,37 @@ pub(crate) fn is_safe_project_path(path: &str) -> bool {
         && Path::new(path).is_absolute()
 }
 
+/// The definition of one server, read fresh: a user server (`project` `None`), a local server (`project` in any
+/// spelling), or with `in_repository`, a project server from that project's `.mcp.json`.
+pub(crate) fn server_entry(
+    paths: &ConfigPaths,
+    project: Option<&str>,
+    name: &str,
+    in_repository: bool,
+) -> Result<Value, String> {
+    if in_repository {
+        let project = project.ok_or("a project server needs its project")?;
+        return project_server(project, name);
+    }
+    let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} does not exist", display_path(&paths.claude_json)))?;
+    let root = parse_claude_json(&text)?;
+    let found = match project {
+        None => root.get("mcpServers").and_then(|s| s.get(name)).cloned(),
+        Some(project) => {
+            let wanted = normalise_project(project);
+            root.get("projects")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter(|(key, _)| normalise_project(key) == wanted)
+                .find_map(|(_, entry)| entry.get("mcpServers").and_then(|s| s.get(name)).cloned())
+        }
+    };
+    found.ok_or_else(|| "the server is no longer in the configuration".to_owned())
+}
+
 /// The definition of one server in a project's `.mcp.json`, as Claude Code would read it (a later duplicate wins).
 pub(crate) fn project_server(project: &str, name: &str) -> Result<Value, String> {
     if !is_safe_project_path(project) {

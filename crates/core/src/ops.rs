@@ -1,7 +1,7 @@
 //! Turns what the user asked for into document edits. Needs the current inventory to know which projects exist.
 use crate::api::{Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot};
 use crate::config::docstore::Op;
-use crate::config::{fsx, inventory};
+use crate::config::{entry, fsx, inventory};
 use crate::sanitize::sanitize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -52,6 +52,8 @@ pub(crate) fn resolve(changes: &[Change], snapshot: &Snapshot) -> Result<Resolve
         match change {
             Change::SetEnabled { id, enabled } => set_enabled(id, *enabled, snapshot, &mut out)?,
             Change::Approve { id } => approve(id, snapshot, &mut out)?,
+            Change::Delete { id } => delete(id, snapshot, &mut out)?,
+            Change::Replace { id, json } => replace(id, json, snapshot, &mut out)?,
         }
     }
     if !out.claude.is_empty() {
@@ -118,6 +120,65 @@ fn set_enabled(
             ));
         }
     }
+    Ok(())
+}
+
+/// Where a user or local server lives, for an op; project servers are refused (the repository's file).
+fn own_server(id: &ServerId, snapshot: &Snapshot, what: &str) -> Result<Option<String>, String> {
+    let row = find(id, snapshot)?;
+    let shown = sanitize(&id.name);
+    match row.scope {
+        Scope::User => Ok(None),
+        Scope::Local => row
+            .project
+            .clone()
+            .map(Some)
+            .ok_or_else(|| format!("{shown} has no project")),
+        Scope::Project => Err(format!(
+            "{shown} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here."
+        )),
+    }
+}
+
+fn delete(id: &ServerId, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
+    let project = own_server(id, snapshot, "delete from")?;
+    out.claude.push(Op::RemoveServer {
+        project,
+        name: id.name.clone(),
+    });
+    out.warnings.push(
+        "Deleting removes the definition only. A sign-in Claude Code keeps for this server is not removed."
+            .to_owned(),
+    );
+    Ok(())
+}
+
+fn replace(
+    id: &ServerId,
+    json: &str,
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let project = own_server(id, snapshot, "edit")?;
+    if json.len() > entry::MAX_ENTRY_BYTES {
+        return Err(format!(
+            "The definition is longer than {} KiB.",
+            entry::MAX_ENTRY_BYTES / 1024
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
+        format!(
+            "The definition is not valid JSON: {}",
+            sanitize(&e.to_string())
+        )
+    })?;
+    // Checked again after hidden values are put back; this catches mistakes before anything is read.
+    entry::validate(&value).map_err(|why| format!("The definition is not usable: {why}."))?;
+    out.claude.push(Op::ReplaceServer {
+        project,
+        name: id.name.clone(),
+        entry: value,
+    });
     Ok(())
 }
 
