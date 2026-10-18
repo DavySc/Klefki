@@ -1,7 +1,7 @@
 # Progress
 
 ## Current slice
-Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done on branch `form-first-json-fallback`, not committed; see below. Next: keyring secrets.
+Owner's feedback (2026-10-18): editing the JSON directly is good, but it should be a fallback to labelled fields. Done; committed as `6e43626` on branch `form-first-json-fallback`, not yet pushed; see below. Next: keyring secrets.
 
 ## Fields first, JSON as the fallback (2026-10-18)
 Before: Edit (pencil, Ctrl+E, the palette's "Edit x", described as "JSON") opened a JSON tab; the labelled form was behind "Edit definition" on the General tab, and a definition the form could not show sent you to "the JSON tab".
