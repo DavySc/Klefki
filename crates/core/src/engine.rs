@@ -853,6 +853,52 @@ fn changer(shared: &Shared) -> Option<Arc<dyn swap::Claude>> {
     }))
 }
 
+/// For each server moved or copied into a project whose entry switches that name off: it arrives switched off there.
+fn stays_off(changes: &[Change], text: &str) -> Vec<String> {
+    let arrivals: Vec<(&str, &str)> = changes
+        .iter()
+        .flat_map(|change| match change {
+            Change::Move {
+                id,
+                to: crate::model::Target::Local(project),
+            } => vec![(id.name.as_str(), project.as_str())],
+            Change::Duplicate { name, targets, .. } => targets
+                .iter()
+                .filter_map(|t| match t {
+                    crate::model::Target::Local(project) => Some((name.as_str(), project.as_str())),
+                    crate::model::Target::User => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect();
+    if arrivals.is_empty() {
+        return Vec::new();
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return Vec::new();
+    };
+    let projects = root.get("projects").and_then(serde_json::Value::as_object);
+    arrivals
+        .into_iter()
+        .filter(|(name, project)| {
+            let wanted = inventory::normalise_project(project);
+            projects.into_iter().flatten().any(|(key, entry)| {
+                inventory::normalise_project(key) == wanted
+                    && entry
+                        .get("disabledMcpServers")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|off| off.iter().any(|n| n.as_str() == Some(name)))
+            })
+        })
+        .map(|(name, project)| {
+            let (name, folder) = (sanitize(name), sanitize(&ops::folder_name(project)));
+            format!("{name} is switched off in {folder}, so it stays off there. Switch it on there to use it.")
+        })
+        .collect()
+}
+
 fn backup_dir(shared: &Shared) -> Result<PathBuf, String> {
     shared.config.backup_dir.clone().ok_or_else(|| {
         "There is no private folder for backups, so nothing will be changed.".to_owned()
@@ -877,6 +923,9 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         let mut fresh = fresh;
         fresh.snapshot.kept = kept_list(shared);
         let mut resolved = ops::resolve(changes, &fresh.snapshot, &fresh.keys)?;
+        if let Ok(Some((text, _))) = &read {
+            resolved.warnings.extend(stays_off(changes, text));
+        }
         // What a swap does to other servers' sign-ins depends on what else is in the file.
         let root: serde_json::Value = if resolved.swaps.is_empty() {
             serde_json::Value::Null
@@ -931,18 +980,21 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             let store = if involves_secrets {
                 let store = secret_store(shared).map_err(store_problem)?;
                 let mut kept = Vec::new();
+                // A swap's warnings (signing in again first) lead: they cost the most.
+                let mut first = Vec::new();
                 for s in std::mem::take(&mut resolved.swaps) {
                     let copy = store.get(&s.from.connection()).map_err(store_problem)?;
                     let review = swap::review(&root, &s, copy.is_some())?;
                     if review.unchanged {
                         continue;
                     }
-                    resolved.warnings.extend(review.warnings);
+                    first.extend(review.warnings);
                     resolved.notes.extend(review.notes);
                     // What the review shows: what Claude Code will write.
                     resolved.preview.extend(swap::preview(&root, &s));
                     kept.push(s);
                 }
+                resolved.warnings.splice(0..0, first);
                 resolved.swaps = kept;
                 Some(store)
             } else if resolved.cli.iter().any(|a| a.secret.is_some()) {
@@ -1524,11 +1576,12 @@ fn kept_list(shared: &Shared) -> Vec<crate::api::Kept> {
     };
     swap::Recovery::list(dir, &paths.claude_json)
         .into_iter()
-        .map(|r| crate::api::Kept {
+        .map(|(r, back)| crate::api::Kept {
             id: r.id,
             name: sanitize(&r.name),
             place: swap::place(r.project.as_deref()),
             signs_in: swap::signs_in(&r.entry),
+            back,
         })
         .collect()
 }
@@ -5923,6 +5976,66 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_put_back_without_some_settings_is_listed_as_back() {
+        // Cross-review round 2: put back, but without alwaysAllow, the notice still said it was out of the
+        // configuration, and Put back again failed with "sso already exists there".
+        let (env, store, key, _) = oauth_move_env(
+            r#"{"rules":[
+            {"args":["mcp","remove"],"delay_ms":600,"stdout_file":"removed.txt"},
+            {"args":["mcp","add-json","-s","local"],"exit_code":1,"stdout_file":"failed.txt"},
+            {"args":["mcp","add-json","-s","user"],"delay_ms":600,"stdout_file":"added.txt"}]}"#,
+        );
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let mut config = config_json(&env);
+        config["mcpServers"]["sso"]["alwaysAllow"] = serde_json::json!(["search"]);
+        write_config(&env, &config);
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key),
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        env.wait_for_run(1);
+        let mut config = config_json(&env);
+        config["mcpServers"].as_object_mut().unwrap().remove("sso");
+        write_config(&env, &config);
+        // Claude Code puts it back as it writes it: without alwaysAllow.
+        env.wait_for_run(3);
+        let mut config = config_json(&env);
+        config["mcpServers"]["sso"] = serde_json::from_str(SSO_ENTRY).unwrap();
+        write_config(&env, &config);
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:#?}"));
+        assert!(error.contains("left out alwaysAllow"), "{error}");
+        assert!(!error.contains("put that back"), "{error}");
+        let kept = &snapshots(&events).last().unwrap().kept;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0].back, "{kept:?}");
+        // The variant: one that is not back is not listed as back.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        keep_sso(&env, &core, &key);
+        core.send(Command::Refresh { live_all: false });
+        let events = collect(&core, |e| !snapshots(e).is_empty());
+        assert!(!snapshots(&events).last().unwrap().kept[0].back);
+    }
+
+    #[test]
     fn a_move_into_a_missing_folder_is_refused_before_anything_runs() {
         // Cross-review B2: the folder was checked only when the add ran, after the remove had signed sso out.
         let (env, store, key, repo) =
@@ -6043,6 +6156,12 @@ mod tests {
             "{:?}",
             plan.warnings
         );
+        // The costliest first: signing in again, before the scope and the dropped settings (cross-review round 2).
+        assert!(
+            plan.warnings[0].contains("sign in to it again"),
+            "{:?}",
+            plan.warnings
+        );
         // The variant: an edit in place.
         let mut edited: serde_json::Value = serde_json::from_str(SSO_ENTRY).unwrap();
         edited["url"] = serde_json::json!("https://sso.example.com/v2");
@@ -6133,6 +6252,56 @@ mod tests {
             plan.warnings
                 .iter()
                 .any(|w| w == "gw will only be in b: it is no longer there for you in a."),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn moving_into_a_project_where_it_is_switched_off_says_it_stays_off() {
+        // Cross-review round 2: the move landed it switched off in the one place chosen, with no word of it.
+        let mut config = two_projects("end");
+        config["projects"]["/work/b"]["disabledMcpServers"] = serde_json::json!(["other", "gw"]);
+        let env = quiet_env(&config);
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("gw"),
+                to: Target::Local("/work/b".into()),
+            }],
+        );
+        assert!(
+            plan.warnings.iter().any(|w| w
+                == "gw is switched off in b, so it stays off there. Switch it on there to use it."),
+            "{:?}",
+            plan.warnings
+        );
+        // The variant: a copy there; and nothing said where it is on.
+        let plan = plan_for(
+            &core,
+            vec![Change::Duplicate {
+                id: user_id("gw"),
+                name: "gw".into(),
+                targets: vec![Target::Local("/work/b".into())],
+            }],
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("switched off in b")),
+            "{:?}",
+            plan.warnings
+        );
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("gw"),
+                to: Target::Local("/work/a".into()),
+            }],
+        );
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("switched off")),
             "{:?}",
             plan.warnings
         );

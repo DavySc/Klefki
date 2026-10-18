@@ -175,7 +175,9 @@ pub(crate) fn recovery_dir(backup_dir: &Path) -> PathBuf {
     backup_dir.with_file_name("recovery")
 }
 
-/// The settings Claude Code 2.1.302's `add-json` writes; it drops any other (`alwaysAllow`, `cwd`, unknown keys).
+/// The settings Claude Code's `add-json` writes; it drops any other (`alwaysAllow`, `cwd`, unknown keys). Checked
+/// against 2.1.302 and 2.1.303. If a later version keeps more, only the preview is wrong: what Claude Code left out
+/// is read back from the file after each command.
 const CLAUDE_KEEPS: [&str; 9] = [
     "type",
     "url",
@@ -395,7 +397,7 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
                 }
                 // Back, but without settings Claude Code dropped: the recovery file keeps the whole definition.
                 Ok(left_out) => Err(format!(
-                    "{shown} was not {verb}: {why}\nIt was put back, but Claude Code left out {}; Klefki kept the whole definition, so you can put that back from the Connections page.",
+                    "{shown} was not {verb}: {why}\nIt was put back, but Claude Code left out {}; Klefki keeps the whole definition, listed on the Connections page until you forget it.",
                     left_out.join(", ")
                 )),
                 Err(again) => {
@@ -539,14 +541,21 @@ pub(crate) fn review(root: &Value, swap: &Swap, has_copy: bool) -> Result<Said, 
                     sharing.join(" and ")
                 ));
             }
-            said.warnings.push(format!(
-                "{name} {} shares this sign-in, so it is signed out too.",
-                sharing.join(" and ")
-            ));
+            said.warnings.insert(
+                0,
+                format!(
+                    "{name} {} shares this sign-in, so it is signed out too.",
+                    sharing.join(" and ")
+                ),
+            );
         }
-        said.warnings.push(format!(
-            "Claude Code removes {name} and adds it again, so you will need to sign in to it again afterwards."
-        ));
+        // The costliest consequence, said first.
+        said.warnings.insert(
+            0,
+            format!(
+                "Claude Code removes {name} and adds it again, so you will need to sign in to it again afterwards."
+            ),
+        );
     }
     // The new definition's sign-in already belongs to another server: Claude Code would give both one client secret.
     let new_key = signs_in(&new)
@@ -1100,7 +1109,9 @@ impl Recovery {
     /// Every kept definition, oldest first, as far as it can be read. One whose change got through after all (its
     /// new definition is in `claude_json` and its old one is not) is deleted instead: Klefki stopped between the add
     /// and deleting the file.
-    pub(crate) fn list(backup_dir: &Path, claude_json: &Path) -> Vec<Self> {
+    /// With each, whether its server is back where it was, without the settings Claude Code does not keep: the file
+    /// then only holds the rest of the definition, until the user forgets it.
+    pub(crate) fn list(backup_dir: &Path, claude_json: &Path) -> Vec<(Self, bool)> {
         let root: Option<Value> = fsx::read_limited(claude_json, inventory::MAX_CLAUDE_JSON)
             .ok()
             .flatten()
@@ -1114,7 +1125,19 @@ impl Recovery {
                 }
                 !done
             })
+            .map(|r| {
+                let back = root.as_ref().is_some_and(|root| r.is_back(root));
+                (r, back)
+            })
             .collect()
+    }
+
+    fn is_back(&self, root: &Value) -> bool {
+        let spot = Spot {
+            project: self.project.clone(),
+            name: self.name.clone(),
+        };
+        entry_in(root, &spot).is_some_and(|there| there == as_claude_writes(&self.entry))
     }
 
     /// Every recovery file, oldest first, as far as it can be read.

@@ -233,6 +233,9 @@ pub struct Kept {
     /// `for the user`, `in app`.
     pub place: String,
     pub signs_in: bool,
+    /// The server is back where it was, without settings Claude Code does not keep; Klefki holds the full
+    /// definition until it is forgotten. Nothing to put back.
+    pub back: bool,
 }
 
 /// A project entry with the old `mcpServersDisabled` list. Claude Code no longer reads it, so the servers it names

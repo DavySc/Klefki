@@ -251,6 +251,8 @@ pub struct ShellApp {
     moved_from: Option<(ServerId, bool)>,
     /// What a slow change (through Claude Code's commands) is doing now, while it is applied.
     applying_step: Option<String>,
+    /// The kept definition a Forget… under review lets go of, in words.
+    forgetting: Option<String>,
     /// egui still remembers text typed into the closed Add dialog (undo steps of secrets): forget it.
     forget_typed: bool,
     /// A server to bring into view in the list, once.
@@ -301,6 +303,7 @@ impl ShellApp {
             moving: None,
             moved_from: None,
             applying_step: None,
+            forgetting: None,
             forget_typed: false,
             reveal: None,
             casing: None,
@@ -487,6 +490,9 @@ impl ShellApp {
                     // What was saved is read again next time it is shown.
                     text: match (changed, added) {
                         (false, _) => "Nothing needed to change.".to_owned(),
+                        (true, None) if let Some(gone) = self.forgetting.take() => {
+                            format!("Klefki no longer keeps the definition of {gone}.{kept}")
+                        }
                         (true, Some(added)) => format!("{added}{next}{kept}"),
                         (true, None) if kept.is_empty() => "Saved.".to_owned(),
                         (true, None) => format!("Saved.{kept}"),
@@ -1037,34 +1043,37 @@ impl ShellApp {
         let pal = theme::palette(ui.ctx());
         let can = self.core.is_some() && self.can_prepare();
         let mut chosen = None;
-        let count = self.snapshot.kept.len();
+        let out = self.snapshot.kept.iter().filter(|k| !k.back).count();
         Frame::new()
             .stroke(egui::Stroke::new(1.0, pal.warn))
             .corner_radius(6)
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let title = if count == 1 {
-                    "A server is out of the configuration".to_owned()
-                } else {
-                    format!("{count} servers are out of the configuration")
+                let (title, body) = match out {
+                    0 => (
+                        "Klefki keeps settings Claude Code left out".to_owned(),
+                        "The server is back, but Claude Code did not keep all of its settings. Klefki keeps the whole definition until you forget it.",
+                    ),
+                    1 => (
+                        "A server is out of the configuration".to_owned(),
+                        "A change took it out and Claude Code could not put it back. Klefki kept its definition, with its client secret, so you can add it back where it was.",
+                    ),
+                    n => (
+                        format!("{n} servers are out of the configuration"),
+                        "A change took them out and Claude Code could not put them back. Klefki kept each definition, with its client secret, so you can add it back where it was.",
+                    ),
                 };
                 ui.label(RichText::new(title).color(pal.warn));
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(
-                            "A change took them out and Claude Code could not put them back. Klefki kept each definition, with its client secret, so you can add it back where it was.",
-                        )
-                        .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
+                ui.add(egui::Label::new(RichText::new(body).color(pal.text_muted)).wrap());
                 let wait = "Wait for the open change to finish";
                 for kept in &self.snapshot.kept {
                     ui.horizontal(|ui| {
                         // The server first, then what can be done with it.
                         let mut what = format!("{} {}", kept.name, kept.place);
-                        if kept.signs_in {
+                        if kept.back {
+                            what.push_str(" is back without some settings");
+                        } else if kept.signs_in {
                             what.push_str(" (signs in with OAuth)");
                         }
                         ui.add(egui::Label::new(what).truncate());
@@ -1079,7 +1088,9 @@ impl ShellApp {
                                     kept: kept.id.clone(),
                                 });
                             }
-                            if ui
+                            // Back already: only its fuller definition is left to forget.
+                            if !kept.back
+                                && ui
                                 .add_enabled(can, egui::Button::new("Put back"))
                                 .on_hover_text("Add it back where it was, after a review")
                                 .on_disabled_hover_text(wait)
@@ -2178,6 +2189,16 @@ impl ShellApp {
                 Some(Change::Duplicate { .. }) => "Copied",
                 _ => "Added",
             };
+            // What Forget… lets go of, said once it is done.
+            self.forgetting = changes.iter().find_map(|c| match c {
+                Change::ForgetKept { kept } => self
+                    .snapshot
+                    .kept
+                    .iter()
+                    .find(|k| k.id == *kept)
+                    .map(|k| format!("{} {}", k.name, k.place)),
+                _ => None,
+            });
             self.send(Command::Prepare(changes));
         }
     }
@@ -10732,6 +10753,7 @@ mod tests {
                     name: "sso".into(),
                     place: "in WebApp".into(),
                     signs_in: true,
+                    back: false,
                 }],
                 ..Snapshot::default()
             })))
@@ -10753,6 +10775,68 @@ mod tests {
                 kept: "1760000000000-0".into()
             }]
         );
+    }
+
+    #[test]
+    fn one_kept_server_is_spoken_of_as_one() {
+        let (h, _engine) = kept_harness();
+        h.get_by_label_contains("A change took it out and Claude Code could not put it back.");
+        assert!(h.query_by_label_contains("took them out").is_none());
+    }
+
+    #[test]
+    fn a_server_back_without_some_settings_offers_only_forget() {
+        // Cross-review round 2: the notice said it was out of the configuration while it was in the list, and Put
+        // back failed with "already exists there".
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a],
+                kept: vec![klefki_core::api::Kept {
+                    id: "1760000000000-0".into(),
+                    name: "sso".into(),
+                    place: "in WebApp".into(),
+                    signs_in: true,
+                    back: true,
+                }],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.get_by_label("Klefki keeps settings Claude Code left out");
+        h.get_by_label("sso in WebApp is back without some settings");
+        assert!(h.query_by_label("Put back").is_none());
+        assert!(
+            h.query_by_label_contains("out of the configuration")
+                .is_none()
+        );
+        // Forgetting it says what was let go of.
+        h.get_by_label("Forget\u{2026}").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::ForgetKept {
+                kept: "1760000000000-0".into()
+            }]
+        );
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["- sso"], &[], false)))
+            .unwrap();
+        h.run();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("Klefki no longer keeps the definition of sso in WebApp.");
     }
 
     #[test]

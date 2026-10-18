@@ -37,7 +37,7 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
   saved through Claude Code); the app test that OAuth servers are not edited in the form is split into one for
   project servers (unchanged) and one that an OAuth server is edited and says it signs in again.
 - Checks after cross-review round 1 and the main merge: `cargo fmt --check` 0, clippy workspace
-  and `-p klefki` 0, `cargo test --workspace` 482 core + 223 app + 32 cli passed (after the main merge), `cargo deny check` 0, no IO in
+  and `-p klefki` 0, `cargo test --workspace` 485 core + 225 app + 32 cli passed (after the main merge), `cargo deny check` 0, no IO in
   `crates/app/src`.
 - **Open / for human review:** OAuth servers are now removed through `claude mcp remove` (invariant area). A move or
   edit of an OAuth server signs it out (Claude deletes its credentials). Proposals in decision 007: letting the
@@ -87,7 +87,21 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
     main too). A 1500-case run of the model test with every project key spelled with a trailing separator passed.
     Real Claude Code on Windows not tried.
   - Soak after all fixes: 3 × 4000 cases passed (~110 s each), twice (before and after the main merge).
+- **Cross-review round 2** (comment 6256596745, head 3a8c10c): no blockers. Folded in:
+  - The replay now follows a chain of renames (add, rename, rename again) inside one check window. Test
+    `an_earlier_adds_check_follows_a_chain_of_renames` (+ a variant that deletes at the end); it failed before.
+  - Moving or copying into a project that switches the name off now warns that it stays off there
+    (`moving_into_a_project_where_it_is_switched_off_says_it_stays_off`).
+  - A definition put back without some settings is listed as back (`Kept::back`). The notice offers only
+    Forget… and says what is kept (core `a_definition_put_back_without_some_settings_is_listed_as_back`, app
+    `a_server_back_without_some_settings_offers_only_forget`). Each failed before.
+  - Singular wording in the notice, and "Klefki no longer keeps the definition of …" after Forget.
+  - Signing in again is the first warning. `CLAUDE_KEEPS` names the versions it was checked against.
+  - Left for Davy: Undo without a second review. Every write goes Prepare → diff → Apply (CLAUDE.md), so Undo
+    stays a reviewed move, and the key's position in `mcpServers` is not restored. Also left: marking a project
+    whose folder is gone in the Move dialog. That needs core to check folders when it lists projects; today it is
+    refused at Review.
 - **Merged main** with the free-port check (#23) and the CLI (#25): one conflict in `api.rs` (`real_config` from
   main, plus `changer: None`). Decision renumbered to 007: main has its own 006 (CLI output).
-- **Next:** re-review round. Not merged by this session:
+- **Next:** re-review round. After the UI-review thread's `closed_on_purpose(&modal)` lands on main: merge main, switch the Duplicate and Move dialogs to it (a backdrop click must not close them), with `click_beside` tests. Not merged by this session:
   the merge is left for Davy.

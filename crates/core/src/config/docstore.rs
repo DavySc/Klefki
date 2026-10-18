@@ -1340,7 +1340,8 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                 _ => continue,
             };
             // Back to where this server came in. Only an add, with the edits since, is rewritten: one that came
-            // in by a rename, or a copy whose definition is not in the plan, replays as it is.
+            // in by a rename, or a copy whose definition is not in the plan, replays as it is. A rename into this
+            // name is passed over: an add before it was already given this name when that rename was reached.
             let mut edits = Vec::new();
             let mut added = None;
             'back: for i in (0..j).rev() {
@@ -1362,11 +1363,9 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                         {
                             break 'back;
                         }
-                        Some(Op::RenameServer {
-                            project,
-                            name,
-                            new_name,
-                        }) if here(project, name, &at, &n) || here(project, new_name, &at, &n) => {
+                        Some(Op::RenameServer { project, name, .. })
+                            if here(project, name, &at, &n) =>
+                        {
                             break 'back;
                         }
                         Some(Op::CopyServer { to, new_name, .. })
@@ -3824,6 +3823,46 @@ mod tests {
         assert_eq!(f.store.verify(&log, &|| false), Ok(false));
         std::fs::write(&f.store.path, &original).unwrap();
         assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_adds_check_follows_a_chain_of_renames() {
+        // Found in cross-review: added, renamed, renamed again, all checked together.
+        let original = pretty(&sample());
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(
+                &f,
+                vec![copy(None, "gateway", Some("C:/work/app"), "gateway")],
+            ),
+            apply_ops(
+                &f,
+                vec![rename_server(Some("C:/work/app"), "gateway", "gw")],
+            ),
+            apply_ops(&f, vec![rename_server(Some("C:/work/app"), "gw", "gz")]),
+        ];
+        let after = f.json();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+        // The variant: deleted at the end of the chain.
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(
+                &f,
+                vec![copy(None, "gateway", Some("C:/work/app"), "gateway")],
+            ),
+            apply_ops(
+                &f,
+                vec![rename_server(Some("C:/work/app"), "gateway", "gw")],
+            ),
+            apply_ops(&f, vec![remove(Some("C:/work/app"), "gw")]),
+        ];
+        let after = f.json();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
         assert_eq!(f.json(), after);
     }
 
