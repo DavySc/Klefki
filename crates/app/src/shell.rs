@@ -1786,13 +1786,49 @@ impl ShellApp {
             }
             DetailTab::RawJson => self.raw_json(ui, s),
             DetailTab::Auth => {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new("Signing in with OAuth arrives with the add wizard. Headers and tokens can be changed in the JSON tab now.")
-                            .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
+                let muted = |ui: &mut Ui, text: &str| {
+                    ui.add(egui::Label::new(RichText::new(text).color(pal.text_muted)).wrap());
+                };
+                match &s.oauth {
+                    Some(oauth) => {
+                        egui::Grid::new("oauth")
+                            .num_columns(2)
+                            .spacing([12.0, 6.0])
+                            .max_col_width(col_width)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Signs in").color(pal.text_muted));
+                                ui.label("with OAuth");
+                                ui.end_row();
+                                ui.label(RichText::new("Client id").color(pal.text_muted));
+                                match &oauth.client_id {
+                                    Some(id) => ui.add(
+                                        egui::Label::new(RichText::new(id).monospace()).wrap(),
+                                    ),
+                                    None => ui.label(
+                                        RichText::new("none: the client registers itself")
+                                            .color(pal.text_muted),
+                                    ),
+                                };
+                                ui.end_row();
+                                ui.label(RichText::new("Scopes").color(pal.text_muted));
+                                if oauth.scopes.is_empty() {
+                                    ui.label(RichText::new("none listed").color(pal.text_muted));
+                                } else {
+                                    ui.add(egui::Label::new(oauth.scopes.join(", ")).wrap());
+                                }
+                                ui.end_row();
+                            });
+                        ui.add_space(8.0);
+                        muted(
+                            ui,
+                            "Signing in again and changing the client arrive with the add wizard; Claude Code keeps the sign-in itself.",
+                        );
+                    }
+                    None => muted(
+                        ui,
+                        "This server does not sign in with OAuth. Headers and tokens are in the Env tab.",
+                    ),
+                }
             }
             DetailTab::HeadersEnv => {
                 if self.core.is_some() {
@@ -2825,6 +2861,7 @@ mod tests {
             approval: None,
             shadowed: false,
             casing_collision: false,
+            oauth: None,
         };
         let mut h = harness_with(Snapshot {
             servers: vec![row("REMOTE_1"), row("REMOTE_2")],
@@ -2947,6 +2984,7 @@ mod tests {
             approval: None,
             shadowed: false,
             casing_collision: false,
+            oauth: None,
         }
     }
 
@@ -4388,6 +4426,41 @@ mod tests {
             }) => text.clone(),
             _ => panic!("no editor"),
         }
+    }
+
+    #[test]
+    fn the_auth_tab_shows_the_oauth_client_and_scopes() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let mut signed = live_row("acme-prod", Scope::User, None);
+        signed.oauth = Some(klefki_core::api::OAuthInfo {
+            client_id: Some("klefki-client-1".into()),
+            scopes: vec!["read".into(), "write".into()],
+        });
+        let mut dynamic = live_row("dyn", Scope::User, None);
+        dynamic.oauth = Some(klefki_core::api::OAuthInfo {
+            client_id: None,
+            scopes: Vec::new(),
+        });
+        let plain = live_row("plain", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![signed, dynamic, plain]))
+            .unwrap();
+        h.run();
+        let open = |h: &mut Harness<'static, ShellApp>, name: &str| {
+            h.get_by_label(name).click();
+            h.run();
+            h.get_by_role_and_label(Role::Button, "Auth").click();
+            h.run();
+        };
+        open(&mut h, "acme-prod");
+        h.get_by_label("klefki-client-1");
+        h.get_by_label("read, write");
+        open(&mut h, "dyn");
+        h.get_by_label_contains("registers itself");
+        open(&mut h, "plain");
+        h.get_by_label_contains("does not sign in with OAuth");
     }
 
     #[test]

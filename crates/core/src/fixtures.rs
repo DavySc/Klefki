@@ -75,6 +75,7 @@ pub(crate) fn load() -> Snapshot {
                 }),
                 shadowed: s.shadowed,
                 casing_collision: s.casing_collision,
+                oauth: None,
             })
             .collect(),
         warnings: Vec::new(),
