@@ -1,5 +1,7 @@
-//! Runs the Claude CLI with no shell, a timeout and a cap on how much output is kept.
+//! Runs the Claude CLI with no shell, a timeout that ends everything it started, and a cap on how much output is
+//! kept.
 use super::locate::{self, LocateError};
+use super::tree;
 use crate::sanitize::sanitize;
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -58,14 +60,8 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> io::Result<RunOutput> {
     if let Some(cwd) = spec.cwd {
         cmd.current_dir(cwd);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
-    let mut child = cmd.spawn()?;
+    let (mut child, tree) = tree::spawn(&mut cmd)?;
     let stdout = Capture::start(child.stdout.take(), spec.max_output);
     let stderr = Capture::start(child.stderr.take(), spec.max_output);
 
@@ -77,6 +73,8 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> io::Result<RunOutput> {
         }
         if Instant::now() >= deadline {
             timed_out = true;
+            // Not waited for yet, so the tree still has its id.
+            tree.kill();
             let _ = child.kill();
             break child.wait().ok();
         }
@@ -151,7 +149,9 @@ impl Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::testutil::{fake_claude, pid_alive, write_scenario};
+    use crate::cli::testutil::{
+        fake_claude, gone_soon, pid_alive, process_tree, tree_pids, write_scenario,
+    };
     use sha2::{Digest, Sha256};
     use std::time::Instant;
 
@@ -276,6 +276,42 @@ mod tests {
             !pid_alive(pid),
             "the child {pid} is still running after the timeout"
         );
+    }
+
+    #[test]
+    fn a_timeout_ends_everything_the_child_started() {
+        // Regression: only `claude` was killed, so a server it started (npx, then node) stayed behind.
+        for depth in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let (program, args, env) = process_tree(&pids, depth);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let env: Vec<(&str, &OsStr)> = env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_os_str()))
+                .collect();
+            let timeout = Duration::from_secs(4);
+            let started = Instant::now();
+            let out = run(&RunSpec {
+                program: &program,
+                args: &args,
+                cwd: None,
+                env: &env,
+                timeout,
+                max_output: 1000,
+            })
+            .unwrap();
+            assert!(out.timed_out);
+            // Whatever held the output pipes is gone too, so nothing waits out the grace period.
+            assert!(
+                started.elapsed() < timeout + PIPE_GRACE,
+                "took {:?}",
+                started.elapsed()
+            );
+            for pid in tree_pids(&pids, depth as usize + 1) {
+                assert!(gone_soon(pid), "process {pid} (depth {depth}) still runs");
+            }
+        }
     }
 
     #[test]

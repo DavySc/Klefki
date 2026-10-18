@@ -21,6 +21,20 @@ portable-pty = "0.9"
 # Opens a checked https sign-in page: ShellExecute on Windows, never `cmd /c start` (no shell).
 open = { version = "5", features = ["shellexecute-on-windows"] }
 
+# Ending a process together with what it started: a process group on Unix, a job object on Windows.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+]
+
 # The OS's own secret store, one per platform; there is no plaintext fallback.
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "1", default-features = false }
