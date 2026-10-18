@@ -52,11 +52,11 @@ fn looks_secret(name: &str, credential: &str) -> bool {
         return false;
     }
     if let Some((_, rest)) = credential.split_once("://") {
-        // An address is a secret only when it carries a password.
+        // An address is a secret only when it signs in: with a password, or with a token as the user name.
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
         return authority
             .rsplit_once('@')
-            .is_some_and(|(userinfo, _)| userinfo.contains(':'));
+            .is_some_and(|(userinfo, _)| userinfo.contains(':') || looks_secret("", userinfo));
     }
     if credential.starts_with(['/', '~'])
         || credential.contains(['/', '\\']) && !is_base64(credential)
@@ -102,8 +102,9 @@ fn sounds_secret(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Without separators or invisible characters, so "api_key" and "t\u{202e}oken" read as they are meant.
     let joined: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
-    const PARTS: [&str; 8] = [
+    const PARTS: [&str; 9] = [
         "token",
+        "bearer",
         "secret",
         "password",
         "passwd",
@@ -132,6 +133,11 @@ pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<Str
             HIDDEN.to_owned()
         } else if let Some(header) = shown_header(arg) {
             header
+        } else if let Some((flag, header)) = arg.split_once('=')
+            && flag.starts_with('-')
+            && let Some(header) = shown_header(header)
+        {
+            format!("{flag}={header}")
         } else if let Some((name, value)) = arg.split_once('=')
             && !name.is_empty()
             && !value.is_empty()
@@ -140,10 +146,15 @@ pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<Str
             format!("{name}={HIDDEN}")
         } else if looks_secret("", arg) {
             HIDDEN.to_owned()
+        } else if let Some(url) = shown_query(arg) {
+            url
         } else {
             arg.to_owned()
         };
-        after_secret_flag = arg.starts_with('-') && !arg.contains('=') && sounds_secret(arg);
+        after_secret_flag = arg.starts_with('-')
+            && !arg.contains('=')
+            && sounds_secret(arg)
+            && !names_a_setting(arg);
         out.push(shown);
     }
     out
@@ -159,18 +170,61 @@ fn shown_header(arg: &str) -> Option<String> {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !is_name || value.is_empty() || value.starts_with("//") || !sounds_secret(name) {
+    if !is_name || value.is_empty() || value.starts_with("//") || value.contains("${") {
         return None;
     }
-    if value.contains("${") {
-        return None;
-    }
-    Some(match value.split_once(' ') {
-        Some((scheme, _)) if SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme)) => {
-            format!("{name}: {scheme} …")
+    let (scheme, credential) = match value.split_once(' ') {
+        Some((scheme, rest)) if SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme)) => {
+            (Some(scheme), rest.trim())
         }
-        _ => format!("{name}: …"),
+        _ => (None, value),
+    };
+    // Any name, when the value has a scheme or a credential's shape.
+    if !sounds_secret(name) && scheme.is_none() && !is_known_shape(credential) {
+        return None;
+    }
+    Some(match scheme {
+        Some(scheme) => format!("{name}: {scheme} …"),
+        None => format!("{name}: …"),
     })
+}
+
+/// An address with each query or fragment parameter that looks secret shown as `name=…`; the others stay, as
+/// they say which workspace or region it is. `None` when nothing in it is hidden.
+fn shown_query(arg: &str) -> Option<String> {
+    let at = arg.find("://")? + 3;
+    let start = at + arg[at..].find(['?', '#'])?;
+    let mut out = arg[..start].to_owned();
+    let mut hid = false;
+    for piece in arg[start..].split_inclusive(['?', '&', '#']) {
+        let (pair, separator) = match piece.strip_suffix(['?', '&', '#']) {
+            Some(pair) => (pair, &piece[pair.len()..]),
+            None => (piece, ""),
+        };
+        match pair.split_once('=') {
+            Some((name, value))
+                if !value.is_empty()
+                    && ((sounds_secret(name) && hideable(value)) || looks_secret(name, value)) =>
+            {
+                hid = true;
+                out.push_str(name);
+                out.push_str("=…");
+            }
+            _ => out.push_str(pair),
+        }
+        out.push_str(separator);
+    }
+    hid.then_some(out)
+}
+
+/// A flag that sounds secret but names where a secret is, or what kind it is: `--token-file`, `--auth-type`.
+fn names_a_setting(flag: &str) -> bool {
+    let last = flag
+        .rsplit(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    ["file", "path", "dir", "type", "mode", "url"].contains(&last.as_str())
 }
 
 /// A value after a secret-sounding name that is worth hiding: not a reference, not a path, not a plain word such
@@ -272,6 +326,100 @@ mod tests {
             shown(&["--key", "C:\\keys\\a.pem"]),
             "--key C:\\keys\\a.pem"
         );
+    }
+
+    #[test]
+    fn secrets_the_first_rules_missed_are_hidden_too() {
+        let shown = |args: &[&str]| shown_args(args.iter().copied()).join(" ");
+        // Found reviewing main: a token used as a URL's user name, as git takes them.
+        assert_eq!(
+            shown(&["--repo", "https://ghp_abcdefghijklmnop1234@github.com/me/x"]),
+            "--repo …"
+        );
+        assert_eq!(
+            shown(&["--repo=https://ghp_abcdefghijklmnop1234@github.com/me/x"]),
+            "--repo=…"
+        );
+        // A secret in a later query parameter; the others stay readable.
+        assert_eq!(
+            shown(&["https://h.example.com/sse?workspace=acme&api_key=S3CRETVALUE#x"]),
+            "https://h.example.com/sse?workspace=acme&api_key=…#x"
+        );
+        assert_eq!(
+            shown(&["--url=https://h.example.com/sse?a=1&token=abc12345"]),
+            "--url=https://h.example.com/sse?a=1&token=…"
+        );
+        assert_eq!(
+            shown(&["https://h.example.com/cb#state=1&access_token=abc12345"]),
+            "https://h.example.com/cb#state=1&access_token=…"
+        );
+        // A flag that names a bearer token.
+        assert_eq!(shown(&["--oauth2Bearer", "abc12345"]), "--oauth2Bearer …");
+        // A header written as one word with its option.
+        assert_eq!(
+            shown(&["--header=Authorization: Bearer abcdef1234567890XYZ"]),
+            "--header=Authorization: Bearer …"
+        );
+        // A header whose name says nothing, carrying a credential's shape.
+        assert_eq!(
+            shown(&["--header", "X-Custom: sk-ant-api03-abcdefghijklmnop"]),
+            "--header X-Custom: …"
+        );
+        assert_eq!(
+            shown(&["--header", "X-Custom:Bearer ghp_abcdefghijklmnop1234"]),
+            "--header X-Custom: Bearer …"
+        );
+        // Still readable: a plain user name, a query without secrets, an ordinary header.
+        assert_eq!(
+            shown(&["https://git@github.com/me/x"]),
+            "https://git@github.com/me/x"
+        );
+        assert_eq!(
+            shown(&["https://h.example.com/sse?workspace=acme&limit=10"]),
+            "https://h.example.com/sse?workspace=acme&limit=10"
+        );
+        assert_eq!(
+            shown(&["--header", "X-Region: eu-west-1"]),
+            "--header X-Region: eu-west-1"
+        );
+    }
+
+    #[test]
+    fn a_setting_named_after_a_secret_stays_readable() {
+        let shown = |args: &[&str]| shown_args(args.iter().copied()).join(" ");
+        // Found reviewing main: the value after these flags is where a secret is kept, or what kind it is, not one.
+        assert_eq!(
+            shown(&["--token-file", "config/token.json"]),
+            "--token-file config/token.json"
+        );
+        assert_eq!(shown(&["--auth-type", "oauth"]), "--auth-type oauth");
+        assert_eq!(shown(&["--auth-mode", "device"]), "--auth-mode device");
+        assert_eq!(
+            shown(&["--token-url", "https://example.com/oauth/token"]),
+            "--token-url https://example.com/oauth/token"
+        );
+        // A secret after a secret flag is still hidden, slashes and all.
+        assert_eq!(shown(&["--token", "ab/cd+ef12=="]), "--token …");
+        assert_eq!(shown(&["--api-key", "k-123"]), "--api-key …");
+        assert_eq!(shown(&["--password", "p@ss/w0rd!"]), "--password …");
+        // A digest is not a header carrying a credential.
+        assert_eq!(
+            shown(&["sha256:e3b0c44298fc1c149afbf4c8996fb924"]),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb924"
+        );
+    }
+
+    #[test]
+    fn a_token_in_an_address_gets_a_reference() {
+        assert_eq!(
+            suggests(
+                "GIT_URL",
+                "https://ghp_abcdefghijklmnop1234@github.com/me/x"
+            )
+            .as_deref(),
+            Some("${GIT_URL}")
+        );
+        assert_eq!(suggests("GIT_URL", "https://git@github.com/me/x"), None);
     }
 
     fn suggests(name: &str, value: &str) -> Option<String> {
