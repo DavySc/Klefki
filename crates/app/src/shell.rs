@@ -3025,14 +3025,25 @@ fn status_cell(
         Status::Checking => pal.primary,
         Status::NotConfigured | Status::Unknown => pal.text_muted,
     };
-    // A status from Claude's cache is a faded ring, not a dot: the column has no room for words that say so; the
-    // tooltip and the Status tab do.
-    let (dot, color) = if last_known {
-        ('\u{25CB}', color.gamma_multiply(0.6))
+    let response = if last_known {
+        // A status from Claude's cache: a ring in the status colour and muted words, not a dot. The column has no
+        // room for words that say so; the tooltip and the Status tab do. Both colours keep the palette's contrast.
+        let font = egui::TextStyle::Body.resolve(ui.style());
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "\u{25CB} ",
+            0.0,
+            egui::TextFormat::simple(font.clone(), color),
+        );
+        job.append(
+            status.label(),
+            0.0,
+            egui::TextFormat::simple(font, pal.text_muted),
+        );
+        ui.label(job)
     } else {
-        ('\u{25CF}', color)
+        ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color))
     };
-    let response = ui.label(RichText::new(format!("{dot} {}", status.label())).color(color));
     match status {
         Status::Failed | Status::NeedsAuth | Status::Degraded => {
             // Not egui's tooltip, which waits half a second for a perfectly still pointer over the words alone:
