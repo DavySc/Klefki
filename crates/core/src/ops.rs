@@ -467,12 +467,18 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
                 .filter(|c| !c.is_empty())
                 .ok_or("it has no command")?;
             lines.push(format!("Command: {}", shown(command)?));
+            lines.extend(environment_line("The command", "uses", command)?);
             match object.get("args") {
                 None | Some(Value::Null) => {}
                 Some(Value::Array(args)) => {
                     for (i, arg) in args.iter().enumerate() {
                         let arg = arg.as_str().ok_or("an argument is not text")?;
                         lines.push(format!("Argument {}: {}", i + 1, shown(arg)?));
+                        lines.extend(environment_line(
+                            &format!("Argument {}", i + 1),
+                            "uses",
+                            arg,
+                        )?);
                     }
                 }
                 Some(_) => return Err("args is not a list".to_owned()),
@@ -483,6 +489,11 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
                     for (name, value) in env {
                         let value = value.as_str().ok_or("an environment value is not text")?;
                         lines.push(format!("Environment: {}={}", shown(name)?, shown(value)?));
+                        lines.extend(environment_line(
+                            &format!("Environment {}", shown(name)?),
+                            "uses",
+                            value,
+                        )?);
                     }
                 }
                 Some(_) => return Err("env is not an object".to_owned()),
@@ -495,6 +506,7 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
                 return Err("the address contains a login".to_owned());
             }
             lines.push(format!("Connects to: {}", shown(raw)?));
+            lines.extend(environment_line("The address", "sends", raw)?);
         }
         other => {
             return Err(format!(
@@ -515,34 +527,54 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
                 // the user's variables would leave the machine is.
                 for (name, value) in headers {
                     let value = value.as_str().ok_or("a header value is not text")?;
-                    let vars = env_references(value)
-                        .map(shown)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if !vars.is_empty() {
-                        lines.push(format!(
-                            "Header {} sends your environment variable{} {}",
-                            shown(name)?,
-                            if vars.len() == 1 { "" } else { "s" },
-                            vars.join(", ")
-                        ));
-                    }
+                    lines.extend(environment_line(
+                        &format!("Header {}", shown(name)?),
+                        "sends",
+                        value,
+                    )?);
                 }
             }
             Some(_) => return Err("headers is not an object".to_owned()),
         }
         if let Some(helper) = text("headersHelper")? {
             lines.push(format!("Runs this to get headers: {}", shown(helper)?));
+            lines.extend(environment_line("The header command", "uses", helper)?);
         }
     }
     Ok(lines)
 }
 
-/// The variable names in `${NAME}` and `${NAME:-default}`, as Claude Code expands them.
-fn env_references(value: &str) -> impl Iterator<Item = &str> {
-    value.split("${").skip(1).filter_map(|rest| {
-        let inner = &rest[..rest.find('}')?];
-        Some(inner.split_once(":-").map_or(inner, |(name, _)| name))
-    })
+/// The variable names in `${NAME}` and `${NAME:-default}`, as Claude Code expands them, each once, in order. A
+/// reference inside a default is named too: it may be read.
+fn env_references(value: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut rest = value;
+    while let Some(at) = rest.find("${") {
+        rest = &rest[at + 2..];
+        let end = rest.find(['}', ':']).unwrap_or(rest.len());
+        let name = &rest[..end];
+        // Only a reference that is closed somewhere is expanded.
+        let closed = rest[end..].contains('}');
+        if !name.is_empty() && closed && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// "`what` uses (or sends) your environment variable X", when `value` fills any in.
+fn environment_line(what: &str, verb: &str, value: &str) -> Result<Option<String>, String> {
+    let vars = env_references(value)
+        .into_iter()
+        .map(shown)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((!vars.is_empty()).then(|| {
+        format!(
+            "{what} {verb} your environment variable{} {}",
+            if vars.len() == 1 { "" } else { "s" },
+            vars.join(", ")
+        )
+    }))
 }
 
 /// A value exactly as it is, or an error when it cannot be shown that way.
@@ -627,6 +659,8 @@ mod tests {
                 "Argument 3: a b",
                 "Environment: NODE_OPTIONS=--require ./evil.js",
                 "Environment: TOKEN=${TOKEN}",
+                // Added when every place that expands `${VAR}` began to say so (only headers did before).
+                "Environment TOKEN uses your environment variable TOKEN",
             ]
         );
     }
@@ -652,6 +686,57 @@ mod tests {
             !lines.join("\n").contains("abc"),
             "header values are not shown"
         );
+    }
+
+    #[test]
+    fn every_place_that_fills_in_your_environment_says_which_variables() {
+        // Found reviewing main: only headers were checked, but Claude Code expands `${VAR}` in the address, the
+        // command, its arguments, its environment and the header helper too.
+        let lines = d(json!({
+            "type": "http",
+            "url": "https://example.com/mcp?k=${ANTHROPIC_API_KEY}",
+            "headersHelper": "get-token --user ${USER}"
+        }))
+        .unwrap();
+        assert!(
+            lines.contains(
+                &"The address sends your environment variable ANTHROPIC_API_KEY".to_owned()
+            ),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"The header command uses your environment variable USER".to_owned()),
+            "{lines:?}"
+        );
+        let lines = d(json!({
+            "command": "${HOME}/bin/server",
+            "args": ["--token", "${GH_TOKEN}", "plain"],
+            "env": {"API_KEY": "${MY_SECRET:-none}", "MODE": "x"}
+        }))
+        .unwrap();
+        for want in [
+            "The command uses your environment variable HOME",
+            "Argument 2 uses your environment variable GH_TOKEN",
+            "Environment API_KEY uses your environment variable MY_SECRET",
+        ] {
+            assert!(lines.contains(&want.to_owned()), "{want}: {lines:?}");
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("your environment"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_variable_inside_a_default_is_named_too() {
+        // `${A:-${B}}`: both may be read, so both are named, once each and in order.
+        assert_eq!(env_references("${A:-${B}}"), ["A", "B"]);
+        assert_eq!(env_references("x ${A} ${A} ${B:-y}"), ["A", "B"]);
+        assert!(env_references("${} ${:-x} $NOT ${UNCLOSED").is_empty());
+        assert!(env_references("no variables").is_empty());
     }
 
     #[test]

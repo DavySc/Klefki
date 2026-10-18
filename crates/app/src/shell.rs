@@ -140,6 +140,10 @@ pub struct ShellApp {
     /// Live results from the engine, which take precedence over the snapshot's hints. One slot per row of the
     /// snapshot, by position, so drawing a row looks its status up without building a key.
     live: Vec<Option<Live>>,
+    /// Bumped whenever `live` or the snapshot changes, so what is built from them can be kept until then.
+    live_gen: u64,
+    /// The selected row's explanation, for (row, `live_gen`): built once per status, not every frame.
+    explained: Option<(ExplainedFor, Option<Arc<Explanation>>)>,
     /// The grid's rows for the current snapshot and search, built when either changes rather than every frame.
     grid_cache: Option<(String, Arc<[GridRow]>)>,
     /// The latest explanation per server, from the Diagnose action.
@@ -174,6 +178,8 @@ impl ShellApp {
             core: None,
             live: vec![None; snapshot.servers.len()],
             grid_cache: None,
+            live_gen: 0,
+            explained: None,
             diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
@@ -250,6 +256,7 @@ impl ShellApp {
                         live[new] = Some(r);
                     }
                 }
+                self.live_gen += 1;
                 self.diagnoses.retain(|id, _| {
                     new_index.contains_key(&(id.scope, id.project.as_deref(), id.name.as_str()))
                 });
@@ -364,6 +371,7 @@ impl ShellApp {
                         detail,
                         hint,
                     });
+                    self.live_gen += 1;
                 }
             }
         }
@@ -1511,7 +1519,15 @@ impl ShellApp {
             let (status, detail) = self.effective(i);
             (status, detail.map(str::to_owned))
         };
-        let explanation = Explanation::for_status(s, status, detail.as_deref(), self.hint(i));
+        let explanation = match &self.explained {
+            Some((key, built)) if *key == (i, self.live_gen) => built.clone(),
+            _ => {
+                let built = Explanation::for_status(s, status, detail.as_deref(), self.hint(i))
+                    .map(Arc::new);
+                self.explained = Some(((i, self.live_gen), built.clone()));
+                built
+            }
+        };
         ui.label(RichText::new(&s.name).heading());
         ui.horizontal(|ui| {
             flat_items(ui);
@@ -2053,6 +2069,9 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32) {
         });
 }
 
+/// The row and the `live_gen` an explanation was built for.
+type ExplainedFor = (usize, u64);
+
 /// The engine's latest answer for one row.
 #[derive(Clone)]
 struct Live {
@@ -2387,6 +2406,35 @@ mod tests {
         h.get_by_label_contains("Can't reach the server's host");
         h.get_by_label_contains("not connected to your VPN");
         h.get_by_label_contains("getaddrinfo ENOTFOUND acme-prod.example.com");
+    }
+
+    #[test]
+    fn the_explanation_follows_each_new_status() {
+        // It is built once per status, not every frame; a new status must still replace it.
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let row = live_row("acme-prod", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        engine.events.send(unknown_host_event(&row)).unwrap();
+        h.run();
+        h.get_by_label("acme-prod").click();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Can't reach the server's host");
+        engine
+            .events
+            .send(status_event(&row, Status::Connected, None))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Can't reach").is_none());
+        engine
+            .events
+            .send(status_event(&row, Status::Failed, Some("boom")))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("could not connect");
+        h.get_by_label_contains("Claude Code said: boom");
     }
 
     #[test]
