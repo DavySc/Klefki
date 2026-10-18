@@ -43,6 +43,22 @@ peak memory (bar from the assessment thread: under about 350 MB with 30 servers)
     `only_statuses_from_claudes_cache_are_marked_last_known`, `the_engine_is_told_which_servers_are_on_screen_when_that_changes`.
     The app tests' `drain` helper leaves out `Command::Visible` (the grid sends it by itself).
 
+## Re-review fixes (from the #16 thread, at `b2fb5ea`)
+- `ttlMs` comes from an untrusted file: a nonsense one (not finite, ≤ 0) counts as none, and it is capped at 4 hours,
+  Claude's own longest default (`1e300` made an entry fresh for ever).
+- A background job's slot is a drop guard (`BackgroundSlot`), so a panicking check cannot stop all later ones.
+- Check now / Diagnose drop the queued check of the same server (it ran twice and the later answer won); a server
+  switched off and on again is queued once.
+- F5 checks unknown rows first again; Check now still goes ahead of everything.
+- Tests, each seen failing first: `check_now_replaces_the_queued_background_check_of_that_server`,
+  `a_server_switched_on_twice_is_queued_once`, `f5_checks_the_servers_with_nothing_to_show_first`,
+  `a_background_check_that_panics_gives_its_slot_back`, and two more cases in
+  `a_needs_auth_entry_counts_only_as_long_as_claude_trusts_it`.
+- Left as optional: a cached row that can never be checked shows no reason (an event would mark it live); needs-auth
+  freshness is decided at load, not re-evaluated as time passes; scrolling re-sorts the queue (a few hundred jobs at
+  most); `Visible` after a refresh into an empty view is not sent (the engine keeps an old, harmless set).
+- After: full verify exit 0, 372 core + 162 app; engine tests 3 more runs, all passed.
+
 ## Not done, on purpose
 - Deduplicating identical local servers across projects (review item 5): `claude mcp get` runs in each project's
   folder, so the same definition can answer differently (relative paths, `.env`). With one background check at a

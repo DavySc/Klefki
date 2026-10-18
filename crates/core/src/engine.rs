@@ -416,6 +416,29 @@ struct Queue {
 impl Queue {
     /// The next job a worker may take: the first that is not background, or the first background one when there is
     /// room for it.
+    /// Queues checks, leaving out servers that already have one queued (a server switched off and on again).
+    fn add(&mut self, jobs: Vec<Job>) {
+        for job in jobs {
+            let queued = self
+                .jobs
+                .iter()
+                .any(|q| q.kind == job.kind && q.id.connection == job.id.connection);
+            if !queued {
+                self.jobs.push_back(job);
+            }
+        }
+        self.order();
+    }
+
+    /// Puts a job the user asked for in front. A check of the same server still waiting is dropped: it would run the
+    /// server again, and its later answer would replace this one.
+    fn push_now(&mut self, job: Job) {
+        let connection = &job.id.connection;
+        self.jobs
+            .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
+        self.jobs.push_front(job);
+    }
+
     fn take(&mut self) -> Option<Job> {
         let room = self.background_running < BACKGROUND_CHECKS;
         let at = self.jobs.iter().position(|j| room || !j.background)?;
@@ -426,18 +449,34 @@ impl Queue {
         Some(job)
     }
 
-    /// Background jobs in order: on screen first, then those with nothing to show yet, then the rest; otherwise in
-    /// the order they came. Jobs the user asked for keep their place.
+    /// Jobs the user asked for first, then background ones on screen; within each, those with nothing to show yet
+    /// first, otherwise in the order they came.
     fn order(&mut self) {
         let visible = &self.visible;
         let rank = |j: &Job| {
-            if !j.background {
-                0
+            let waiting = u8::from(!j.announce);
+            if j.background {
+                2 + u8::from(!visible.contains(&j.id.connection)) * 2 + waiting
             } else {
-                1 + u8::from(!visible.contains(&j.id.connection)) * 2 + u8::from(!j.announce)
+                waiting
             }
         };
         self.jobs.make_contiguous().sort_by_key(rank);
+    }
+}
+
+/// A running background job's place in [`Queue::background_running`], given back when dropped, also when the job
+/// panics: a slot kept by a panic would stop every later background check.
+struct BackgroundSlot<'a> {
+    queue: &'a Mutex<Queue>,
+    wake: &'a Condvar,
+}
+
+impl Drop for BackgroundSlot<'_> {
+    fn drop(&mut self) {
+        lock(self.queue).background_running -= 1;
+        // A worker may be waiting for room to run the next one.
+        self.wake.notify_all();
     }
 }
 
@@ -975,10 +1014,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
             jobs.push(job);
         }
     }
-    let mut queue = lock(&shared.queue);
-    queue.jobs.extend(jobs);
-    queue.order();
-    drop(queue);
+    lock(&shared.queue).add(jobs);
     shared.wake_workers.notify_all();
 }
 
@@ -1020,10 +1056,7 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
         })
         .collect();
     if !jobs.is_empty() {
-        let mut queue = lock(&shared.queue);
-        queue.jobs.extend(jobs);
-        queue.order();
-        drop(queue);
+        lock(&shared.queue).add(jobs);
         shared.wake_workers.notify_all();
     }
 }
@@ -1046,7 +1079,7 @@ fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind) {
     };
     let generation = shared.generation.load(Ordering::SeqCst);
     if let Some(job) = build_job(shared, row, Some(file), generation, kind, true) {
-        lock(&shared.queue).jobs.push_front(job);
+        lock(&shared.queue).push_now(job);
         shared.wake_workers.notify_one();
     }
 }
@@ -1137,12 +1170,12 @@ fn worker(shared: &Shared) {
                     .unwrap_or_else(|e| e.into_inner());
             }
         };
+        // Built only for a background job: dropping one gives a slot back.
+        let _slot = job.background.then(|| BackgroundSlot {
+            queue: &shared.queue,
+            wake: &shared.wake_workers,
+        });
         run(shared, &job);
-        if job.background {
-            lock(&shared.queue).background_running -= 1;
-            // A worker may be waiting for room to run the next one.
-            shared.wake_workers.notify_all();
-        }
     }
 }
 
@@ -1795,6 +1828,123 @@ mod tests {
             at("s3") < at("s4"),
             "on screen in their own order: {order:?}"
         );
+    }
+
+    #[test]
+    fn check_now_replaces_the_queued_background_check_of_that_server() {
+        // Re-review: the background job stayed queued, so the server was checked twice and the later answer won.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "a": {"command": "x"}, "b": {"command": "x"}, "t": http("https://t.example.com")}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":400}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        std::fs::write(
+            env.dir.path().join("cfg").join("mcp-health-cache.json"),
+            r#"{"version":1,"servers":{"t":{"status":"failed"}}}"#,
+        )
+        .unwrap();
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| {
+                matches!(
+                    x,
+                    Event::Status {
+                        status: Status::Checking,
+                        ..
+                    }
+                )
+            })
+        });
+        core.send(Command::Check(user_id("t")));
+        collect(&core, |e| {
+            ["a", "b"].iter().all(|n| final_status(e, n).is_some())
+        });
+        std::thread::sleep(Duration::from_millis(600));
+        let asked = env.gets().iter().filter(|g| g.0 == "t").count();
+        assert_eq!(asked, 1, "{:?}", env.gets());
+    }
+
+    #[test]
+    fn a_server_switched_on_twice_is_queued_once() {
+        // Variant: reloads before its check ran must not queue it twice.
+        let config = |off: bool| {
+            serde_json::json!({
+                "mcpServers": {"slow": {"command": "x"}, "t": {"command": "x"}},
+                "projects": {"/p": {"disabledMcpServers": if off { vec!["t"] } else { vec![] }}}
+            })
+        };
+        let env = Env::new(
+            &config(true),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get","slow"],"stdout_file":"c.txt","delay_ms":2500},
+                        {"args":["mcp","get","t"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| {
+                matches!(
+                    x,
+                    Event::Status {
+                        status: Status::Checking,
+                        ..
+                    }
+                )
+            })
+        });
+        for off in [false, true, false] {
+            write_config(&env, &config(off));
+            collect(&core, |e| !snapshots(e).is_empty());
+        }
+        collect(&core, |e| final_status(e, "t").is_some());
+        std::thread::sleep(Duration::from_millis(300));
+        let asked = env.gets().iter().filter(|g| g.0 == "t").count();
+        assert_eq!(asked, 1, "{:?}", env.gets());
+    }
+
+    #[test]
+    fn f5_checks_the_servers_with_nothing_to_show_first() {
+        // Re-review: F5 jobs lost the unknown-first order.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "k0": http("https://a.example.com"), "k1": http("https://b.example.com"),
+                "k2": http("https://c.example.com"), "z": {"command": "x"}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["k0".to_owned(), "k1".to_owned(), "k2".to_owned()]);
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| final_status(e, "z").is_some());
+        core.send(Command::Refresh { live_all: true });
+        collect(&core, |e| {
+            ["k0", "k1", "k2", "z"]
+                .iter()
+                .all(|n| final_status(e, n).is_some())
+        });
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(order, ["z", "z", "k0", "k1", "k2"]);
+    }
+
+    #[test]
+    fn a_background_check_that_panics_gives_its_slot_back() {
+        let queue = Mutex::new(Queue::default());
+        let wake = Condvar::new();
+        lock(&queue).background_running = 1;
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = BackgroundSlot {
+                queue: &queue,
+                wake: &wake,
+            };
+            panic!("a check went wrong");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(lock(&queue).background_running, 0);
     }
 
     #[test]

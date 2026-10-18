@@ -616,6 +616,9 @@ enum Freshness {
 
 /// How long Claude Code trusts a needs-auth entry without its own `ttlMs` (2.1.302: 15 minutes).
 const NEEDS_AUTH_TTL_MS: f64 = 15.0 * 60.0 * 1000.0;
+/// The longest time to live Claude Code gives an entry itself (4 hours, for claude.ai and plugin servers). An
+/// entry's own `ttlMs` comes from a file anyone could have written, so it is held to this.
+const NEEDS_AUTH_MAX_TTL_MS: f64 = 4.0 * 60.0 * 60.0 * 1000.0;
 /// How far in the future an entry's time may be, for clocks that disagree (Claude allows a minute too).
 const CLOCK_SKEW_MS: f64 = 60.0 * 1000.0;
 
@@ -680,7 +683,8 @@ fn needs_auth_freshness(entry: &Value, now: f64) -> Option<Freshness> {
     let ttl = entry
         .get("ttlMs")
         .and_then(Value::as_f64)
-        .unwrap_or(NEEDS_AUTH_TTL_MS);
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .map_or(NEEDS_AUTH_TTL_MS, |t| t.min(NEEDS_AUTH_MAX_TTL_MS));
     let age = now - at;
     (age > -CLOCK_SKEW_MS && age < ttl).then_some(Freshness::Fresh)
 }
@@ -961,6 +965,8 @@ mod tests {
             "future",
             "undated",
             "junk-time",
+            "huge-ttl",
+            "negative-ttl",
         ]
         .iter()
         .map(|n| {
@@ -986,7 +992,10 @@ mod tests {
                 "own-ttl-gone": {"timestamp": now - 2 * min, "ttlMs": min},
                 "future": {"timestamp": now + 5 * min},
                 "undated": {},
-                "junk-time": {"timestamp": "yesterday"}
+                "junk-time": {"timestamp": "yesterday"},
+                // From an untrusted file: a time to live of ages would make the entry fresh for ever.
+                "huge-ttl": {"timestamp": now - 5 * 60 * min, "ttlMs": 1e300},
+                "negative-ttl": {"timestamp": now - min, "ttlMs": -5}
             }),
         );
         let s = e.load();
@@ -1004,6 +1013,9 @@ mod tests {
         // No usable time: shown, but only as last known.
         assert_eq!(got("undated"), (Status::NeedsAuth, true));
         assert_eq!(got("junk-time"), (Status::NeedsAuth, true));
+        // At most Claude's longest default (4 hours); a nonsense one counts as no time to live of its own.
+        assert_eq!(got("huge-ttl"), (Status::Unknown, false));
+        assert_eq!(got("negative-ttl"), (Status::NeedsAuth, false));
     }
 
     #[test]
