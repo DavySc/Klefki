@@ -5579,6 +5579,37 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_answers_whether_a_callback_port_is_held_for_that_port() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let core = with_store(&env, Arc::new(crate::secrets::MemoryStore::default()));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let answer = |core: &Core| {
+            core.send(Command::CheckCallbackPort(port));
+            collect(core, |e| {
+                e.iter().any(|x| matches!(x, Event::CallbackPort { .. }))
+            })
+            .into_iter()
+            .find_map(|e| match e {
+                Event::CallbackPort { port, warning } => Some((port, warning)),
+                _ => None,
+            })
+            .unwrap()
+        };
+        let (answered, warning) = answer(&core);
+        assert_eq!(answered, port);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.starts_with(&format!("Port {port} is in use"))),
+            "{warning:?}"
+        );
+        drop(held);
+        assert_eq!(answer(&core), (port, None));
+    }
+
+    #[test]
     fn a_callback_port_another_program_holds_is_warned_about_in_the_review_and_the_add_goes_on() {
         let (env, _, _) = oauth_add_env(ADD_JSON_OK);
         let core = with_store(&env, Arc::new(crate::secrets::MemoryStore::default()));

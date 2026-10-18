@@ -41,6 +41,10 @@ Branch `claude/callback-port-check-eaow5h`, from main `86f2ad7`.
 - Checks: full verify exit 0, 448 core + 210 app tests; `cargo clippy -p klefki -- -D warnings` clean; no IO calls in `crates/app/src`.
 - Real window again (127.0.0.1:8766 held): Fill in, port 8766, Tab: the engine's answer shows under the field (`reviews/2026-10-18-callback-port/r2-field-warning-from-engine.png`).
 
+## Review round 2 (re-review of `826206d`: 1 blocking)
+- **T1:** engine test `the_engine_answers_whether_a_callback_port_is_held_for_that_port`: holds 127.0.0.1:0, sends `CheckCallbackPort`, gets `CallbackPort` for the same port with a warning, then `None` once let go. Fails when the arm answers `None`, and when it answers for another port.
+- Checks: full verify exit 0, 449 core + 210 app tests.
+
 ## Next
 - Merge before the "Safe edits and move or copy" slice.
 - Open for Davy's Windows machine: hold `0.0.0.0:<port>` and check the warning appears (the native `claude.exe` may use `SO_EXCLUSIVEADDRUSE`).
