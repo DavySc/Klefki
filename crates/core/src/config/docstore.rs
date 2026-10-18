@@ -152,9 +152,10 @@ impl Op {
 enum Purpose {
     Change,
     Verify,
-    /// To show a change another program will write: Claude Code's own `mcp add-json`, which adds servers that sign
-    /// in with OAuth. Only here may a new server have `oauth` settings; a plan made this way is never written (its
-    /// ops are made again as a [`Purpose::Change`] to write them, which refuses them).
+    /// To show a change another program will write: Claude Code's own `mcp add-json` and `mcp remove`, which add,
+    /// and remove, servers that sign in with OAuth. Only here may a server with `oauth` settings be added, replaced,
+    /// copied or removed; a plan made this way is never written (its ops are made again as a [`Purpose::Change`] to
+    /// write them, which refuses them).
     Preview,
 }
 
@@ -573,6 +574,36 @@ impl Docstore {
         }))
     }
 
+    /// Keeps a private copy of the file as it is now, in the rotation, before another program (Claude Code's own
+    /// commands) changes it. A copy, not a link: that program may write the file in place.
+    pub(crate) fn keep_copy(&self) -> Result<PathBuf, StoreError> {
+        let current = self.read()?;
+        create_private_dir(&self.backup_dir)?;
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        for n in 0u32.. {
+            let path = self
+                .backup_dir
+                .join(format!("{}.{ms:016}-{n}.bak", self.backup_label()));
+            match create_private_file(&path) {
+                Ok(mut file) => {
+                    if current.bom {
+                        file.write_all(BOM.as_bytes())?;
+                    }
+                    file.write_all(current.text.as_bytes())?;
+                    file.sync_all()?;
+                    self.rotate_backups();
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!("some backup name is free")
+    }
+
     /// Keeps the bytes about to be replaced. A hard link to the current file costs nothing, whatever its size: the
     /// rename that follows leaves the old file to the link alone. Where a link is not possible (another drive, a
     /// file system without links) the text that was read is copied instead.
@@ -668,7 +699,7 @@ fn make_private(path: &Path) {
 fn make_private(_path: &Path) {}
 
 #[cfg(unix)]
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -677,12 +708,12 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
 #[cfg(unix)]
-fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
@@ -692,7 +723,7 @@ fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1271,9 +1302,14 @@ fn legacy_names(
     Ok(Some((at, names)))
 }
 
-/// A delete being checked whose server is already gone: that is the delete in place.
+/// A change being checked whose server is already gone. For a delete (or a rename) that is the change in place. For an
+/// edit, a later change, ours or someone else's, deleted the server; the edit is no reason to bring it back.
 fn gone_is_done(op: &Op, purpose: Purpose) -> bool {
-    purpose == Purpose::Verify && matches!(op, Op::RemoveServer { .. } | Op::RenameServer { .. })
+    purpose == Purpose::Verify
+        && matches!(
+            op,
+            Op::RemoveServer { .. } | Op::RenameServer { .. } | Op::ReplaceServer { .. }
+        )
 }
 
 /// What an edit of `.claude.json` produces so far.
@@ -1394,7 +1430,8 @@ fn edit_servers<'o>(
         let member = &object.members[index];
         let old: Value = serde_json::from_str(&text[member.value.clone()])
             .map_err(|e| invalid(sanitize(&e.to_string())))?;
-        if old.get("oauth").is_some() {
+        // Claude Code's own commands change a server that signs in with OAuth; klefki only shows what they will do.
+        if old.get("oauth").is_some() && purpose != Purpose::Preview {
             return Err(invalid(oauth_refusal(name)));
         }
         if removed.contains(&index)
@@ -1439,7 +1476,11 @@ fn edit_servers<'o>(
             }
             Op::ReplaceServer { entry: new, .. } => {
                 let new = entry::unmasked(new, &old).map_err(invalid)?;
-                entry::validate(&new).map_err(invalid)?;
+                if purpose == Purpose::Preview {
+                    entry::validate_new(&new).map_err(invalid)?;
+                } else {
+                    entry::validate(&new).map_err(invalid)?;
+                }
                 let pretty =
                     |v: &Value| serde_json::to_string_pretty(&entry::masked(v)).unwrap_or_default();
                 let diff = entry::diff_lines(&pretty(&old), &pretty(&new));
@@ -1507,7 +1548,7 @@ fn edit_servers<'o>(
 
 fn oauth_refusal(name: &str) -> String {
     format!(
-        "{} signs in with OAuth; it is changed through Claude Code's own command, which Klefki does not run yet",
+        "{} signs in with OAuth; only Claude Code's own commands change it",
         sanitize(name)
     )
 }
@@ -1613,7 +1654,7 @@ fn expand_copies<'a>(
                 )));
             }
         };
-        if definition.get("oauth").is_some() {
+        if definition.get("oauth").is_some() && purpose != Purpose::Preview {
             return Err(invalid(oauth_refusal(name)));
         }
         out.push(Op::AddServer {
@@ -2706,6 +2747,32 @@ mod tests {
         assert_eq!(f.store.verify(&[a, b], &|| false), Ok(true));
         assert_eq!(f.json()["mcpServers"]["gateway"], json!({"command": "b"}));
         assert_eq!(f.store.verify(&[], &|| false), Ok(false));
+    }
+
+    #[test]
+    fn an_edit_then_a_delete_of_the_same_server_checks_out() {
+        // Found by the model-based test: an edit and then a delete of one server within the check's delay. The log
+        // is replayed on the file, where the server is already gone; the edit must not fail the check.
+        let f = Fixture::new(&pretty(&sample()));
+        let edit = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "a"}))]);
+        let delete = apply_ops(&f, vec![remove(None, "gateway")]);
+        assert_eq!(f.store.verify(&[edit, delete], &|| false), Ok(false));
+        assert!(f.json()["mcpServers"].get("gateway").is_none());
+    }
+
+    #[test]
+    fn an_edit_of_a_server_deleted_from_outside_is_not_put_back() {
+        // The variant: someone else deleted it before the check. The edit is not a reason to bring it back.
+        let f = Fixture::new(&pretty(&sample()));
+        let edit = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "a"}))]);
+        let mut theirs = f.json();
+        theirs["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gateway");
+        std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
+        assert_eq!(f.store.verify(&[edit], &|| false), Ok(false));
+        assert!(f.json()["mcpServers"].get("gateway").is_none());
     }
 
     #[test]

@@ -239,6 +239,10 @@ pub struct ShellApp {
     adding: Vec<(String, Vec<Target>)>,
     /// What is being added signs in with OAuth: once added, the user is reminded to sign in.
     adding_signs_in: bool,
+    /// What the success message says was done to them: "Added", "Moved" or "Copied".
+    adding_verb: &'static str,
+    /// The Move dialog, while open.
+    moving: Option<MoveForm>,
     /// egui still remembers text typed into the closed Add dialog (undo steps of secrets): forget it.
     forget_typed: bool,
     /// A server to bring into view in the list, once.
@@ -285,6 +289,8 @@ impl ShellApp {
             add_mode: AddMode::default(),
             adding: Vec::new(),
             adding_signs_in: false,
+            adding_verb: "Added",
+            moving: None,
             forget_typed: false,
             reveal: None,
             casing: None,
@@ -416,6 +422,7 @@ impl ShellApp {
                 plan,
                 changed,
                 backup,
+                notes,
             } => {
                 if changed {
                     // Read again what was saved, for the server still being edited; drop it for any other.
@@ -457,9 +464,11 @@ impl ShellApp {
                     (None, true) => " Sign in to it from its Status tab.",
                     (None, false) => "",
                 };
-                let kept = backup
-                    .map(|b| format!(" The previous file is kept in {b}"))
-                    .unwrap_or_default();
+                // How it went, when there is more to say (settings Claude Code left out, say), then the backup.
+                let mut kept: String = notes.iter().map(|n| format!(" {n}")).collect();
+                if let Some(b) = backup {
+                    kept.push_str(&format!(" The previous file is kept in {b}"));
+                }
                 self.outcome = Some(Outcome {
                     // What was saved is read again next time it is shown.
                     text: match (changed, added) {
@@ -639,6 +648,7 @@ impl ShellApp {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
             && self.plan.is_none()
             && self.duplicate.is_none()
+            && self.moving.is_none()
             && self.add.is_none()
             && self.casing.is_none()
             && self.sign_in.is_none()
@@ -656,6 +666,7 @@ impl ShellApp {
             && self.plan.is_none()
             && !self.command.is_open()
             && self.duplicate.is_none()
+            && self.moving.is_none()
             && self.add.is_none()
             && self.casing.is_none()
             && self.sign_in.is_none();
@@ -712,6 +723,7 @@ impl ShellApp {
         }
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
+        self.move_dialog(&ctx);
         self.add_dialog(&ctx);
         if std::mem::take(&mut self.forget_typed) {
             forget_typed(&ctx);
@@ -731,6 +743,7 @@ impl ShellApp {
                 Page::Connections => {
                     self.warnings(ui);
                     self.legacy_notice(ui);
+                    self.kept_notice(ui);
                     self.toolbar(ui);
                     ui.add_space(6.0);
                     self.grid(ui);
@@ -973,14 +986,87 @@ impl ShellApp {
         }
     }
 
+    /// Servers a change took out and could not put back (Claude Code's command failed twice): Klefki kept their
+    /// definitions, and offers to add each back where it was, or to forget it.
+    fn kept_notice(&mut self, ui: &mut Ui) {
+        if self.snapshot.kept.is_empty() {
+            return;
+        }
+        let pal = theme::palette(ui.ctx());
+        let can = self.core.is_some() && self.can_prepare();
+        let mut chosen = None;
+        let count = self.snapshot.kept.len();
+        Frame::new()
+            .stroke(egui::Stroke::new(1.0, pal.warn))
+            .corner_radius(6)
+            .inner_margin(Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let title = if count == 1 {
+                    "1 server could not be put back".to_owned()
+                } else {
+                    format!("{count} servers could not be put back")
+                };
+                ui.label(RichText::new(title).color(pal.warn));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Claude Code's command failed while changing them, and again while putting them back. Klefki kept what they were, client secrets included, so you can add them back where they were.",
+                        )
+                        .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+                for kept in &self.snapshot.kept {
+                    ui.horizontal(|ui| {
+                        let wait = "Wait for the open change to finish";
+                        if ui
+                            .add_enabled(can, egui::Button::new("Put back"))
+                            .on_hover_text("Review the change before anything is written")
+                            .on_disabled_hover_text(wait)
+                            .clicked()
+                        {
+                            chosen = Some(Change::PutBack {
+                                kept: kept.id.clone(),
+                            });
+                        }
+                        if ui
+                            .add_enabled(can, egui::Button::new("Forget\u{2026}"))
+                            .on_hover_text("Delete Klefki's copy; the review says what is lost")
+                            .on_disabled_hover_text(wait)
+                            .clicked()
+                        {
+                            chosen = Some(Change::ForgetKept {
+                                kept: kept.id.clone(),
+                            });
+                        }
+                        let what = format!("{} {}", kept.name, kept.place);
+                        ui.add(egui::Label::new(what).truncate());
+                        if kept.signs_in {
+                            ui.label(
+                                RichText::new("signs in with OAuth").small().color(pal.text_muted),
+                            );
+                        }
+                    });
+                }
+            });
+        ui.add_space(6.0);
+        if let Some(change) = chosen {
+            self.prepare(vec![change]);
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        // Only what works today: a button that can never be pressed is noise (Move, Export and Import arrive with M2
-        // and M3).
-        const ACTIONS: [(&str, &str); 7] = [
+        // Only what works today: a button that can never be pressed is noise (Export and Import arrive with M3).
+        const ACTIONS: [(&str, &str); 8] = [
             (icon::PLUS, "Add (Ctrl+N)"),
             (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
             (icon::COPY, "Duplicate (Ctrl+D)"),
+            (
+                icon::ARROWS_LEFT_RIGHT,
+                "Move to another project or the user",
+            ),
             (icon::SIGN_IN, "Sign in"),
             (icon::TOGGLE_RIGHT, "Turn on"),
             (icon::TOGGLE_LEFT, "Turn off"),
@@ -1007,7 +1093,9 @@ impl ShellApp {
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
                     }
-                    g if g == icon::COPY => (can_duplicate, "select one user or local server"),
+                    g if g == icon::COPY || g == icon::ARROWS_LEFT_RIGHT => {
+                        (can_duplicate, "select one user or local server")
+                    }
                     g if g == icon::SIGN_IN => {
                         (can_sign_in, "select one server that needs you to sign in")
                     }
@@ -1025,6 +1113,7 @@ impl ShellApp {
                         g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
                         g if g == icon::TRASH => self.prepare_delete(),
                         g if g == icon::COPY => self.open_duplicate(),
+                        g if g == icon::ARROWS_LEFT_RIGHT => self.open_move(),
                         g if g == icon::PLUS => self.open_add(),
                         g if g == icon::SIGN_IN => {
                             if let Some(s) = self.single_selected().cloned() {
@@ -1108,6 +1197,13 @@ impl ShellApp {
                         "To another project or the user".into(),
                         Some(shortcut("D")),
                         command::Action::Duplicate,
+                    );
+                    add(
+                        icon::ARROWS_LEFT_RIGHT,
+                        format!("Move {}", s.name),
+                        "To another project or the user".into(),
+                        None,
+                        command::Action::Move,
                     );
                 }
                 if s.casing_collision {
@@ -1274,6 +1370,7 @@ impl ShellApp {
             }
             A::Settings => self.page = Page::Settings,
             A::Duplicate => self.open_duplicate(),
+            A::Move => self.open_move(),
             A::Add => self.open_add(),
             A::FixCasing => self.open_casing(),
             A::MigrateLegacy => self.migrate_legacy(),
@@ -1324,6 +1421,25 @@ impl ShellApp {
             name: format!("{}_copy", row.name),
             places,
             focus: true,
+        });
+    }
+
+    /// Opens the Move dialog for the selected server, with nowhere chosen yet: where it is now cannot be chosen.
+    fn open_move(&mut self) {
+        let Some(row) = self.duplicable() else {
+            return;
+        };
+        let mut places = Places::new(&self.snapshot.projects, row.project.as_deref());
+        places.one = true;
+        places.now = Some(match (&row.project, row.scope) {
+            (Some(p), Scope::Local) => Target::Local(p.clone()),
+            _ => Target::User,
+        });
+        self.moving = Some(MoveForm {
+            source: row.id(),
+            about: format!("{} \u{b7} {}", row.transport.label(), row.target),
+            places,
+            signs_in: row.oauth.is_some(),
         });
     }
 
@@ -1562,10 +1678,96 @@ impl ShellApp {
                 name: form.name.clone(),
                 targets: form.places.targets(),
             };
+            // A copy that signs in has no sign-in of its own yet.
+            let signs_in = self
+                .snapshot
+                .servers
+                .iter()
+                .any(|r| r.id() == form.source && r.oauth.is_some());
             self.duplicate = None;
             self.prepare(vec![change]);
+            self.adding_signs_in = signs_in;
         } else if cancel || modal.should_close() {
             self.duplicate = None;
+        }
+    }
+
+    fn move_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let Some(form) = &mut self.moving else {
+            return;
+        };
+        let name = form.source.name.clone();
+        let taken = form.places.taken(&name, &self.snapshot.servers);
+        let places = form.places.in_words();
+        let ready = taken.is_none() && form.places.targets().len() == 1;
+        let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut cancel = false;
+        let list_height = (ctx.content_rect().height() - 420.0).clamp(96.0, 320.0);
+        let modal = egui::Modal::new(egui::Id::new("move_dialog")).show(ctx, |ui| {
+            ui.set_width(520.0);
+            ui.heading(format!("Move {name}"));
+            ui.add(
+                egui::Label::new(RichText::new(&form.about).small().color(pal.text_muted))
+                    .truncate(),
+            );
+            ui.add_space(12.0);
+            ui.label(RichText::new("Move it to").color(pal.text_muted));
+            form.places.ui(ui, list_height, None);
+            ui.add_space(10.0);
+            // What Review will lead to, or why it cannot yet.
+            if let Some(taken) = &taken {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{name} already exists {taken}. Rename one of them first, or choose another place."
+                        ))
+                        .color(pal.danger),
+                    )
+                    .wrap(),
+                );
+            } else if let Some(places) = &places {
+                ui.add(egui::Label::new(format!("Moves {name} {places}.")).wrap());
+            } else {
+                ui.label(RichText::new("Choose where it goes.").color(pal.text_muted));
+            }
+            let keeps = if form.signs_in {
+                "It signs in with OAuth: Claude Code removes it and adds it again, so you sign in to it again afterwards."
+            } else {
+                "It keeps its settings, environment and header values."
+            };
+            ui.add(
+                egui::Label::new(RichText::new(keeps).small().color(pal.text_muted)).wrap(),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let confirm =
+                    egui::Button::new(RichText::new("Review").strong().color(pal.on_bright))
+                        .fill(pal.primary)
+                        .min_size(egui::vec2(96.0, 34.0));
+                review |= ui
+                    .add_enabled(ready, confirm)
+                    .on_hover_text("Enter")
+                    .on_disabled_hover_text("Choose where it goes")
+                    .clicked();
+                cancel |= ui
+                    .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
+                    .on_hover_text("Esc")
+                    .clicked();
+            });
+        });
+        if review {
+            let to = form.places.targets().remove(0);
+            let change = Change::Move {
+                id: form.source.clone(),
+                to,
+            };
+            let signs_in = form.signs_in;
+            self.moving = None;
+            self.prepare(vec![change]);
+            self.adding_signs_in = signs_in;
+        } else if cancel || modal.should_close() {
+            self.moving = None;
         }
     }
 
@@ -1908,13 +2110,23 @@ impl ShellApp {
         if self.can_prepare() {
             self.outcome = None;
             self.preparing = true;
+            self.adding_signs_in = false;
+            // What will be in the list afterwards, selected once it is there.
             self.adding = changes
                 .iter()
                 .filter_map(|c| match c {
-                    Change::Add { name, targets, .. } => Some((name.clone(), targets.clone())),
+                    Change::Add { name, targets, .. } | Change::Duplicate { name, targets, .. } => {
+                        Some((name.clone(), targets.clone()))
+                    }
+                    Change::Move { id, to } => Some((id.name.clone(), vec![to.clone()])),
                     _ => None,
                 })
                 .collect();
+            self.adding_verb = match changes.first() {
+                Some(Change::Move { .. }) => "Moved",
+                Some(Change::Duplicate { .. }) => "Copied",
+                _ => "Added",
+            };
             self.send(Command::Prepare(changes));
         }
     }
@@ -1936,8 +2148,9 @@ impl ShellApp {
             })
             .collect();
         let places = places_in_words(user, &folders).unwrap_or_default();
+        let verb = self.adding_verb;
         Some(format!(
-            "Added {} {places}.",
+            "{verb} {} {places}.",
             list_in_words(&names, "server")
         ))
     }
@@ -2849,19 +3062,22 @@ impl ShellApp {
                         .desired_width(f32::INFINITY),
                 );
             }
-            EditorState::Ready { form, .. }
+            EditorState::Ready { form, .. } => {
+                // Said before anything is typed, so the sign-in it costs is no surprise at Review.
                 if form
                     .as_ref()
                     .as_ref()
-                    .is_ok_and(Definition::signs_in_with_oauth) =>
-            {
-                muted(
-                    ui,
-                    "Signs in with OAuth: it is changed through Claude Code's own command, which Klefki does not run yet.",
-                    pal.text_muted,
-                )
+                    .is_ok_and(Definition::signs_in_with_oauth)
+                {
+                    muted(
+                        ui,
+                        "Signs in with OAuth: Claude Code saves a change by removing the server and adding it again, so you sign in again afterwards.",
+                        pal.text_muted,
+                    );
+                    ui.add_space(4.0);
+                }
+                return false;
             }
-            EditorState::Ready { .. } => return false,
         }
         true
     }
@@ -4230,6 +4446,16 @@ struct DuplicateForm {
     focus: bool,
 }
 
+/// What the Move dialog holds: the one place the server goes.
+struct MoveForm {
+    source: ServerId,
+    /// What is being moved, under the title: `http · https://…`.
+    about: String,
+    places: Places,
+    /// It signs in with OAuth, so it is signed out by the move.
+    signs_in: bool,
+}
+
 /// Where a new server goes, as ticked in a dialog: for the user, and in any of the projects Claude Code knows.
 struct Places {
     user: bool,
@@ -4244,6 +4470,10 @@ struct Places {
     shared_folders: BTreeSet<String>,
     /// Narrows the list of projects: part of a path, any case.
     filter: String,
+    /// Choose one place, like radio buttons, rather than tick any number: the Move dialog.
+    one: bool,
+    /// Where the server is now, which cannot be chosen: the Move dialog.
+    now: Option<Target>,
 }
 
 impl Places {
@@ -4271,6 +4501,8 @@ impl Places {
             here: here.map(str::to_owned),
             shared_folders,
             filter: String::new(),
+            one: false,
+            now: None,
         }
     }
 
@@ -4336,13 +4568,29 @@ impl Places {
     /// Says whether a tick changed.
     fn ui(&mut self, ui: &mut Ui, list_height: f32, tag: Option<&str>) -> bool {
         let pal = theme::palette(ui.ctx());
-        let mut changed =
-            place_row(ui, &mut self.user, "For the user", "in every project", None).changed();
+        const NOW: &str = "where it is now";
+        let mark = if self.one { Mark::Radio } else { Mark::Tick };
+        let user_now = self.now == Some(Target::User);
+        let mut changed = place_mark(
+            ui,
+            &mut self.user,
+            "For the user",
+            "in every project",
+            user_now.then_some(NOW),
+            mark,
+            !user_now,
+        )
+        .changed();
+        if changed && self.one && self.user {
+            for (_, on) in &mut self.projects {
+                *on = false;
+            }
+        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let ticked = self.projects.iter().filter(|(_, on)| *on).count();
             let mut heading = format!("Projects ({})", self.projects.len());
-            if ticked > 0 {
+            if ticked > 0 && !self.one {
                 heading.push_str(&format!(", {ticked} ticked"));
             }
             ui.label(RichText::new(heading).color(pal.text_muted));
@@ -4369,6 +4617,7 @@ impl Places {
                 ui.spacing_mut().item_spacing.y = PLACE_GAP;
                 let needle = self.filter.trim().to_lowercase();
                 let mut shown = 0;
+                let mut picked = None;
                 for &i in &self.order {
                     let (path, on) = &mut self.projects[i];
                     if !path.to_lowercase().contains(&needle) {
@@ -4382,9 +4631,21 @@ impl Places {
                     } else {
                         ""
                     };
-                    changed |= place_row(ui, on, folder, parent, tag.filter(|_| here))
-                        .on_hover_text(path.as_str())
-                        .changed();
+                    let now = matches!(&self.now, Some(Target::Local(p)) if same_project(p, path));
+                    let tag = if now { Some(NOW) } else { tag.filter(|_| here) };
+                    let row = place_mark(ui, on, folder, parent, tag, mark, !now)
+                        .on_hover_text(path.as_str());
+                    if row.changed() {
+                        changed = true;
+                        picked = Some(i);
+                    }
+                }
+                // One place at a time: choosing a project un-chooses the rest.
+                if let Some(picked) = picked.filter(|_| self.one) {
+                    self.user = false;
+                    for (i, (_, on)) in self.projects.iter_mut().enumerate() {
+                        *on = i == picked;
+                    }
                 }
                 if shown == 0 {
                     ui.label(RichText::new("No project matches.").color(pal.text_muted));
@@ -4419,12 +4680,41 @@ fn place_row(
     detail: &str,
     tag: Option<&str>,
 ) -> egui::Response {
+    place_mark(ui, on, title, detail, tag, Mark::Tick, true)
+}
+
+/// How a place is chosen: a tick box among many, or a radio button for one.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    Tick,
+    Radio,
+}
+
+/// [`place_row`] drawn as `mark`; a row that is not `enabled` cannot be chosen and is drawn faded.
+fn place_mark(
+    ui: &mut Ui,
+    on: &mut bool,
+    title: &str,
+    detail: &str,
+    tag: Option<&str>,
+    mark: Mark,
+    enabled: bool,
+) -> egui::Response {
     let pal = theme::palette(ui.ctx());
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
     let (rect, mut response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), PLACE_ROW), Sense::click());
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), PLACE_ROW), sense);
     if response.clicked() {
-        *on = !*on;
-        response.mark_changed();
+        // A radio button stays chosen when clicked again.
+        let next = mark == Mark::Tick && *on;
+        if *on != !next {
+            *on = !next;
+            response.mark_changed();
+        }
     }
     let ticked = *on;
     response.widget_info(|| {
@@ -4433,20 +4723,31 @@ fn place_row(
         } else {
             format!("{title}, {detail}")
         };
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, ticked, label)
+        let kind = match mark {
+            Mark::Tick => egui::WidgetType::Checkbox,
+            Mark::Radio => egui::WidgetType::RadioButton,
+        };
+        egui::WidgetInfo::selected(kind, enabled, ticked, label)
     });
     if !ui.is_rect_visible(rect) {
         return response;
     }
     let painter = ui.painter_at(rect);
-    if response.hovered() || response.has_focus() {
+    if enabled && (response.hovered() || response.has_focus()) {
         painter.rect_filled(rect, 6.0, pal.hover);
     }
     let tick = egui::Rect::from_center_size(
         rect.left_center() + egui::vec2(18.0, 0.0),
         egui::vec2(18.0, 18.0),
     );
-    if ticked {
+    let text = if enabled { pal.text } else { pal.text_muted };
+    if mark == Mark::Radio {
+        let stroke = if ticked { pal.primary } else { pal.text_muted };
+        painter.circle_stroke(tick.center(), 8.25, egui::Stroke::new(1.5, stroke));
+        if ticked {
+            painter.circle_filled(tick.center(), 4.5, pal.primary);
+        }
+    } else if ticked {
         painter.rect_filled(tick, 4.0, pal.primary);
         painter.text(
             tick.center(),
@@ -4468,7 +4769,7 @@ fn place_row(
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(15.0),
-        pal.text,
+        text,
     );
     let small = egui::FontId::proportional(13.0);
     let mut right = rect.right() - 10.0;
@@ -6149,6 +6450,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: Some("/data/backups/claude.json.1.bak".to_owned()),
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -6201,6 +6503,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: Some("b".to_owned()),
+                notes: Vec::new(),
             })
             .unwrap();
         engine.events.send(Event::Reapplied { plan: 7 }).unwrap();
@@ -6247,6 +6550,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -6328,6 +6632,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -6479,6 +6784,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -7190,16 +7496,37 @@ mod tests {
     }
 
     #[test]
-    fn project_and_oauth_servers_are_shown_but_not_edited_in_the_form() {
+    fn project_servers_are_shown_but_not_edited_in_the_form() {
         let (h, _engine, _a) = form_harness("{\n  \"command\": \"x\"\n}", false);
         h.get_by_label_contains("does not edit files in a repository");
         assert!(h.query_by_label("Review and save…").is_none());
-        let (h, _engine, _a) = form_harness(
+    }
+
+    #[test]
+    fn a_server_that_signs_in_is_edited_in_the_form_and_says_it_signs_in_again() {
+        let (mut h, engine, a) = form_harness(
             "{\n  \"type\": \"http\",\n  \"url\": \"https://h.example/mcp\",\n  \"oauth\": {\n    \"clientId\": \"c\"\n  }\n}",
             true,
         );
-        h.get_by_label_contains("OAuth");
-        assert!(h.query_by_label("Review and save…").is_none());
+        // Before anything is typed.
+        h.get_by_label_contains("you sign in again afterwards");
+        form(&mut h).url = "https://h.example/v2/mcp".into();
+        h.run();
+        h.get_by_label("Review and save…").click();
+        h.run();
+        match &drain(&engine)[..] {
+            [Command::Prepare(changes)] => match &changes[..] {
+                [Change::Replace { id, json }] => {
+                    assert_eq!(*id, a.id());
+                    assert!(
+                        json.contains("v2/mcp") && json.contains("\"clientId\": \"c\""),
+                        "{json}"
+                    );
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -7254,6 +7581,7 @@ mod tests {
                 plan: 1,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -7275,6 +7603,7 @@ mod tests {
         for glyph in [
             icon::PENCIL_SIMPLE,
             icon::COPY,
+            icon::ARROWS_LEFT_RIGHT,
             icon::TOGGLE_RIGHT,
             icon::TOGGLE_LEFT,
             icon::TRASH,
@@ -8174,6 +8503,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -8215,6 +8545,7 @@ mod tests {
                 plan: 8,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -8581,6 +8912,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -8615,6 +8947,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -9160,6 +9493,7 @@ mod tests {
                 plan: 1,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -9801,6 +10135,7 @@ mod tests {
                 plan: 7,
                 changed: true,
                 backup: None,
+                notes: Vec::new(),
             })
             .unwrap();
         h.run();
@@ -9814,5 +10149,335 @@ mod tests {
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(sso.id())]);
         h.get_by_label("Sign in to sso");
         assert!(h.query_by_label_contains("Added sso").is_none());
+    }
+
+    // ---- move
+
+    fn open_move_of(h: &mut Harness<'static, ShellApp>, name: &str) {
+        h.get_by_label(name).click();
+        h.run();
+        h.get_by_label(icon::ARROWS_LEFT_RIGHT).click();
+        h.run();
+        assert!(h.state().moving.is_some());
+        h.get_by_label(&format!("Move {name}"));
+    }
+
+    #[test]
+    fn move_sends_a_local_server_to_the_user_and_cannot_choose_where_it_is_now() {
+        let (mut h, engine) = duplicate_harness();
+        open_move_of(&mut h, "beta");
+        // Nothing is chosen yet, and where it is now cannot be.
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.get_by_label_contains("Choose where it goes.");
+        let here = h.get_by_label("WebApp");
+        assert!(here.accesskit_node().is_disabled());
+        here.click();
+        h.run();
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.get_by_label("For the user, in every project").click();
+        h.run();
+        h.get_by_label("Moves beta for the user.");
+        h.get_by_label_contains("keeps its settings");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(h.state().moving.is_none());
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Move {
+                id: h.state().snapshot.servers[1].id(),
+                to: Target::User,
+            }]
+        );
+    }
+
+    #[test]
+    fn move_chooses_one_place_at_a_time() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = duplicate_harness();
+        open_move_of(&mut h, "alpha");
+        assert!(
+            h.get_by_label("For the user, in every project")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("notes").click();
+        h.run();
+        h.get_by_label("WebApp").click();
+        h.run();
+        // Clicking the chosen one again keeps it chosen.
+        h.get_by_label("WebApp").click();
+        h.run();
+        let chosen: Vec<String> = h
+            .get_all_by_role(Role::RadioButton)
+            .filter(|n| n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True))
+            .map(|n| n.accesskit_node().label().unwrap_or_default())
+            .collect();
+        assert_eq!(chosen, vec!["WebApp".to_owned()]);
+        h.get_by_label("Moves alpha in WebApp.");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Move {
+                id: h.state().snapshot.servers[0].id(),
+                to: Target::Local("C:/Repos/WebApp".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn move_will_not_go_where_the_name_is_taken() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        // Another alpha already in notes, written with another spelling of its path.
+        let there = live_row("alpha", Scope::Local, Some(r"/home/me/notes/"));
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, there],
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.state_mut().selected = BTreeSet::from([0]);
+        h.run();
+        h.get_by_label(icon::ARROWS_LEFT_RIGHT).click();
+        h.run();
+        h.get_by_label("notes").click();
+        h.run();
+        h.get_by_label_contains("alpha already exists in notes");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+        // Somewhere free is fine.
+        h.get_by_label("WebApp").click();
+        h.run();
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn move_is_in_the_palette_for_user_and_local_servers_only() {
+        let (mut h, _engine) = duplicate_harness();
+        h.get_by_label("gamma").click();
+        h.run();
+        assert!(
+            h.get_by_label(icon::ARROWS_LEFT_RIGHT)
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        h.run();
+        assert!(h.query_by_label_contains("Move gamma").is_none());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.get_by_label("beta").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        h.run();
+        h.get_by_label_contains("Move beta").click();
+        h.run();
+        assert!(h.state().moving.is_some());
+        h.get_by_label("Move beta");
+    }
+
+    #[test]
+    fn a_moved_server_is_selected_where_it_went_and_the_message_says_moved() {
+        let (mut h, engine) = duplicate_harness();
+        open_move_of(&mut h, "beta");
+        h.get_by_label("notes").click();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(
+                7,
+                &["- beta", "+ beta"],
+                &[],
+                false,
+            )))
+            .unwrap();
+        h.run();
+        let (a, _) = two_rows();
+        let moved = live_row("beta", Scope::Local, Some("/home/me/notes"));
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, moved],
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+                notes: vec!["Claude Code left out alwaysAllow.".into()],
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().selected, BTreeSet::from([1]));
+        h.get_by_label("Moved beta in notes. Claude Code left out alwaysAllow.");
+    }
+
+    #[test]
+    fn a_server_that_signs_in_says_it_signs_in_again_after_a_move_and_offers_it() {
+        let (mut h, engine) = live_harness();
+        let sso = ServerRow {
+            oauth: Some(OAuthInfo {
+                client_id: None,
+                scopes: vec![],
+            }),
+            ..web_row("sso")
+        };
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![sso.clone()],
+                projects: vec!["C:/Repos/WebApp".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        open_move_of(&mut h, "sso");
+        h.get_by_label_contains("so you sign in to it again afterwards");
+        h.get_by_label("WebApp").click();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(
+                7,
+                &["- sso", "+ sso"],
+                &[],
+                false,
+            )))
+            .unwrap();
+        h.run();
+        let moved = ServerRow {
+            connection: klefki_core::api::ConnectionId::new(
+                Scope::Local,
+                Some("C:/Repos/WebApp"),
+                "sso",
+            ),
+            scope: Scope::Local,
+            project: Some("C:/Repos/WebApp".into()),
+            ..sso
+        };
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![moved],
+                projects: vec!["C:/Repos/WebApp".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("Moved sso in WebApp. Sign in now, or later from its Status tab.");
+    }
+
+    // ---- kept
+
+    fn kept_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a],
+                kept: vec![klefki_core::api::Kept {
+                    id: "1760000000000-0".into(),
+                    name: "sso".into(),
+                    place: "in WebApp".into(),
+                    signs_in: true,
+                }],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    #[test]
+    fn a_server_that_could_not_be_put_back_is_shown_and_can_be_put_back() {
+        let (mut h, engine) = kept_harness();
+        h.get_by_label("1 server could not be put back");
+        h.get_by_label("sso in WebApp");
+        h.get_by_label("Put back").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::PutBack {
+                kept: "1760000000000-0".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_kept_server_can_be_forgotten_after_a_review() {
+        let (mut h, engine) = kept_harness();
+        h.get_by_label("Forget\u{2026}").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::ForgetKept {
+                kept: "1760000000000-0".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn nothing_kept_shows_no_notice() {
+        let (h, _engine) = duplicate_harness();
+        assert!(h.query_by_label_contains("could not be put back").is_none());
+    }
+
+    #[test]
+    fn a_copy_is_selected_and_the_message_says_copied() {
+        let (mut h, engine) = duplicate_harness();
+        open_duplicate_of(&mut h, "beta");
+        h.get_by_label("Review").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ beta_copy"], &[], false)))
+            .unwrap();
+        h.run();
+        let mut rows = h.state().snapshot.servers.clone();
+        rows.push(live_row("beta_copy", Scope::Local, Some("C:/Repos/WebApp")));
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: rows,
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().selected, BTreeSet::from([3]));
+        h.get_by_label("Copied beta_copy in WebApp.");
     }
 }

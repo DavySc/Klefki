@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c0c2843e01a4fda84d3b8ef8b458bc91b9322c389a5ff36d33e60108187e51fd # shrinks to cases = [(Edit { pick: 6, oauth: false, url: 0, client: 1 }, []), (Delete { pick: 1 }, []), (Edit { pick: 3, oauth: false, url: 0, client: 0 }, [])]
+cc f72ea81a010709827cad785203938fa09ba1a027b8d66c2cf0eff906aef324e2 # shrinks to cases = [(Copy { pick: 0, to: 0, rename: true }, []), (Edit { pick: 3, oauth: false, url: 0, client: 0 }, []), (Move { pick: 3, to: 2 }, [])]
+cc 9a374c81011a88ae1ed7c06389f79e579cc2c34bd1f90bdb7482a52ed6587e9e # shrinks to cases = [(Edit { pick: 7, oauth: true, url: 0, client: 1 }, []), (Move { pick: 0, to: 0 }, [Overtaken]), (Edit { pick: 1, oauth: true, url: 1, client: 0 }, [FailsAfter]), (Copy { pick: 0, to: 1, rename: false }, [FailsBefore]), (Rename { pick: 0 }, [NeverStarts, Works, Works]), (Rename { pick: 0 }, [Works, NeverStarts]), (Move { pick: 6, to: 2 }, []), (PutBack { pick: 3 }, [Works, TimesOutAfter]), (Edit { pick: 2, oauth: false, url: 1, client: 1 }, []), (Edit { pick: 2, oauth: true, url: 1, client: 1 }, [Works, Overtaken, FailsAfter])]
+cc 4f015c4e50a418447546b34dee6450c4daad87e3b8e803c85a08afc64e77b32f # shrinks to cases = [(Edit { pick: 5, oauth: true, url: 0, client: 0 }, [NeverStarts, Works, Overtaken]), (PutBack { pick: 7 }, [NeverStarts, FailsAfter, Works]), (Edit { pick: 4, oauth: false, url: 1, client: 0 }, []), (Edit { pick: 7, oauth: true, url: 0, client: 1 }, [Works, Works]), (Copy { pick: 6, to: 1, rename: false }, [Works]), (Edit { pick: 7, oauth: true, url: 2, client: 0 }, [Works, Works, FailsBefore])]
+cc eff11b7fb40b81c215f76e5ad93be4c96b17ce66bce17150be04b327e0233451 # shrinks to cases = [(Move { pick: 5, to: 1 }, [])]
+cc acc7f0d071d889911e4fa569c9616ba2623d5683668bc0a68468983a6daff088 # shrinks to cases = [(Copy { pick: 0, to: 0, rename: true }, []), (Edit { pick: 6, oauth: false, url: 0, client: 0 }, [NeverStarts]), (Move { pick: 0, to: 1 }, [])]
+cc c87ec2aa83aa07b52e77eff8a3fa13d1291b76fbd429c3c7cbcddeb390f6ed23 # shrinks to cases = [(Edit { pick: 4, oauth: true, url: 0, client: 0 }, [Works, FailsBefore])]

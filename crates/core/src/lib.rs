@@ -11,4 +11,5 @@ mod ops;
 mod paste;
 mod sanitize;
 mod secrets;
+mod swap;
 mod watch;

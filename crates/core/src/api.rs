@@ -220,6 +220,19 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
     /// Projects whose entry still has the switch-off list of older Claude Code versions.
     pub legacy_disabled: Vec<LegacyDisabled>,
+    /// Definitions Klefki kept because a change removed a server and could not add it back. Oldest first.
+    pub kept: Vec<Kept>,
+}
+
+/// A server definition Klefki kept in its private folder after a change removed the server and could not put it back
+/// (Claude Code's command failed twice). [`Change::PutBack`] adds it back where it was. Sanitised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub id: String,
+    pub name: String,
+    /// `for the user`, `in app`.
+    pub place: String,
+    pub signs_in: bool,
 }
 
 /// A project entry with the old `mcpServersDisabled` list. Claude Code no longer reads it, so the servers it names
@@ -259,6 +272,7 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
             secrets: None,
             open_url: std::sync::Arc::new(open_https),
             sign_in_timeout: std::time::Duration::from_secs(5 * 60),
+            changer: None,
         },
         wake,
     )
