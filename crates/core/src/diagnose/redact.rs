@@ -4,23 +4,24 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// Applied in order. Each replacement keeps the label and hides the value, so the text stays readable.
+/// Applied in order. Each replacement keeps the label and hides the value, so the text stays readable. A quote may
+/// arrive escaped (`\"`): the client logs a server's stderr inside a quoted string, JSON the server printed included.
 const RULES: &[(&str, &str)] = &[
     // Whole header and environment objects, quoted (JSON) and bare (`Environment: {...}`).
     (
-        r#"(?i)("(?:headers|env|environment|http_headers)"\s*:\s*)\{[^{}]*\}"#,
+        r#"(?i)(\\?"(?:headers|env|environment|http_headers)\\?"\s*:\s*)\{[^{}]*\}"#,
         "${1}{***}",
     ),
     (r#"(?i)(\b(?:headers|env)\s*:\s*)\{[^{}]*\}"#, "${1}{***}"),
     // Authentication headers: everything after the name up to the end of the value.
     (
-        r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)(["']?\s*[:=]\s*["']?)[^"',}\r\n]+"#,
+        r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)((?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[^"',}\r\n]+"#,
         "${1}${2}***",
     ),
     (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer ***"),
     // Names that say they hold a secret, whatever the separator.
     (
-        r#"(?i)\b([a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|code[_-]?verifier)["']?\s*[:=]\s*["']?)[^\s"',&}]+"#,
+        r#"(?i)\b([a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|code[_-]?verifier)(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?)[^\s"',&}]+"#,
         "${1}***",
     ),
     // OAuth redirect parameters.
@@ -39,7 +40,12 @@ const RULES: &[(&str, &str)] = &[
         "***",
     ),
     (r"\bsk-[A-Za-z0-9_-]{16,}", "sk-***"),
+    (r"\bsk_live_[A-Za-z0-9]{16,}", "sk_live_***"),
     (r"\bgh[pousr]_[A-Za-z0-9]{20,}", "***"),
+    (r"\bgithub_pat_[A-Za-z0-9_]{20,}", "***"),
+    (r"\bglpat-[A-Za-z0-9_-]{20,}", "***"),
+    (r"\bAIza[0-9A-Za-z_-]{30,}", "***"),
+    (r"\bnpm_[A-Za-z0-9]{30,}", "***"),
     (r"\bxox[abprs]-[A-Za-z0-9-]{10,}", "***"),
     (r"\bAKIA[0-9A-Z]{16}\b", "***"),
     (r"\b[0-9a-fA-F]{32,}\b", "***"),
@@ -141,6 +147,24 @@ mod tests {
     }
 
     #[test]
+    fn escaped_quotes_hide_nothing() {
+        // JSON logged inside a quoted string: every quote arrives as `\"`.
+        for (input, secret) in [
+            (r#"{\"api_key\":\"LEAK-1234567\"}"#, "LEAK-1234567"),
+            (r#"{\"client_secret\": \"LEAK-1234567\"}"#, "LEAK-1234567"),
+            (r#"{\"x-api-key\":\"LEAK-1234567\"}"#, "LEAK-1234567"),
+            (r#"{\"Cookie\":\"sid=LEAK-1234567\"}"#, "LEAK-1234567"),
+            (
+                r#"{\"headers\":{\"X-Custom\":\"LEAK-1234567\"}}"#,
+                "LEAK-1234567",
+            ),
+            (r#"{\"env\":{\"FOO\":\"LEAK-1234567\"}}"#, "LEAK-1234567"),
+        ] {
+            gone(input, secret);
+        }
+    }
+
+    #[test]
     fn oauth_query_parameters() {
         gone(
             "https://x.example.com/cb?code=AUTHCODE123&state=STATE456",
@@ -199,6 +223,12 @@ mod tests {
             "xoxb-1234567890-abcdefghij",
             "AKIAIOSFODNN7EXAMPLE",
             "3af80102dbd95c6b2d44754855d60231273336825c5374948ed964056cac5f9b",
+            // The shapes core masks in arguments too (`config::secretlike`).
+            concat!("sk_live_", "51ABCDEFGHIJKLMNOPQRSTUVWX"),
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+            "glpat-abcdefghij0123456789",
+            "AIzaSyA1234567890abcdefghijklmnopqrstu",
+            "npm_abcdefghijklmnopqrstuvwxyz0123456789",
         ] {
             gone(&format!("value is {secret} here"), secret);
         }
