@@ -981,7 +981,7 @@ impl ShellApp {
             (icon::PLUS, "Add (Ctrl+N)"),
             (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
             (icon::COPY, "Duplicate (Ctrl+D)"),
-            (icon::SIGN_IN, "Sign in (re-authorize)"),
+            (icon::SIGN_IN, "Sign in"),
             (icon::TOGGLE_RIGHT, "Turn on"),
             (icon::TOGGLE_LEFT, "Turn off"),
             (icon::TRASH, "Delete (Del)"),
@@ -992,7 +992,12 @@ impl ShellApp {
         let can_add = self.core.is_some() && self.can_prepare();
         let can_sign_in = self.core.is_some()
             && self.sign_in.is_none()
-            && self.single_selected().is_some_and(sign_in::can_sign_in);
+            && self.single_selected().is_some_and(|row| {
+                // One is selected: its status as shown now.
+                self.selected
+                    .iter()
+                    .all(|&i| sign_in::offers_sign_in(row, self.effective(i).0))
+            });
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
             for (glyph, tip) in ACTIONS {
@@ -1003,7 +1008,9 @@ impl ShellApp {
                         (can_toggle, "select a server first")
                     }
                     g if g == icon::COPY => (can_duplicate, "select one user or local server"),
-                    g if g == icon::SIGN_IN => (can_sign_in, "select one HTTP or SSE server"),
+                    g if g == icon::SIGN_IN => {
+                        (can_sign_in, "select one server that needs you to sign in")
+                    }
                     g if g == icon::PLUS => (can_add, "wait for the change under way"),
                     _ => (can_edit, "select one server"),
                 };
@@ -1113,18 +1120,9 @@ impl ShellApp {
                     );
                 }
                 if sign_in::can_sign_in(s) && self.sign_in.is_none() {
-                    let status = self
-                        .selected
-                        .iter()
-                        .next()
-                        .map_or(s.status, |&i| self.effective(i).0);
-                    let title = match status {
-                        Status::NeedsAuth => format!("Sign in to {}", s.name),
-                        _ => format!("Sign in to {} again", s.name),
-                    };
                     add(
                         icon::SIGN_IN,
-                        title,
+                        format!("Sign in to {}", s.name),
                         "Through Claude Code, in your browser".into(),
                         None,
                         command::Action::SignIn,
@@ -2541,13 +2539,12 @@ impl ShellApp {
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
                 ui.horizontal_wrapped(|ui| {
-                if self.core.is_some() && sign_in::can_sign_in(s) {
-                    let label = sign_in::action_label(status);
+                if self.core.is_some() && sign_in::offers_sign_in(s, status) {
                     // The way out of "Needs auth", so it leads; otherwise it is one action among others.
                     let button = if status == Status::NeedsAuth {
-                        egui::Button::new(RichText::new(label).strong().color(pal.on_bright)).fill(pal.primary)
+                        egui::Button::new(RichText::new("Sign in").strong().color(pal.on_bright)).fill(pal.primary)
                     } else {
-                        egui::Button::new(label)
+                        egui::Button::new("Sign in")
                     };
                     if ui
                         .add_enabled(self.sign_in.is_none(), button)
@@ -2619,7 +2616,7 @@ impl ShellApp {
                     }
                     None if sign_in::can_sign_in(s) => muted(
                         ui,
-                        "No OAuth client is set up for it. If the server asks you to sign in, Claude Code registers itself with it.",
+                        "Claude Code signs in to this server for you when the server asks for it.",
                     ),
                     None => muted(
                         ui,
@@ -2629,19 +2626,13 @@ impl ShellApp {
                 if self.core.is_some() && sign_in::can_sign_in(s) {
                     ui.add_space(8.0);
                     if ui
-                        .add_enabled(
-                            self.sign_in.is_none(),
-                            egui::Button::new(sign_in::action_label(status)),
-                        )
+                        .add_enabled(self.sign_in.is_none(), egui::Button::new("Sign in"))
                         .on_hover_text("Sign in through Claude Code, in your browser")
                         .clicked()
                     {
                         self.start_sign_in(s);
                     }
-                    muted(
-                        ui,
-                        "Claude Code keeps the sign-in; Klefki starts it and never sees it.",
-                    );
+                    muted(ui, "Klefki starts the sign-in and never sees it.");
                 }
             }
             DetailTab::HeadersEnv => {
@@ -9271,7 +9262,32 @@ mod tests {
 
     // ---- signing in (decision 005)
 
-    use klefki_core::api::SignInStep;
+    use klefki_core::api::{OAuthInfo, SignInFailure, SignInStep};
+    use std::time::Duration;
+
+    fn starting() -> SignInStep {
+        SignInStep::Starting {
+            wait: Duration::from_secs(300),
+        }
+    }
+
+    fn failure(title: &str, said: Option<&str>, can_retry: bool) -> SignInStep {
+        SignInStep::Failed(SignInFailure {
+            title: title.into(),
+            help: vec!["Check that the server is running.".into()],
+            said: said.map(Into::into),
+            can_retry,
+        })
+    }
+
+    /// A click on the dimmed window beside the dialog.
+    fn click_beside(h: &mut Harness<'static, ShellApp>) {
+        let at = egui::pos2(6.0, h.ctx.content_rect().max.y - 6.0);
+        h.hover_at(at);
+        h.drag_at(at);
+        h.drop_at(at);
+        h.run();
+    }
 
     fn web_row(name: &str) -> ServerRow {
         ServerRow {
@@ -9323,6 +9339,7 @@ mod tests {
                     Command::SignIn(_)
                         | Command::SignInPaste { .. }
                         | Command::OpenSignInPage(_)
+                        | Command::KeepWaitingForSignIn(_)
                         | Command::CancelSignIn(_)
                 )
             })
@@ -9339,17 +9356,20 @@ mod tests {
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(row.id())]);
         h.get_by_label("Sign in to web");
         h.get_by_label("Starting Claude Code…");
-        engine
-            .events
-            .send(sign_in_event(&row, SignInStep::Starting))
-            .unwrap();
+        engine.events.send(sign_in_event(&row, starting())).unwrap();
         engine
             .events
             .send(sign_in_event(&row, waiting(true)))
             .unwrap();
         h.run();
         h.get_by_label("Finish signing in in your browser.");
-        h.get_by_label_contains("auth.example.com is open in your browser");
+        h.get_by_label("The sign-in page at auth.example.com is open in your browser.");
+        // auth.example.com signs in for web.example.com: the same site, nothing to point out.
+        assert!(
+            h.query_by_label_contains("not the server's own address")
+                .is_none()
+        );
+        h.get_by_label_contains("Klefki waits 5 more minutes.");
         // The fallback stays folded away.
         assert!(h.query_by_label_contains("paste it here").is_none());
         h.get_by_label_contains("Open the page again").click();
@@ -9507,13 +9527,18 @@ mod tests {
             .events
             .send(sign_in_event(
                 &row,
-                SignInStep::Failed("OAuth callback port 8766 is already in use".into()),
+                failure(
+                    "The sign-in did not finish.",
+                    Some("OAuth callback port 8766 is already in use"),
+                    true,
+                ),
             ))
             .unwrap();
         h.run();
         drain_all(&engine);
         h.get_by_label("The sign-in did not finish.");
-        h.get_by_label("OAuth callback port 8766 is already in use");
+        h.get_by_label("Check that the server is running.");
+        h.get_by_label("Claude Code said: OAuth callback port 8766 is already in use");
         assert!(
             h.query_by_label("Cancel").is_none(),
             "nothing is running to cancel"
@@ -9524,7 +9549,7 @@ mod tests {
         h.get_by_label("Starting Claude Code…");
         engine
             .events
-            .send(sign_in_event(&row, SignInStep::Failed("again".into())))
+            .send(sign_in_event(&row, failure("Again.", None, true)))
             .unwrap();
         h.run();
         h.get_by_label("Close").click();
@@ -9552,10 +9577,17 @@ mod tests {
     }
 
     #[test]
-    fn only_http_and_sse_servers_offer_sign_in_and_it_says_again_once_signed_in() {
+    fn sign_in_is_offered_up_front_only_where_it_is_needed_and_always_by_one_name() {
         use egui::accesskit::Role;
         let (mut h, engine) = live_harness();
         let web = web_row("web");
+        let sso = ServerRow {
+            oauth: Some(OAuthInfo {
+                client_id: None,
+                scopes: vec![],
+            }),
+            ..web_row("sso")
+        };
         let sse = ServerRow {
             transport: TransportKind::Sse,
             ..web_row("events")
@@ -9563,37 +9595,177 @@ mod tests {
         let cmd = live_row("cmd", Scope::User, None);
         engine
             .events
-            .send(snapshot_of(vec![web.clone(), sse.clone(), cmd.clone()]))
+            .send(snapshot_of(vec![
+                web.clone(),
+                sso.clone(),
+                sse.clone(),
+                cmd.clone(),
+            ]))
             .unwrap();
+        for row in [&web, &sso] {
+            engine
+                .events
+                .send(status_event(row, Status::Connected, None))
+                .unwrap();
+        }
         engine
             .events
-            .send(status_event(&web, Status::Connected, None))
+            .send(status_event(&sse, Status::NeedsAuth, None))
             .unwrap();
         h.run();
+        // A server that works and has no OAuth set up (most likely a token in a header): not up front.
         open_status_tab(&mut h, "web");
-        h.get_by_label("Sign in again");
-        assert!(h.query_by_label("Sign in").is_none());
+        assert!(h.query_by_label_contains("Sign in").is_none());
+        assert!(h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
+        // Its Auth tab still has it, without contradicting itself.
         h.get_by_role_and_label(Role::Button, "Auth").click();
         h.run();
-        h.get_by_label("Sign in again");
-        h.get_by_label_contains("Claude Code registers itself");
-        h.get_by_label("events").click();
-        h.run();
-        h.get_by_label("Sign in again");
+        h.get_by_label("Sign in");
+        h.get_by_label("Claude Code signs in to this server for you when the server asks for it.");
+        h.get_by_label("Klefki starts the sign-in and never sees it.");
+        // OAuth set up, or Claude says it needs it: up front, and only ever called "Sign in".
+        for name in ["sso", "events"] {
+            open_status_tab(&mut h, name);
+            h.get_by_label("Sign in");
+            assert!(h.query_by_label_contains("again").is_none(), "{name}");
+            assert!(!h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
+        }
         h.get_by_label("cmd").click();
         h.run();
         assert!(h.query_by_label_contains("Sign in").is_none());
-        h.get_by_label_contains("does not sign in with OAuth");
-        // The toolbar's button needs one such server.
         assert!(h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
-        h.get_by_label("web").click();
+        h.get_by_role_and_label(Role::Button, "Auth").click();
         h.run();
-        assert!(!h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
+        h.get_by_label_contains("does not sign in with OAuth");
+        h.get_by_label("sso").click();
+        h.run();
         h.get_by_label(icon::SIGN_IN).click();
         h.run();
-        assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(web.id())]);
+        assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(sso.id())]);
         // One at a time: while the dialog is open, nothing else starts one.
         assert!(h.state().sign_in.is_some());
+    }
+
+    /// The click that brings Klefki back from the browser lands beside the dialog most of the time; it must not
+    /// stop the sign-in. Only Esc and Cancel do.
+    #[test]
+    fn a_click_beside_the_dialog_does_not_stop_a_running_sign_in() {
+        for checking in [false, true] {
+            let (mut h, engine, row) = needs_auth_harness();
+            h.get_by_label("Sign in").click();
+            h.run();
+            engine.events.send(sign_in_event(&row, starting())).unwrap();
+            engine
+                .events
+                .send(sign_in_event(&row, waiting(true)))
+                .unwrap();
+            if checking {
+                engine
+                    .events
+                    .send(sign_in_event(&row, SignInStep::Pasted))
+                    .unwrap();
+            }
+            h.run();
+            drain_all(&engine);
+            click_beside(&mut h);
+            assert!(h.state().sign_in.is_some(), "checking: {checking}");
+            assert!(sign_in_commands(&engine).is_empty(), "checking: {checking}");
+            h.get_by_label("Sign in to web");
+        }
+        // Once it has ended there is nothing to lose: a click beside closes it.
+        let (mut h, engine, row) = needs_auth_harness();
+        h.get_by_label("Sign in").click();
+        h.run();
+        engine
+            .events
+            .send(sign_in_event(&row, failure("Down.", None, true)))
+            .unwrap();
+        h.run();
+        drain_all(&engine);
+        click_beside(&mut h);
+        assert!(h.state().sign_in.is_none());
+        assert!(sign_in_commands(&engine).is_empty());
+    }
+
+    #[test]
+    fn when_trying_again_cannot_help_close_is_the_way_on() {
+        let (mut h, engine, row) = needs_auth_harness();
+        h.get_by_label("Sign in").click();
+        h.run();
+        engine
+            .events
+            .send(sign_in_event(
+                &row,
+                failure(
+                    "This server does not sign in through Claude Code.",
+                    Some("Dynamic Client Registration rejected (HTTP 501)"),
+                    false,
+                ),
+            ))
+            .unwrap();
+        h.run();
+        drain_all(&engine);
+        h.get_by_label("This server does not sign in through Claude Code.");
+        assert!(h.query_by_label("Try again").is_none());
+        // Close is the default: Enter closes, and starts nothing.
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.state().sign_in.is_none());
+        assert!(sign_in_commands(&engine).is_empty());
+    }
+
+    #[test]
+    fn the_wait_is_said_and_can_be_made_longer_before_it_ends() {
+        let (mut h, engine, row) = needs_auth_harness();
+        h.get_by_label("Sign in").click();
+        h.run();
+        engine.events.send(sign_in_event(&row, starting())).unwrap();
+        engine
+            .events
+            .send(sign_in_event(&row, waiting(true)))
+            .unwrap();
+        h.run();
+        drain_all(&engine);
+        h.get_by_label_contains("Klefki waits 5 more minutes.");
+        assert!(h.query_by_label("Keep waiting").is_none());
+        // Near the end: said in seconds, with one action to wait the whole time again.
+        let now = h.ctx.input(|i| i.time);
+        h.state_mut()
+            .sign_in
+            .as_mut()
+            .unwrap()
+            .set_ends_at(now + 20.0);
+        h.run();
+        h.get_by_label_contains("Klefki stops waiting in");
+        h.get_by_label("Keep waiting").click();
+        h.run();
+        assert_eq!(
+            sign_in_commands(&engine),
+            vec![Command::KeepWaitingForSignIn(row.id())]
+        );
+        h.get_by_label_contains("Klefki waits 5 more minutes.");
+        assert!(h.query_by_label("Keep waiting").is_none());
+    }
+
+    #[test]
+    fn a_sign_in_page_on_another_site_is_pointed_out() {
+        let (mut h, engine, row) = needs_auth_harness();
+        h.get_by_label("Sign in").click();
+        h.run();
+        engine
+            .events
+            .send(sign_in_event(
+                &row,
+                SignInStep::Waiting {
+                    host: "login.other.org".into(),
+                    link: LINK.into(),
+                    opened: true,
+                },
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("at login.other.org is open");
+        h.get_by_label_contains("That is not the server's own address (web.example.com)");
     }
 
     #[test]

@@ -5,7 +5,7 @@ pub use crate::config::ConfigPaths;
 pub use crate::config::definition::Definition;
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
-    SignInStep,
+    SignInFailure, SignInStep,
 };
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};

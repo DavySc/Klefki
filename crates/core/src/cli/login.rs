@@ -200,6 +200,8 @@ pub(crate) enum Outcome {
 pub(crate) enum Message {
     Output(Vec<u8>),
     Paste(String),
+    /// Wait the whole time again from now.
+    KeepWaiting,
     Cancel,
 }
 
@@ -313,7 +315,7 @@ pub(crate) fn drive(
     timeout: Duration,
     progress: &mut dyn FnMut(Progress),
 ) {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let mut read = Reading::default();
     let outcome = loop {
         match messages.recv_timeout(TICK) {
@@ -334,7 +336,7 @@ pub(crate) fn drive(
                         let mut line = address.into_bytes();
                         line.push(b'\r');
                         if term.write(&line).is_ok() {
-                            read.pasted_at = Some(read.text.len());
+                            read.after_paste = Some(Vec::new());
                             progress(Progress::Pasted);
                         } else {
                             progress(Progress::PasteRefused(
@@ -345,6 +347,7 @@ pub(crate) fn drive(
                     Err(why) => progress(Progress::PasteRefused(why)),
                 }
             }
+            Ok(Message::KeepWaiting) => deadline = Instant::now() + timeout,
             Ok(Message::Cancel) => {
                 term.kill();
                 break Outcome::Cancelled;
@@ -383,8 +386,8 @@ struct Reading {
     /// `output`, cleaned of escapes and control characters.
     text: String,
     page: Option<Page>,
-    /// Where `text` stood when an address was typed in: what Claude says after it is its answer.
-    pasted_at: Option<usize>,
+    /// What Claude printed since an address was typed in: its answer.
+    after_paste: Option<Vec<u8>>,
 }
 
 impl Reading {
@@ -402,11 +405,12 @@ impl Reading {
                 None => {}
             }
         }
-        if let Some(at) = self.pasted_at
-            && let Some(answer) = refusal(self.text.get(at..).unwrap_or(""))
-        {
-            self.pasted_at = None;
-            progress(Progress::PasteRefused(answer));
+        if let Some(after) = &mut self.after_paste {
+            keep(after, bytes);
+            if let Some(answer) = refusal(&sanitize(&String::from_utf8_lossy(after))) {
+                self.after_paste = None;
+                progress(Progress::PasteRefused(answer));
+            }
         }
         Ok(())
     }
@@ -826,6 +830,71 @@ mod tests {
         );
         assert_eq!(seen.last(), Some(&Progress::Finished(Outcome::Cancelled)));
         assert!(term.killed);
+    }
+
+    /// The output buffer drops its oldest half when it grows too large; a refusal after that must still be seen
+    /// (it used to be looked for at a position the shortened text no longer reached).
+    #[test]
+    fn a_refusal_is_seen_after_a_long_output_was_cut_down() {
+        for noise in [MAX_OUTPUT, MAX_OUTPUT * 3] {
+            let page = https_page();
+            let mut term = Script::default();
+            let (tx, rx) = mpsc::channel();
+            tx.send(Message::Output(fixture("synthetic-waiting-https.txt")))
+                .unwrap();
+            tx.send(Message::Output(b"[mcp-sdk] notice\r\n".repeat(noise / 18)))
+                .unwrap();
+            tx.send(Message::Paste(format!(
+                "http://localhost:61983/callback?code=c0de&state={}",
+                page.state
+            )))
+            .unwrap();
+            let mut seen = Vec::new();
+            drive(&mut term, &rx, Duration::from_secs(5), &mut |p| {
+                if p == Progress::Pasted {
+                    tx.send(Message::Output(fixture("real-paste-refused-tail.txt")))
+                        .unwrap();
+                }
+                if matches!(p, Progress::PasteRefused(_)) {
+                    tx.send(Message::Cancel).unwrap();
+                }
+                seen.push(p);
+            });
+            assert!(
+                seen.iter().any(
+                    |p| matches!(p, Progress::PasteRefused(w) if w.starts_with("That doesn't look"))
+                ),
+                "{noise}: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keep_waiting_gives_the_whole_wait_again() {
+        let mut term = Script::default();
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let feeder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            tx.send(Message::KeepWaiting).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            tx.send(Message::Cancel).unwrap();
+        });
+        let mut seen = Vec::new();
+        drive(&mut term, &rx, Duration::from_millis(500), &mut |p| {
+            seen.push(p)
+        });
+        feeder.join().unwrap();
+        // Without it, the wait would have ended at 500 ms; with it, it runs to 800 ms and the cancel comes first.
+        assert_eq!(
+            seen,
+            vec![Progress::Finished(Outcome::Cancelled)],
+            "after {:?}",
+            start.elapsed()
+        );
+        let mut term = Script::default();
+        let seen = run(&mut term, vec![], Duration::from_millis(200));
+        assert_eq!(seen, vec![Progress::Finished(Outcome::TimedOut)]);
     }
 
     #[test]

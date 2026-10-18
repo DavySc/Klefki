@@ -1,10 +1,12 @@
 //! Signing in to a server from Klefki: `claude mcp login` in a pseudo-terminal, one at a time (decision 005).
 use super::{
-    Command, Emitter, Event, Input, OpenUrl, Shared, SignInStep, State, lock, where_to_run,
+    Command, Emitter, Event, Input, OpenUrl, Shared, SignInFailure, SignInStep, State, lock,
+    where_to_run,
 };
 use crate::api::{Approval, Scope, ServerId, TransportKind};
 use crate::cli::login::{self, LoginSpec, Message, Outcome, Progress};
 use crate::config::inventory;
+use crate::diagnose::hints::hints_for;
 use crate::sanitize::sanitize;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,10 +37,10 @@ impl Running {
 /// Starts signing in to `id`, or says why not.
 pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
     let emitter = &shared.emitter;
-    let fail = |why: String| {
+    let fail = |why: String, can_retry: bool| {
         emitter.emit(Event::SignIn {
             id: id.clone(),
-            step: SignInStep::Failed(why),
+            step: SignInStep::Failed(SignInFailure::plain(why, can_retry)),
         });
     };
     if let Some(running) = state.sign_in.as_ref().filter(|r| r.active()) {
@@ -47,29 +49,38 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
         } else {
             sanitize(&running.id.name)
         };
-        return fail(format!(
-            "Klefki is already signing in to {what}. Finish or cancel that sign-in first."
-        ));
+        return fail(
+            format!("Klefki is already signing in to {what}. Finish or cancel that sign-in first."),
+            true,
+        );
     }
     let Some((row, file)) = inventory::locate(&state.snapshot, &state.keys, &id) else {
-        return fail("The server is no longer in the configuration.".to_owned());
+        return fail(
+            "The server is no longer in the configuration.".to_owned(),
+            false,
+        );
     };
     if !matches!(row.transport, TransportKind::Http | TransportKind::Sse) {
-        return fail("Only servers reached over HTTP or SSE sign in.".to_owned());
+        return fail(
+            "Only servers reached over HTTP or SSE sign in.".to_owned(),
+            false,
+        );
     }
     if row.scope == Scope::Project && row.approval != Some(Approval::Approved) {
         return fail(
             "Approve this project server first: until then Claude Code does not use it.".to_owned(),
+            false,
         );
     }
     let (name, cwd) = match where_to_run(shared, row, Some(file)) {
         Ok(found) => found,
-        Err(why) => return fail(format!("Klefki cannot sign in to it: {why}.")),
+        Err(why) => return fail(format!("Klefki cannot sign in to it: {why}."), false),
     };
     let Some(program) = super::claude_program(shared) else {
         return fail(
             "The Claude Code command line was not found, and signing in goes through it."
                 .to_owned(),
+            false,
         );
     };
 
@@ -82,9 +93,10 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
         page: Arc::clone(&page),
         done: Arc::clone(&done),
     });
+    let timeout = shared.config.sign_in_timeout;
     emitter.emit(Event::SignIn {
         id: id.clone(),
-        step: SignInStep::Starting,
+        step: SignInStep::Starting { wait: timeout },
     });
 
     let session = Session {
@@ -93,9 +105,9 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
         open_url: Arc::clone(&shared.config.open_url),
         input: shared.input.clone(),
         page,
+        done: Arc::clone(&done),
     };
     let env: Vec<(String, OsString)> = shared.config.cli_env.clone();
-    let timeout = shared.config.sign_in_timeout;
     let spawned = std::thread::Builder::new()
         .name("klefki-sign-in".into())
         .spawn(move || {
@@ -111,13 +123,14 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
             };
             match login::start(&spec, tx) {
                 Ok(mut pty) => login::drive(&mut pty, &rx, timeout, &mut |p| session.report(p)),
-                Err(e) => session.step(SignInStep::Failed(format!(
-                    "Klefki could not start Claude Code to sign in: {}",
-                    sanitize(&e.to_string())
+                Err(e) => session.finish(SignInStep::Failed(SignInFailure::plain(
+                    format!(
+                        "Klefki could not start Claude Code to sign in: {}",
+                        sanitize(&e.to_string())
+                    ),
+                    true,
                 ))),
             }
-            // Only now: the terminal is closed and Claude has ended.
-            done.store(true, Ordering::SeqCst);
         });
     if spawned.is_err()
         && let Some(running) = &state.sign_in
@@ -125,7 +138,10 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
         running.done.store(true, Ordering::SeqCst);
         emitter.emit(Event::SignIn {
             id: running.id.clone(),
-            step: SignInStep::Failed("Klefki could not start the sign-in.".to_owned()),
+            step: SignInStep::Failed(SignInFailure::plain(
+                "Klefki could not start the sign-in.".to_owned(),
+                true,
+            )),
         });
     }
 }
@@ -137,9 +153,17 @@ struct Session {
     open_url: OpenUrl,
     input: Sender<Input>,
     page: Arc<Mutex<Option<(String, String)>>>,
+    done: Arc<AtomicBool>,
 }
 
 impl Session {
+    /// The last report. Claude has ended by now (the session waits for that), so a new sign-in may start as soon
+    /// as the user sees this one end.
+    fn finish(&self, step: SignInStep) {
+        self.done.store(true, Ordering::SeqCst);
+        self.step(step);
+    }
+
     fn step(&self, step: SignInStep) {
         self.emitter.emit(Event::SignIn {
             id: self.id.clone(),
@@ -160,16 +184,23 @@ impl Session {
             }
             Progress::Pasted => SignInStep::Pasted,
             Progress::PasteRefused(why) => SignInStep::PasteRefused(why),
-            Progress::Finished(Outcome::SignedIn) => {
-                // Confirm it the way every status is known: Claude's own check.
-                let _ = self.input.send(Input::Ui(Command::Check(self.id.clone())));
-                SignInStep::SignedIn
+            Progress::Finished(outcome) => {
+                let step = match outcome {
+                    Outcome::SignedIn => {
+                        // Confirm it the way every status is known: Claude's own check.
+                        let _ = self.input.send(Input::Ui(Command::Check(self.id.clone())));
+                        SignInStep::SignedIn
+                    }
+                    Outcome::Failed(why) => SignInStep::Failed(SignInFailure::from_claude(&why)),
+                    Outcome::Cancelled => SignInStep::Cancelled,
+                    Outcome::TimedOut => SignInStep::Failed(SignInFailure::plain(
+                        "Nothing came back from the browser in time, so the sign-in was stopped."
+                            .to_owned(),
+                        true,
+                    )),
+                };
+                return self.finish(step);
             }
-            Progress::Finished(Outcome::Failed(why)) => SignInStep::Failed(why),
-            Progress::Finished(Outcome::Cancelled) => SignInStep::Cancelled,
-            Progress::Finished(Outcome::TimedOut) => SignInStep::Failed(
-                "Nothing came back from the browser in time, so the sign-in was stopped. Try again.".to_owned(),
-            ),
         };
         self.step(step);
     }
@@ -199,6 +230,12 @@ pub(super) fn open_again(shared: &Shared, state: &State, id: &ServerId) {
     });
 }
 
+pub(super) fn keep_waiting(state: &State, id: &ServerId) {
+    if let Some(running) = running(state, id) {
+        let _ = running.tx.send(Message::KeepWaiting);
+    }
+}
+
 pub(super) fn cancel(state: &State, id: &ServerId) {
     if let Some(running) = running(state, id) {
         let _ = running.tx.send(Message::Cancel);
@@ -217,5 +254,138 @@ pub(super) fn stop(state: &mut State) {
     let until = Instant::now() + STOP_WAIT;
     while running.active() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl SignInFailure {
+    /// Klefki's own words, with nothing more to add.
+    fn plain(title: String, can_retry: bool) -> Self {
+        Self {
+            title,
+            help: Vec::new(),
+            said: None,
+            can_retry,
+        }
+    }
+
+    /// Claude Code's last message, turned into what happened and what to do. Its words are kept below, without
+    /// any web page a server sent along with an error.
+    fn from_claude(why: &str) -> Self {
+        let said = Some(page_cut(why)).filter(|s| !s.is_empty());
+        let lower = why.to_lowercase();
+        if lower.contains("dynamic client registration") || lower.contains("support oauth") {
+            return Self {
+                title: "This server does not sign in through Claude Code.".to_owned(),
+                help: vec![
+                    "A server that takes a fixed token gets it in a header instead: add it on the Env tab."
+                        .to_owned(),
+                ],
+                said,
+                can_retry: false,
+            };
+        }
+        if lower.contains("no mcp server named") {
+            return Self {
+                title: "Claude Code does not see this server.".to_owned(),
+                help: vec![
+                    "It may have been changed outside Klefki. Refresh, then sign in again."
+                        .to_owned(),
+                ],
+                said,
+                can_retry: false,
+            };
+        }
+        match hints_for(why).first() {
+            Some(&kind) => Self {
+                title: format!("{}.", kind.title()),
+                help: kind
+                    .help()
+                    .iter()
+                    .map(|&h| h.to_owned())
+                    // Advice to sign in, which is what just failed, says nothing here.
+                    .filter(|h| !h.contains("Sign in"))
+                    .collect(),
+                said,
+                can_retry: true,
+            },
+            None => Self {
+                title: "The sign-in did not finish.".to_owned(),
+                help: Vec::new(),
+                said,
+                can_retry: true,
+            },
+        }
+    }
+}
+
+/// `text` up to a web page in it: servers answer some errors with a whole HTML page, which says nothing here.
+fn page_cut(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let end = ["<!doctype", "<html", "<head", "<body"]
+        .iter()
+        .filter_map(|tag| lower.find(tag))
+        .min()
+        .unwrap_or(text.len());
+    text[..end]
+        .trim()
+        .trim_end_matches(':')
+        .trim_end()
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claudes_failures_say_what_happened_and_whether_trying_again_can_help() {
+        // Real: an HTTP server that takes a header token, not OAuth.
+        let dcr = "SDK auth failed: Dynamic Client Registration rejected (HTTP 501): <!DOCTYPE HTML> <html lang=\"en\"> <head> <meta charset=\"utf-8\">";
+        let f = SignInFailure::from_claude(dcr);
+        assert_eq!(f.title, "This server does not sign in through Claude Code.");
+        assert!(!f.can_retry);
+        assert_eq!(
+            f.said.as_deref(),
+            Some("SDK auth failed: Dynamic Client Registration rejected (HTTP 501)")
+        );
+        let f = SignInFailure::from_claude(
+            "\"stdiosrv\" doesn't support OAuth login — it's only available for HTTP and SSE servers.",
+        );
+        assert!(!f.can_retry, "{f:?}");
+        let f =
+            SignInFailure::from_claude("No MCP server named \"nope\". Configured servers: a, b");
+        assert!(!f.can_retry, "{f:?}");
+
+        // A server that is down: plain words and what to check; trying again can work once it runs.
+        let f = SignInFailure::from_claude(
+            "ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
+        );
+        assert_eq!(f.title, "Nothing is listening at that address.");
+        assert_eq!(f.help[0], "Check that the server is running.");
+        assert!(f.can_retry);
+
+        // Advice to sign in is not given when signing in is what failed.
+        let f = SignInFailure::from_claude("HTTP 401 Unauthorized: invalid_token");
+        assert!(!f.help.is_empty());
+        assert!(f.help.iter().all(|h| !h.contains("Sign in")), "{f:?}");
+
+        // Anything else keeps Claude's words under a plain title.
+        let f = SignInFailure::from_claude(
+            "Couldn't complete authentication for \"fixed\": OAuth callback port 8766 is already in use",
+        );
+        assert_eq!(f.title, "The sign-in did not finish.");
+        assert!(f.said.unwrap().contains("8766"));
+        assert!(f.can_retry);
+    }
+
+    #[test]
+    fn a_web_page_in_an_error_is_left_out() {
+        assert_eq!(page_cut("rejected: <html><body>x"), "rejected");
+        assert_eq!(
+            page_cut("rejected (HTTP 500): <!doctype html>"),
+            "rejected (HTTP 500)"
+        );
+        assert_eq!(page_cut("no page here"), "no page here");
+        assert_eq!(page_cut("<HTML>only a page"), "");
     }
 }

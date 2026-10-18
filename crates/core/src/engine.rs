@@ -67,6 +67,8 @@ pub enum Command {
     SignInPaste { id: ServerId, address: String },
     /// Open the running sign-in's page in the browser again.
     OpenSignInPage(ServerId),
+    /// Give the running sign-in its whole wait again.
+    KeepWaitingForSignIn(ServerId),
     /// Stop the running sign-in.
     CancelSignIn(ServerId),
 }
@@ -74,8 +76,11 @@ pub enum Command {
 /// Where a sign-in is ([`Event::SignIn`]). Text is sanitised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInStep {
-    /// Claude Code is starting.
-    Starting,
+    /// Claude Code is starting. The sign-in is stopped once `wait` has passed with nothing back from the browser,
+    /// unless [`Command::KeepWaitingForSignIn`] asks for longer.
+    Starting {
+        wait: Duration,
+    },
     /// The sign-in page is open in the browser (or could not be opened: `opened` is false), and Claude Code waits for
     /// the browser to come back. `host` is where the page is; `link` the page itself, checked (https, and back to
     /// Claude Code on this computer), for copying.
@@ -90,9 +95,22 @@ pub enum SignInStep {
     PasteRefused(String),
     /// Claude Code signed in. The server is checked again next.
     SignedIn,
-    /// The sign-in ended without signing in; says why.
-    Failed(String),
+    /// The sign-in ended without signing in.
+    Failed(SignInFailure),
     Cancelled,
+}
+
+/// Why a sign-in did not finish, in plain words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInFailure {
+    /// What happened, as a sentence.
+    pub title: String,
+    /// What to do about it, the most likely fix first.
+    pub help: Vec<String>,
+    /// Claude Code's own words, when they add something.
+    pub said: Option<String>,
+    /// Whether starting it again could work without changing anything first.
+    pub can_retry: bool,
 }
 
 /// Something the user wants changed. Targets are rows of the current inventory; project scope cannot be
@@ -643,6 +661,7 @@ fn engine_main(
             Command::SignIn(id) => sign_in::start(&shared, &mut state, id),
             Command::SignInPaste { id, address } => sign_in::paste(&state, &id, address),
             Command::OpenSignInPage(id) => sign_in::open_again(&shared, &state, &id),
+            Command::KeepWaitingForSignIn(id) => sign_in::keep_waiting(&state, &id),
             Command::CancelSignIn(id) => sign_in::cancel(&state, &id),
         }
     }
@@ -5824,7 +5843,12 @@ mod tests {
                     .any(|x| matches!(x, Event::Status { id, status: Status::Connected, .. } if id.name == "loc"))
         });
         let steps = sign_in_steps(&events, "loc");
-        assert_eq!(steps[0], SignInStep::Starting);
+        assert_eq!(
+            steps[0],
+            SignInStep::Starting {
+                wait: Duration::from_secs(20)
+            }
+        );
         let SignInStep::Waiting { host, link, opened } = &steps[1] else {
             panic!("{steps:?}");
         };
@@ -5869,8 +5893,22 @@ mod tests {
         let Some(SignInStep::Failed(why)) = sign_in_steps(&events, "web").pop() else {
             panic!("{events:?}");
         };
-        assert!(why.contains("port 8766 is already in use"), "{why}");
+        assert!(
+            why.said
+                .as_deref()
+                .is_some_and(|s| s.contains("port 8766 is already in use")),
+            "{why:?}"
+        );
+        assert!(why.can_retry, "{why:?}");
         assert!(lock(&env.opened).is_empty());
+        // The sign-in that ended is over as soon as it says so: trying again at once starts again.
+        core.send(Command::SignIn(user_id("web")));
+        let events = collect(&core, |e| sign_in_ended(e, "web"));
+        let steps = sign_in_steps(&events, "web");
+        assert!(
+            matches!(steps.as_slice(), [SignInStep::Starting { .. }, .., SignInStep::Failed(w)] if w.can_retry),
+            "{steps:?}"
+        );
     }
 
     #[test]
@@ -5894,7 +5932,7 @@ mod tests {
             let events = collect(&core, |e| sign_in_ended(e, &name));
             let steps = sign_in_steps(&events, &name);
             assert!(
-                matches!(steps.as_slice(), [SignInStep::Failed(w)] if w.contains(says)),
+                matches!(steps.as_slice(), [SignInStep::Failed(w)] if w.title.contains(says) && !w.can_retry),
                 "{name}: {steps:?}"
             );
         }
@@ -5936,7 +5974,9 @@ mod tests {
         started(&core);
         core.send(Command::SignIn(user_id("web")));
         collect(&core, |e| {
-            sign_in_steps(e, "web").contains(&SignInStep::Starting)
+            sign_in_steps(e, "web")
+                .iter()
+                .any(|s| matches!(s, SignInStep::Starting { .. }))
         });
         let pid = wait_for_pid(&pid_file);
         // Another one, and the same one again, are refused while it runs.
@@ -5949,7 +5989,7 @@ mod tests {
                     .any(|s| matches!(s, SignInStep::Failed(_)))
         });
         assert!(
-            matches!(sign_in_steps(&events, "loc").as_slice(), [SignInStep::Failed(w)] if w.contains("already signing in to web")),
+            matches!(sign_in_steps(&events, "loc").as_slice(), [SignInStep::Failed(w)] if w.title.contains("already signing in to web")),
             "{events:?}"
         );
         // Pasting before the page is there is refused, not typed.
@@ -5971,7 +6011,9 @@ mod tests {
         // Once it ended, another sign-in may start.
         core.send(Command::SignIn(local_id("loc", &project)));
         collect(&core, |e| {
-            sign_in_steps(e, "loc").contains(&SignInStep::Starting)
+            sign_in_steps(e, "loc")
+                .iter()
+                .any(|s| matches!(s, SignInStep::Starting { .. }))
         });
         core.send(Command::CancelSignIn(local_id("loc", &project)));
         collect(&core, |e| {

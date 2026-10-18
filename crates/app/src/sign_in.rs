@@ -5,20 +5,19 @@
 use crate::theme;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
-use klefki_core::api::{Command, ServerId, ServerRow, SignInStep, Status, TransportKind};
+use klefki_core::api::{
+    Command, ServerId, ServerRow, SignInFailure, SignInStep, Status, TransportKind,
+};
 
 /// Whether a server signs in through Claude Code: those reached over HTTP or SSE.
 pub(crate) fn can_sign_in(row: &ServerRow) -> bool {
     matches!(row.transport, TransportKind::Http | TransportKind::Sse)
 }
 
-/// What the button says: signing in for the first time, or again (re-authorizing).
-pub(crate) fn action_label(status: Status) -> &'static str {
-    if status == Status::NeedsAuth {
-        "Sign in"
-    } else {
-        "Sign in again"
-    }
+/// Whether signing in is offered up front (Status tab, toolbar): when Claude Code said the server needs it, or the
+/// server has OAuth set up. Any HTTP or SSE server can still sign in from its Auth tab and the palette.
+pub(crate) fn offers_sign_in(row: &ServerRow, status: Status) -> bool {
+    can_sign_in(row) && (status == Status::NeedsAuth || row.oauth.is_some())
 }
 
 /// An open sign-in dialog.
@@ -38,6 +37,9 @@ pub(crate) struct SignInView {
     refused: Option<String>,
     /// The link was copied (said next to the button, briefly).
     copied_at: Option<f64>,
+    /// How long Claude Code waits for the browser, and when that ends (in the UI's clock, set on the first frame).
+    wait: f64,
+    ends_at: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,7 +48,7 @@ enum Phase {
     Waiting,
     /// A pasted address is with Claude.
     Checking,
-    Failed(String),
+    Failed(SignInFailure),
 }
 
 /// What the dialog asks of the shell after a frame.
@@ -71,13 +73,19 @@ impl SignInView {
             focus_field: false,
             refused: None,
             copied_at: None,
+            wait: 0.0,
+            ends_at: None,
         }
     }
 
     /// Takes in what the engine reported. `true` when the sign-in succeeded: the dialog closes.
     pub(crate) fn step(&mut self, step: SignInStep) -> bool {
         match step {
-            SignInStep::Starting => self.phase = Phase::Starting,
+            SignInStep::Starting { wait } => {
+                self.phase = Phase::Starting;
+                self.wait = wait.as_secs_f64();
+                self.ends_at = None;
+            }
             SignInStep::Waiting { host, link, opened } => {
                 self.page = Some((host, link, opened));
                 if self.phase != Phase::Checking {
@@ -112,6 +120,11 @@ impl SignInView {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_ends_at(&mut self, at: f64) {
+        self.ends_at = Some(at);
+    }
+
+    #[cfg(test)]
     pub(crate) fn pasted(&self) -> &str {
         &self.pasted
     }
@@ -125,7 +138,13 @@ impl SignInView {
         let now = ctx.input(|i| i.time);
         let mut next = Next::Stay;
         let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-        let modal = egui::Modal::new(egui::Id::new("sign_in_dialog")).show(ctx, |ui| {
+        let id = egui::Id::new("sign_in_dialog");
+        // Anchored at the top, so it grows downwards and its buttons stay where they were.
+        let area = egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, [0.0, 96.0]);
+        if self.ends_at.is_none() && self.wait > 0.0 {
+            self.ends_at = Some(now + self.wait);
+        }
+        let modal = egui::Modal::new(id).area(area).show(ctx, |ui| {
             ui.set_width(500.0);
             ui.heading(format!("Sign in to {}", self.id.name));
             ui.add(
@@ -137,18 +156,7 @@ impl SignInView {
                 Phase::Starting => busy(ui, pal, "Starting Claude Code…"),
                 Phase::Checking => busy(ui, pal, "Claude Code is checking the address…"),
                 Phase::Waiting => next = self.waiting(ui, pal, now, enter),
-                Phase::Failed(why) => {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(icon::WARNING_CIRCLE)
-                                .size(18.0)
-                                .color(pal.danger),
-                        );
-                        ui.label(RichText::new("The sign-in did not finish.").strong());
-                    });
-                    ui.add_space(4.0);
-                    ui.add(egui::Label::new(why).wrap());
-                }
+                Phase::Failed(failure) => failed(ui, pal, &failure),
             }
             ui.add_space(16.0);
             ui.horizontal(|ui| {
@@ -160,12 +168,13 @@ impl SignInView {
                     {
                         next = Next::Close(Some(Command::CancelSignIn(self.id.clone())));
                     }
-                } else {
-                    let again =
-                        egui::Button::new(RichText::new("Try again").strong().color(pal.on_bright))
-                            .fill(pal.primary)
-                            .min_size(egui::vec2(96.0, 34.0));
-                    if ui.add(again).on_hover_text("Enter").clicked() || enter {
+                } else if self.can_retry() {
+                    if ui
+                        .add(primary(pal, "Try again", 96.0))
+                        .on_hover_text("Enter")
+                        .clicked()
+                        || enter
+                    {
                         next = Next::Send(Command::SignIn(self.id.clone()));
                     }
                     if ui
@@ -175,11 +184,22 @@ impl SignInView {
                     {
                         next = Next::Close(None);
                     }
+                } else if ui
+                    .add(primary(pal, "Close", 80.0))
+                    .on_hover_text("Enter or Esc")
+                    .clicked()
+                    || enter
+                {
+                    // Starting it again would end the same way: closing is the way on.
+                    next = Next::Close(None);
                 }
             });
         });
         crate::shell::settle(ctx, &modal.response);
-        if next == Next::Stay && modal.should_close() {
+        // A click beside the dialog does not stop a sign-in that runs: it is most likely the click that brings
+        // Klefki back from the browser. Esc and Cancel do.
+        let stray = self.running() && modal.backdrop_response.clicked();
+        if next == Next::Stay && !stray && modal.should_close() {
             next = Next::Close(
                 self.running()
                     .then(|| Command::CancelSignIn(self.id.clone())),
@@ -200,12 +220,57 @@ impl SignInView {
         self.focus_field = false;
         self.refused = None;
         self.copied_at = None;
+        self.ends_at = None;
+    }
+
+    fn can_retry(&self) -> bool {
+        matches!(&self.phase, Phase::Failed(f) if f.can_retry)
+    }
+
+    /// How long Klefki still waits, and a way to wait longer once that is short (WCAG 2.2.1: warned, and at least
+    /// 20 seconds to extend with one action). It repaints only when what it says changes.
+    fn time_left(&mut self, ui: &mut Ui, pal: &theme::Palette, now: f64) -> Next {
+        let Some(ends_at) = self.ends_at else {
+            return Next::Stay;
+        };
+        let left = (ends_at - now).max(0.0);
+        let ctx = ui.ctx().clone();
+        let mut next = Next::Stay;
+        if left > WARN_BEFORE {
+            let minutes = (left / 60.0).ceil();
+            let text = if minutes <= 1.0 {
+                "This closes by itself when you are done. Klefki waits about a minute more."
+                    .to_owned()
+            } else {
+                format!(
+                    "This closes by itself when you are done. Klefki waits {minutes} more minutes."
+                )
+            };
+            ui.add(egui::Label::new(text).wrap());
+            let change = (left - (minutes - 1.0) * 60.0).min(left - WARN_BEFORE);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(change.max(0.05)));
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(format!("Klefki stops waiting in {} seconds.", left.ceil()))
+                        .color(pal.warn),
+                );
+                if ui.button("Keep waiting").clicked() {
+                    self.ends_at = Some(now + self.wait);
+                    next = Next::Send(Command::KeepWaitingForSignIn(self.id.clone()));
+                }
+            });
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                (left - left.ceil() + 1.0).clamp(0.05, 1.0),
+            ));
+        }
+        next
     }
 
     fn waiting(&mut self, ui: &mut Ui, pal: &theme::Palette, now: f64, enter: bool) -> Next {
-        let mut next = Next::Stay;
+        let mut next;
         let Some((host, link, opened)) = self.page.clone() else {
-            return next;
+            return Next::Stay;
         };
         if opened {
             ui.horizontal(|ui| {
@@ -213,25 +278,34 @@ impl SignInView {
                 ui.label(RichText::new("Finish signing in in your browser.").strong());
             });
             ui.add_space(4.0);
-            ui.add(
-                egui::Label::new(format!(
-                    "The sign-in page at {host} is open in your browser. This closes by itself when you are done."
-                ))
-                .wrap(),
-            );
+            with_host(ui, "The sign-in page at", &host, "is open in your browser.");
         } else {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icon::WARNING).size(18.0).color(pal.warn));
                 ui.label(RichText::new("Klefki could not open your browser.").strong());
             });
             ui.add_space(4.0);
+            with_host(
+                ui,
+                "Copy the link to the sign-in page at",
+                &host,
+                "and open it in your browser.",
+            );
+        }
+        if let Some(own) = elsewhere(&host, &self.target) {
             ui.add(
-                egui::Label::new(format!(
-                    "Copy the link to the sign-in page at {host} and open it in your browser. This closes by itself when you are done."
-                ))
+                egui::Label::new(
+                    RichText::new(format!(
+                        "That is not the server's own address ({own}). Many servers sign in through another site; \
+                         go on only if you expect {host}."
+                    ))
+                    .color(pal.text_muted),
+                )
                 .wrap(),
             );
         }
+        ui.add_space(4.0);
+        next = self.time_left(ui, pal, now);
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             if opened
@@ -336,6 +410,78 @@ impl SignInView {
         }
         next
     }
+}
+
+/// When the dialog offers to wait longer.
+const WARN_BEFORE: f64 = 30.0;
+
+fn primary(pal: &theme::Palette, text: &str, width: f32) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(pal.on_bright))
+        .fill(pal.primary)
+        .min_size(egui::vec2(width, 34.0))
+}
+
+/// What went wrong, what to do, and Claude's own words below.
+fn failed(ui: &mut Ui, pal: &theme::Palette, failure: &SignInFailure) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(icon::WARNING_CIRCLE)
+                .size(18.0)
+                .color(pal.danger),
+        );
+        ui.add(egui::Label::new(RichText::new(&failure.title).strong()).wrap());
+    });
+    for help in &failure.help {
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(help).wrap());
+    }
+    if let Some(said) = &failure.said {
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Claude Code said: {said}"))
+                    .small()
+                    .color(pal.text_muted),
+            )
+            .wrap(),
+        );
+    }
+}
+
+/// A sentence with the host in bold: it is what the user checks in the browser. One label, so it wraps as text.
+fn with_host(ui: &mut Ui, before: &str, host: &str, after: &str) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let visuals = ui.visuals();
+    let format = |color| egui::TextFormat::simple(font.clone(), color);
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&format!("{before} "), 0.0, format(visuals.text_color()));
+    job.append(host, 0.0, format(visuals.strong_text_color()));
+    job.append(&format!(" {after}"), 0.0, format(visuals.text_color()));
+    ui.add(egui::Label::new(job).wrap());
+}
+
+/// The server's own host when the sign-in page is somewhere else. Hosts that share their last two labels
+/// (`auth.example.com` for `mcp.example.com`) count as the same place.
+fn elsewhere(page_host: &str, target: &str) -> Option<String> {
+    let rest = target.split_once("://").map_or(target, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let own = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let page = page_host.trim_start_matches('[').trim_end_matches(']');
+    let site = |h: &str| {
+        let labels: Vec<String> = h
+            .to_ascii_lowercase()
+            .rsplit('.')
+            .take(2)
+            .map(str::to_owned)
+            .collect();
+        labels
+    };
+    (!own.is_empty() && site(own) != site(page)).then(|| own.to_owned())
 }
 
 /// A short wait. A still icon, not a spinner: a spinner repaints every frame for as long as it shows.
