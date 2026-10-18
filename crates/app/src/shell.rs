@@ -1640,7 +1640,7 @@ impl ShellApp {
             let changes = form.changes();
             self.casing = None;
             self.prepare(changes);
-        } else if cancel || modal.should_close() {
+        } else if cancel || closed_on_purpose(&modal) {
             self.casing = None;
         }
     }
@@ -1760,7 +1760,7 @@ impl ShellApp {
             self.duplicate = None;
             self.prepare(vec![change]);
             self.adding_signs_in = signs_in;
-        } else if cancel || modal.should_close() {
+        } else if cancel || closed_on_purpose(&modal) {
             self.duplicate = None;
         }
     }
@@ -1856,7 +1856,7 @@ impl ShellApp {
             self.prepare(vec![change]);
             self.adding_signs_in = signs_in;
             self.moved_from = Some((from, signs_in));
-        } else if cancel || modal.should_close() {
+        } else if cancel || closed_on_purpose(&modal) {
             self.moving = None;
         }
     }
@@ -2084,7 +2084,7 @@ impl ShellApp {
                     form.failed = None;
                 }
             }
-        } else if (cancel || modal.should_close()) && !review {
+        } else if (cancel || closed_on_purpose(&modal)) && !review {
             self.close_add();
         }
     }
@@ -2593,7 +2593,7 @@ impl ShellApp {
             });
         });
         settle(ctx, &modal.response);
-        if modal.should_close() && !applying {
+        if closed_on_purpose(&modal) && !applying {
             cancel = true;
         }
         if apply {
@@ -4729,6 +4729,13 @@ pub(crate) fn settle(ctx: &egui::Context, dialog: &egui::Response) {
         ctx.data_mut(|d| d.insert_temp(id, size));
         ctx.request_repaint();
     }
+}
+
+/// Esc, or a close the dialog asked for itself; not a click on the dimmed window beside it. That click is easily a
+/// slip (the one that brings Klefki back to the front, say), and a dialog holds what was pasted, typed or chosen:
+/// closing it takes Esc or Cancel.
+fn closed_on_purpose<T>(modal: &egui::ModalResponse<T>) -> bool {
+    !modal.backdrop_response.clicked() && modal.should_close()
 }
 
 /// Why `name` cannot be a server's name, as a sentence; `None` when it can.
@@ -9011,6 +9018,104 @@ mod tests {
         klefki_core::api::Pasted::parse(text).unwrap().servers[i]
             .json
             .clone()
+    }
+
+    // A click on the dimmed window beside a dialog is easily a slip (bringing Klefki back to the front, say), so it
+    // never throws away what was pasted, typed or chosen. Esc and Cancel close on purpose.
+
+    #[test]
+    fn a_click_beside_the_add_dialog_keeps_what_was_pasted() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label(icon::PLUS).click();
+        h.run();
+        let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
+        paste(&mut h, text);
+        click_beside(&mut h);
+        assert_eq!(h.state().add.as_ref().map(|f| f.text.as_str()), Some(text));
+        h.get_by_label_contains("Adds files for the user.");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().add.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_click_beside_the_review_of_an_add_keeps_the_review_and_the_add_dialog() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label(icon::PLUS).click();
+        h.run();
+        let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
+        paste(&mut h, text);
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(waits_behind_review(&h));
+        drain(&engine);
+        let mut plan = plan_view(9, &["+   \"files\""], &[], false);
+        plan.action = "Add".to_owned();
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        click_beside(&mut h);
+        assert!(drain(&engine).is_empty(), "the plan is not discarded");
+        assert!(h.state().plan.is_some());
+        assert_eq!(h.state().add.as_ref().map(|f| f.text.as_str()), Some(text));
+    }
+
+    #[test]
+    fn a_click_beside_a_plan_leaves_it_to_apply_or_cancel() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        click_beside(&mut h);
+        assert!(drain(&engine).is_empty());
+        h.get_by_label_contains("Review the change");
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Discard(7)]);
+    }
+
+    #[test]
+    fn a_click_beside_the_casing_dialog_keeps_it_open() {
+        let (mut h, engine) = casing_harness(Vec::new());
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        click_beside(&mut h);
+        assert!(h.state().casing.is_some());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().casing.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_click_beside_the_duplicate_dialog_keeps_the_name_typed() {
+        let (mut h, engine) = duplicate_harness();
+        open_duplicate_of(&mut h, "beta");
+        h.state_mut().duplicate.as_mut().unwrap().name = "beta_two".into();
+        h.run();
+        click_beside(&mut h);
+        assert_eq!(
+            h.state().duplicate.as_ref().map(|f| f.name.as_str()),
+            Some("beta_two")
+        );
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().duplicate.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_click_beside_the_move_dialog_keeps_the_place_chosen() {
+        let (mut h, engine) = duplicate_harness();
+        open_move_of(&mut h, "beta");
+        h.get_by_label("For the user, in every project").click();
+        h.run();
+        click_beside(&mut h);
+        assert!(h.state().moving.is_some());
+        h.get_by_label("Moves beta to the user.");
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(h.state().moving.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
     }
 
     #[test]
