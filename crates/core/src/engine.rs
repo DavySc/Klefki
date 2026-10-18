@@ -862,6 +862,23 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             } else {
                 None
             };
+            // A fixed callback port another program holds makes the sign-in fail later, so it is said now. Each
+            // server's port is checked once, even when it is added to several places.
+            let mut checked = Vec::new();
+            for add in &resolved.cli {
+                let port = serde_json::from_str::<serde_json::Value>(&add.json)
+                    .ok()
+                    .and_then(|v| v.pointer("/oauth/callbackPort")?.as_u64())
+                    .and_then(|p| u16::try_from(p).ok());
+                if let Some(port) = port
+                    && !checked.contains(&(add.name.as_str(), port))
+                {
+                    checked.push((add.name.as_str(), port));
+                    if let Some(warning) = crate::form::callback_port_warning(port) {
+                        resolved.warnings.push(format!("{}: {warning}", add.name));
+                    }
+                }
+            }
             let docstore = Docstore::new(paths.claude_json.clone(), backup_dir(shared)?);
             let preview = docstore
                 .preview(std::mem::take(&mut resolved.preview))
@@ -5548,6 +5565,58 @@ mod tests {
                 .any(|a| a == "--client-secret")
         );
         assert!(store.values.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_callback_port_another_program_holds_is_warned_about_in_the_review_and_the_add_goes_on() {
+        let (env, _, _) = oauth_add_env(ADD_JSON_OK);
+        let core = with_store(&env, Arc::new(crate::secrets::MemoryStore::default()));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let add = |json: String| Change::Add {
+            name: "sso2".to_owned(),
+            json,
+            targets: vec![Target::User],
+            secret: None,
+        };
+        let with_port = format!(
+            r#"{{"type": "http", "url": "https://sso.example.com/mcp", "oauth": {{"clientId": "c", "callbackPort": {port}}}}}"#
+        );
+        let said = |plan: &PlanView| {
+            plan.warnings
+                .iter()
+                .filter(|w| w.contains(&format!("port {port}")))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let plan = plan_for(&core, vec![add(with_port.clone())]);
+        assert_eq!(plan.action, "Add");
+        assert_eq!(plan.summary, ["Add sso2 for the user"]);
+        let warned = said(&plan);
+        assert_eq!(warned.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            warned[0].starts_with(&format!("sso2: Another program is using port {port}")),
+            "{warned:?}"
+        );
+        // A port let go is not warned about, and neither is a server that leaves the port to Claude Code.
+        drop(held);
+        assert_eq!(
+            said(&plan_for(&core, vec![add(with_port)])),
+            Vec::<String>::new()
+        );
+        let plan = plan_for(
+            &core,
+            vec![add(
+                r#"{"type": "http", "url": "https://sso.example.com/mcp", "oauth": {"clientId": "c"}}"#
+                    .to_owned(),
+            )],
+        );
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("signing in")),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     #[test]

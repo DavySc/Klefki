@@ -444,6 +444,28 @@ fn program_name(command: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// Why the sign-in could not come back to `port` if it started now, or `None` when it could (or for a reason
+/// Klefki cannot name). Claude Code listens on 127.0.0.1 at that port while the user signs in, and stops at once
+/// when it cannot. It is a warning, not a problem: the port is the one registered with the provider, and the
+/// program holding it may be gone by the time the user signs in.
+pub fn callback_port_warning(port: u16) -> Option<String> {
+    if port == 0 {
+        return None;
+    }
+    // Let go at once. Like Node's listener in Claude Code, Rust's reuses addresses on Unix and not on Windows, so
+    // it finds the port taken where Claude Code would.
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Some(format!(
+            "Another program is using port {port} right now, so signing in would fail. Close that program before you sign in, or use another port if the provider lets you register one."
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(format!(
+            "This computer does not let programs listen on port {port} (it is reserved, or needs administrator rights), so signing in would fail. Use another port if the provider lets you register one."
+        )),
+        Err(_) => None,
+    }
+}
+
 /// The `${VAR}` reference to write instead of `value`, the value of the variable or header `name`, when it looks
 /// like a secret typed in; `None` otherwise. For a "use a reference instead" button.
 pub fn secret_reference(name: &str, value: &str) -> Option<String> {
@@ -794,5 +816,28 @@ mod tests {
         ] {
             assert_eq!(ServerFields::from_definition(json), None, "{json}");
         }
+    }
+
+    #[test]
+    fn a_callback_port_another_program_holds_is_warned_about_and_a_free_one_is_not() {
+        // Held as Claude Code holds it while signing in. On Linux a program listening on every address holds it
+        // too; macOS lets Claude Code take 127.0.0.1 beside such a program, and the check takes it the same way.
+        let mut holders = vec![std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST)];
+        if cfg!(target_os = "linux") {
+            holders.push(std::net::Ipv4Addr::UNSPECIFIED.into());
+        }
+        for at in holders {
+            let held = std::net::TcpListener::bind((at, 0)).unwrap();
+            let port = held.local_addr().unwrap().port();
+            let warning = callback_port_warning(port).unwrap_or_else(|| panic!("{at}:{port}"));
+            assert!(
+                warning.starts_with(&format!("Another program is using port {port}")),
+                "{warning}"
+            );
+            assert!(warning.contains("signing in would fail"), "{warning}");
+            drop(held);
+            assert_eq!(callback_port_warning(port), None, "{at}:{port} once let go");
+        }
+        assert_eq!(callback_port_warning(0), None);
     }
 }

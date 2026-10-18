@@ -10,7 +10,8 @@ use egui_phosphor::regular as icon;
 use klefki_core::api::{
     Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint,
     LegacyDisabled, Part, Pasted, PastedServer, PlanView, Scope, Secret, ServerFields, ServerId,
-    ServerName, ServerRow, Snapshot, Status, Target, TransportKind, same_project, secret_reference,
+    ServerName, ServerRow, Snapshot, Status, Target, TransportKind, callback_port_warning,
+    same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -3385,6 +3386,12 @@ struct AddForm {
     failed: Option<String>,
     /// Bring the OAuth settings into view on the next frame.
     reveal_oauth: bool,
+    /// Says why a sign-in could not come back to a callback port now: `api::callback_port_warning`, or a fake in
+    /// tests.
+    port_check: fn(u16) -> Option<String>,
+    /// The callback port as last checked, and what was found. Checked when the field is left or Review is pressed,
+    /// not while it is typed in.
+    port_checked: Option<(String, Option<String>)>,
 }
 
 struct Filled {
@@ -3430,6 +3437,8 @@ impl AddForm {
             reviewing: false,
             failed: None,
             reveal_oauth: false,
+            port_check: callback_port_warning,
+            port_checked: None,
         }
     }
 
@@ -3638,6 +3647,8 @@ impl AddForm {
         if self.mode != AddMode::Fill {
             return;
         }
+        // It may have been taken, or let go, since the field was left.
+        self.check_port();
         let name = matches!(checked.first(), Some(Check::Name(_))).then_some(Field::Name);
         let part = self
             .filled
@@ -3780,6 +3791,30 @@ impl AddForm {
             // Optional, and anything typed is kept as it is.
             Field::Secret => None,
         }
+    }
+
+    /// Checks whether a sign-in could come back to the callback port as typed now.
+    fn check_port(&mut self) {
+        let text = self.fields.callback_port.trim().to_owned();
+        let warning = text
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .and_then(self.port_check);
+        self.port_checked = Some((text, warning));
+    }
+
+    /// Why a sign-in could not come back to the callback port, as last checked: only while the port is still the
+    /// one checked, and nothing is wrong with it.
+    fn port_warning(&self) -> Option<&str> {
+        let (text, warning) = self.port_checked.as_ref()?;
+        let wrong = self
+            .filled
+            .as_ref()
+            .is_some_and(|f| f.problems.iter().any(|(p, _)| *p == Part::CallbackPort));
+        (self.fields.oauth && *text == self.fields.callback_port.trim() && !wrong)
+            .then_some(warning.as_deref())
+            .flatten()
     }
 
     /// Draws a text field for `field`: gives it the keyboard when asked, and notes when the keyboard leaves it.
@@ -3960,7 +3995,15 @@ impl AddForm {
                     )
                 });
                 self.track(field, &response);
+                if part == Part::CallbackPort && response.lost_focus() {
+                    self.check_port();
+                }
                 field_note(ui, pal, label_width, self.message(field, None), "");
+                if part == Part::CallbackPort
+                    && let Some(warning) = self.port_warning()
+                {
+                    field_warning(ui, pal, label_width, warning);
+                }
             }
             field_note(
                 ui,
@@ -4059,6 +4102,21 @@ fn field_note(ui: &mut Ui, pal: &Palette, label_width: f32, problem: Option<&str
     ui.horizontal(|ui| {
         ui.add_space(label_width + 8.0);
         ui.add(egui::Label::new(RichText::new(text).small().color(color)).wrap());
+    });
+}
+
+/// Under a field, in its column: what may go wrong later with what it holds, though it can be added as it is.
+fn field_warning(ui: &mut Ui, pal: &Palette, label_width: f32, warning: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(label_width + 8.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("{} {warning}", icon::WARNING))
+                    .small()
+                    .color(pal.warn),
+            )
+            .wrap(),
+        );
     });
 }
 
@@ -8399,6 +8457,59 @@ mod tests {
         assert_eq!(f.name, "linear");
         h.run();
         assert!(h.query_by_label_contains("Start the address").is_none());
+    }
+
+    #[test]
+    fn a_callback_port_another_program_holds_is_warned_about_once_left_and_does_not_stop_review() {
+        let (mut h, _engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        let f = add_form(&mut h);
+        f.fields.url = "https://sso.example.com/mcp".into();
+        f.fields.oauth = true;
+        f.port_check = |port| {
+            (port == 8766).then(|| {
+                format!("Another program is using port {port} right now, so signing in would fail.")
+            })
+        };
+        h.run();
+        let port = field_id(Field::Part(Part::CallbackPort));
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        add_form(&mut h).fields.callback_port = "8766".into();
+        h.run();
+        // Not while it is typed in.
+        assert!(h.query_by_label_contains("Another program").is_none());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.get_by_label_contains("Another program is using port 8766 right now");
+        // A warning, not a problem: the port is the one the provider registered, and it may be free by sign-in.
+        assert!(ready(&mut h));
+        // Changed, it is said again only once checked again; a free port says nothing.
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        add_form(&mut h).fields.callback_port = "8767".into();
+        h.run();
+        assert!(h.query_by_label_contains("Another program").is_none());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert!(h.query_by_label_contains("Another program").is_none());
+        // Pressing Review checks again: the port may have been taken since.
+        let f = add_form(&mut h);
+        f.port_check = |port| Some(format!("Another program is using port {port} right now."));
+        f.name = String::new();
+        f.name_edited = true;
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        h.get_by_label_contains("Give it a name");
+        h.get_by_label_contains("Another program is using port 8767 right now");
+        // A wrong port is a problem, said instead, and not checked.
+        add_form(&mut h).fields.callback_port = "99999".into();
+        h.run();
+        h.get_by_label_contains("must be a number from 1 to 65535");
+        assert!(h.query_by_label_contains("Another program").is_none());
     }
 
     #[test]
