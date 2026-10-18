@@ -511,6 +511,22 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
                     let names: Result<Vec<_>, _> = headers.keys().map(|k| shown(k)).collect();
                     lines.push(format!("Sends headers: {}", names?.join(", ")));
                 }
+                // Values are not shown, but Claude Code fills `${VAR}` in from the user's environment, so which of
+                // the user's variables would leave the machine is.
+                for (name, value) in headers {
+                    let value = value.as_str().ok_or("a header value is not text")?;
+                    let vars = env_references(value)
+                        .map(shown)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !vars.is_empty() {
+                        lines.push(format!(
+                            "Header {} sends your environment variable{} {}",
+                            shown(name)?,
+                            if vars.len() == 1 { "" } else { "s" },
+                            vars.join(", ")
+                        ));
+                    }
+                }
             }
             Some(_) => return Err("headers is not an object".to_owned()),
         }
@@ -521,6 +537,14 @@ fn describe(entry: &Value) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// The variable names in `${NAME}` and `${NAME:-default}`, as Claude Code expands them.
+fn env_references(value: &str) -> impl Iterator<Item = &str> {
+    value.split("${").skip(1).filter_map(|rest| {
+        let inner = &rest[..rest.find('}')?];
+        Some(inner.split_once(":-").map_or(inner, |(name, _)| name))
+    })
+}
+
 /// A value exactly as it is, or an error when it cannot be shown that way.
 fn shown(value: &str) -> Result<String, String> {
     if value.chars().count() > MAX_REVIEW_CHARS {
@@ -528,10 +552,21 @@ fn shown(value: &str) -> Result<String, String> {
             "a value is longer than {MAX_REVIEW_CHARS} characters"
         ));
     }
-    if sanitize(value) != value || value.chars().any(char::is_control) {
+    if sanitize(value) != value || value.chars().any(|c| c.is_control() || is_invisible(c)) {
         return Err("a value contains control or hidden characters".to_owned());
     }
     Ok(value.to_owned())
+}
+
+/// Characters that take no visible space or render blank, so a reviewed value would not read as it is: format
+/// characters (zero-width, joiners, bidi, tags, variation selectors), line and paragraph separators, the soft
+/// hyphen and the blank Hangul and Mongolian fillers.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}'
+        | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}'
+        | '\u{fff0}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')
 }
 
 /// Is `.claude/settings.local.json` named by the repository's own ignore files? Only the common spellings are
@@ -547,17 +582,23 @@ fn ignored_by_git(project: &Path) -> bool {
         ".claude/*",
         "**/settings.local.json",
     ];
-    [
+    let texts: Vec<String> = [
         project.join(".gitignore"),
         project.join(".git").join("info").join("exclude"),
     ]
     .iter()
     .filter_map(|p| fsx::read_limited(p, MAX_GITIGNORE).ok().flatten())
-    .any(|text| {
-        text.lines()
-            .map(|l| l.trim().trim_start_matches('/'))
-            .any(|l| COVERING.contains(&l))
-    })
+    .collect();
+    let lines = || texts.iter().flat_map(|t| t.lines()).map(str::trim);
+    let covered = lines()
+        .map(|l| l.trim_start_matches('/'))
+        .any(|l| COVERING.contains(&l));
+    // A `!` line can bring the file back whatever else is listed. Rule order is not worked out: any negation that
+    // could name it means "may be committed".
+    let negated = lines().filter_map(|l| l.strip_prefix('!')).any(|l| {
+        l.contains(".claude") || l.contains("settings.local") || l.contains(".local.json")
+    });
+    covered && !negated
 }
 
 #[cfg(test)]
@@ -611,6 +652,71 @@ mod tests {
             !lines.join("\n").contains("abc"),
             "header values are not shown"
         );
+    }
+
+    #[test]
+    fn headers_that_fill_in_your_environment_say_which_variables() {
+        // Claude Code expands `${VAR}` in headers: the repository chooses what of yours is sent, and where.
+        let lines = d(json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+            "headers": {
+                "X-Leak": "Bearer ${ANTHROPIC_API_KEY}",
+                "X-Two": "${A:-fallback} and ${B}",
+                "X-Plain": "secret-literal"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "Connects to: https://example.com/mcp",
+                "Sends headers: X-Leak, X-Two, X-Plain",
+                "Header X-Leak sends your environment variable ANTHROPIC_API_KEY",
+                "Header X-Two sends your environment variables A, B",
+            ]
+        );
+        assert!(!lines.join("\n").contains("secret-literal"));
+        // A name that cannot be shown exactly is refused like any other value.
+        assert!(
+            d(json!({"type": "http", "url": "https://e.com", "headers": {"X": "${A\u{200b}B}"}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invisible_characters_are_refused_too() {
+        for c in [
+            '\u{200b}',
+            '\u{200c}',
+            '\u{200d}',
+            '\u{2060}',
+            '\u{feff}',
+            '\u{ad}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{e0041}',
+            '\u{3164}',
+            '\u{115f}',
+            '\u{180e}',
+        ] {
+            let bad = json!({"command": "node", "args": [format!("a{c}b")]});
+            assert!(d(bad).is_err(), "U+{:04X}", c as u32);
+        }
+        // Ordinary non-ASCII text is fine.
+        assert!(d(json!({"command": "node", "args": ["café", "日本"]})).is_ok());
+    }
+
+    #[test]
+    fn a_negated_ignore_line_means_the_file_may_be_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        for text in [
+            ".claude/\n!.claude/settings.local.json\n",
+            "*.local.json\n!/.claude/settings.local.json\n",
+        ] {
+            std::fs::write(dir.path().join(".gitignore"), text).unwrap();
+            assert!(!ignored_by_git(dir.path()), "{text:?}");
+        }
     }
 
     #[test]

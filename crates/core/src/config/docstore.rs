@@ -4,23 +4,34 @@
 //! Every change is a [`Plan`] made from [`Op`]s: `prepare` shows what would change, `apply` re-reads the file under
 //! Claude's own lock directory, re-applies the ops to that fresh copy, backs the old bytes up, and replaces the file
 //! atomically. Key order, unknown keys and untouched values survive because the ops patch the parsed document.
-//! Claude may still write without the lock (it gives up waiting after about 1.5 s), so `verify` re-reads a moment
-//! later and re-applies if our change is gone.
+//! Claude may still write without the lock (it gives up waiting after about 1.5 s). Two defences, borrowed from
+//! databases:
+//! - Validation before commit, as in optimistic concurrency control: just before the rename the file is checked to
+//!   be the version we read. If someone wrote meanwhile, our edit is redone on their version instead of replacing it.
+//! - Redo from a log: the engine keeps the plans written to a file in order, and `verify` replays all of them a
+//!   moment later on whatever is there (each op is idempotent when checking), the way a database replays its
+//!   write-ahead log after a crash. Replaying the whole log in order puts back every change Claude overwrote and
+//!   keeps the user's last word when two changes touch the same thing.
 use super::inventory::{MAX_CLAUDE_JSON, normalise_project};
 use super::{entry, fsx, jsonspan};
 use crate::sanitize::sanitize;
+use crate::watch;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Claude's own staleness rule for its lock directory.
 const LOCK_STALE: Duration = Duration::from_secs(10);
 const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
 const MAX_VERIFY_ROUNDS: usize = 3;
+/// How often a write is redone because the file changed between our read and our rename, before giving up.
+const VALIDATION_ATTEMPTS: usize = 3;
 /// Waits between attempts to replace the file while Windows refuses because someone has it open.
 const DENIED_RETRY_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
 const BOM: &str = "\u{feff}";
@@ -209,6 +220,9 @@ pub(crate) struct Docstore {
     pub lock_wait: Duration,
     /// How long after a write to look again for an unlocked overwrite by Claude.
     pub verify_delay: Duration,
+    /// Runs just before the validation and rename, so a test can write the file at that moment.
+    #[cfg(test)]
+    pub before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Docstore {
@@ -220,6 +234,8 @@ impl Docstore {
             keep_backups: 20,
             lock_wait: Duration::from_secs(3),
             verify_delay: Duration::from_secs(1),
+            #[cfg(test)]
+            before_replace: None,
         }
     }
 
@@ -249,6 +265,8 @@ impl Docstore {
                 text,
                 bom,
                 missing: false,
+                // Only for writing, and a plan is never written from this copy.
+                stamp: None,
             },
             ops,
         )
@@ -315,39 +333,87 @@ impl Docstore {
             ensure_plain_dir(dir)?;
         }
         let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
-        let current = self.read()?;
-        let (text, changes) = self.edit(&current, &plan.ops, Purpose::Change)?;
-        if changes != plan.changes && current.hash() != plan.base_hash {
-            return Err(StoreError::Changed);
-        }
-        self.write(&current, text.as_ref())
+        self.read_edit_write(|current| {
+            let (text, changes) = self.edit(current, &plan.ops, Purpose::Change)?;
+            if changes != plan.changes && current.hash() != plan.base_hash {
+                return Err(StoreError::Changed);
+            }
+            Ok(text)
+        })
     }
 
-    /// Waits `verify_delay`, then makes sure the change is still there. Claude may write without our lock, from a
-    /// copy it read before ours; if so the ops are applied again (up to three times). Says whether it had to.
-    /// Looking needs no lock (every writer replaces the file whole), so in the usual case, the change intact, Claude
-    /// is never kept waiting; the lock is taken only to write.
-    pub(crate) fn verify(&self, plan: &Plan) -> Result<bool, StoreError> {
+    /// Under the lock: reads the file, makes `edit`'s change and writes it. When the file is replaced between our
+    /// read and our rename (Claude writing without the lock), the edit is redone on that version, so neither write
+    /// is lost; a file that never holds still is given up on as locked.
+    fn read_edit_write(
+        &self,
+        mut edit: impl FnMut(&Current) -> Result<Option<Splices>, StoreError>,
+    ) -> Result<Applied, StoreError> {
+        for _ in 0..VALIDATION_ATTEMPTS {
+            let current = self.read()?;
+            let Some(edits) = edit(&current)? else {
+                return Ok(Applied {
+                    wrote: false,
+                    backup: None,
+                });
+            };
+            if let Some(applied) = self.write(&current, &edits)? {
+                return Ok(applied);
+            }
+        }
+        Err(StoreError::Locked)
+    }
+
+    /// The log's changes, replayed in order on `current`, as one replacement of the whole text; `None` when they
+    /// are all in place. Each plan is applied to the result of the one before, as it was when it was written.
+    fn replay(&self, current: &Current, log: &[Plan]) -> Result<Option<Splices>, StoreError> {
+        let mut redone: Option<Current> = None;
+        for plan in log {
+            let base = redone.as_ref().unwrap_or(current);
+            if let (Some(edits), _) = self.edit(base, &plan.ops, Purpose::Verify)? {
+                redone = Some(Current {
+                    text: spliced(&base.text, &edits),
+                    bom: current.bom,
+                    missing: false,
+                    stamp: None,
+                });
+            }
+        }
+        Ok(redone
+            .filter(|r| r.text != current.text)
+            .map(|r| vec![(0..current.text.len(), r.text)]))
+    }
+
+    /// Waits `verify_delay`, then makes sure the changes in `log` (every plan written to this file whose check is
+    /// still due, oldest first) are still there. Claude may write without our lock, from a copy it read before
+    /// ours; if so the log is replayed (up to twice). Says whether it had to. Looking needs no lock (every writer
+    /// replaces the file whole), so in the usual case, the changes intact, Claude is never kept waiting; the lock is
+    /// taken only to write.
+    ///
+    /// `superseded` says whether a newer change of ours to this file has started since. Its own check will replay
+    /// a longer log, this one included, so this one stops quietly rather than race it.
+    pub(crate) fn verify(
+        &self,
+        log: &[Plan],
+        superseded: &dyn Fn() -> bool,
+    ) -> Result<bool, StoreError> {
         let mut reapplied = false;
         for round in 0..MAX_VERIFY_ROUNDS {
             std::thread::sleep(self.verify_delay);
-            if self
-                .edit(&self.read()?, &plan.ops, Purpose::Verify)?
-                .0
-                .is_none()
-            {
+            if superseded() || self.replay(&self.read()?, log)?.is_none() {
                 return Ok(reapplied);
             }
             if round + 1 == MAX_VERIFY_ROUNDS {
                 break;
             }
             let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
-            let current = self.read()?;
-            let (edits, _) = self.edit(&current, &plan.ops, Purpose::Verify)?;
-            if edits.is_some() {
-                self.write(&current, edits.as_ref())?;
-                reapplied = true;
+            // A newer change marks itself before it takes the lock, so under the lock this answer is final.
+            if superseded() {
+                return Ok(reapplied);
             }
+            reapplied |= self
+                .read_edit_write(|current| self.replay(current, log))?
+                .wrote;
         }
         Err(StoreError::Lost)
     }
@@ -359,17 +425,21 @@ impl Docstore {
     }
 
     fn read(&self) -> Result<Current, StoreError> {
+        // Taken before reading: a write that lands while we read then shows as a change at validation.
+        let stamp = watch::stamp(&self.path);
         match fsx::read_limited_bom(&self.path, MAX_CLAUDE_JSON)? {
             Some((text, bom)) => Ok(Current {
                 text,
                 bom,
                 missing: false,
+                stamp,
             }),
             // An approval may create the file; the main configuration is never created.
             None if self.kind == Kind::ProjectSettings => Ok(Current {
                 text: "{}".to_owned(),
                 bom: false,
                 missing: true,
+                stamp,
             }),
             None => Err(StoreError::Invalid(format!(
                 "{} does not exist; there is nothing to change.",
@@ -379,14 +449,9 @@ impl Docstore {
     }
 
     /// Replaces the file with its text after `edits` (plus the byte-order mark it had), written piece by piece so a
-    /// large file is not copied in memory first. `None` writes nothing.
-    fn write(&self, current: &Current, edits: Option<&Splices>) -> Result<Applied, StoreError> {
-        let Some(edits) = edits else {
-            return Ok(Applied {
-                wrote: false,
-                backup: None,
-            });
-        };
+    /// large file is not copied in memory first. `None` (nothing written, no backup) when the file is no longer
+    /// the version `current` was read from.
+    fn write(&self, current: &Current, edits: &Splices) -> Result<Option<Applied>, StoreError> {
         let dir = self.path.parent().ok_or_else(|| {
             StoreError::Invalid("the configuration file has no parent folder".to_owned())
         })?;
@@ -407,28 +472,44 @@ impl Docstore {
         }
         tmp.write_all(&current.text.as_bytes()[at..])?;
         tmp.as_file().sync_all()?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_replace {
+            hook();
+        }
+        // Validation: is the file still the version we read? A writer that ignored the lock would otherwise be
+        // overwritten. The window left is between this look and the rename, microseconds rather than the whole edit.
+        if watch::stamp(&self.path) != current.stamp {
+            return Ok(None);
+        }
         let backup = if current.missing {
             None
         } else {
             Some(self.backup(current)?)
         };
         let mut tmp = Some(tmp);
-        retry_denied(|| {
+        let replaced = retry_denied(|| {
             let file = tmp.take().expect("put back after every failed attempt");
             file.persist(&self.path).map(drop).map_err(|e| {
                 tmp = Some(e.file);
                 e.error
             })
-        })?;
+        });
+        if let Err(e) = replaced {
+            // Nothing was replaced, so the backup is of a file still in place; it would only crowd out real ones.
+            if let Some(backup) = &backup {
+                let _ = std::fs::remove_file(backup);
+            }
+            return Err(e.into());
+        }
         if let Some(backup) = &backup {
             // A hard link shares the old file's permissions until now; it is the only name of that file left.
             make_private(backup);
         }
         self.rotate_backups();
-        Ok(Applied {
+        Ok(Some(Applied {
             wrote: true,
             backup,
-        })
+        }))
     }
 
     /// Keeps the bytes about to be replaced. A hard link to the current file costs nothing, whatever its size: the
@@ -563,6 +644,9 @@ struct Current {
     bom: bool,
     /// The file does not exist yet; `text` is an empty object.
     missing: bool,
+    /// The file's identity when it was read (`None`: it did not exist), to tell at the rename whether anyone wrote
+    /// it since.
+    stamp: Option<watch::Stamp>,
 }
 
 impl Current {
@@ -623,9 +707,10 @@ impl Lock {
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if is_stale(dir) {
-                        // Whoever held it is gone. `remove_dir` only removes an empty directory.
-                        let _ = std::fs::remove_dir(dir);
+                    // Whoever held it is gone. `remove_dir` only removes an empty directory; anything else at that
+                    // path (a file, a folder with contents) is not a lock we can take over, so it is waited out
+                    // like a held one rather than retried at once forever.
+                    if is_stale(dir) && std::fs::remove_dir(dir).is_ok() {
                         continue;
                     }
                 }
@@ -699,6 +784,19 @@ fn retry_denied<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> 
         }
     }
     attempt()
+}
+
+/// `text` with `edits` made (sorted, not overlapping).
+fn spliced(text: &str, edits: &Splices) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, with) in edits {
+        out.push_str(&text[at..range.start]);
+        out.push_str(with);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// Below this size a second thread costs more than it saves.
@@ -1950,6 +2048,69 @@ mod tests {
         assert!(!f.lock().exists(), "our own lock is released");
     }
 
+    /// Applies `plan` on another thread, so a lock loop that never ends fails the test instead of hanging it.
+    fn apply_within(f: &Fixture, plan: &Plan, limit: Duration) -> Result<Applied, StoreError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (store, plan) = (f.store.clone(), plan.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(store.apply(&plan));
+        });
+        rx.recv_timeout(limit)
+            .expect("apply never returned: the lock loop does not give up")
+    }
+
+    #[test]
+    fn a_stale_lock_that_cannot_be_removed_is_given_up_on() {
+        let old = SystemTime::now() - Duration::from_secs(60);
+        // A folder with something in it (a repository can commit one) and a plain file in place of the folder.
+        for as_file in [false, true] {
+            let text = pretty(&sample());
+            let f = Fixture::new(&text);
+            let plan = f
+                .store
+                .prepare(vec![disable("C:/work/app", "gateway")])
+                .unwrap();
+            if as_file {
+                std::fs::write(f.lock(), "x").unwrap();
+            } else {
+                std::fs::create_dir(f.lock()).unwrap();
+                std::fs::write(f.lock().join("x"), "x").unwrap();
+            }
+            filetime::set_file_mtime(f.lock(), filetime::FileTime::from_system_time(old)).unwrap();
+            assert_eq!(
+                apply_within(&f, &plan, Duration::from_secs(10)),
+                Err(StoreError::Locked),
+                "as_file={as_file}"
+            );
+            assert_eq!(f.text(), text);
+            assert!(f.backups().is_empty());
+        }
+    }
+
+    /// Windows refuses to replace a read-only file; the rename fails after the backup was made.
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_replace_leaves_no_backup_behind() {
+        let text = pretty(&sample());
+        let f = Fixture::new(&text);
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        let set_readonly = |on: bool| {
+            let mut perms = std::fs::metadata(&f.store.path).unwrap().permissions();
+            perms.set_readonly(on);
+            std::fs::set_permissions(&f.store.path, perms).unwrap();
+        };
+        set_readonly(true);
+        let result = f.store.apply(&plan);
+        set_readonly(false);
+        assert!(matches!(result, Err(StoreError::Io(_))), "{result:?}");
+        assert_eq!(f.text(), text);
+        assert!(f.backups().is_empty(), "{:?}", f.backups());
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
     #[test]
     fn a_fresh_lock_is_waited_for_and_then_used() {
         let f = Fixture::new(&pretty(&sample()));
@@ -2071,6 +2232,107 @@ mod tests {
         );
     }
 
+    // ---- the write path as a log: redo in order, and validation before the rename
+
+    #[test]
+    fn verify_replays_every_logged_change_in_order() {
+        // Two changes, then Claude saves a copy it read before both: verify of the log puts both back.
+        let f = Fixture::new(&pretty(&sample()));
+        let first = apply_ops(&f, vec![disable("C:/work/app", "gateway")]);
+        let second = apply_ops(&f, vec![disable("C:/work/app", "other")]);
+        let mut theirs = sample();
+        theirs["numStartups"] = json!(99);
+        std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
+        assert_eq!(f.store.verify(&[first, second], &|| false), Ok(true));
+        let j = f.json();
+        assert_eq!(j["numStartups"], 99);
+        assert_eq!(
+            j["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway", "other"])
+        );
+    }
+
+    #[test]
+    fn replaying_keeps_the_users_last_word() {
+        // Off, then on again: Claude saves the copy from in between. The log ends with "on", so on it is.
+        let f = Fixture::new(&pretty(&sample()));
+        let off = apply_ops(&f, vec![disable("C:/work/app", "gateway")]);
+        let in_between = f.text();
+        let on = apply_ops(&f, vec![enable("C:/work/app", "gateway")]);
+        std::fs::write(&f.store.path, &in_between).unwrap();
+        assert_eq!(f.store.verify(&[off, on], &|| false), Ok(true));
+        assert_eq!(
+            f.json()["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old"])
+        );
+    }
+
+    #[test]
+    fn replaying_two_edits_of_one_server_ends_with_the_second() {
+        // Each change is applied to the result of the one before, not all at once to the file.
+        let f = Fixture::new(&pretty(&sample()));
+        let a = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "a"}))]);
+        let b = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "b"}))]);
+        std::fs::write(&f.store.path, pretty(&sample())).unwrap();
+        assert_eq!(f.store.verify(&[a, b], &|| false), Ok(true));
+        assert_eq!(f.json()["mcpServers"]["gateway"], json!({"command": "b"}));
+        assert_eq!(f.store.verify(&[], &|| false), Ok(false));
+    }
+
+    #[test]
+    fn a_write_landing_between_our_read_and_our_rename_is_not_overwritten() {
+        // Claude writes without the lock while we hold it. Checked just before the rename (validation, as in
+        // optimistic concurrency control), the change is redone on Claude's version instead of replacing it.
+        let mut f = Fixture::new(&pretty(&sample()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (path, seen) = (f.store.path.clone(), Arc::clone(&calls));
+        f.store.before_replace = Some(Arc::new(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut theirs = sample();
+                theirs["numStartups"] = json!(99);
+                std::fs::write(&path, pretty(&theirs)).unwrap();
+            }
+        }));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let j = f.json();
+        assert_eq!(j["numStartups"], 99, "Claude's write survives");
+        assert_eq!(
+            j["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway"]),
+            "and so does ours"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
+    #[test]
+    fn a_file_that_never_holds_still_is_given_up_on() {
+        let mut f = Fixture::new(&pretty(&sample()));
+        let (path, n) = (
+            f.store.path.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = Arc::clone(&n);
+        f.store.before_replace = Some(Arc::new(move || {
+            let i = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut theirs = sample();
+            theirs["numStartups"] = json!(100 + i);
+            std::fs::write(&path, pretty(&theirs)).unwrap();
+        }));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        assert_eq!(f.store.apply(&plan), Err(StoreError::Locked));
+        assert!(f.json()["projects"]["C:/work/app"]["disabledMcpServers"] == json!(["old"]));
+        assert!(f.backups().is_empty(), "{:?}", f.backups());
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
     #[test]
     fn verify_puts_the_change_back_when_claude_overwrote_it() {
         let f = Fixture::new(&pretty(&sample()));
@@ -2083,13 +2345,44 @@ mod tests {
         let mut theirs = sample();
         theirs["numStartups"] = json!(99);
         std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
-        assert_eq!(f.store.verify(&plan), Ok(true));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(true)
+        );
         let j = f.json();
         assert_eq!(j["numStartups"], 99);
         assert_eq!(
             j["projects"]["C:/work/app"]["disabledMcpServers"],
             json!(["old", "gateway"])
         );
+    }
+
+    #[test]
+    fn verify_leaves_a_newer_change_of_ours_alone() {
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let newer = sample();
+        std::fs::write(&f.store.path, pretty(&newer)).unwrap();
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| true),
+            Ok(false)
+        );
+        assert_eq!(f.text(), pretty(&newer));
+        // Superseded only once the lock is held: still nothing written.
+        let calls = std::cell::Cell::new(0);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &late),
+            Ok(false)
+        );
+        assert_eq!(f.text(), pretty(&newer));
     }
 
     #[test]
@@ -2101,7 +2394,10 @@ mod tests {
             .unwrap();
         f.store.apply(&plan).unwrap();
         let backups = f.backups().len();
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
         assert_eq!(f.backups().len(), backups);
     }
 
@@ -2119,7 +2415,10 @@ mod tests {
             pretty(&json!({"projects": {"C:/work/app": {"disabledMcpServers": 5}}})),
         )
         .unwrap();
-        assert!(matches!(f.store.verify(&plan), Err(StoreError::Invalid(_))));
+        assert!(matches!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Err(StoreError::Invalid(_))
+        ));
     }
 
     #[test]
@@ -2716,7 +3015,10 @@ mod tests {
         f.store.apply(&plan).unwrap();
         // Claude is busy saving: an intact change needs nothing from it, so verify must not wait or fail.
         std::fs::create_dir(f.lock()).unwrap();
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
         assert!(f.lock().is_dir(), "someone else's lock is left alone");
     }
 
@@ -2731,7 +3033,10 @@ mod tests {
         let before = pretty(&sample());
         std::fs::write(&f.store.path, &before).unwrap();
         std::fs::create_dir(f.lock()).unwrap();
-        assert_eq!(f.store.verify(&plan), Err(StoreError::Locked));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Err(StoreError::Locked)
+        );
         assert_eq!(f.text(), before, "nothing written without the lock");
     }
 
@@ -2814,14 +3119,20 @@ mod tests {
         // Reproducer: verify re-runs the ops on the written file, where the deleted server no longer exists.
         let f = Fixture::new(&pretty(&sample()));
         let plan = apply_ops(&f, vec![remove(None, "gateway")]);
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
         // A local server too, and one deleted from every spelling of its project.
         let mut doc = sample();
         doc["projects"]["C:/work/app"]["mcpServers"] = json!({"x": {"command": "a"}});
         doc["projects"]["c:\\work\\app"] = json!({"mcpServers": {"x": {"command": "a"}}});
         let f = Fixture::new(&pretty(&doc));
         let plan = apply_ops(&f, vec![remove(Some("C:/work/app"), "x")]);
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
     }
 
     fn copy(from: Option<&str>, name: &str, to: Option<&str>, new_name: &str) -> Op {
@@ -2850,7 +3161,10 @@ mod tests {
         assert!(lines.iter().any(|l| l == "+ gateway_copy"), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("s3cret")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("<hidden>")), "{lines:?}");
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -2954,12 +3268,18 @@ mod tests {
         let f = Fixture::new(&pretty(&sample()));
         let plan = apply_ops(&f, vec![copy(None, "gateway", None, "gw2")]);
         std::fs::write(&f.store.path, pretty(&sample())).unwrap();
-        assert_eq!(f.store.verify(&plan), Ok(true));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(true)
+        );
         assert_eq!(
             f.json()["mcpServers"]["gw2"],
             sample()["mcpServers"]["gateway"]
         );
-        assert_eq!(f.store.verify(&plan), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
     }
 
     #[test]

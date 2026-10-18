@@ -1,4 +1,5 @@
 mod command;
+mod explain;
 mod shell;
 mod theme;
 

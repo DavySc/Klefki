@@ -9,6 +9,7 @@ use crate::config::docstore::{Docstore, Plan};
 use crate::config::entry;
 use crate::config::fsx;
 use crate::config::inventory;
+use crate::diagnose::hints::{HintKind, hints_for};
 use crate::diagnose::report;
 use crate::model::ServerName;
 use crate::ops;
@@ -17,6 +18,7 @@ use crate::watch::{self, Watch};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -100,11 +102,70 @@ pub struct PlanView {
     pub nothing_to_do: bool,
 }
 
-/// One plain-language explanation of a common failure.
+/// One plain-language explanation of a common failure, in the parts a compiler error has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hint {
     pub title: String,
-    pub advice: String,
+    /// The error code it was reported with, such as `ENOTFOUND`.
+    pub code: Option<String>,
+    /// What to do, one step per line, the most likely fix first.
+    pub help: Vec<String>,
+    /// The part of the server's command or URL the failure is about, and what to say under it.
+    pub points_at: Option<(Focus, String)>,
+}
+
+/// A part of a server's command line or URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// The host name of the URL.
+    Host,
+    /// Host and port.
+    Address,
+    /// The URL's path.
+    Path,
+    /// The program, without its arguments.
+    Command,
+}
+
+impl Hint {
+    /// Where in `target` (a row's command line or URL, as shown) the failure is, as a byte range. `said` is
+    /// Claude's own message, which tells how much of a command line is the program when its path has spaces.
+    pub fn span(&self, target: &str, said: Option<&str>) -> Option<Range<usize>> {
+        let (focus, _) = self.points_at.as_ref()?;
+        let Some(scheme_end) = target.find("://") else {
+            if *focus != Focus::Command {
+                return None;
+            }
+            let first = target.find(' ').unwrap_or(target.len());
+            let mut ends = target
+                .match_indices(' ')
+                .map(|(i, _)| i)
+                .chain([target.len()]);
+            let named = said.and_then(|s| ends.rfind(|&e| s.contains(&target[..e])));
+            let end = named.unwrap_or(first).max(first);
+            return (end > 0).then_some(0..end);
+        };
+        let start = scheme_end + 3;
+        let rest = &target[start..];
+        let authority = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let host_at = rest[..authority].rfind('@').map_or(0, |i| i + 1);
+        let host = &rest[host_at..authority];
+        let host_len = if host.starts_with('[') {
+            host.find(']').map_or(host.len(), |i| i + 1)
+        } else {
+            host.find(':').unwrap_or(host.len())
+        };
+        let range = match focus {
+            Focus::Host => start + host_at..start + host_at + host_len,
+            Focus::Address => start + host_at..start + authority,
+            Focus::Path => {
+                let path = &rest[authority..];
+                start + authority..start + authority + path.find(['?', '#']).unwrap_or(path.len())
+            }
+            Focus::Command => return None,
+        };
+        (!range.is_empty()).then_some(range)
+    }
 }
 
 /// What the client's debug output says about one server, made safe to show: sanitised, with secrets redacted.
@@ -131,6 +192,8 @@ pub enum Event {
         id: ServerId,
         status: Status,
         detail: Option<String>,
+        /// What `detail` most likely means, in plain language. `None` when it matches no known failure.
+        hint: Option<Hint>,
     },
     Diagnosis {
         id: ServerId,
@@ -274,7 +337,18 @@ impl Emitter {
     }
 
     fn status(&self, id: ServerId, status: Status, detail: Option<String>) {
-        self.emit(Event::Status { id, status, detail });
+        let hint = match status {
+            Status::Failed | Status::Degraded | Status::NeedsAuth => detail
+                .as_deref()
+                .and_then(|d| Some(hint(*hints_for(d).first()?, d))),
+            _ => None,
+        };
+        self.emit(Event::Status {
+            id,
+            status,
+            detail,
+            hint,
+        });
     }
 }
 
@@ -310,6 +384,8 @@ struct Shared {
     /// The CLI's version, for the program file it was read from. Asking costs a process start (Claude Code is a
     /// large Node program), so it is only asked again when the file changes.
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
+    /// Per file, the redo log of klefki's changes whose check is still due.
+    journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
     /// For threads that need the engine thread to do something (read the files again).
     input: Sender<Input>,
@@ -348,6 +424,7 @@ fn engine_main(
         generation: AtomicU64::new(0),
         claude: RwLock::new(None),
         version: Mutex::new(None),
+        journals: Arc::default(),
         emitter,
         input: input_tx.clone(),
     });
@@ -531,11 +608,24 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     }
     let mut written = Vec::new();
     let mut backups = Vec::new();
+    // Every file this change starts on, with its sequence number there; each gets checked afterwards, written or not.
+    let mut started = Vec::new();
     for (plan, store) in &parts {
+        // Numbered before the write, so an earlier change's check that takes the lock after it already knows.
+        let lsn = lock(&shared.journals)
+            .entry(store.path.clone())
+            .or_default()
+            .start();
+        started.push((store.clone(), lsn));
         match store.apply(plan) {
             Ok(applied) => {
                 if applied.wrote {
-                    written.push((plan.clone(), store.clone()));
+                    lock(&shared.journals)
+                        .entry(store.path.clone())
+                        .or_default()
+                        .pending
+                        .push((lsn, plan.clone()));
+                    written.push(plan.clone());
                 }
                 backups.extend(applied.backup);
             }
@@ -544,7 +634,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                 if !written.is_empty() {
                     let done: Vec<String> = written
                         .iter()
-                        .flat_map(|(p, _)| p.changes().iter().map(|c| c.path.clone()))
+                        .flat_map(|p| p.changes().iter().map(|c| c.path.clone()))
                         .collect();
                     message.push_str(&format!(
                         " Already saved: {}. The rest was not changed.",
@@ -552,6 +642,8 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                     ));
                     reload_after_change(shared, state);
                 }
+                // This change now numbers last on the file, so the earlier ones' checks stand down for it.
+                check_later(shared, id, started);
                 return fail(message);
             }
         }
@@ -559,29 +651,8 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     let changed = !written.is_empty();
     if changed {
         reload_after_change(shared, state);
-        // Claude Code can write without our lock; look again shortly, off the engine thread.
-        let emitter = shared.emitter.clone();
-        let input = shared.input.clone();
-        std::thread::spawn(move || {
-            let mut reapplied = false;
-            for (plan, store) in &written {
-                match store.verify(plan) {
-                    Ok(again) => reapplied |= again,
-                    Err(e) => {
-                        return emitter.emit(Event::ApplyFailed {
-                            plan: id,
-                            error: e.to_string(),
-                        });
-                    }
-                }
-            }
-            if reapplied {
-                // The engine thread reads the files again, as for any change on disk.
-                let _ = input.send(Input::FilesChanged);
-                emitter.emit(Event::Reapplied { plan: id });
-            }
-        });
     }
+    check_later(shared, id, started);
     shared.emitter.emit(Event::Applied {
         plan: id,
         changed,
@@ -594,6 +665,74 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                     .join(", "),
             )
         }),
+    });
+}
+
+/// The changes klefki wrote to one file and has not yet checked, oldest first: a small redo log. Claude Code may
+/// write without our lock from a copy it read earlier; replaying the log in order puts every overwritten change
+/// back, and two changes to the same thing end the way the later one says.
+#[derive(Default)]
+struct Journal {
+    /// The sequence number of the latest change started on the file.
+    latest: u64,
+    pending: Vec<(u64, Plan)>,
+}
+
+impl Journal {
+    fn start(&mut self) -> u64 {
+        self.latest += 1;
+        self.latest
+    }
+}
+
+/// Shortly after a change, off the engine thread, checks each file it started on against that file's whole log.
+/// Only the latest change on a file checks it (older ones stand down, the newest log covers theirs), the way a
+/// database groups commits; once checked, the logged changes are retired.
+fn check_later(shared: &Shared, id: u64, started: Vec<(Docstore, u64)>) {
+    let journals = Arc::clone(&shared.journals);
+    let logs: Vec<_> = {
+        let j = lock(&journals);
+        started
+            .into_iter()
+            .filter_map(|(store, lsn)| {
+                let pending = &j.get(&store.path)?.pending;
+                let last = pending.last()?.0;
+                let log: Vec<Plan> = pending.iter().map(|(_, p)| p.clone()).collect();
+                Some((store, lsn, last, log))
+            })
+            .collect()
+    };
+    if logs.is_empty() {
+        return;
+    }
+    let emitter = shared.emitter.clone();
+    let input = shared.input.clone();
+    std::thread::spawn(move || {
+        let mut reapplied = false;
+        for (store, lsn, last, log) in &logs {
+            let superseded = || lock(&journals).get(&store.path).map(|j| j.latest) != Some(*lsn);
+            let result = store.verify(log, &superseded);
+            // Retired whatever the outcome: a log that cannot be put back is reported now, not retried forever.
+            if let Some(j) = lock(&journals).get_mut(&store.path)
+                && j.latest == *lsn
+            {
+                j.pending.retain(|(n, _)| n > last);
+            }
+            match result {
+                Ok(again) => reapplied |= again,
+                Err(e) => {
+                    return emitter.emit(Event::ApplyFailed {
+                        plan: id,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+        if reapplied {
+            // The engine thread reads the files again, as for any change on disk.
+            let _ = input.send(Input::FilesChanged);
+            emitter.emit(Event::Reapplied { plan: id });
+        }
     });
 }
 
@@ -864,7 +1003,8 @@ fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
         return version.clone();
     }
     let version = cli_version(shared, program);
-    if let Some(stamp) = stamp {
+    // Only an answer is kept: a failed ask (a timeout, a virus scan on first start) is tried again next time.
+    if let (Some(stamp), Some(_)) = (stamp, &version) {
         *lock(&shared.version) = Some((stamp, version.clone()));
     }
     version
@@ -1023,25 +1163,31 @@ fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
         ),
     };
     let note = if timed_out { detail.clone() } else { read_note };
-    let report = report::build(
-        &debug_text,
-        job.name.as_str(),
-        &format!("{}\n{}", detail.as_deref().unwrap_or(""), stderr),
-    );
+    let said = format!("{}\n{}", detail.as_deref().unwrap_or(""), stderr);
+    let report = report::build(&debug_text, job.name.as_str(), &said);
     Diagnosis {
         status,
         detail,
         hints: report
             .hints
             .iter()
-            .map(|kind| Hint {
-                title: kind.title().to_owned(),
-                advice: kind.advice().to_owned(),
-            })
+            .map(|&kind| hint(kind, &format!("{said}\n{debug_text}")))
             .collect(),
         server_said: report.server_said,
         client_log: report.client_log,
         note,
+    }
+}
+
+/// `said` is the text the failure was recognised in, where its error code is looked up.
+fn hint(kind: HintKind, said: &str) -> Hint {
+    Hint {
+        title: kind.title().to_owned(),
+        code: kind.code_in(said).map(str::to_owned),
+        help: kind.help().iter().map(|&line| line.to_owned()).collect(),
+        points_at: kind
+            .points_at()
+            .map(|(focus, label)| (focus, label.to_owned())),
     }
 }
 
@@ -1147,9 +1293,9 @@ mod tests {
 
     fn status_of(events: &[Event], name: &str) -> Option<(Status, Option<String>)> {
         events.iter().rev().find_map(|e| match e {
-            Event::Status { id, status, detail } if id.name == name => {
-                Some((*status, detail.clone()))
-            }
+            Event::Status {
+                id, status, detail, ..
+            } if id.name == name => Some((*status, detail.clone())),
             _ => None,
         })
     }
@@ -1402,6 +1548,199 @@ mod tests {
             let detail = detail.unwrap_or_default();
             assert!(detail.contains(needle), "{name}: {detail:?}");
         }
+    }
+
+    fn hint_of(events: &[Event], name: &str) -> Option<Hint> {
+        events.iter().rev().find_map(|e| match e {
+            Event::Status { id, hint, .. } if id.name == name => Some(hint.clone()),
+            _ => None,
+        })?
+    }
+
+    fn pointing_at(focus: Focus) -> Hint {
+        Hint {
+            title: "t".into(),
+            code: None,
+            help: Vec::new(),
+            points_at: Some((focus, "label".into())),
+        }
+    }
+
+    fn spanned<'a>(focus: Focus, target: &'a str, said: Option<&str>) -> Option<&'a str> {
+        pointing_at(focus)
+            .span(target, said)
+            .map(|range| &target[range])
+    }
+
+    #[test]
+    fn a_hint_points_at_the_part_of_the_url_it_is_about() {
+        let url = "https://acme-prod.example.com/gateway/mcp";
+        assert_eq!(
+            spanned(Focus::Host, url, None),
+            Some("acme-prod.example.com")
+        );
+        assert_eq!(
+            spanned(Focus::Address, url, None),
+            Some("acme-prod.example.com")
+        );
+        assert_eq!(spanned(Focus::Path, url, None), Some("/gateway/mcp"));
+        // Variants: a port, an IPv6 address, user info, a hidden query, no path at all.
+        let port = "http://127.0.0.1:9/mcp";
+        assert_eq!(spanned(Focus::Host, port, None), Some("127.0.0.1"));
+        assert_eq!(spanned(Focus::Address, port, None), Some("127.0.0.1:9"));
+        assert_eq!(
+            spanned(Focus::Host, "http://[::1]:8080/mcp", None),
+            Some("[::1]")
+        );
+        assert_eq!(
+            spanned(Focus::Address, "http://[::1]:8080/mcp", None),
+            Some("[::1]:8080")
+        );
+        assert_eq!(
+            spanned(Focus::Host, "https://me@host.example/x", None),
+            Some("host.example")
+        );
+        assert_eq!(
+            spanned(Focus::Path, "https://host.example/mcp?…", None),
+            Some("/mcp")
+        );
+        assert_eq!(spanned(Focus::Path, "https://host.example", None), None);
+        // A URL focus never points into a command line, nor a command focus into a URL.
+        assert_eq!(spanned(Focus::Host, "npx -y pkg", None), None);
+        assert_eq!(spanned(Focus::Command, url, None), None);
+    }
+
+    #[test]
+    fn a_hint_points_at_the_program_even_when_its_path_has_spaces() {
+        assert_eq!(spanned(Focus::Command, "npx -y pkg", None), Some("npx"));
+        assert_eq!(
+            spanned(
+                Focus::Command,
+                "npx -y pkg",
+                Some("Error: spawn npx ENOENT")
+            ),
+            Some("npx")
+        );
+        let spaced = r"C:\Program Files\nodejs\node.exe server.js --port 9";
+        assert_eq!(
+            spanned(
+                Focus::Command,
+                spaced,
+                Some(
+                    r"'C:\Program Files\nodejs\node.exe' is not recognized as an internal or external command"
+                )
+            ),
+            Some(r"C:\Program Files\nodejs\node.exe")
+        );
+        // Without Claude naming it, only the first word is certain.
+        assert_eq!(spanned(Focus::Command, spaced, None), Some(r"C:\Program"));
+        let none = Hint {
+            points_at: None,
+            ..pointing_at(Focus::Host)
+        };
+        assert_eq!(none.span("https://h.example/mcp", None), None);
+    }
+
+    #[test]
+    fn a_hint_is_named_by_the_code_it_was_reported_with() {
+        let enotfound = hint(
+            HintKind::HostNotFound,
+            "getaddrinfo ENOTFOUND acme.example.com",
+        );
+        assert_eq!(enotfound.code.as_deref(), Some("ENOTFOUND"));
+        let again = hint(
+            HintKind::HostNotFound,
+            "getaddrinfo EAI_AGAIN acme.example.com",
+        );
+        assert_eq!(again.code.as_deref(), Some("EAI_AGAIN"));
+        // Whole words only: a host or port containing the digits is not a status code.
+        let port = hint(
+            HintKind::Forbidden,
+            "forbidden by http://h.example:14030/mcp",
+        );
+        assert_eq!(port.code, None);
+        assert_eq!(
+            hint(HintKind::Forbidden, "HTTP 403 Forbidden")
+                .code
+                .as_deref(),
+            Some("403")
+        );
+        assert_eq!(
+            hint(HintKind::HostNotFound, "could not resolve host").code,
+            None
+        );
+        assert_eq!(enotfound.help.len(), HintKind::HostNotFound.help().len());
+        assert_eq!(
+            enotfound.points_at,
+            Some((Focus::Host, "this name could not be looked up".into()))
+        );
+    }
+
+    #[test]
+    fn an_unknown_host_is_explained_as_the_network_or_vpn_with_claudes_words_kept() {
+        // How Claude reports an HTTP server whose host name it cannot look up, e.g. a company server off the VPN.
+        let issue = |name: &str, said: &str| {
+            format!(
+                "{name}:\n  Scope: User config (available in all your projects)\n  Status: ✘ Failed to connect\n  Issue: {said}\n  Type: http\n  URL: https://{name}.example.com/mcp\n"
+            )
+        };
+        let enotfound = issue(
+            "acme-prod",
+            "ENOTFOUND: getaddrinfo ENOTFOUND acme-prod.example.com",
+        );
+        // The variant: the lookup failed for now (no answer from the DNS server) rather than for good.
+        let eai_again = issue("acme-dev", "getaddrinfo EAI_AGAIN acme-dev.example.com");
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "acme-prod": http("https://acme-prod.example.com/mcp"),
+                "acme-dev": http("https://acme-dev.example.com/mcp"),
+                "azure-devops": {"type": "stdio", "command": "npx"}}}),
+            r#"{"rules":[
+                {"args":["--version"],"stdout_file":"version.txt"},
+                {"args":["mcp","get","acme-prod"],"stdout_file":"prod.txt"},
+                {"args":["mcp","get","acme-dev"],"stdout_file":"dev.txt"},
+                {"args":["mcp","get","azure-devops"],"stdout_file":"connected.txt"}]}"#,
+            &[
+                ("version.txt", b"2.1.302 (Claude Code)\n"),
+                ("prod.txt", enotfound.as_bytes()),
+                ("dev.txt", eai_again.as_bytes()),
+                ("connected.txt", CONNECTED),
+            ],
+        );
+        let core = env.start();
+        let events = collect(&core, |e| {
+            ["acme-prod", "acme-dev", "azure-devops"]
+                .iter()
+                .all(|n| final_status(e, n).is_some())
+        });
+        for (name, said) in [
+            ("acme-prod", "getaddrinfo ENOTFOUND acme-prod.example.com"),
+            ("acme-dev", "getaddrinfo EAI_AGAIN acme-dev.example.com"),
+        ] {
+            let (status, detail) = status_of(&events, name).unwrap();
+            assert_eq!(status, Status::Failed, "{name}");
+            assert!(
+                detail.as_deref().is_some_and(|d| d.contains(said)),
+                "{name}: Claude's own words stay available: {detail:?}"
+            );
+            let hint = hint_of(&events, name).unwrap_or_else(|| panic!("{name}: no explanation"));
+            assert!(
+                !hint.title.contains("ENOTFOUND") && !hint.title.contains("getaddrinfo"),
+                "{name}: the title is plain language: {hint:?}"
+            );
+            // The usual causes, being offline or off the VPN, come before the rarer typo in the URL.
+            let advice = hint.help.join(" ").to_lowercase();
+            let at = |word: &str| advice.find(word).unwrap_or(usize::MAX);
+            assert!(
+                at("offline") < at("typo") && at("vpn") < at("typo"),
+                "{name}: {hint:?}"
+            );
+        }
+        assert_eq!(
+            hint_of(&events, "azure-devops"),
+            None,
+            "a connected server needs no explanation"
+        );
     }
 
     #[test]
@@ -2092,6 +2431,169 @@ mod tests {
         );
     }
 
+    /// Applies `changes` and waits for the answer.
+    fn apply_now(core: &Core, changes: Vec<Change>) {
+        let plan = plan_for(core, changes);
+        core.send(Command::Apply(plan.id));
+        collect(core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+    }
+
+    /// Events that arrive within `window`, without waiting for any in particular.
+    fn events_for(core: &Core, window: Duration) -> Vec<Event> {
+        let until = Instant::now() + window;
+        let mut events = Vec::new();
+        while Instant::now() < until {
+            while let Some(e) = core.try_recv() {
+                events.push(e);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        events
+    }
+
+    #[test]
+    fn switching_back_right_away_is_not_undone_by_the_first_change() {
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        let loc = local_id("loc", "/work/a");
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: loc.clone(),
+                enabled: false,
+            }],
+        );
+        // Within the first change's verify window, the user switches it back on.
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: loc,
+                enabled: true,
+            }],
+        );
+        let events = events_for(&core, Duration::from_millis(3000));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Reapplied { .. } | Event::ApplyFailed { .. })),
+            "{events:#?}"
+        );
+        assert_eq!(
+            config_json(&env)["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn claude_overwriting_after_two_quick_changes_loses_neither() {
+        // Found reviewing main: the first change's check stood down for the second, whose check only put its own
+        // change back, so the first was silently lost.
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        // Claude saves a copy it read before either change, without the lock.
+        let mut theirs = two_projects("end");
+        theirs["numStartups"] = serde_json::json!(9);
+        write_config(&env, &theirs);
+        let events = events_for(&core, Duration::from_millis(3000));
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Reapplied { .. })),
+            "{events:#?}"
+        );
+        let now = config_json(&env);
+        assert_eq!(now["numStartups"], 9, "Claude's own change stays");
+        assert_eq!(
+            now["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!(["loc", "gw"])
+        );
+    }
+
+    #[test]
+    fn a_later_change_that_writes_nothing_still_has_the_earlier_one_checked() {
+        // The variant: the second change finds nothing to write, yet it numbers last on the file.
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        // Already off: nothing to write.
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        write_config(&env, &two_projects("end"));
+        events_for(&core, Duration::from_millis(3000));
+        assert_eq!(
+            config_json(&env)["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!(["loc"])
+        );
+    }
+
+    #[test]
+    fn a_later_change_to_another_server_still_leaves_both_in_place() {
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        let events = events_for(&core, Duration::from_millis(3000));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Reapplied { .. } | Event::ApplyFailed { .. })),
+            "{events:#?}"
+        );
+        let disabled = &config_json(&env)["projects"]["/work/a"]["disabledMcpServers"];
+        let names: Vec<&str> = disabled
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(names.contains(&"loc") && names.contains(&"gw"), "{names:?}");
+    }
+
     // ---- approving a project server
 
     const MCP_JSON: &str = r#"{"mcpServers":{"ps":{"type":"stdio","command":"node","args":["server.js","--port","9"],"env":{"NODE_OPTIONS":"--require ./hook.js"}}}}"#;
@@ -2475,6 +2977,22 @@ mod tests {
             });
         }
         assert_eq!(env.runs(&["--version"]), 1);
+    }
+
+    #[test]
+    fn a_failed_version_ask_is_tried_again_on_the_next_refresh() {
+        // A first run can fail for reasons that pass (a virus scan on first start, a timeout); it is not an answer.
+        let env = Env::new(
+            &two_projects("end"),
+            r#"{"rules":[{"args":["--version"],"exit_code":1}]}"#,
+            &[],
+        );
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::CliVersion(None)))
+        });
+        core.send(Command::Refresh { live_all: false });
+        collect(&core, |_| env.runs(&["--version"]) == 2);
     }
 
     /// `gw` (user) and `loc` (local, in a project folder that exists), both checkable. Returns the project key.
