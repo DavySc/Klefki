@@ -16,6 +16,10 @@ sha2 = "0.10"
 memchr = "2"
 keyring-core = "1"
 zeroize = "1"
+# `claude mcp login` needs a terminal (decision 005).
+portable-pty = "0.9"
+# Opens a checked https sign-in page: ShellExecute on Windows, never `cmd /c start` (no shell).
+open = { version = "5", features = ["shellexecute-on-windows"] }
 
 # The OS's own secret store, one per platform; there is no plaintext fallback.
 [target.'cfg(windows)'.dependencies]

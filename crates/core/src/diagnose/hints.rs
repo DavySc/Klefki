@@ -102,7 +102,7 @@ impl HintKind {
             ],
             Self::NeedsAuthentication => &[
                 "The server rejected the request, or no token is stored for it.",
-                "Use Re-authorize to sign in again.",
+                "Use Sign in again: Claude Code opens the sign-in page in your browser.",
             ],
             Self::Forbidden => &["Check that your account has access to this server."],
             Self::UrlNotFound => &[
