@@ -28,6 +28,7 @@ fn fake_claude() -> &'static Path {
 const API_KEY: &str = "sk-live-ARGSECRET123456";
 const TOKEN_FLAG: &str = "--token=tok-SECRET-98765";
 const GHP: &str = "ghp_abcdefghijklmnop1234";
+const HEADER: &str = "Authorization: Bearer hdr-SECRET-abcdef123";
 
 fn get_output(name: &str, status: &str, extra: &str) -> String {
     format!(
@@ -55,6 +56,7 @@ impl Env {
                 "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-mcp", "--api-key", API_KEY, TOKEN_FLAG, GHP]},
                 "beta": {"type": "http", "url": "http://127.0.0.1:9/mcp"},
                 "delta": {"type": "sse", "url": "https://delta.example.com/sse"},
+                "remote": {"command": "npx", "args": ["mcp-remote", "https://r.example.com/mcp", "--header", HEADER]},
             },
             "projects": {
                 key.clone(): {
@@ -101,6 +103,7 @@ impl Env {
                 {"args":["mcp","get","beta"],"stdout_file":"beta.txt"},
                 {"args":["mcp","get","gamma"],"stdout_file":"gamma.txt"},
                 {"args":["mcp","get","delta"],"stdout_file":"alpha.txt"},
+                {"args":["mcp","get","remote"],"stdout_file":"alpha.txt"},
                 {"args":["mcp","get","docs"],"stdout_file":"docs.txt"}]}"#,
         )
         .unwrap();
@@ -232,7 +235,7 @@ fn list_json_has_one_object_per_server_with_stable_fields() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
     assert_eq!(v["schema"], 1);
     let servers = v["servers"].as_array().unwrap();
-    assert_eq!(servers.len(), 5, "{v:#}");
+    assert_eq!(servers.len(), 6, "{v:#}");
     let find = |name: &str| servers.iter().find(|s| s["name"] == name).unwrap();
     assert_eq!(find("alpha")["scope"], "user");
     assert_eq!(find("alpha")["transport"], "stdio");
@@ -329,8 +332,8 @@ fn status_checks_user_and_local_servers_that_are_on_and_reports_failures() {
     let mut gets = env.gets();
     gets.sort();
     gets.dedup();
-    assert_eq!(gets, ["alpha", "beta", "gamma"]);
-    assert!(stdout.contains("1 connected"), "{stdout}");
+    assert_eq!(gets, ["alpha", "beta", "gamma", "remote"]);
+    assert!(stdout.contains("2 connected"), "{stdout}");
 }
 
 #[test]
@@ -540,7 +543,7 @@ fn secrets_in_a_stdio_servers_arguments_are_never_printed() {
     ] {
         let out = env.run(args);
         let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
-        for secret in [API_KEY, "tok-SECRET-98765", GHP] {
+        for secret in [API_KEY, "tok-SECRET-98765", GHP, "hdr-SECRET-abcdef123"] {
             assert!(!all.contains(secret), "{args:?} printed {secret}:\n{all}");
         }
         assert!(all.contains("alpha"), "{args:?}: {all}");

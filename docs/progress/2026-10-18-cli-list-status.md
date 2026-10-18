@@ -22,6 +22,7 @@ Cross-review round 1 (review 5565041236; 2 blocking, 7 should-fix, 4 polish), al
 - S1 exit 3 when Claude Code cannot be used (not found, shim, or no check answered). S2 JSON `schema: 1`, `claude_version`, `status: null` + `last_known` for skipped rows, `not_checked`/`check_failed`/`no_answer`. S3 a named project server's command goes to stderr first; the hint shows it; rejected ones get no "check it". S4 "Check failed"/"No answer" instead of "Not checked" for checks that ran. S5 typo suggestions (edit distance) for names and commands. S6 no arguments prints the help with examples; usage line names `--claude`. S7 progress names the server waited on.
 - P1 `reload_after_change` also honours `background_checks`. P2 the hint's first line names the server. P4 `~/…` for project paths under home. Natural sort of names.
 - Merged main (#24, process-tree kill) with no conflicts.
+- Round 2 (review 5565099974): one gap in B1, mcp-remote's `--header "Authorization: Bearer <token>"` (either spacing) was shown in full. `shown_args` now shows a secret-sounding header as `Name: …`, keeping the scheme and `${VAR}` values; core test both spacings, CLI end-to-end row (fails without the fix). Suggestion ties prefer the typed case.
 
 Not verified: a real Claude Code (only fake-claude).
 

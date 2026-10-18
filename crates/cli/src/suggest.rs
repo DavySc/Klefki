@@ -12,7 +12,8 @@ pub fn closest<'a>(typed: &str, candidates: impl IntoIterator<Item = &'a str>) -
             let longer = typed.chars().count().max(c.chars().count());
             d <= 2 && d * 3 <= longer
         })
-        .min_by_key(|&(d, c)| (d, c))
+        // On a tie, the one whose case is closest to what was typed.
+        .min_by_key(|&(d, c)| (d, distance(typed, c), c))
         .map(|(_, c)| c)
 }
 

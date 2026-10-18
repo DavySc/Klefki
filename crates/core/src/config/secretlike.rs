@@ -128,6 +128,8 @@ pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<Str
     for arg in args {
         let shown = if after_secret_flag && !arg.starts_with('-') && hideable(arg) {
             HIDDEN.to_owned()
+        } else if let Some(header) = shown_header(arg) {
+            header
         } else if let Some((name, value)) = arg.split_once('=')
             && !name.is_empty()
             && !value.is_empty()
@@ -143,6 +145,30 @@ pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<Str
         out.push(shown);
     }
     out
+}
+
+/// An HTTP header passed as one argument, as mcp-remote takes them (`--header "Authorization: Bearer <token>"`):
+/// `Name: …` when the name sounds secret, keeping a `Bearer`/`Basic`/`Token` scheme. `None` for anything else,
+/// including a value that is a `${VAR}` reference.
+fn shown_header(arg: &str) -> Option<String> {
+    let (name, value) = arg.split_once(':')?;
+    let value = value.trim();
+    let is_name = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !is_name || value.is_empty() || value.starts_with("//") || !sounds_secret(name) {
+        return None;
+    }
+    if value.contains("${") {
+        return None;
+    }
+    Some(match value.split_once(' ') {
+        Some((scheme, _)) if SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme)) => {
+            format!("{name}: {scheme} …")
+        }
+        _ => format!("{name}: …"),
+    })
 }
 
 /// A value after a secret-sounding name that is worth hiding: not a reference, not a path, not a plain word such
@@ -196,6 +222,32 @@ mod tests {
         assert_eq!(shown(&["--password", "hunter2"]), "--password …");
         assert_eq!(shown(&["--secret", "x"]), "--secret …");
         assert_eq!(shown(&["API_KEY=0a1b2c3d4e"]), "API_KEY=…");
+        // Review of #25, round 2: mcp-remote's `--header`, in both spacings, and other secret headers.
+        assert_eq!(
+            shown(&["--header", "Authorization: Bearer abcdef1234567890XYZ"]),
+            "--header Authorization: Bearer …"
+        );
+        assert_eq!(
+            shown(&["--header", "Authorization:Bearer abcdef1234567890XYZ="]),
+            "--header Authorization: Bearer …"
+        );
+        assert_eq!(
+            shown(&["--header", "X-Api-Key: k123"]),
+            "--header X-Api-Key: …"
+        );
+        assert_eq!(shown(&["--header", "Cookie:sid=1"]), "--header Cookie: …");
+        assert_eq!(
+            shown(&["--header", "Authorization: Bearer ${AUTH_TOKEN}"]),
+            "--header Authorization: Bearer ${AUTH_TOKEN}"
+        );
+        assert_eq!(
+            shown(&["--header", "Accept: text/event-stream"]),
+            "--header Accept: text/event-stream"
+        );
+        assert_eq!(
+            shown(&["https://x.example.com/mcp"]),
+            "https://x.example.com/mcp"
+        );
         // A credential's shape alone gives it away, wherever it is.
         assert_eq!(shown(&["serve", "ghp_abcdefghijklmnop1234"]), "serve …");
         assert_eq!(
