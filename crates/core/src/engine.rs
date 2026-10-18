@@ -762,9 +762,15 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             )?;
             // Asked now, so a store that is missing or locked stops the change before anything runs.
             let store = if resolved.cli.iter().any(|a| a.secret.is_some()) {
+                // What happened and what to do first, in plain words; what the store said after, on its own line.
                 let next = |e: crate::secrets::SecretError| {
+                    let which = if cfg!(target_os = "linux") {
+                        " (GNOME Keyring or KWallet)"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "{e} To add it with its client secret, start your system's secret store (on Linux, GNOME Keyring or KWallet) and press Review again; or leave the client secret empty if the server does not need one."
+                        "Klefki can't use your system's secret store. Start or unlock it{which} and press Review again, or leave the client secret empty if the server does not need one.\n{e}"
                     )
                 };
                 let store = secret_store(shared).map_err(next)?;
@@ -5507,16 +5513,22 @@ mod tests {
             &core,
             vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
         );
-        assert!(refused.contains("no plaintext copy"), "{refused}");
-        // And what to do about it.
+        // First what happened and what to do, in plain words; what the store said comes after, on its own line.
+        let (plain, detail) = refused.split_once('\n').expect("a detail line");
         assert!(
-            refused.contains("start your system's secret store"),
+            plain.starts_with("Klefki can't use your system's secret store."),
             "{refused}"
         );
-        assert!(
-            refused.contains("leave the client secret empty"),
+        assert!(plain.contains("press Review again"), "{refused}");
+        assert!(plain.contains("leave the client secret empty"), "{refused}");
+        assert_eq!(
+            plain.contains("GNOME Keyring"),
+            cfg!(target_os = "linux"),
             "{refused}"
         );
+        assert!(!plain.contains("Secret Service"), "{refused}");
+        assert!(detail.contains("no Secret Service"), "{refused}");
+        assert!(detail.contains("no plaintext copy"), "{refused}");
         assert!(env.add_json_runs().is_empty());
         // A store that is there but refuses says the same next step.
         *store.fail.lock().unwrap() = Some(crate::secrets::SecretError::Failed("denied".into()));
@@ -5524,11 +5536,9 @@ mod tests {
             &core,
             vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
         );
-        assert!(refused.contains("denied"), "{refused}");
-        assert!(
-            refused.contains("leave the client secret empty"),
-            "{refused}"
-        );
+        let (plain, detail) = refused.split_once('\n').expect("a detail line");
+        assert!(plain.contains("leave the client secret empty"), "{refused}");
+        assert!(detail.contains("denied"), "{refused}");
         assert!(env.add_json_runs().is_empty());
     }
 
