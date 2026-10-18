@@ -226,6 +226,35 @@ mod tests {
     }
 
     #[test]
+    fn secrets_the_server_printed_as_json_never_reach_the_report() {
+        // Found reviewing main: the client logs a server's stderr inside a quoted string, so the quotes of JSON the
+        // server printed arrive escaped (`\"`), and the rules, written for plain quotes, let the values through, both
+        // in the client's log lines and, once unescaped, in what the server said.
+        let text = r#"[ERROR] "MCP server \"s\" Server stderr: loaded {\"apiKey\":\"SECRETKEY111\", \"password\" : \"SECRETPW222\",\"headers\":{\"X-Custom\":\"SECRETHDR333\"},\"Authorization\":\"Basic SECRETBASIC444\",\"env\":{\"PLAIN\":\"SECRETENV555\"}}"
+"#;
+        let r = build(text, "s", "");
+        assert_eq!(r.server_said.len(), 1, "{r:?}");
+        let everything = format!("{r:?}");
+        for secret in [
+            "SECRETKEY111",
+            "SECRETPW222",
+            "SECRETHDR333",
+            "SECRETBASIC444",
+            "SECRETENV555",
+        ] {
+            assert!(
+                !everything.contains(secret),
+                "{secret} leaked: {everything}"
+            );
+        }
+        assert!(
+            r.server_said[0].starts_with("loaded {\"apiKey\":"),
+            "names stay readable: {:?}",
+            r.server_said
+        );
+    }
+
+    #[test]
     fn without_lines_about_the_server_the_tail_of_the_log_is_shown() {
         let text: String = (0..100)
             .map(|i| format!("2026-10-17T20:00:00.{i:03}Z [DEBUG] unrelated line {i}\n"))
