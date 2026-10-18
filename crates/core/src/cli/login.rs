@@ -38,7 +38,7 @@ pub(crate) struct Page {
     state: String,
 }
 
-/// Finds the sign-in link in what Claude printed so far (already cleaned of escapes). `None` while there is none;
+/// Finds the sign-in link in what Claude printed so far (already cleaned of escapes, see [`words`]). `None` while there is none;
 /// `Err` says why a link that was printed cannot be used.
 pub(crate) fn find_page(text: &str) -> Option<Result<Page, String>> {
     // Only words that are complete: output arrives in pieces, and a link cut short can look whole.
@@ -393,7 +393,7 @@ impl Reading {
         keep(&mut self.output, bytes);
         self.text = sanitize(&String::from_utf8_lossy(&self.output));
         if self.page.is_none() {
-            match find_page(&self.text) {
+            match find_page(&words(&self.output)) {
                 Some(Ok(found)) => {
                     self.page = Some(found.clone());
                     progress(Progress::Page(found));
@@ -410,6 +410,20 @@ impl Reading {
         }
         Ok(())
     }
+}
+
+/// `output` as text in which a word also ends where the terminal moved on: at an escape or a carriage return. A
+/// Windows pseudo-console redraws lines with cursor moves instead of line breaks, which cleaning alone would close up.
+fn words(output: &[u8]) -> String {
+    let mut spaced = Vec::with_capacity(output.len() + output.len() / 8);
+    for &b in output {
+        match b {
+            0x1b => spaced.extend_from_slice(b" \x1b"),
+            b'\r' => spaced.push(b'\n'),
+            _ => spaced.push(b),
+        }
+    }
+    sanitize(&String::from_utf8_lossy(&spaced))
 }
 
 fn answer_queries(term: &mut dyn Terminal, bytes: &[u8]) {
@@ -881,6 +895,40 @@ mod tests {
             .collect();
         assert_eq!(pages.len(), 1, "{seen:?}");
         assert_eq!(pages[0], &Progress::Page(https_page()));
+    }
+
+    /// A Windows pseudo-console redraws what it shows: a line can end in a cursor move, or a bare carriage return,
+    /// instead of a line break. The link must still end where the line does (CI on windows-latest read
+    /// `…%2FmcpWaiting`).
+    #[test]
+    fn a_link_ends_where_its_line_does_however_the_terminal_moves_on() {
+        let bytes = fixture("synthetic-waiting-https.txt");
+        let at = bytes
+            .windows(11)
+            .position(|w| w == b"\r\n\r\nWaiting")
+            .unwrap();
+        for moves_on in [
+            &b"\x1b[5;1H"[..],
+            b"\x1b[K\x1b[2C",
+            b"\r",
+            b"\x1b[?25l\r\x1b[?25h",
+        ] {
+            let mut redrawn = bytes[..at].to_vec();
+            redrawn.extend_from_slice(moves_on);
+            redrawn.extend_from_slice(&bytes[at + 4..]);
+            let mut term = Script::default();
+            let seen = run(
+                &mut term,
+                vec![Message::Output(redrawn), Message::Cancel],
+                Duration::from_secs(5),
+            );
+            assert_eq!(
+                seen.first(),
+                Some(&Progress::Page(https_page())),
+                "{:?}",
+                String::from_utf8_lossy(moves_on)
+            );
+        }
     }
 
     /// `claude mcp login` played by fake-claude, in a real pseudo-terminal.
