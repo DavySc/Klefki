@@ -14,7 +14,8 @@ const fn hex(rgb: u32) -> Color32 {
 }
 
 pub struct Palette {
-    /// Text fields and code: Mocha crust.
+    /// Text fields and code. In the dark themes one step lighter than `panel` (between base and
+    /// surface0), not a well darker than it: a field is a place to type, so it should sit up, not recede.
     pub field: Color32,
     /// Nav and top bar: Mocha mantle.
     pub chrome: Color32,
@@ -48,7 +49,7 @@ pub struct Palette {
 }
 
 pub const DARK: Palette = Palette {
-    field: hex(0x11111B),
+    field: hex(0x282839),
     chrome: hex(0x181825),
     panel: hex(0x1E1E2E),
     panel_raised: hex(0x313244),
@@ -97,7 +98,7 @@ pub const LIGHT: Palette = Palette {
 
 /// Warm gray, dark: less saturated than Mocha's blue-violet, warm without going muddy. Same accents.
 pub const WARM_DARK: Palette = Palette {
-    field: hex(0x131211),
+    field: hex(0x262422),
     chrome: hex(0x181716),
     panel: hex(0x1D1C1A),
     panel_raised: hex(0x2A2826),
@@ -482,12 +483,34 @@ pub(crate) mod tests {
         // Spot checks against the published Mocha and Latte values.
         assert_eq!(DARK.panel, hex(0x1E1E2E)); // Mocha base
         assert_eq!(DARK.chrome, hex(0x181825)); // Mocha mantle
-        assert_eq!(DARK.field, hex(0x11111B)); // Mocha crust
         assert_eq!(DARK.text, hex(0xCDD6F4));
         assert_eq!(DARK.primary, hex(0xCBA6F7)); // Mocha mauve
         assert_eq!(LIGHT.panel, hex(0xEFF1F5)); // Latte base
         assert_eq!(LIGHT.chrome, hex(0xE6E9EF)); // Latte mantle
         assert_eq!(LIGHT.text, hex(0x4C4F69)); // Latte text
+    }
+
+    #[test]
+    fn dark_fields_sit_above_the_panel_not_below_it() {
+        // Fields used to be the darkest surface (crust), which read as holes in the window.
+        for (name, p) in [("cool", &DARK), ("warm", &WARM_DARK)] {
+            assert!(
+                lum(p.field) > lum(p.panel),
+                "{name}: field is not lighter than panel"
+            );
+            assert!(
+                lum(p.field) < lum(p.panel_raised),
+                "{name}: field outshines raised surfaces"
+            );
+            assert!(
+                contrast(p.field, p.panel) >= 1.1,
+                "{name}: field does not stand out"
+            );
+            assert!(
+                contrast(p.border, p.field) >= 1.5,
+                "{name}: field outline is lost"
+            );
+        }
     }
 
     #[test]
