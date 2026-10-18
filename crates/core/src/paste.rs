@@ -257,7 +257,7 @@ fn is_definition(object: &Map<String, Value>) -> bool {
 // --- Commands --------------------------------------------------------------------------------------------------
 
 fn from_commands(text: &str) -> Result<Pasted, String> {
-    let lexed = lex(text);
+    let lexed = lex_with(text, true);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
     for command in &lexed.commands {
@@ -275,8 +275,18 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
                     "This command uses the shell ({what}), and Klefki never runs pasted text. Paste the claude mcp add command on its own."
                 ),
             )),
-            (Some(("add", rest)), None) => servers.push(add(rest, &mut notes)),
-            (Some((_, rest)), None) => servers.push(add_json(rest, &mut notes)),
+            (Some((verb, rest)), None) => {
+                let mut server = if verb == "add" {
+                    add(rest, &mut notes)
+                } else {
+                    add_json(rest, &mut notes)
+                };
+                if let Some(what) = command.typography {
+                    // First: what it causes (an odd name, a stray word) is not the problem.
+                    server.problem = Some(what.to_owned());
+                }
+                servers.push(server);
+            }
             (None, _) => notes.push(format!(
                 "Skipped a line that is not a claude mcp add command: {}",
                 clip(&sanitize(&command.words.join(" ")), 60)
@@ -341,6 +351,23 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             Some((o, v)) if o.starts_with("--") => (o, Some(v)),
             _ => (word, None),
         };
+        let takes_value = matches!(
+            option,
+            "-s" | "--scope"
+                | "-t"
+                | "--transport"
+                | "-e"
+                | "--env"
+                | "-H"
+                | "--header"
+                | "--client-id"
+                | "--callback-port"
+        );
+        if takes_value && inline.is_none() && i >= words.len() {
+            // Claude Code stops here too.
+            problem.get_or_insert(format!("{option} needs a value after it."));
+            continue;
+        }
         // The option's value: after `=`, or the next word.
         let value = |i: &mut usize| -> Option<&str> {
             if inline.is_some() {
@@ -561,7 +588,13 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
         match word.split_once('=') {
             Some(("--scope", v)) => scope = Some(v),
             _ if word == "-s" || word == "--scope" => {
-                scope = words.get(i).copied();
+                let Some(value) = words.get(i).copied() else {
+                    return PastedServer::refused(
+                        positional.first().copied().unwrap_or_default(),
+                        format!("{word} needs a value after it."),
+                    );
+                };
+                scope = Some(value);
                 i += 1;
             }
             Some(("--client-secret", _)) => {
@@ -691,7 +724,8 @@ fn pairs(pairs: &[(String, String)]) -> Value {
     )
 }
 
-/// Git Bash rewrites `/c` to `C:/` on the way to a Windows program, so `cmd /c npx …` arrives as `cmd C:/ npx …`.
+/// Git Bash rewrites `/c` to `C:/` on the way to a Windows program, so `cmd /c npx …` arrives as `cmd C:/ npx …`,
+/// and `cmd /s /c` as `cmd S:/ C:/`: every such switch right after cmd is put back.
 fn undo_git_bash_drive(entry: &mut Value, notes: &mut Vec<String>) {
     let is_cmd = entry
         .get("command")
@@ -703,16 +737,19 @@ fn undo_git_bash_drive(entry: &mut Value, notes: &mut Vec<String>) {
     if !is_cmd {
         return;
     }
-    if let Some(first) = entry.pointer_mut("/args/0")
-        && let Some(s) = first.as_str()
-        && s.len() == 3
-        && s.as_bytes()[0].is_ascii_alphabetic()
-        && &s[1..] == ":/"
-    {
+    let Some(Value::Array(args)) = entry.get_mut("args") else {
+        return;
+    };
+    for arg in args {
+        let Some(s) = arg.as_str() else { break };
+        if !(s.len() == 3 && s.as_bytes()[0].is_ascii_alphabetic() && &s[1..] == ":/") {
+            break;
+        }
+        let switch = format!("/{}", s[..1].to_ascii_lowercase());
         notes.push(format!(
-            "Read {s} after cmd as /c: Git Bash turns /c into a drive on its way to a Windows program."
+            "Read {s} after cmd as {switch}: Git Bash turns {switch} into a drive on its way to a Windows program."
         ));
-        *first = Value::String(format!("/{}", s[..1].to_ascii_lowercase()));
+        *arg = Value::String(switch);
     }
 }
 
@@ -818,13 +855,26 @@ pub(crate) struct Words {
     /// What in it needs a shell to run (a pipe, a redirect, a substitution, an open quote): the rest of its line was
     /// not read.
     pub shell: Option<&'static str>,
+    /// What a web page or word processor put in place of a plain character: a curly quote or a long dash starting a
+    /// word. Kept as written; the reason it may not do what it says.
+    pub typography: Option<&'static str>,
 }
+
+const CURLY_QUOTES: &str = "The command has curly quotes (\u{201c} \u{201d} or \u{2018} \u{2019}), which a web page puts in place of straight quotes, so a shell would not read them as quotes. Type them again as straight quotes (\" or ').";
+const LONG_DASH: &str = "A word starts with a long dash (\u{2013} or \u{2014}), which a web page puts in place of two hyphens. Type it again as --.";
 
 /// Splits pasted shell text into commands and words the way a POSIX shell would, plus the line continuations of
 /// PowerShell (`` ` ``) and cmd (`^`). A backslash only escapes what a shell would need escaping, so a Windows path
 /// keeps its backslashes. A command that needs a shell to run (pipes, redirects, substitutions) is marked, and the
-/// rest of its line skipped; the other lines are still read.
+/// rest of its line skipped; the other lines are still read. A non-breaking space separates words, as a web page
+/// shows one where a space was meant.
 pub(crate) fn lex(text: &str) -> Lexed {
+    lex_with(text, false)
+}
+
+/// [`lex`], and with `pasted`, a line that does not start with `claude` is kept whole as one word, unread: it is
+/// prose or another program's command, and read, an apostrophe (`Don't`) would open a quote running to the end.
+fn lex_with(text: &str, pasted: bool) -> Lexed {
     let mut commands: Vec<Words> = Vec::new();
     let mut variables: Vec<String> = Vec::new();
     let mut current = Words::default();
@@ -843,8 +893,29 @@ pub(crate) fn lex(text: &str) -> Lexed {
         }
     };
     while let Some(c) = chars.next() {
+        if pasted
+            && !in_word
+            && current.words.is_empty()
+            && !c.is_whitespace()
+            && !"$#'\"\\`^;&|<>()".contains(c)
+        {
+            let mut ahead = chars.clone();
+            let mut first = String::from(c);
+            while let Some(n) = ahead.next_if(|n| !n.is_whitespace()) {
+                first.push(n);
+            }
+            if !is_claude(&first) {
+                let mut line = String::from(c);
+                while let Some(n) = chars.next_if(|&n| n != '\n') {
+                    line.push(n);
+                }
+                current.words.push(line);
+                end_command(&mut commands, &mut current);
+                continue;
+            }
+        }
         let shell: Option<&'static str> = match c {
-            ' ' | '\t' | '\r' => {
+            ' ' | '\t' | '\r' | '\u{a0}' | '\u{202f}' => {
                 end_word(&mut current, &mut word, &mut in_word);
                 None
             }
@@ -916,6 +987,13 @@ pub(crate) fn lex(text: &str) -> Lexed {
                 variable(&mut chars, &mut word, &mut variables).err()
             }
             _ => {
+                if !in_word {
+                    if matches!(c, '\u{201c}' | '\u{201d}' | '\u{2018}' | '\u{2019}') {
+                        current.typography.get_or_insert(CURLY_QUOTES);
+                    } else if matches!(c, '\u{2013}' | '\u{2014}') {
+                        current.typography.get_or_insert(LONG_DASH);
+                    }
+                }
                 in_word = true;
                 word.push(c);
                 None
@@ -1491,6 +1569,98 @@ mod tests {
         assert!(s.summary.contains("\"has space\""), "{s:?}");
         let s = one(&format!("claude mcp add x -- node {}", "y".repeat(5000)));
         assert!(s.summary.chars().count() < 400, "{}", s.summary.len());
+    }
+
+    #[test]
+    fn prose_with_an_apostrophe_hides_none_of_the_commands_after_it() {
+        // Found reviewing main: an apostrophe in a README line opened a quote that ran to the end of the paste.
+        for text in [
+            "Don't run as root.\nclaude mcp add a -s user node\nclaude mcp add b node",
+            "Here's how:\nclaude mcp add a -s user node\nclaude mcp add b node",
+            "1. Don't forget the scope:\n$ claude mcp add a -s user node\n$ claude mcp add b node",
+            "claude mcp add a -s user node\nThat's it. The next one's for docs:\nclaude mcp add b node",
+        ] {
+            let pasted = Pasted::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            let names: Vec<_> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["a", "b"], "{text}");
+            assert!(
+                pasted.notes.iter().any(|n| n.starts_with("Skipped a line")),
+                "{:?}",
+                pasted.notes
+            );
+        }
+        // A quote in a claude command still runs over lines, and a quoted program path is still read.
+        let s = one("claude mcp add-json x '{\n  \"command\": \"node\"\n}'\nThat's all.");
+        assert_eq!(json_of(&s)["command"], "node");
+        let s = one(r#""C:\Program Files\claude\claude.exe" mcp add x node"#);
+        assert_eq!(json_of(&s)["command"], "node");
+    }
+
+    #[test]
+    fn every_switch_git_bash_turned_into_a_drive_is_undone() {
+        // Found reviewing main: `cmd /s /c npx` arrives as `cmd S:/ C:/ npx`, and only the first was undone.
+        let pasted = Pasted::parse("claude mcp add w -- cmd S:/ C:/ npx -y pkg").unwrap();
+        assert_eq!(
+            json_of(&pasted.servers[0])["args"],
+            json!(["/s", "/c", "npx", "-y", "pkg"])
+        );
+        // Still only the switches right after cmd.
+        let v = json_of(&one("claude mcp add w -- cmd C:/ dir D:/"));
+        assert_eq!(v["args"], json!(["/c", "dir", "D:/"]));
+    }
+
+    #[test]
+    fn an_option_without_its_value_is_a_problem() {
+        // Found reviewing main: these were dropped without a word, where Claude Code stops with an error.
+        for (text, option) in [
+            ("claude mcp add x node -e", "-e"),
+            (
+                "claude mcp add --transport http x https://h.example.com/mcp -H",
+                "-H",
+            ),
+            ("claude mcp add x node --client-id", "--client-id"),
+            ("claude mcp add x node -t", "-t"),
+            (r#"claude mcp add-json x '{"command":"node"}' -s"#, "-s"),
+        ] {
+            let s = one(text);
+            let problem = s.problem.unwrap_or_else(|| panic!("no problem for {text}"));
+            assert!(problem.contains(option), "{text}: {problem}");
+        }
+    }
+
+    #[test]
+    fn typography_from_a_web_page_is_read_or_named() {
+        // Found reviewing main: a page's non-breaking spaces, en dash and curly quotes.
+        let s = one("claude\u{a0}mcp\u{a0}add x\u{a0}--\u{a0}npx -y pkg");
+        assert_eq!(json_of(&s)["args"], json!(["-y", "pkg"]));
+        for (text, says) in [
+            (
+                "claude mcp add \u{2013}-transport http x https://h.example.com/mcp",
+                "--",
+            ),
+            (
+                "claude mcp add \u{2014}transport http x https://h.example.com/mcp",
+                "--",
+            ),
+            (
+                "claude mcp add x -- node \u{201c}a b\u{201d}",
+                "straight quotes",
+            ),
+            (
+                "claude mcp add x -- node \u{2018}a b\u{2019}",
+                "straight quotes",
+            ),
+        ] {
+            let s = one(text);
+            let problem = s.problem.unwrap_or_else(|| panic!("no problem for {text}"));
+            assert!(problem.contains(says), "{text}: {problem}");
+        }
+        // Inside straight quotes, they are what was meant.
+        let s = one("claude mcp add x -- node \"\u{201c}quoted\u{201d}\u{a0}text\"");
+        assert_eq!(
+            json_of(&s)["args"],
+            json!(["\u{201c}quoted\u{201d}\u{a0}text"])
+        );
     }
 
     #[test]
