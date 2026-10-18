@@ -97,10 +97,10 @@ impl Approval {
     }
 }
 
-/// Identifies a row across snapshots, so live results can be matched back to it. `scope`, `project` and `name`
-/// are as shown (cleaned, cut); `connection` is made from the keys as the file spells them and is what tells two
-/// servers apart: two names can look the same once cleaned.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Identifies a row across snapshots, so live results can be matched back to it. Identity is `connection` alone,
+/// made from the keys as the file spells them: two names can look the same once cleaned. `scope`, `project` and
+/// `name` are for showing, cleaned and cut like the row's; equality, hashing and order ignore them.
+#[derive(Debug, Clone)]
 pub struct ServerId {
     pub scope: Scope,
     pub project: Option<String>,
@@ -109,14 +109,41 @@ pub struct ServerId {
 }
 
 impl ServerId {
-    /// The id of a server whose project and name are spelled in the file exactly as given.
+    /// The id of a server whose project key and name the file spells exactly as given.
     pub fn new(scope: Scope, project: Option<&str>, name: &str) -> Self {
         Self {
             scope,
-            project: project.map(str::to_owned),
-            name: name.to_owned(),
+            project: project
+                .map(|p| crate::sanitize::shown(&crate::config::inventory::normalise_project(p))),
+            name: crate::sanitize::shown(name),
             connection: crate::model::ConnectionId::new(scope, project, name),
         }
+    }
+}
+
+impl PartialEq for ServerId {
+    fn eq(&self, other: &Self) -> bool {
+        self.connection == other.connection
+    }
+}
+
+impl Eq for ServerId {}
+
+impl std::hash::Hash for ServerId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.connection.hash(state);
+    }
+}
+
+impl PartialOrd for ServerId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ServerId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.connection.cmp(&other.connection)
     }
 }
 
@@ -225,7 +252,7 @@ pub fn load_snapshot() -> Arc<Snapshot> {
 }
 
 pub fn load_snapshot_from(paths: &ConfigPaths) -> Arc<Snapshot> {
-    Arc::new(crate::config::inventory::load(paths))
+    Arc::new(crate::config::inventory::load(paths).snapshot)
 }
 
 /// Demo data from an embedded fixture, passed through the same sanitising path real data uses.
@@ -279,6 +306,25 @@ mod tests {
                 .filter(|r| r.scope != Scope::User)
                 .all(|r| r.project.is_some())
         );
+    }
+
+    #[test]
+    fn a_server_id_is_its_connection() {
+        // Review of the fix: equality and hashing also compared the shown fields, so two ids for one server could
+        // differ while `is()` said they matched.
+        let a = ServerId::new(Scope::Local, Some("C:\\x"), "s");
+        let mut b = a.clone();
+        b.name = "other".into();
+        b.project = None;
+        b.scope = Scope::User;
+        assert_eq!(a, b);
+        let set: std::collections::HashSet<ServerId> = [a.clone(), b].into_iter().collect();
+        assert_eq!(set.len(), 1);
+        // The shown fields are cleaned and cut like a row's.
+        let hidden = ServerId::new(Scope::User, None, "a\u{202e}b");
+        assert_eq!(hidden.name, "ab");
+        assert_ne!(hidden, ServerId::new(Scope::User, None, "ab"));
+        assert_eq!(a.project.as_deref(), Some("C:/x"));
     }
 
     #[test]
