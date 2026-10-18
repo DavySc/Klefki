@@ -7,9 +7,9 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint, Pasted,
-    PastedServer, PlanView, Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status,
-    Target, TransportKind,
+    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint,
+    LegacyDisabled, Pasted, PastedServer, PlanView, Scope, Secret, ServerId, ServerName, ServerRow,
+    Snapshot, Status, Target, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -206,6 +206,8 @@ pub struct ShellApp {
     explained: Option<(ExplainedFor, Option<Arc<Explanation>>)>,
     /// The grid's rows for the current snapshot and search, built when either changes rather than every frame.
     grid_cache: Option<(String, Arc<[GridRow]>)>,
+    /// The notice about old switch-off lists, for the snapshot it was built from.
+    legacy_cache: Option<(Arc<Snapshot>, Arc<LegacyNotice>)>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
     cli_version: Option<String>,
@@ -248,6 +250,7 @@ impl ShellApp {
             grid_cache: None,
             live_gen: 0,
             explained: None,
+            legacy_cache: None,
             diagnoses: HashMap::new(),
             cli_version: None,
             cli_problem: None,
@@ -810,14 +813,22 @@ impl ShellApp {
     /// Projects with the switch-off list of older Claude Code versions: what is on because Claude Code no longer
     /// reads it, and a button that moves it into the list it does read. Read-only until the user reviews the plan.
     fn legacy_notice(&mut self, ui: &mut Ui) {
-        let lists = &self.snapshot.legacy_disabled;
-        if lists.is_empty() {
+        if self.snapshot.legacy_disabled.is_empty() {
             return;
         }
-        const SHOWN: usize = 4;
+        // Built once per snapshot, not every frame.
+        let notice = match &self.legacy_cache {
+            Some((for_snapshot, built)) if Arc::ptr_eq(for_snapshot, &self.snapshot) => {
+                built.clone()
+            }
+            _ => {
+                let built = Arc::new(LegacyNotice::new(&self.snapshot.legacy_disabled));
+                self.legacy_cache = Some((self.snapshot.clone(), built.clone()));
+                built
+            }
+        };
         let pal = theme::palette(ui.ctx());
-        let can_migrate =
-            self.core.is_some() && self.can_prepare() && lists.iter().any(|l| !l.malformed);
+        let can_migrate = self.core.is_some() && self.can_prepare() && notice.migratable;
         let mut migrate = false;
         Frame::new()
             .stroke(egui::Stroke::new(1.0, pal.warn))
@@ -825,15 +836,7 @@ impl ShellApp {
             .inner_margin(Margin::same(10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                let title = if lists.len() == 1 {
-                    "Old switch-off list in 1 project".to_owned()
-                } else {
-                    format!("Old switch-off lists in {} projects", lists.len())
-                };
-                ui.label(
-                    RichText::new(format!("{} {title}", icon::CLOCK_COUNTER_CLOCKWISE))
-                        .color(pal.warn),
-                );
+                ui.label(RichText::new(notice.title.as_str()).color(pal.warn));
                 ui.add(
                     egui::Label::new(
                         RichText::new(
@@ -843,35 +846,19 @@ impl ShellApp {
                     )
                     .wrap(),
                 );
-                for l in lists.iter().take(SHOWN) {
-                    let folder = folder_name(&l.shown);
-                    let line = if l.malformed {
-                        format!("{folder}: holds something other than server names; edit it in .claude.json by hand")
-                    } else if l.names.is_empty() {
-                        format!("{folder}: an empty list")
-                    } else {
-                        let state = match l.turns_off.as_slice() {
-                            [] => "already off".to_owned(),
-                            [one] => format!("{one} is on"),
-                            many => format!("{} are on", some_names(many)),
-                        };
-                        format!("{folder}: {} ({state})", some_names(&l.names))
-                    };
-                    ui.add(egui::Label::new(line).wrap())
-                        .on_hover_text(l.shown.as_str());
+                for (line, path) in &notice.lines {
+                    ui.add(egui::Label::new(line.as_str()).wrap())
+                        .on_hover_text(path.as_str());
                 }
-                if lists.len() > SHOWN {
-                    ui.label(
-                        RichText::new(format!("… and {} more", lists.len() - SHOWN))
-                            .color(pal.text_muted),
-                    );
+                if let Some(more) = &notice.more {
+                    ui.label(RichText::new(more.as_str()).color(pal.text_muted));
                 }
                 migrate = ui
                     .add_enabled(can_migrate, egui::Button::new("Migrate…"))
                     .on_hover_text("Review the change before anything is written")
                     .on_disabled_hover_text(if self.core.is_none() {
                         "Not connected to the configuration"
-                    } else if lists.iter().all(|l| l.malformed) {
+                    } else if !notice.migratable {
                         "Only lists of server names can be migrated"
                     } else {
                         "Wait for the open change to finish"
@@ -3366,9 +3353,59 @@ fn parent_folder(path: &str) -> &str {
     }
 }
 
-/// Names joined with commas; past the first few, only counted, so a long list stays readable.
+/// What the notice about old switch-off lists says, for one snapshot.
+struct LegacyNotice {
+    title: String,
+    /// One line per project shown, with its full path for the hover.
+    lines: Vec<(String, String)>,
+    /// "… and N more" when there are more projects than lines.
+    more: Option<String>,
+    /// At least one list can be migrated (holds only names).
+    migratable: bool,
+}
+
+impl LegacyNotice {
+    fn new(lists: &[LegacyDisabled]) -> Self {
+        const SHOWN: usize = 4;
+        let title = if lists.len() == 1 {
+            "Old switch-off list in 1 project".to_owned()
+        } else {
+            format!("Old switch-off lists in {} projects", lists.len())
+        };
+        let lines = lists
+            .iter()
+            .take(SHOWN)
+            .map(|l| {
+                let folder = folder_name(&l.shown);
+                let line = if l.malformed {
+                    format!(
+                        "{folder}: holds something other than server names; edit it in .claude.json by hand"
+                    )
+                } else if l.names.is_empty() {
+                    format!("{folder}: an empty list")
+                } else {
+                    let state = match l.turns_off.as_slice() {
+                        [] => "already off".to_owned(),
+                        [one] => format!("{one} is on"),
+                        many => format!("{} are on", some_names(many)),
+                    };
+                    format!("{folder}: {} ({state})", some_names(&l.names))
+                };
+                (line, l.shown.clone())
+            })
+            .collect();
+        Self {
+            title: format!("{} {title}", icon::CLOCK_COUNTER_CLOCKWISE),
+            lines,
+            more: (lists.len() > SHOWN).then(|| format!("… and {} more", lists.len() - SHOWN)),
+            migratable: lists.iter().any(|l| !l.malformed),
+        }
+    }
+}
+
+/// Names joined with commas; past the first few, only counted, so a long list stays readable. The app cannot use
+/// core's `ops::some_of`, which cuts the review's summary the same way; keep the two alike.
 fn some_names(names: &[String]) -> String {
-    // As many as the review's summary names.
     const NAMED: usize = 5;
     if names.len() <= NAMED + 1 {
         return names.join(", ");
@@ -6176,6 +6213,29 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_notice_is_built_once_per_snapshot() {
+        // Review of #16: its lines were formatted every frame.
+        let (mut h, engine) = legacy_harness(vec![legacy("/p", &["gw"], &["gw"], false)]);
+        let first = h.state().legacy_cache.as_ref().unwrap().1.clone();
+        h.run();
+        assert!(Arc::ptr_eq(
+            &first,
+            &h.state().legacy_cache.as_ref().unwrap().1
+        ));
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                legacy_disabled: vec![legacy("/q", &["x"], &[], false)],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        let now = &h.state().legacy_cache.as_ref().unwrap().1;
+        assert!(!Arc::ptr_eq(&first, now));
+        h.get_by_label_contains("q: x (already off)");
     }
 
     #[test]

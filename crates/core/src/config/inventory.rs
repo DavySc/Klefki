@@ -240,7 +240,9 @@ fn legacy_disabled(
         return None;
     }
     let mut malformed = false;
+    // In file order, once each; the set keeps a long (untrusted) list linear.
     let mut names: Vec<&str> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for list in lists {
         let Some(items) = list.as_array() else {
             malformed = true;
@@ -248,7 +250,7 @@ fn legacy_disabled(
         };
         for item in items {
             match item.as_str() {
-                Some(name) if !names.contains(&name) => names.push(name),
+                Some(name) if seen.insert(name) => names.push(name),
                 Some(_) => {}
                 None => malformed = true,
             }
@@ -1537,6 +1539,29 @@ mod tests {
                 .iter()
                 .all(|l| s.projects.contains(&l.project))
         );
+    }
+
+    #[test]
+    fn a_huge_old_list_is_read_in_linear_time() {
+        // Review of #16: names were de-duplicated with `Vec::contains`, so 40,000 names took 1.8 s (release) on every
+        // reload. The file is untrusted and may be 64 MiB.
+        let e = Env::new();
+        let names: Vec<String> = (0..60_000).map(|i| format!("s{i}")).collect();
+        let half: Vec<&String> = names.iter().step_by(2).collect();
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                "/p": {"mcpServersDisabled": names, "disabledMcpServers": half},
+                "/p/": {"mcpServersDisabled": names}
+            }}),
+        );
+        let started = std::time::Instant::now();
+        let s = e.load();
+        let took = started.elapsed();
+        let l = &s.legacy_disabled[0];
+        assert_eq!(l.names.len(), 60_000);
+        assert_eq!(l.turns_off.len(), 30_000);
+        assert!(took < std::time::Duration::from_secs(10), "{took:?}");
     }
 
     #[test]

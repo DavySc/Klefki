@@ -209,6 +209,7 @@ fn and_list(items: &[String]) -> String {
 }
 
 /// Like [`and_list`], naming the first few and counting the rest, so a long list keeps the summary one line.
+/// The app's notice cuts names the same way (`shell::some_names`, which cannot call this); keep the two alike.
 fn some_of(items: &[String]) -> String {
     const NAMED: usize = 5;
     if items.len() <= NAMED + 1 {

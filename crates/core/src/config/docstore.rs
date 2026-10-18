@@ -18,6 +18,7 @@ use crate::sanitize::sanitize;
 use crate::watch;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
@@ -958,8 +959,8 @@ fn edit_valid_claude_json(
         .filter_map(|(_, t)| t.as_deref())
         .collect();
     let mut legacy_at = vec![None; projects.members.len()];
-    let mut legacy_union: std::collections::HashMap<&str, Vec<String>> =
-        std::collections::HashMap::new();
+    // In order, once each, with a set beside the list so a long (untrusted) list stays linear.
+    let mut legacy_union: HashMap<&str, (Vec<String>, HashSet<String>)> = HashMap::new();
     for (i, (member, key)) in projects.members.iter().zip(&keys).enumerate() {
         if !migrating.contains(&key.as_str()) {
             continue;
@@ -968,9 +969,9 @@ fn edit_valid_claude_json(
             continue;
         };
         if let Some((at, names)) = legacy_names(text, entry, &member.key)? {
-            let union = legacy_union.entry(key.as_str()).or_default();
+            let (union, seen) = legacy_union.entry(key.as_str()).or_default();
             for name in &names {
-                if !union.contains(name) {
+                if seen.insert(name.clone()) {
                     union.push(name.clone());
                 }
             }
@@ -1112,9 +1113,16 @@ fn edit_valid_claude_json(
                         }
                     }
                     Op::MigrateLegacyDisabled { .. } => {
-                        for name in legacy_union.get(key.as_str()).into_iter().flatten() {
-                            let list = items.get_or_insert_with(Vec::new);
-                            if !list.iter().any(|v| v.as_str() == Some(name)) {
+                        let Some((union, _)) = legacy_union.get(key.as_str()) else {
+                            continue;
+                        };
+                        let list = items.get_or_insert_with(Vec::new);
+                        let mut present: HashSet<String> = list
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect();
+                        for name in union {
+                            if present.insert(name.clone()) {
                                 list.push(Value::String(name.clone()));
                                 out.lines.push(header.clone());
                                 out.lines.push(format!("+ {}", sanitize(name)));
@@ -4131,6 +4139,37 @@ mod tests {
             };
             assert_eq!(f.text(), want, "compact {compact}");
         }
+    }
+
+    #[test]
+    fn migrating_a_huge_old_list_takes_linear_time() {
+        // Review of #16: each name was looked up in the toggle list and the union with a linear scan.
+        let names: Vec<String> = (0..60_000).map(|i| format!("s{i}")).collect();
+        let half: Vec<&String> = names.iter().step_by(2).collect();
+        let doc = json!({"projects": {
+            "/p": {"mcpServersDisabled": names, "disabledMcpServers": half},
+            "/p/": {"mcpServersDisabled": names}
+        }});
+        let f = Fixture::new(&pretty(&doc));
+        let started = Instant::now();
+        apply_ops(&f, vec![migrate("/p")]);
+        let took = started.elapsed();
+        let after = f.json();
+        assert_eq!(
+            after["projects"]["/p"]["disabledMcpServers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            60_000
+        );
+        assert_eq!(
+            after["projects"]["/p/"]["disabledMcpServers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            60_000
+        );
+        assert!(took < Duration::from_secs(10), "{took:?}");
     }
 
     #[test]
