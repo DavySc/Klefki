@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 pub use crate::config::ConfigPaths;
+pub use crate::config::definition::Definition;
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
 };
