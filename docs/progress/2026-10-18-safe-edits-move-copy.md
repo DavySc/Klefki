@@ -101,6 +101,7 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
     stays a reviewed move, and the key's position in `mcpServers` is not restored. Also left: marking a project
     whose folder is gone in the Move dialog. That needs core to check folders when it lists projects; today it is
     refused at Review.
+- **Merged main** again with the core review fixes (#27): no conflicts; verify 0 (490 core + 225 app + 32 cli).
 - **Merged main** with the free-port check (#23) and the CLI (#25): one conflict in `api.rs` (`real_config` from
   main, plus `changer: None`). Decision renumbered to 007: main has its own 006 (CLI output).
 - **Next:** re-review round. After the UI-review thread's `closed_on_purpose(&modal)` lands on main: merge main, switch the Duplicate and Move dialogs to it (a backdrop click must not close them), with `click_beside` tests. Not merged by this session:

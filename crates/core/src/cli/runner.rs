@@ -81,8 +81,10 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> io::Result<RunOutput> {
         std::thread::sleep(POLL);
     };
 
-    let (stdout, out_cut) = stdout.finish();
-    let (stderr, err_cut) = stderr.finish();
+    // One grace period for both pipes, not one each.
+    let grace = Instant::now() + PIPE_GRACE;
+    let (stdout, out_cut) = stdout.finish(grace);
+    let (stderr, err_cut) = stderr.finish(grace);
     Ok(RunOutput {
         stdout: text(&stdout, out_cut),
         stderr: text(&stderr, err_cut),
@@ -139,8 +141,11 @@ impl Capture {
         Self { shared, done }
     }
 
-    fn finish(self) -> (Vec<u8>, bool) {
-        let _ = self.done.recv_timeout(PIPE_GRACE);
+    /// What was read, once the pipe closes or `until` passes.
+    fn finish(self, until: Instant) -> (Vec<u8>, bool) {
+        let _ = self
+            .done
+            .recv_timeout(until.saturating_duration_since(Instant::now()));
         let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         (guard.0.clone(), guard.1)
     }
@@ -311,6 +316,62 @@ mod tests {
             for pid in tree_pids(&pids, depth as usize + 1) {
                 assert!(gone_soon(pid), "process {pid} (depth {depth}) still runs");
             }
+        }
+    }
+
+    #[test]
+    fn pipes_left_open_after_the_child_ends_are_waited_for_once() {
+        // Found reviewing main: each stream waited out the grace period in turn, so a process the child left
+        // behind holding both pipes delayed the answer by twice the grace period.
+        let program = std::env::current_exe().expect("the test binary");
+        let started = Instant::now();
+        let out = run(&RunSpec {
+            program: &program,
+            args: &[
+                "--exact",
+                "cli::runner::tests::pipe_holder",
+                "--nocapture",
+                "--test-threads=1",
+            ],
+            cwd: None,
+            env: &[(PIPE_HOLDER, OsStr::new("parent"))],
+            timeout: SECS,
+            max_output: 100_000,
+        })
+        .unwrap();
+        assert!(!out.timed_out);
+        assert!(
+            out.stdout.contains("said before ending") && out.stderr.contains("and on stderr"),
+            "what was read is kept: {out:?}"
+        );
+        assert!(
+            started.elapsed() < 2 * PIPE_GRACE,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    const PIPE_HOLDER: &str = "KLEFKI_TEST_PIPE_HOLDER";
+
+    /// Does nothing in a normal test run. Run by `pipes_left_open_after_the_child_ends_are_waited_for_once` as
+    /// "parent", it starts itself again as "child", which keeps the same output pipes open for a while, and ends.
+    #[test]
+    fn pipe_holder() {
+        match std::env::var(PIPE_HOLDER).as_deref() {
+            Ok("parent") => {
+                let child = Command::new(std::env::current_exe().unwrap())
+                    .args(std::env::args_os().skip(1))
+                    .env(PIPE_HOLDER, "child")
+                    .stdin(Stdio::null())
+                    .spawn()
+                    .unwrap();
+                // Never waited for: ending before it, with the pipes still open, is the point.
+                std::mem::forget(child);
+                println!("said before ending");
+                eprintln!("and on stderr");
+            }
+            Ok("child") => std::thread::sleep(3 * PIPE_GRACE),
+            _ => {}
         }
     }
 
