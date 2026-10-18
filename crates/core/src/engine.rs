@@ -80,6 +80,13 @@ pub enum Change {
         name: String,
         targets: Vec<crate::model::Target>,
     },
+    /// Add a new server `name` with the definition `json` (from [`Pasted`](crate::api::Pasted), say) to each of
+    /// `targets`. The plan shows everything it would run first.
+    Add {
+        name: String,
+        json: String,
+        targets: Vec<crate::model::Target>,
+    },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -3573,6 +3580,214 @@ mod tests {
             plan.warnings
                 .iter()
                 .any(|w| w.contains("local") && w.contains("a")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    fn add(name: &str, json: &str, targets: Vec<Target>) -> Change {
+        Change::Add {
+            name: name.to_owned(),
+            json: json.to_owned(),
+            targets,
+        }
+    }
+
+    const PASTED_FS: &str = r#"{"type": "stdio", "command": "npx", "args": ["-y", "@x/fs", "/tmp"], "env": {"API_KEY": "pasted-secret", "HOME_DIR": "${HOME}", "MIXED": "sk-live-123${SUFFIX}", "DEFAULTED": "${TOK:-ghp_realsecret}"}}"#;
+
+    #[test]
+    fn adding_a_server_writes_it_where_asked_and_shows_everything_it_runs() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![add(
+                "fs",
+                PASTED_FS,
+                vec![Target::User, Target::Local("/work/b".into())],
+            )],
+        );
+        assert_eq!(plan.summary, ["Add fs for the user and in b"]);
+        assert_eq!(plan.action, "Add");
+        assert!(!plan.destructive);
+        let review = &plan.reviews[0];
+        assert!(review.title.contains("fs"), "{review:?}");
+        for line in [
+            "Command: npx",
+            "Argument 1: -y",
+            "Argument 2: @x/fs",
+            "Argument 3: /tmp",
+        ] {
+            assert!(review.lines.iter().any(|l| l == line), "{line}: {review:?}");
+        }
+        // The variables it reads are named; what was typed in is not shown anywhere, even next to a reference.
+        for name in ["HOME", "SUFFIX", "TOK"] {
+            assert!(
+                review
+                    .lines
+                    .iter()
+                    .any(|l| l.contains(&format!("variable {name}"))),
+                "{name}: {review:?}"
+            );
+        }
+        assert!(
+            review
+                .lines
+                .iter()
+                .any(|l| l == "Environment: HOME_DIR=${HOME}"),
+            "{review:?}"
+        );
+        let shown = format!("{plan:?}");
+        for secret in ["pasted-secret", "sk-live-123", "ghp_realsecret"] {
+            assert!(!shown.contains(secret), "{secret}: {shown}");
+        }
+        assert!(
+            plan.notes.iter().any(|n| n.contains("starts its command")),
+            "{:?}",
+            plan.notes
+        );
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. }))
+        );
+        let now = config_json(&env);
+        let written: serde_json::Value = serde_json::from_str(PASTED_FS).unwrap();
+        assert_eq!(now["mcpServers"]["fs"], written);
+        assert_eq!(now["projects"]["/work/b"]["mcpServers"]["fs"], written);
+        // In the order pasted.
+        let text =
+            std::fs::read_to_string(env.dir.path().join("cfg").join(".claude.json")).unwrap();
+        let at = |s: &str| text.find(s).unwrap();
+        assert!(at("\"npx\"") < at("\"args\"") && at("\"args\"") < at("\"API_KEY\""));
+        // Nothing else moved.
+        assert_eq!(
+            now["mcpServers"]["gw"],
+            two_projects("end")["mcpServers"]["gw"]
+        );
+        assert_eq!(
+            now["projects"]["/work/a"],
+            two_projects("end")["projects"]["/work/a"]
+        );
+        let rows = &snapshots(&events).last().unwrap().servers;
+        assert_eq!(rows.iter().filter(|r| r.name == "fs").count(), 2);
+        verify_passes(&core);
+    }
+
+    #[test]
+    fn several_servers_can_be_added_to_one_place_in_one_plan() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![
+                add(
+                    "one",
+                    r#"{"command": "a"}"#,
+                    vec![Target::Local("/work/a".into())],
+                ),
+                add(
+                    "two",
+                    r#"{"type": "http", "url": "https://two.example/mcp", "headers": {"Authorization": "Bearer pasted-token"}}"#,
+                    vec![Target::Local("/work/a".into())],
+                ),
+            ],
+        );
+        assert_eq!(plan.summary, ["Add one in a", "Add two in a"]);
+        assert_eq!(plan.reviews.len(), 2);
+        assert!(
+            plan.reviews[1]
+                .lines
+                .iter()
+                .any(|l| l == "Connects to: https://two.example/mcp"),
+            "{:?}",
+            plan.reviews
+        );
+        assert!(!format!("{plan:?}").contains("pasted-token"));
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        let servers = &now["projects"]["/work/a"]["mcpServers"];
+        assert_eq!(servers["one"], serde_json::json!({"command": "a"}));
+        assert_eq!(
+            servers["two"]["headers"]["Authorization"],
+            "Bearer pasted-token"
+        );
+        assert_eq!(
+            servers["loc"],
+            two_projects("end")["projects"]["/work/a"]["mcpServers"]["loc"]
+        );
+        verify_passes(&core);
+    }
+
+    #[test]
+    fn what_cannot_be_added_is_refused_saying_why() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let a = || vec![Target::Local("/work/a".into())];
+        for (changes, why) in [
+            (vec![add("bad name", r#"{"command": "x"}"#, a())], "name"),
+            (vec![add("loc", r#"{"command": "x"}"#, a())], "already"),
+            (
+                vec![add("gw", r#"{"command": "x"}"#, vec![Target::User])],
+                "already",
+            ),
+            (
+                vec![
+                    add("twice", r#"{"command": "x"}"#, a()),
+                    add("twice", r#"{"command": "y"}"#, a()),
+                ],
+                "twice",
+            ),
+            (
+                vec![add(
+                    "n",
+                    r#"{"command": "x"}"#,
+                    vec![Target::Local("/elsewhere".into())],
+                )],
+                "not a project",
+            ),
+            (
+                vec![add("n", r#"{"command": "x"}"#, vec![])],
+                "Choose where",
+            ),
+            (vec![add("n", "{not json", a())], "JSON"),
+            (
+                vec![add(
+                    "n",
+                    r#"{"type": "http", "url": "https://o.example", "oauth": {"clientId": "c"}}"#,
+                    a(),
+                )],
+                "OAuth",
+            ),
+            (
+                vec![add(
+                    "n",
+                    r#"{"type": "http", "url": "javascript:alert(1)"}"#,
+                    a(),
+                )],
+                "url",
+            ),
+            (vec![add("n", r#"{"command": "x\u202ey"}"#, a())], "safely"),
+        ] {
+            let refused = plan_failure(&core, changes.clone());
+            assert!(refused.contains(why), "{changes:?}: {refused}");
+        }
+        assert_eq!(config_json(&env), two_projects("end"));
+    }
+
+    #[test]
+    fn a_server_added_under_a_name_used_elsewhere_warns_which_one_claude_uses() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![add("loc", r#"{"command": "x"}"#, vec![Target::User])],
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("local") && w.contains("instead of this server")),
             "{:?}",
             plan.warnings
         );

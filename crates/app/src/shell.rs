@@ -7,8 +7,9 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint, PlanView,
-    Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
+    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Hint, Pasted,
+    PastedServer, PlanView, Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status,
+    Target, TransportKind,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -221,6 +222,8 @@ pub struct ShellApp {
     command: CommandPalette,
     /// The Duplicate dialog, while open.
     duplicate: Option<DuplicateForm>,
+    /// The Add dialog, while open.
+    add: Option<AddForm>,
     /// The Fix casing dialog, while open.
     casing: Option<CasingForm>,
     /// What is known about the shown OAuth server's client secret.
@@ -254,6 +257,7 @@ impl ShellApp {
             editor: None,
             command: CommandPalette::default(),
             duplicate: None,
+            add: None,
             casing: None,
             secret: None,
             secret_input: None,
@@ -536,6 +540,7 @@ impl ShellApp {
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
             && self.plan.is_none()
             && self.duplicate.is_none()
+            && self.add.is_none()
             && self.casing.is_none()
         {
             if self.command.is_open() {
@@ -551,6 +556,7 @@ impl ShellApp {
             && self.plan.is_none()
             && !self.command.is_open()
             && self.duplicate.is_none()
+            && self.add.is_none()
             && self.casing.is_none();
         // Up and down walk the list, like any list.
         if idle && self.page == Page::Connections {
@@ -574,6 +580,9 @@ impl ShellApp {
             }
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
                 self.open_duplicate();
+            }
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
+                self.open_add();
             }
         }
         let pal = theme::palette(ui.ctx());
@@ -602,6 +611,7 @@ impl ShellApp {
         }
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
+        self.add_dialog(&ctx);
         self.casing_dialog(&ctx);
         self.outcome_toast(&ctx);
         let mut command = std::mem::take(&mut self.command);
@@ -798,9 +808,10 @@ impl ShellApp {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        // Only what works today: a button that can never be pressed is noise (Add, Move, Re-authorize, Export and
-        // Import arrive with M2 and M3).
-        const ACTIONS: [(&str, &str); 5] = [
+        // Only what works today: a button that can never be pressed is noise (Move, Re-authorize, Export and Import
+        // arrive with M2 and M3).
+        const ACTIONS: [(&str, &str); 6] = [
+            (icon::PLUS, "Add (Ctrl+N)"),
             (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
             (icon::COPY, "Duplicate (Ctrl+D)"),
             (icon::TOGGLE_RIGHT, "Turn on"),
@@ -810,6 +821,7 @@ impl ShellApp {
         let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.can_prepare();
         let can_edit = self.core.is_some() && self.selected.len() == 1;
         let can_duplicate = self.duplicable().is_some();
+        let can_add = self.core.is_some() && self.can_prepare();
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
             for (glyph, tip) in ACTIONS {
@@ -820,6 +832,7 @@ impl ShellApp {
                         (can_toggle, "select a server first")
                     }
                     g if g == icon::COPY => (can_duplicate, "select one user or local server"),
+                    g if g == icon::PLUS => (can_add, "wait for the change under way"),
                     _ => (can_edit, "select one server"),
                 };
                 let clicked = ui
@@ -833,6 +846,7 @@ impl ShellApp {
                         g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
                         g if g == icon::TRASH => self.prepare_delete(),
                         g if g == icon::COPY => self.open_duplicate(),
+                        g if g == icon::PLUS => self.open_add(),
                         _ => self.edit_selected(),
                     }
                 }
@@ -1005,6 +1019,16 @@ impl ShellApp {
                 command::Action::Select(i),
             );
         }
+        // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
+        if live {
+            add(
+                icon::PLUS,
+                "Add a server".into(),
+                "Paste a claude mcp add command or an mcpServers block".into(),
+                Some(shortcut("N")),
+                command::Action::Add,
+            );
+        }
         out
     }
 
@@ -1048,6 +1072,7 @@ impl ShellApp {
             }
             A::Settings => self.page = Page::Settings,
             A::Duplicate => self.open_duplicate(),
+            A::Add => self.open_add(),
             A::FixCasing => self.open_casing(),
         }
     }
@@ -1066,36 +1091,14 @@ impl ShellApp {
         let Some(row) = self.duplicable() else {
             return;
         };
-        let here = row.project.as_deref();
-        let projects: Vec<(String, bool)> = self
-            .snapshot
-            .projects
-            .iter()
-            .map(|p| (p.clone(), Some(p.as_str()) == here))
-            .collect();
-        let mut order: Vec<usize> = (0..projects.len()).collect();
-        order.sort_by_cached_key(|&i| {
-            let path = &projects[i].0;
-            (
-                Some(path.as_str()) != here,
-                folder_name(path).to_lowercase(),
-            )
-        });
-        let mut seen = BTreeSet::new();
-        let shared_folders = projects
-            .iter()
-            .map(|(p, _)| folder_name(p).to_lowercase())
-            .filter(|f| !seen.insert(f.clone()))
-            .collect();
+        let mut places = Places::new(&self.snapshot.projects, row.project.as_deref());
+        places.user = row.scope == Scope::User;
+        places.tick_here();
         self.duplicate = Some(DuplicateForm {
             source: row.id(),
             about: format!("{} \u{b7} {}", row.transport.label(), row.target),
             name: format!("{}_copy", row.name),
-            user: row.scope == Scope::User,
-            projects,
-            order,
-            shared_folders,
-            filter: String::new(),
+            places,
             focus: true,
         });
     }
@@ -1234,15 +1237,9 @@ impl ShellApp {
         let Some(form) = &mut self.duplicate else {
             return;
         };
-        let problem = ServerName::parse(&form.name).err().map(|e| {
-            let e = e.to_string();
-            let mut c = e.chars();
-            c.next()
-                .map(|f| f.to_uppercase().chain(c).collect::<String>())
-                .unwrap_or(e)
-        });
-        let taken = form.taken(&self.snapshot.servers);
-        let places = form.places();
+        let problem = name_problem(&form.name);
+        let taken = form.places.taken(&form.name, &self.snapshot.servers);
+        let places = form.places.in_words();
         let ready = problem.is_none() && taken.is_none() && places.is_some();
         let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
@@ -1267,58 +1264,7 @@ impl ShellApp {
             }
             ui.add_space(12.0);
             ui.label(RichText::new("Add it").color(pal.text_muted));
-            place_row(ui, &mut form.user, "For the user", "in every project", None);
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let ticked = form.projects.iter().filter(|(_, on)| *on).count();
-                let mut heading = format!("Projects ({})", form.projects.len());
-                if ticked > 0 {
-                    heading.push_str(&format!(", {ticked} ticked"));
-                }
-                ui.label(RichText::new(heading).color(pal.text_muted));
-                // A short list is read at a glance; a long one is searched.
-                if form.projects.len() > 8 {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut form.filter)
-                                .hint_text(format!("{} Filter projects", icon::MAGNIFYING_GLASS))
-                                .desired_width(220.0),
-                        );
-                    });
-                }
-            });
-            // As tall as the whole list would be, up to that room, and no shorter while filtering: the dialog keeps
-            // its size and its buttons stay where they are as you type.
-            let rows = form.projects.len().max(1) as f32;
-            let height = (rows * (PLACE_ROW + PLACE_GAP)).min(list_height);
-            egui::ScrollArea::vertical()
-                .max_height(height)
-                .min_scrolled_height(height)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = PLACE_GAP;
-                    let needle = form.filter.trim().to_lowercase();
-                    let mut shown = 0;
-                    for &i in &form.order {
-                        let (path, on) = &mut form.projects[i];
-                        if !path.to_lowercase().contains(&needle) {
-                            continue;
-                        }
-                        shown += 1;
-                        let here = form.source.project.as_deref() == Some(path.as_str());
-                        let folder = folder_name(path);
-                        let parent = if form.shared_folders.contains(&folder.to_lowercase()) {
-                            parent_folder(path)
-                        } else {
-                            ""
-                        };
-                        place_row(ui, on, folder, parent, here.then_some("where it is now"))
-                            .on_hover_text(path.as_str());
-                    }
-                    if shown == 0 {
-                        ui.label(RichText::new("No project matches.").color(pal.text_muted));
-                    }
-                });
+            form.places.ui(ui, list_height, Some("where it is now"));
             ui.add_space(10.0);
             // What Review will lead to, or why it cannot yet.
             if let Some(taken) = &taken {
@@ -1362,21 +1308,198 @@ impl ShellApp {
             });
         });
         if review {
-            let targets = form
-                .user
-                .then_some(Target::User)
-                .into_iter()
-                .chain(form.ticked().map(|p| Target::Local(p.to_owned())))
-                .collect();
             let change = Change::Duplicate {
                 id: form.source.clone(),
                 name: form.name.clone(),
-                targets,
+                targets: form.places.targets(),
             };
             self.duplicate = None;
             self.prepare(vec![change]);
         } else if cancel || modal.should_close() {
             self.duplicate = None;
+        }
+    }
+
+    /// Opens the Add dialog, starting from the selected server's project if it has one.
+    fn open_add(&mut self) {
+        if self.core.is_none() || !self.can_prepare() {
+            return;
+        }
+        let here = self
+            .single_selected()
+            .filter(|r| r.scope != Scope::User)
+            .and_then(|r| r.project.clone());
+        let mut places = Places::new(&self.snapshot.projects, here.as_deref());
+        places.user = true;
+        self.add = Some(AddForm {
+            text: String::new(),
+            read_for: String::new(),
+            read: Err(String::new()),
+            names: Vec::new(),
+            places,
+            places_chosen: false,
+            focus: true,
+        });
+    }
+
+    fn add_dialog(&mut self, ctx: &egui::Context) {
+        let pal = theme::palette(ctx);
+        let Some(form) = &mut self.add else {
+            return;
+        };
+        form.reread();
+        let checked = form.check(&self.snapshot.servers);
+        let places = form.places.in_words();
+        let addable: Vec<usize> = (0..checked.len())
+            .filter(|&i| checked[i] == Check::Ready)
+            .collect();
+        let ready = !addable.is_empty()
+            && places.is_some()
+            && checked.iter().all(|c| !matches!(c, Check::Name(_)));
+        let mut review =
+            ready && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
+        let mut cancel = false;
+        // The lists get what the window has left once the rest of the dialog is laid out.
+        let room = (ctx.content_rect().height() - 560.0).clamp(96.0, 320.0);
+        let modal = egui::Modal::new(egui::Id::new("add_dialog")).show(ctx, |ui| {
+            ui.set_width(640.0);
+            ui.heading("Add servers");
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Paste a claude mcp add command, or JSON such as {\"mcpServers\": {…}}. Klefki only reads it; nothing is run until you review it.",
+                    )
+                    .small()
+                    .color(pal.text_muted),
+                )
+                .wrap(),
+            );
+            ui.add_space(8.0);
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut form.text)
+                    .code_editor()
+                    .desired_rows(5)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("claude mcp add --transport http notion https://mcp.notion.com/mcp"),
+            );
+            if std::mem::take(&mut form.focus) {
+                field.request_focus();
+            }
+            ui.add_space(8.0);
+            match &form.read {
+                Err(why) if !why.is_empty() => {
+                    ui.add(egui::Label::new(RichText::new(why).color(pal.danger)).wrap());
+                }
+                Err(_) => {}
+                Ok(read) => {
+                    egui::ScrollArea::vertical()
+                        .id_salt("add_servers")
+                        .max_height(room)
+                        .min_scrolled_height(room)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (i, server) in read.servers.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    if server.problem.is_none() {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut form.names[i])
+                                                .hint_text("name")
+                                                .desired_width(180.0),
+                                        );
+                                    } else {
+                                        ui.label(RichText::new(&server.name).strikethrough());
+                                    }
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&server.summary).color(pal.text_muted),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                                let problem = match &checked[i] {
+                                    Check::Skipped(why) | Check::Name(why) => Some(why.as_str()),
+                                    Check::Ready => None,
+                                };
+                                if let Some(why) = problem {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(why).small().color(pal.danger))
+                                            .wrap(),
+                                    );
+                                }
+                                for hint in &server.hints {
+                                    ui.add(
+                                        egui::Label::new(RichText::new(hint).small().color(pal.warn))
+                                            .wrap(),
+                                    );
+                                }
+                                ui.add_space(4.0);
+                            }
+                            for note in &read.notes {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(note).small().color(pal.text_muted),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                }
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("Add them").color(pal.text_muted));
+            if form.places.ui(ui, room, Some("selected")) {
+                form.places_chosen = true;
+            }
+            ui.add_space(10.0);
+            // What Review will lead to, or why it cannot yet.
+            let skipped = checked.iter().filter(|c| matches!(c, Check::Skipped(_))).count();
+            if skipped > 0 && form.read.is_ok() {
+                ui.label(
+                    RichText::new(if skipped == 1 {
+                        "1 server cannot be added and is left out.".to_owned()
+                    } else {
+                        format!("{skipped} servers cannot be added and are left out.")
+                    })
+                    .color(pal.text_muted),
+                );
+            }
+            match &places {
+                None => {
+                    ui.label(RichText::new("Tick at least one place.").color(pal.text_muted));
+                }
+                Some(places) if ready => {
+                    let names: Vec<&str> = addable.iter().map(|&i| form.names[i].as_str()).collect();
+                    ui.add(egui::Label::new(format!("Adds {} {places}.", list_in_words(&names, "server"))).wrap());
+                }
+                Some(_) => {}
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let confirm =
+                    egui::Button::new(RichText::new("Review").strong().color(pal.on_bright))
+                        .fill(pal.primary)
+                        .min_size(egui::vec2(96.0, 34.0));
+                review |= ui
+                    .add_enabled(ready, confirm)
+                    .on_hover_text(shortcut("Enter"))
+                    .on_disabled_hover_text("Paste a server, give it a usable name and tick a place")
+                    .clicked();
+                cancel |= ui
+                    .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
+                    .on_hover_text("Esc")
+                    .clicked();
+            });
+        });
+        settle(ctx, &modal.response);
+        // The text and names may have changed in this frame: what is sent is checked again as it is now.
+        let changes = review
+            .then(|| form.changes(&self.snapshot.servers))
+            .flatten();
+        if let Some(changes) = changes {
+            self.add = None;
+            self.prepare(changes);
+        } else if cancel || modal.should_close() {
+            self.add = None;
         }
     }
 
@@ -1566,90 +1689,104 @@ impl ShellApp {
         let mut cancel = false;
         let modal = egui::Modal::new(egui::Id::new("plan_dialog")).show(ctx, |ui| {
             ui.set_width(540.0);
-            // What happens, in words, first; the exact lines follow for those who want them.
-            if plan.summary.is_empty() {
-                ui.heading("Review the change");
-            } else {
-                ui.label(RichText::new("Review the change").color(pal.text_muted));
-                for line in &plan.summary {
-                    ui.add(egui::Label::new(RichText::new(line).heading()).wrap());
-                }
-            }
-            ui.add_space(8.0);
-            if plan.nothing_to_do {
-                ui.label("The configuration already looks like this. Nothing would be written.");
-            }
-            for review in &plan.reviews {
-                ui.add_space(4.0);
-                Frame::new()
-                    .stroke(egui::Stroke::new(1.0, pal.warn))
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(RichText::new(&review.title).strong().color(pal.warn));
-                        for line in &review.lines {
-                            ui.add(egui::Label::new(RichText::new(line).monospace()).wrap());
+            // Everything above the buttons scrolls when it is taller than the window (many servers added at once),
+            // so the buttons always stay in view.
+            let room = (ctx.content_rect().height() - 140.0).max(160.0);
+            egui::ScrollArea::vertical()
+                .id_salt("plan_body")
+                .max_height(room)
+                .min_scrolled_height(room)
+                .show(ui, |ui| {
+                    // What happens, in words, first; the exact lines follow for those who want them.
+                    if plan.summary.is_empty() {
+                        ui.heading("Review the change");
+                    } else {
+                        ui.label(RichText::new("Review the change").color(pal.text_muted));
+                        for line in &plan.summary {
+                            ui.add(egui::Label::new(RichText::new(line).heading()).wrap());
                         }
-                    });
-            }
-            for warning in &plan.warnings {
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("{} {warning}", icon::WARNING)).color(pal.warn),
-                    )
-                    .wrap(),
-                );
-            }
-            for file in &plan.files {
-                if file.lines.is_empty() {
-                    continue;
-                }
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!("Changes in {}", file.path))
-                        .small()
-                        .color(pal.text_muted),
-                );
-                Frame::new()
-                    .fill(pal.field)
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(10))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        egui::ScrollArea::vertical()
-                            .max_height(220.0)
+                    }
+                    ui.add_space(8.0);
+                    if plan.nothing_to_do {
+                        ui.label(
+                            "The configuration already looks like this. Nothing would be written.",
+                        );
+                    }
+                    for review in &plan.reviews {
+                        ui.add_space(4.0);
+                        Frame::new()
+                            .stroke(egui::Stroke::new(1.0, pal.warn))
+                            .corner_radius(8)
+                            .inner_margin(Margin::same(10))
                             .show(ui, |ui| {
-                                for line in &file.lines {
-                                    let color = if line.starts_with("+ ") {
-                                        pal.success
-                                    } else if line.starts_with("- ") {
-                                        pal.danger
-                                    } else {
-                                        pal.text_muted
-                                    };
+                                ui.set_width(ui.available_width());
+                                ui.label(RichText::new(&review.title).strong().color(pal.warn));
+                                for line in &review.lines {
                                     ui.add(
-                                        egui::Label::new(
-                                            RichText::new(line).monospace().color(color),
-                                        )
-                                        .wrap(),
+                                        egui::Label::new(RichText::new(line).monospace()).wrap(),
                                     );
                                 }
                             });
-                    });
-            }
-            for note in &plan.notes {
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!("{} {note}", icon::INFO))
-                            .small()
-                            .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
-            }
+                    }
+                    for warning in &plan.warnings {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {warning}", icon::WARNING))
+                                    .color(pal.warn),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    for file in &plan.files {
+                        if file.lines.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("Changes in {}", file.path))
+                                .small()
+                                .color(pal.text_muted),
+                        );
+                        Frame::new()
+                            .fill(pal.field)
+                            .corner_radius(8)
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                egui::ScrollArea::vertical()
+                                    .max_height(220.0)
+                                    .show(ui, |ui| {
+                                        for line in &file.lines {
+                                            let color = if line.starts_with("+ ") {
+                                                pal.success
+                                            } else if line.starts_with("- ") {
+                                                pal.danger
+                                            } else {
+                                                pal.text_muted
+                                            };
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(line).monospace().color(color),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                    });
+                            });
+                    }
+                    for note in &plan.notes {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {note}", icon::INFO))
+                                    .small()
+                                    .color(pal.text_muted),
+                            )
+                            .wrap(),
+                        );
+                    }
+                });
             ui.add_space(12.0);
             let label = if !plan.action.is_empty() {
                 plan.action.as_str()
@@ -1699,6 +1836,7 @@ impl ShellApp {
                 }
             });
         });
+        settle(ctx, &modal.response);
         if modal.should_close() && !applying {
             cancel = true;
         }
@@ -2688,27 +2826,225 @@ impl CasingForm {
     }
 }
 
+/// What the Add dialog holds: the pasted text, what was read from it, the names to add the servers under and where.
+struct AddForm {
+    text: String,
+    /// The text `read` was read from: it is read again only when the text changes.
+    read_for: String,
+    /// The servers found, or why there are none (empty while nothing is pasted).
+    read: Result<Pasted, String>,
+    /// One name per server read, as the user may have changed it.
+    names: Vec<String>,
+    places: Places,
+    /// A place was ticked by hand: what is pasted next no longer moves the ticks.
+    places_chosen: bool,
+    /// Give the text field the keyboard on the first frame.
+    focus: bool,
+}
+
+/// Whether one pasted server can be added.
+#[derive(Debug, PartialEq)]
+enum Check {
+    Ready,
+    /// It cannot be added as pasted, and is left out.
+    Skipped(String),
+    /// Its name needs changing before anything is added.
+    Name(String),
+}
+
+impl AddForm {
+    /// Reads the text again if it changed. A name the user changed is kept while the server it names is still read
+    /// with the same name in the same place; the ticks follow what the text asks for until one is set by hand.
+    fn reread(&mut self) {
+        if self.text == self.read_for {
+            return;
+        }
+        let read = if self.text.trim().is_empty() {
+            Err(String::new())
+        } else {
+            Pasted::parse(&self.text)
+        };
+        let before: &[PastedServer] = self.read.as_ref().map_or(&[], |r| r.servers.as_slice());
+        let names = match &read {
+            Ok(r) => r
+                .servers
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match before.get(i) {
+                    Some(b) if b.name == s.name => self.names[i].clone(),
+                    _ => s.name.clone(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if let (Ok(r), false) = (&read, self.places_chosen) {
+            // Local, Claude Code's default, means the project it is run in: the selected server's, if any.
+            let local =
+                !r.servers.is_empty() && r.servers.iter().all(|s| s.scope == Some(Scope::Local));
+            for (_, on) in &mut self.places.projects {
+                *on = false;
+            }
+            self.places.user = !(local && self.places.tick_here());
+        }
+        self.names = names;
+        self.read = read;
+        self.read_for.clone_from(&self.text);
+    }
+
+    /// What Review sends, read and checked as the dialog is now; `None` while something stops it.
+    fn changes(&mut self, servers: &[ServerRow]) -> Option<Vec<Change>> {
+        self.reread();
+        let checked = self.check(servers);
+        let targets = self.places.targets();
+        let read = self.read.as_ref().ok()?;
+        if targets.is_empty() || checked.iter().any(|c| matches!(c, Check::Name(_))) {
+            return None;
+        }
+        let changes: Vec<Change> = (0..checked.len())
+            .filter(|&i| checked[i] == Check::Ready)
+            .map(|i| Change::Add {
+                name: self.names[i].clone(),
+                json: read.servers[i].json.clone(),
+                targets: targets.clone(),
+            })
+            .collect();
+        (!changes.is_empty()).then_some(changes)
+    }
+
+    /// Each server read, in order: ready, left out, or waiting for a better name.
+    fn check(&self, servers: &[ServerRow]) -> Vec<Check> {
+        let Ok(read) = &self.read else {
+            return Vec::new();
+        };
+        read.servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                if let Some(problem) = &server.problem {
+                    return Check::Skipped(problem.clone());
+                }
+                let name = &self.names[i];
+                if name.is_empty() {
+                    return Check::Name("Give it a name.".to_owned());
+                }
+                if let Some(problem) = name_problem(name) {
+                    return Check::Name(problem);
+                }
+                let twice =
+                    (0..i).any(|j| read.servers[j].problem.is_none() && self.names[j] == *name);
+                if twice {
+                    return Check::Name(format!("{name} is named twice in what you pasted."));
+                }
+                if let Some(taken) = self.places.taken(name, servers) {
+                    return Check::Name(format!(
+                        "{name} already exists {taken}. Choose another name, or untick it there."
+                    ));
+                }
+                Check::Ready
+            })
+            .collect()
+    }
+}
+
+/// A dialog is centred by the size it had on the previous frame. When its size changes (text pasted, a long plan
+/// laid out), draw once more so it is centred, and its buttons are where they are drawn, before the next click.
+fn settle(ctx: &egui::Context, dialog: &egui::Response) {
+    let id = dialog.id.with("settled_size");
+    let size = dialog.rect.size();
+    if ctx.data(|d| d.get_temp::<egui::Vec2>(id)) != Some(size) {
+        ctx.data_mut(|d| d.insert_temp(id, size));
+        ctx.request_repaint();
+    }
+}
+
+/// Why `name` cannot be a server's name, as a sentence; `None` when it can.
+fn name_problem(name: &str) -> Option<String> {
+    ServerName::parse(name).err().map(|e| {
+        let e = e.to_string();
+        let mut c = e.chars();
+        c.next()
+            .map(|f| f.to_uppercase().chain(c).collect::<String>())
+            .unwrap_or(e)
+    })
+}
+
+/// `a`, `a and b`, `a, b and c`; more than three are counted: `5 projects`.
+fn list_in_words(items: &[&str], noun: &str) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] if items.len() <= 3 => format!("{} and {last}", rest.join(", ")),
+        _ => format!("{} {noun}s", items.len()),
+    }
+}
+
 /// What the Duplicate dialog holds: the copy's name and where it goes.
 struct DuplicateForm {
     source: ServerId,
     /// What is being copied, under the title: `http · https://…`.
     about: String,
     name: String,
+    places: Places,
+    /// Give the name field the keyboard on the first frame.
+    focus: bool,
+}
+
+/// Where a new server goes, as ticked in a dialog: for the user, and in any of the projects Claude Code knows.
+struct Places {
     user: bool,
-    /// Every project Claude Code knows, in the snapshot's order, and whether the copy goes there.
+    /// Every project Claude Code knows, in the snapshot's order, and whether the server goes there.
     projects: Vec<(String, bool)>,
-    /// The order the projects are listed in: the one the server is in first, then by folder name.
+    /// The order the projects are listed in: `here` first, then by folder name.
     order: Vec<usize>,
+    /// The project the dialog starts from (the selected server's), if any.
+    here: Option<String>,
     /// Folder names (lower case) that more than one project has: only those rows also say where they live. The rest
     /// would all repeat the same few parent folders.
     shared_folders: BTreeSet<String>,
     /// Narrows the list of projects: part of a path, any case.
     filter: String,
-    /// Give the name field the keyboard on the first frame.
-    focus: bool,
 }
 
-impl DuplicateForm {
+impl Places {
+    /// Nothing ticked yet.
+    fn new(projects: &[String], here: Option<&str>) -> Self {
+        let projects: Vec<(String, bool)> = projects.iter().map(|p| (p.clone(), false)).collect();
+        let mut order: Vec<usize> = (0..projects.len()).collect();
+        order.sort_by_cached_key(|&i| {
+            let path = &projects[i].0;
+            (
+                Some(path.as_str()) != here,
+                folder_name(path).to_lowercase(),
+            )
+        });
+        let mut seen = BTreeSet::new();
+        let shared_folders = projects
+            .iter()
+            .map(|(p, _)| folder_name(p).to_lowercase())
+            .filter(|f| !seen.insert(f.clone()))
+            .collect();
+        Self {
+            user: false,
+            projects,
+            order,
+            here: here.map(str::to_owned),
+            shared_folders,
+            filter: String::new(),
+        }
+    }
+
+    /// Ticks the project the dialog starts from. False when there is none.
+    fn tick_here(&mut self) -> bool {
+        let mut ticked = false;
+        for (path, on) in &mut self.projects {
+            if Some(path.as_str()) == self.here.as_deref() {
+                *on = true;
+                ticked = true;
+            }
+        }
+        ticked
+    }
+
     /// The projects ticked, in the snapshot's order.
     fn ticked(&self) -> impl Iterator<Item = &str> {
         self.projects
@@ -2717,20 +3053,28 @@ impl DuplicateForm {
             .map(|(p, _)| p.as_str())
     }
 
-    /// Where the copy goes, in words: `for the user and in a and b`. None when nothing is ticked.
-    fn places(&self) -> Option<String> {
+    fn targets(&self) -> Vec<Target> {
+        self.user
+            .then_some(Target::User)
+            .into_iter()
+            .chain(self.ticked().map(|p| Target::Local(p.to_owned())))
+            .collect()
+    }
+
+    /// Where it goes, in words: `for the user and in a and b`. None when nothing is ticked.
+    fn in_words(&self) -> Option<String> {
         let folders: Vec<&str> = self.ticked().map(folder_name).collect();
         places_in_words(self.user, &folders)
     }
 
-    /// The ticked places that already have a server by the copy's name, in words. Only the lists a copy is written
-    /// to count: the engine refuses those, while a name in a project's `.mcp.json` is only hidden by the copy, which
-    /// the review warns about.
-    fn taken(&self, servers: &[ServerRow]) -> Option<String> {
+    /// The ticked places that already have a server called `name`, in words. Only the lists a new server is written
+    /// to count: the engine refuses those, while a name in a project's `.mcp.json` is only hidden by it, which the
+    /// review warns about.
+    fn taken(&self, name: &str, servers: &[ServerRow]) -> Option<String> {
         let has = |scope: Scope, project: Option<&str>| {
             servers
                 .iter()
-                .any(|s| s.name == self.name && s.scope == scope && s.project.as_deref() == project)
+                .any(|s| s.name == name && s.scope == scope && s.project.as_deref() == project)
         };
         let user = self.user && has(Scope::User, None);
         let folders: Vec<&str> = self
@@ -2740,18 +3084,74 @@ impl DuplicateForm {
             .collect();
         places_in_words(user, &folders)
     }
+
+    /// The tick boxes: the user, then the projects in a list of at most `list_height`, searchable when long. `tag`
+    /// marks the project the dialog starts from.
+    /// Says whether a tick changed.
+    fn ui(&mut self, ui: &mut Ui, list_height: f32, tag: Option<&str>) -> bool {
+        let pal = theme::palette(ui.ctx());
+        let mut changed =
+            place_row(ui, &mut self.user, "For the user", "in every project", None).changed();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let ticked = self.projects.iter().filter(|(_, on)| *on).count();
+            let mut heading = format!("Projects ({})", self.projects.len());
+            if ticked > 0 {
+                heading.push_str(&format!(", {ticked} ticked"));
+            }
+            ui.label(RichText::new(heading).color(pal.text_muted));
+            // A short list is read at a glance; a long one is searched.
+            if self.projects.len() > 8 {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.filter)
+                            .hint_text(format!("{} Filter projects", icon::MAGNIFYING_GLASS))
+                            .desired_width(220.0),
+                    );
+                });
+            }
+        });
+        // As tall as the whole list would be, up to that room, and no shorter while filtering: the dialog keeps
+        // its size and its buttons stay where they are as you type.
+        let rows = self.projects.len().max(1) as f32;
+        let height = (rows * (PLACE_ROW + PLACE_GAP)).min(list_height);
+        egui::ScrollArea::vertical()
+            .max_height(height)
+            .min_scrolled_height(height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = PLACE_GAP;
+                let needle = self.filter.trim().to_lowercase();
+                let mut shown = 0;
+                for &i in &self.order {
+                    let (path, on) = &mut self.projects[i];
+                    if !path.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    shown += 1;
+                    let here = self.here.as_deref() == Some(path.as_str());
+                    let folder = folder_name(path);
+                    let parent = if self.shared_folders.contains(&folder.to_lowercase()) {
+                        parent_folder(path)
+                    } else {
+                        ""
+                    };
+                    changed |= place_row(ui, on, folder, parent, tag.filter(|_| here))
+                        .on_hover_text(path.as_str())
+                        .changed();
+                }
+                if shown == 0 {
+                    ui.label(RichText::new("No project matches.").color(pal.text_muted));
+                }
+            });
+        changed
+    }
 }
 
 /// `for the user`, `in a and b`, `for the user and in 5 projects`; None for nowhere.
 fn places_in_words(user: bool, folders: &[&str]) -> Option<String> {
-    let projects = match folders {
-        [] => None,
-        [one] => Some(format!("in {one}")),
-        [rest @ .., last] if folders.len() <= 3 => {
-            Some(format!("in {} and {last}", rest.join(", ")))
-        }
-        _ => Some(format!("in {} projects", folders.len())),
-    };
+    let projects =
+        (!folders.is_empty()).then(|| format!("in {}", list_in_words(folders, "project")));
     match (user, projects) {
         (false, None) => None,
         (true, None) => Some("for the user".to_owned()),
@@ -4593,6 +4993,42 @@ mod tests {
     }
 
     #[test]
+    fn a_long_plan_scrolls_and_keeps_its_buttons_in_the_window() {
+        // Several pasted servers make a plan taller than the window; Add and Cancel must stay reachable.
+        let (core, engine) = klefki_core::api::Core::detached();
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1200.0, 720.0))
+            .build_eframe(move |cc| {
+                crate::theme::apply(&cc.egui_ctx, ThemeChoice::Dark);
+                ShellApp::with_core(core, ThemeChoice::Dark)
+            });
+        h.run();
+        let lines: Vec<String> = (0..40).map(|i| format!("+   \"line {i}\"")).collect();
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut plan = plan_view(4, &lines, &[], false);
+        plan.action = "Add".to_owned();
+        plan.summary = (0..6)
+            .map(|i| format!("Add server{i} for the user"))
+            .collect();
+        plan.reviews = (0..6)
+            .map(|i| klefki_core::api::Review {
+                title: format!("server{i} would run:"),
+                lines: (1..=5).map(|a| format!("Argument {a}: value")).collect(),
+            })
+            .collect();
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 720.0));
+        for button in ["Add", "Cancel"] {
+            let rect = h.get_by_label(button).rect();
+            assert!(window.contains_rect(rect), "{button} at {rect:?}");
+        }
+        h.get_by_label("Add").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Apply(4)]);
+    }
+
+    #[test]
     fn a_saved_approval_without_a_backup_just_says_saved() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
         engine
@@ -5679,6 +6115,184 @@ mod tests {
         assert!(duplicate_requested(&engine).is_empty());
     }
 
+    // ---- add
+
+    fn paste(h: &mut Harness<'static, ShellApp>, text: &str) {
+        h.state_mut().add.as_mut().unwrap().text = text.to_owned();
+        h.run();
+    }
+
+    fn pasted_json(text: &str, i: usize) -> String {
+        klefki_core::api::Pasted::parse(text).unwrap().servers[i]
+            .json
+            .clone()
+    }
+
+    #[test]
+    fn add_reads_a_pasted_command_and_adds_it_where_it_asks() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label(icon::PLUS).click();
+        h.run();
+        h.get_by_label_contains("Add servers");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
+        paste(&mut h, text);
+        h.get_by_label_contains("npx -y @x/fs /tmp");
+        h.get_by_label_contains("Adds files for the user.");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(h.state().add.is_none());
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Add {
+                name: "files".into(),
+                json: pasted_json(text, 0),
+                targets: vec![Target::User],
+            }]
+        );
+    }
+
+    #[test]
+    fn many_servers_are_counted_not_listed() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text: String = (0..5)
+            .map(|i| format!("claude mcp add -s user s{i} node\n"))
+            .collect();
+        paste(&mut h, &text);
+        h.get_by_label_contains("Adds 5 servers for the user.");
+    }
+
+    #[test]
+    fn a_local_command_goes_to_the_selected_servers_project() {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label("beta").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text = "claude mcp add one node\nclaude mcp add two -- node two.js";
+        paste(&mut h, text);
+        h.get_by_label_contains("Adds one and two in WebApp.");
+        // Ticking a place by hand is kept when the text changes.
+        h.get_by_label("notes").click();
+        h.run();
+        paste(&mut h, &format!("{text}\n"));
+        h.get_by_label_contains("Adds one and two in WebApp and notes.");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
+        h.run();
+        let targets = vec![
+            Target::Local("C:/Repos/WebApp".into()),
+            Target::Local("/home/me/notes".into()),
+        ];
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![
+                Change::Add {
+                    name: "one".into(),
+                    json: pasted_json(text, 0),
+                    targets: targets.clone(),
+                },
+                Change::Add {
+                    name: "two".into(),
+                    json: pasted_json(text, 1),
+                    targets,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn add_explains_what_it_cannot_add_and_needs_usable_names() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text = "claude mcp add --client-id x corp https://c.example/mcp\nclaude mcp add -s user ok node\nclaude mcp add -s user ok node";
+        paste(&mut h, text);
+        h.get_by_label_contains("OAuth");
+        h.get_by_label_contains("twice");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.state_mut().add.as_mut().unwrap().names[2] = "ok2".into();
+        h.run();
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        h.get_by_label_contains("1 server cannot be added");
+        // A name already used for the user, and one that is not a name.
+        h.state_mut().add.as_mut().unwrap().names[1] = "alpha".into();
+        h.run();
+        h.get_by_label_contains("alpha already exists for the user");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.state_mut().add.as_mut().unwrap().names[1] = "has space".into();
+        h.run();
+        h.get_by_label_contains("not allowed");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.state_mut().add.as_mut().unwrap().names[1] = "ok".into();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let names: Vec<String> = duplicate_requested(&engine)
+            .into_iter()
+            .map(|c| match c {
+                Change::Add { name, .. } => name,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["ok", "ok2"]);
+    }
+
+    #[test]
+    fn a_definition_without_a_name_needs_one_and_nowhere_is_not_a_place() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(
+            &mut h,
+            r#"{"type": "http", "url": "https://x.example/mcp"}"#,
+        );
+        h.get_by_label_contains("http · https://x.example/mcp");
+        h.get_by_label_contains("Give it a name");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.state_mut().add.as_mut().unwrap().names[0] = "x".into();
+        h.run();
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        h.get_by_label_contains("For the user").click();
+        h.run();
+        h.get_by_label_contains("Tick at least one place");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn add_hints_at_secrets_and_says_how_it_read_the_text() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(
+            &mut h,
+            "claude mcp add -e GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789 -e B=$HOME gh node",
+        );
+        h.get_by_label_contains("GITHUB_TOKEN looks like a secret");
+        h.get_by_label_contains("Claude Code fills it in");
+        assert!(h.query_by_label_contains("ghp_abc").is_none());
+        paste(&mut h, "npm install thing");
+        h.get_by_label_contains("Nothing here adds a server");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+    }
+
+    #[test]
+    fn add_is_in_the_palette_and_esc_closes_it_without_asking_anything() {
+        let (mut h, engine) = duplicate_harness();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "add a server");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.state().add.is_some());
+        paste(&mut h, "claude mcp add x node");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().add.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
     /// alpha (user) and beta (local in WebApp), and the forty-odd projects of a long-time Claude Code user.
     fn duplicate_harness_with_many_projects()
     -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
@@ -5728,17 +6342,23 @@ mod tests {
     fn duplicate_finds_a_project_by_part_of_its_path_and_keeps_what_was_ticked() {
         let (mut h, engine) = duplicate_harness_with_many_projects();
         open_duplicate_of(&mut h, "alpha");
-        h.state_mut().duplicate.as_mut().unwrap().filter = "HOME/me".into();
+        h.state_mut().duplicate.as_mut().unwrap().places.filter = "HOME/me".into();
         h.run();
         assert!(h.query_by_label("project-00").is_none());
         h.get_by_label("notes").click();
         h.run();
-        h.state_mut().duplicate.as_mut().unwrap().filter = "web".into();
+        h.state_mut().duplicate.as_mut().unwrap().places.filter = "web".into();
         h.run();
         assert!(h.query_by_label("notes").is_none());
         h.get_by_label("WebApp").click();
         h.run();
-        h.state_mut().duplicate.as_mut().unwrap().filter.clear();
+        h.state_mut()
+            .duplicate
+            .as_mut()
+            .unwrap()
+            .places
+            .filter
+            .clear();
         h.run();
         h.get_by_label("Review").click();
         h.run();
@@ -6088,10 +6708,10 @@ mod tests {
     fn the_toolbar_shows_only_what_works() {
         let (mut h, _engine) = live_harness();
         h.run();
-        // Duplicate (icon::COPY) was in this list until it was built; it is shown now.
+        // Duplicate (icon::COPY) and Add (icon::PLUS) were in this list until they were built; they are shown now.
         h.get_by_label(icon::COPY);
+        h.get_by_label(icon::PLUS);
         for gone in [
-            icon::PLUS,
             icon::SWAP,
             icon::SIGN_IN,
             icon::EXPORT,
