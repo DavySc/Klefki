@@ -69,7 +69,7 @@ impl Page {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DetailTab {
     General,
     Auth,
@@ -715,8 +715,28 @@ impl ShellApp {
                 .default_size((width * 0.34).clamp(360.0, 640.0))
                 .min_size(280.0)
                 .max_size((width * 0.5).max(460.0))
-                .frame(Frame::new().fill(pal.panel).inner_margin(Margin::same(12)))
-                .show(ui, |ui| self.detail(ui));
+                // The right margin is mostly inside the scroll area, where the scroll bar shows, so that the bar
+                // never covers a button at the panel's edge.
+                .frame(Frame::new().fill(pal.panel).inner_margin(Margin {
+                    right: 12 - DETAIL_SCROLL_BAR,
+                    ..Margin::same(12)
+                }))
+                .show(ui, |ui| {
+                    // A diagnosis or an open form is often taller than the window. Each selection and tab keeps
+                    // a place of its own, so another server's details start at the top.
+                    let shown = (self.selected.first().copied(), self.tab);
+                    egui::ScrollArea::vertical()
+                        .id_salt(("detail", shown))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            Frame::new()
+                                .inner_margin(Margin {
+                                    right: DETAIL_SCROLL_BAR,
+                                    ..Margin::ZERO
+                                })
+                                .show(ui, |ui| self.detail(ui));
+                        });
+                });
         }
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
@@ -3249,6 +3269,9 @@ fn bar_frame(pal: &Palette) -> Frame {
 fn search_id() -> egui::Id {
     egui::Id::new("search")
 }
+
+/// Room kept free for the detail panel's scroll bar: egui's bar at its widest, when the pointer is on it.
+const DETAIL_SCROLL_BAR: i8 = 10;
 
 /// What the Fix casing dialog holds: the servers that differ only in case, and the spelling they are to get.
 struct CasingForm {
@@ -5832,6 +5855,155 @@ mod tests {
         h.get_by_label("'xyz' is not recognized as an internal or external command,");
         h.get_by_label("operable program or batch file.");
         h.get_by_label_contains("the client wrote no debug output");
+    }
+
+    /// The size the app opens at (`main.rs`).
+    const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
+
+    /// Turns the wheel over the detail panel, a notch at a time, until `label` is inside the window, and says
+    /// where it was at first and where it ended up. It must start outside, or the test proves nothing.
+    fn wheel_the_detail_panel_to(
+        h: &mut Harness<'static, ShellApp>,
+        label: &str,
+    ) -> (egui::Rect, egui::Rect) {
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, OPENING_SIZE);
+        let first = h.get_by_label(label).rect();
+        assert!(
+            !window.contains_rect(first),
+            "{label} is already in view at {first:?}; the panel must be taller than the window"
+        );
+        let over = egui::pos2(first.center().x, window.center().y);
+        let mut rect = first;
+        for _ in 0..40 {
+            if window.contains_rect(rect) {
+                break;
+            }
+            h.event(egui::Event::PointerMoved(over));
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            for _ in 0..10 {
+                h.step();
+            }
+            rect = h.get_by_label(label).rect();
+        }
+        (first, rect)
+    }
+
+    #[test]
+    fn a_long_diagnosis_scrolls_into_view_at_the_opening_size() {
+        // Several causes and what the server said make the Status tab taller than the window the app opens at;
+        // the report, and the button that copies it, must still be reachable.
+        let (mut h, engine) = live_harness();
+        h.set_size(OPENING_SIZE);
+        let row = live_row("bad-stdio", Scope::User, None);
+        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+        let said: Vec<String> = (0..8).map(|i| format!("server line {i}")).collect();
+        let said: Vec<&str> = said.iter().map(String::as_str).collect();
+        engine
+            .events
+            .send(klefki_core::api::Event::Diagnosis {
+                id: row.id(),
+                diagnosis: diagnosis(
+                    Status::Failed,
+                    &[
+                        ("The command was not found", "Claude could not start the server because the program is not on the PATH it uses."),
+                        ("The server stopped while starting", "It closed its output before it answered, which usually means it crashed on start-up."),
+                        ("A value it needs is missing", "Check the environment variables the server's documentation lists."),
+                    ],
+                    &said,
+                    &["[ERROR] MCP server \"bad-stdio\" Connection failed (CONNECTION_CLOSED)"],
+                    Some("the client wrote no debug output"),
+                ),
+            })
+            .unwrap();
+        h.run();
+        open_status_tab(&mut h, "bad-stdio");
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, OPENING_SIZE);
+        let (_, rect) = wheel_the_detail_panel_to(&mut h, "Copy report");
+        assert!(window.contains_rect(rect), "Copy report at {rect:?}");
+        // What was scrolled past is still there, above.
+        h.get_by_label("The command was not found");
+    }
+
+    #[test]
+    fn another_servers_details_start_at_the_top() {
+        let (mut h, engine) = live_harness();
+        h.set_size(OPENING_SIZE);
+        let a = live_row("first-stdio", Scope::User, None);
+        let b = live_row("second-stdio", Scope::User, None);
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        let said: Vec<String> = (0..30).map(|i| format!("server line {i}")).collect();
+        let said: Vec<&str> = said.iter().map(String::as_str).collect();
+        for row in [&a, &b] {
+            engine
+                .events
+                .send(klefki_core::api::Event::Diagnosis {
+                    id: row.id(),
+                    diagnosis: diagnosis(Status::Failed, &[], &said, &[], None),
+                })
+                .unwrap();
+        }
+        h.run();
+        open_status_tab(&mut h, "first-stdio");
+        let (first, scrolled) = wheel_the_detail_panel_to(&mut h, "Copy report");
+        assert!(scrolled.top() < first.top());
+        h.get_by_label("second-stdio").click();
+        h.run();
+        let rect = h.get_by_label("Copy report").rect();
+        assert!(
+            (rect.top() - first.top()).abs() < 1.0,
+            "at {rect:?}, not where the first one started, {first:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_definition_form_scrolls_to_its_save_button_at_the_opening_size() {
+        let args: Vec<String> = (0..14).map(|i| format!("\"--flag-{i}\"")).collect();
+        let json = format!(
+            "{{\n  \"command\": \"node\",\n  \"args\": [{}]\n}}",
+            args.join(", ")
+        );
+        let (mut h, _engine, _) = form_harness(&json, true);
+        h.set_size(OPENING_SIZE);
+        h.run();
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, OPENING_SIZE);
+        let (_, rect) = wheel_the_detail_panel_to(&mut h, "Review and save…");
+        assert!(window.contains_rect(rect), "Review and save… at {rect:?}");
+    }
+
+    #[test]
+    fn the_detail_panels_scroll_bar_leaves_the_buttons_beside_it_clickable() {
+        let args: Vec<String> = (0..14).map(|i| format!("\"--flag-{i}\"")).collect();
+        let json = format!(
+            "{{\n  \"command\": \"node\",\n  \"args\": [{}]\n}}",
+            args.join(", ")
+        );
+        let (mut h, _engine, _) = form_harness(&json, true);
+        h.set_size(OPENING_SIZE);
+        h.run();
+        // The very edge of a button at the panel's right side, where the scroll bar shows.
+        let rect = h.get_by_label("Remove argument 1").rect();
+        let edge = egui::pos2(rect.right() - 2.0, rect.center().y);
+        h.event(egui::Event::PointerMoved(edge));
+        h.run();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: edge,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run();
+        }
+        assert_eq!(form(&mut h).args.len(), 13, "the click reached the button");
+        assert_eq!(form(&mut h).args[0], "--flag-1");
     }
 
     #[test]
