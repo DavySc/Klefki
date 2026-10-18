@@ -4,28 +4,40 @@
 //! Every change is a [`Plan`] made from [`Op`]s: `prepare` shows what would change, `apply` re-reads the file under
 //! Claude's own lock directory, re-applies the ops to that fresh copy, backs the old bytes up, and replaces the file
 //! atomically. Key order, unknown keys and untouched values survive because the ops patch the parsed document.
-//! Claude may still write without the lock (it gives up waiting after about 1.5 s), so `verify` re-reads a moment
-//! later and re-applies if our change is gone.
+//! Claude may still write without the lock (it gives up waiting after about 1.5 s). Two defences, borrowed from
+//! databases:
+//! - Validation before commit, as in optimistic concurrency control: just before the rename the file is checked to
+//!   be the version we read. If someone wrote meanwhile, our edit is redone on their version instead of replacing it.
+//! - Redo from a log: the engine keeps the plans written to a file in order, and `verify` replays all of them a
+//!   moment later on whatever is there (each op is idempotent when checking), the way a database replays its
+//!   write-ahead log after a crash. Replaying the whole log in order puts back every change Claude overwrote and
+//!   keeps the user's last word when two changes touch the same thing.
 use super::inventory::{MAX_CLAUDE_JSON, normalise_project};
 use super::{entry, fsx, jsonspan};
 use crate::sanitize::sanitize;
+use crate::watch;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Claude's own staleness rule for its lock directory.
 const LOCK_STALE: Duration = Duration::from_secs(10);
 const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
 const MAX_VERIFY_ROUNDS: usize = 3;
+/// How often a write is redone because the file changed between our read and our rename, before giving up.
+const VALIDATION_ATTEMPTS: usize = 3;
 /// Waits between attempts to replace the file while Windows refuses because someone has it open.
 const DENIED_RETRY_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
 const BOM: &str = "\u{feff}";
 
-/// One edit to the document. Idempotent: applying it twice changes nothing the second time.
+/// One edit to the document. Idempotent when checked ([`Purpose::Verify`]): once applied, applying it again changes
+/// nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Op {
     /// Put `name` in, or take it out of, `projects[<project>].disabledMcpServers`. `project` is a path in any
@@ -54,6 +66,21 @@ pub(crate) enum Op {
         name: String,
         entry: Value,
     },
+    /// Add server `name` with definition `entry` (same places as [`Op::RemoveServer`]; in every spelling of the
+    /// project). Refused when the name is taken there.
+    AddServer {
+        project: Option<String>,
+        name: String,
+        entry: Value,
+    },
+    /// Copy server `name` from `from` (same places as [`Op::RemoveServer`]) to `to` as `new_name`. The definition is
+    /// taken from the file as it is when the change is made, secrets included, so they never leave this module.
+    CopyServer {
+        from: Option<String>,
+        name: String,
+        to: Option<String>,
+        new_name: String,
+    },
 }
 
 impl Op {
@@ -61,25 +88,40 @@ impl Op {
     fn project(&self) -> Option<&str> {
         match self {
             Op::SetDisabled { project, .. } | Op::ClearRejection { project, .. } => Some(project),
-            Op::RemoveServer { project, .. } | Op::ReplaceServer { project, .. } => {
-                project.as_deref()
-            }
+            Op::RemoveServer { project, .. }
+            | Op::ReplaceServer { project, .. }
+            | Op::AddServer { project, .. } => project.as_deref(),
+            Op::CopyServer { to, .. } => to.as_deref(),
             Op::Approve { .. } => None,
         }
     }
 
     fn is_server_op(&self) -> bool {
-        matches!(self, Op::RemoveServer { .. } | Op::ReplaceServer { .. })
+        matches!(
+            self,
+            Op::RemoveServer { .. } | Op::ReplaceServer { .. } | Op::AddServer { .. }
+        )
     }
 
     fn server_name(&self) -> &str {
         match self {
-            Op::RemoveServer { name, .. } | Op::ReplaceServer { name, .. } => name,
+            Op::RemoveServer { name, .. }
+            | Op::ReplaceServer { name, .. }
+            | Op::AddServer { name, .. } => name,
+            Op::CopyServer { new_name, .. } => new_name,
             Op::SetDisabled { name, .. }
             | Op::ClearRejection { name, .. }
             | Op::Approve { name } => name,
         }
     }
+}
+
+/// Why ops are applied: to make a change, or to check that one made earlier is still in place. When checking, a
+/// server to delete that is already gone is the change in place, not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Change,
+    Verify,
 }
 
 /// Which file a [`Docstore`] writes, and so which ops it accepts.
@@ -178,6 +220,9 @@ pub(crate) struct Docstore {
     pub lock_wait: Duration,
     /// How long after a write to look again for an unlocked overwrite by Claude.
     pub verify_delay: Duration,
+    /// Runs just before the validation and rename, so a test can write the file at that moment.
+    #[cfg(test)]
+    pub before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Docstore {
@@ -189,6 +234,8 @@ impl Docstore {
             keep_backups: 20,
             lock_wait: Duration::from_secs(3),
             verify_delay: Duration::from_secs(1),
+            #[cfg(test)]
+            before_replace: None,
         }
     }
 
@@ -218,6 +265,8 @@ impl Docstore {
                 text,
                 bom,
                 missing: false,
+                // Only for writing, and a plan is never written from this copy.
+                stamp: None,
             },
             ops,
         )
@@ -227,7 +276,7 @@ impl Docstore {
         let (hash, edited) = alongside(
             current.text.len() >= PARALLEL_FROM,
             || current.hash(),
-            || self.edit(&current, &ops),
+            || self.edit(&current, &ops, Purpose::Change),
         );
         let (_, changes) = edited?;
         Ok(Plan {
@@ -243,10 +292,11 @@ impl Docstore {
         &self,
         current: &Current,
         ops: &[Op],
+        purpose: Purpose,
     ) -> Result<(Option<Splices>, Vec<FileChange>), StoreError> {
         let (text, lines) = match self.kind {
             // Possibly tens of megabytes: only the bytes of the changed lists are replaced.
-            Kind::ClaudeJson => edit_claude_json(&current.text, ops)?,
+            Kind::ClaudeJson => edit_claude_json(&current.text, ops, purpose)?,
             // A small file: parse, change, write it out whole.
             Kind::ProjectSettings => {
                 let mut doc = current.parse()?;
@@ -283,30 +333,74 @@ impl Docstore {
             ensure_plain_dir(dir)?;
         }
         let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
-        let current = self.read()?;
-        let (text, changes) = self.edit(&current, &plan.ops)?;
-        if changes != plan.changes && current.hash() != plan.base_hash {
-            return Err(StoreError::Changed);
-        }
-        self.write(&current, text.as_ref())
+        self.read_edit_write(|current| {
+            let (text, changes) = self.edit(current, &plan.ops, Purpose::Change)?;
+            if changes != plan.changes && current.hash() != plan.base_hash {
+                return Err(StoreError::Changed);
+            }
+            Ok(text)
+        })
     }
 
-    /// Waits `verify_delay`, then makes sure the change is still there. Claude may write without our lock, from a
-    /// copy it read before ours; if so the ops are applied again (up to twice). Says whether it had to.
-    /// Looking needs no lock (every writer replaces the file whole), so in the usual case, the change intact, Claude
-    /// is never kept waiting; the lock is taken only to write.
+    /// Under the lock: reads the file, makes `edit`'s change and writes it. When the file is replaced between our
+    /// read and our rename (Claude writing without the lock), the edit is redone on that version, so neither write
+    /// is lost; a file that never holds still is given up on as locked.
+    fn read_edit_write(
+        &self,
+        mut edit: impl FnMut(&Current) -> Result<Option<Splices>, StoreError>,
+    ) -> Result<Applied, StoreError> {
+        for _ in 0..VALIDATION_ATTEMPTS {
+            let current = self.read()?;
+            let Some(edits) = edit(&current)? else {
+                return Ok(Applied {
+                    wrote: false,
+                    backup: None,
+                });
+            };
+            if let Some(applied) = self.write(&current, &edits)? {
+                return Ok(applied);
+            }
+        }
+        Err(StoreError::Locked)
+    }
+
+    /// The log's changes, replayed in order on `current`, as one replacement of the whole text; `None` when they
+    /// are all in place. Each plan is applied to the result of the one before, as it was when it was written.
+    fn replay(&self, current: &Current, log: &[Plan]) -> Result<Option<Splices>, StoreError> {
+        let mut redone: Option<Current> = None;
+        for plan in log {
+            let base = redone.as_ref().unwrap_or(current);
+            if let (Some(edits), _) = self.edit(base, &plan.ops, Purpose::Verify)? {
+                redone = Some(Current {
+                    text: spliced(&base.text, &edits),
+                    bom: current.bom,
+                    missing: false,
+                    stamp: None,
+                });
+            }
+        }
+        Ok(redone
+            .filter(|r| r.text != current.text)
+            .map(|r| vec![(0..current.text.len(), r.text)]))
+    }
+
+    /// Waits `verify_delay`, then makes sure the changes in `log` (every plan written to this file whose check is
+    /// still due, oldest first) are still there. Claude may write without our lock, from a copy it read before
+    /// ours; if so the log is replayed (up to twice). Says whether it had to. Looking needs no lock (every writer
+    /// replaces the file whole), so in the usual case, the changes intact, Claude is never kept waiting; the lock is
+    /// taken only to write.
     ///
-    /// `superseded` says whether a newer change of ours to this file has started since. Then a difference is that
-    /// change, not an overwrite by Claude, and putting this one back would undo it; the check stops quietly.
+    /// `superseded` says whether a newer change of ours to this file has started since. Its own check will replay
+    /// a longer log, this one included, so this one stops quietly rather than race it.
     pub(crate) fn verify(
         &self,
-        plan: &Plan,
+        log: &[Plan],
         superseded: &dyn Fn() -> bool,
     ) -> Result<bool, StoreError> {
         let mut reapplied = false;
         for round in 0..MAX_VERIFY_ROUNDS {
             std::thread::sleep(self.verify_delay);
-            if superseded() || self.edit(&self.read()?, &plan.ops)?.0.is_none() {
+            if superseded() || self.replay(&self.read()?, log)?.is_none() {
                 return Ok(reapplied);
             }
             if round + 1 == MAX_VERIFY_ROUNDS {
@@ -317,12 +411,9 @@ impl Docstore {
             if superseded() {
                 return Ok(reapplied);
             }
-            let current = self.read()?;
-            let (edits, _) = self.edit(&current, &plan.ops)?;
-            if edits.is_some() {
-                self.write(&current, edits.as_ref())?;
-                reapplied = true;
-            }
+            reapplied |= self
+                .read_edit_write(|current| self.replay(current, log))?
+                .wrote;
         }
         Err(StoreError::Lost)
     }
@@ -334,17 +425,21 @@ impl Docstore {
     }
 
     fn read(&self) -> Result<Current, StoreError> {
+        // Taken before reading: a write that lands while we read then shows as a change at validation.
+        let stamp = watch::stamp(&self.path);
         match fsx::read_limited_bom(&self.path, MAX_CLAUDE_JSON)? {
             Some((text, bom)) => Ok(Current {
                 text,
                 bom,
                 missing: false,
+                stamp,
             }),
             // An approval may create the file; the main configuration is never created.
             None if self.kind == Kind::ProjectSettings => Ok(Current {
                 text: "{}".to_owned(),
                 bom: false,
                 missing: true,
+                stamp,
             }),
             None => Err(StoreError::Invalid(format!(
                 "{} does not exist; there is nothing to change.",
@@ -354,14 +449,9 @@ impl Docstore {
     }
 
     /// Replaces the file with its text after `edits` (plus the byte-order mark it had), written piece by piece so a
-    /// large file is not copied in memory first. `None` writes nothing.
-    fn write(&self, current: &Current, edits: Option<&Splices>) -> Result<Applied, StoreError> {
-        let Some(edits) = edits else {
-            return Ok(Applied {
-                wrote: false,
-                backup: None,
-            });
-        };
+    /// large file is not copied in memory first. `None` (nothing written, no backup) when the file is no longer
+    /// the version `current` was read from.
+    fn write(&self, current: &Current, edits: &Splices) -> Result<Option<Applied>, StoreError> {
         let dir = self.path.parent().ok_or_else(|| {
             StoreError::Invalid("the configuration file has no parent folder".to_owned())
         })?;
@@ -382,6 +472,15 @@ impl Docstore {
         }
         tmp.write_all(&current.text.as_bytes()[at..])?;
         tmp.as_file().sync_all()?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_replace {
+            hook();
+        }
+        // Validation: is the file still the version we read? A writer that ignored the lock would otherwise be
+        // overwritten. The window left is between this look and the rename, microseconds rather than the whole edit.
+        if watch::stamp(&self.path) != current.stamp {
+            return Ok(None);
+        }
         let backup = if current.missing {
             None
         } else {
@@ -407,10 +506,10 @@ impl Docstore {
             make_private(backup);
         }
         self.rotate_backups();
-        Ok(Applied {
+        Ok(Some(Applied {
             wrote: true,
             backup,
-        })
+        }))
     }
 
     /// Keeps the bytes about to be replaced. A hard link to the current file costs nothing, whatever its size: the
@@ -545,6 +644,9 @@ struct Current {
     bom: bool,
     /// The file does not exist yet; `text` is an empty object.
     missing: bool,
+    /// The file's identity when it was read (`None`: it did not exist), to tell at the rename whether anyone wrote
+    /// it since.
+    stamp: Option<watch::Stamp>,
 }
 
 impl Current {
@@ -648,13 +750,17 @@ const REJECTED: &str = "disabledMcpjsonServers";
 /// Applies `ops` to the text of `.claude.json` by replacing only the bytes of the lists they change. One pass over
 /// the projects, however many ops (switching a user server touches every project). Returns the new text, or `None`
 /// when nothing changes, and the plan's lines.
-fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<String>), StoreError> {
+fn edit_claude_json(
+    text: &str,
+    ops: &[Op],
+    purpose: Purpose,
+) -> Result<(Option<Splices>, Vec<String>), StoreError> {
     // Checking the whole text and finding the lists are independent passes over it: on a large file they run side
     // by side. A broken file is reported as such even when the scan also failed.
     let (valid, edited) = alongside(
         text.len() >= PARALLEL_FROM,
         || serde_json::from_str::<serde::de::IgnoredAny>(text),
-        || edit_valid_claude_json(text, ops),
+        || edit_valid_claude_json(text, ops, purpose),
     );
     valid.map_err(|e| {
         StoreError::Invalid(format!(
@@ -678,6 +784,19 @@ fn retry_denied<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> 
         }
     }
     attempt()
+}
+
+/// `text` with `edits` made (sorted, not overlapping).
+fn spliced(text: &str, edits: &Splices) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, with) in edits {
+        out.push_str(&text[at..range.start]);
+        out.push_str(with);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// Below this size a second thread costs more than it saves.
@@ -704,6 +823,7 @@ fn alongside<A: Send, B>(
 fn edit_valid_claude_json(
     text: &str,
     ops: &[Op],
+    purpose: Purpose,
 ) -> Result<(Option<Splices>, Vec<String>), StoreError> {
     let invalid = |why: String| StoreError::Invalid(why);
     let b = text.as_bytes();
@@ -719,6 +839,8 @@ fn edit_valid_claude_json(
     if ops.iter().any(|op| matches!(op, Op::Approve { .. })) {
         return Err(wrong_file());
     }
+    let expanded = expand_copies(text, start, ops, purpose)?;
+    let ops: &[Op] = &expanded;
     // `None` for an op on a user server (the top-level `mcpServers`).
     let targets: Vec<Option<String>> = ops
         .iter()
@@ -747,6 +869,7 @@ fn edit_valid_claude_json(
         nl: if text.contains("\r\n") { "\r\n" } else { "\n" },
         splices: Vec::new(),
         lines: Vec::new(),
+        purpose,
     };
 
     if user_servers {
@@ -760,6 +883,7 @@ fn edit_valid_claude_json(
         edit_servers(
             text,
             servers,
+            (&root, jsonspan::line_indent(text, root.open)),
             "  mcpServers".to_owned(),
             &here,
             true,
@@ -767,7 +891,7 @@ fn edit_valid_claude_json(
         )?;
     }
     if targets.iter().all(Option::is_none) {
-        return Ok(out.finish());
+        return out.finish();
     }
 
     let projects = single(&root, "projects", "the configuration")?
@@ -826,6 +950,7 @@ fn edit_valid_claude_json(
             let found = edit_servers(
                 text,
                 servers,
+                (entry, jsonspan::line_indent(text, member.key_start)),
                 format!("  projects[\"{shown_key}\"].mcpServers"),
                 &server_ops,
                 false,
@@ -905,7 +1030,11 @@ fn edit_valid_claude_json(
                             }
                         }
                     }
-                    Op::Approve { .. } | Op::RemoveServer { .. } | Op::ReplaceServer { .. } => {}
+                    Op::Approve { .. }
+                    | Op::RemoveServer { .. }
+                    | Op::ReplaceServer { .. }
+                    | Op::AddServer { .. }
+                    | Op::CopyServer { .. } => {}
                 }
             }
             if !changed {
@@ -921,15 +1050,23 @@ fn edit_valid_claude_json(
             });
         }
     }
-    if let Some(i) =
-        (0..ops.len()).find(|&i| ops[i].is_server_op() && targets[i].is_some() && !server_found[i])
-    {
+    if let Some(i) = (0..ops.len()).find(|&i| {
+        ops[i].is_server_op()
+            && targets[i].is_some()
+            && !server_found[i]
+            && !gone_is_done(&ops[i], purpose)
+    }) {
         return Err(invalid(format!(
             "{} is no longer in that project's configuration",
             sanitize(ops[i].server_name())
         )));
     }
-    Ok(out.finish())
+    out.finish()
+}
+
+/// A delete being checked whose server is already gone: that is the delete in place.
+fn gone_is_done(op: &Op, purpose: Purpose) -> bool {
+    purpose == Purpose::Verify && matches!(op, Op::RemoveServer { .. })
 }
 
 /// What an edit of `.claude.json` produces so far.
@@ -938,29 +1075,40 @@ struct Edited<'n> {
     nl: &'n str,
     splices: Splices,
     lines: Vec<String>,
+    purpose: Purpose,
 }
 
 impl Edited<'_> {
-    fn finish(mut self) -> (Option<Splices>, Vec<String>) {
+    fn finish(mut self) -> Result<(Option<Splices>, Vec<String>), StoreError> {
         // In file order; a stable sort keeps two insertions at the same place in the order they were made.
         self.splices.sort_by_key(|(range, _)| range.start);
-        (
+        // Two edits of the same bytes (say, two lists added to an empty project entry) would garble the file.
+        if self.splices.windows(2).any(|w| w[1].0.start < w[0].0.end) {
+            return Err(StoreError::Invalid(
+                "these changes overlap; make them one at a time".to_owned(),
+            ));
+        }
+        Ok((
             (!self.splices.is_empty()).then_some(self.splices),
             self.lines,
-        )
+        ))
     }
 }
 
-/// Deletes or replaces servers in one `mcpServers` object. Returns the ops that found their server. With
-/// `required`, an op whose server is missing is an error right away (user servers have one place only).
+/// Deletes, replaces or adds servers in one `mcpServers` object, which belongs to `owner` (the object and the
+/// indentation of its key's line), where a missing `mcpServers` is created. Returns the ops that found their server
+/// (or added it). With `required`, an op whose server is missing is an error right away (user servers have one place
+/// only).
 fn edit_servers<'o>(
     text: &str,
     servers: Option<&jsonspan::Member>,
+    owner: (&jsonspan::Object, Option<&str>),
     header: String,
     ops: &[&'o Op],
     required: bool,
     out: &mut Edited<'_>,
 ) -> Result<Vec<&'o Op>, StoreError> {
+    let purpose = out.purpose;
     let (nl, splices, lines) = (out.nl, &mut out.splices, &mut out.lines);
     let invalid = |why: String| StoreError::Invalid(why);
     let object = match servers {
@@ -973,6 +1121,8 @@ fn edit_servers<'o>(
     };
     let mut found = Vec::new();
     let mut removed = Vec::new();
+    let mut added: Vec<(&str, Value)> = Vec::new();
+    let mut changed_existing = false;
     for op in ops {
         let name = op.server_name();
         let index = object.and_then(|o| {
@@ -980,6 +1130,38 @@ fn edit_servers<'o>(
             let first = hits.next().map(|(i, _)| i);
             hits.next().map_or(first, |_| Some(usize::MAX))
         });
+        if let Op::AddServer { entry: new, .. } = op {
+            if index.is_some() {
+                if purpose == Purpose::Verify {
+                    // Added before; whatever it says now is someone's newer choice.
+                    found.push(*op);
+                    continue;
+                }
+                return Err(invalid(format!("{} already exists there", sanitize(name))));
+            }
+            crate::model::ServerName::parse(name).map_err(|e| {
+                invalid(format!(
+                    "{:?} cannot be used as a server name: {e}",
+                    sanitize(name)
+                ))
+            })?;
+            if added.iter().any(|(n, _)| *n == name) {
+                return Err(invalid(format!(
+                    "{} is added twice in one place",
+                    sanitize(name)
+                )));
+            }
+            // A new definition has no earlier values, so `<hidden>` in it is refused.
+            let new = entry::unmasked(new, &Value::Null).map_err(invalid)?;
+            entry::validate(&new).map_err(invalid)?;
+            lines.push(header.clone());
+            lines.push(format!("+ {}", sanitize(name)));
+            let shown = serde_json::to_string_pretty(&entry::masked(&new)).unwrap_or_default();
+            lines.extend(shown.lines().map(|l| format!("+ {}", sanitize(l))));
+            added.push((name, new));
+            found.push(*op);
+            continue;
+        }
         let index = match index {
             Some(usize::MAX) => {
                 return Err(invalid(format!(
@@ -988,7 +1170,7 @@ fn edit_servers<'o>(
                 )));
             }
             Some(i) => i,
-            None if required => {
+            None if required && !gone_is_done(op, purpose) => {
                 return Err(invalid(format!(
                     "{} is no longer in the configuration",
                     sanitize(name)
@@ -1001,10 +1183,7 @@ fn edit_servers<'o>(
         let old: Value = serde_json::from_str(&text[member.value.clone()])
             .map_err(|e| invalid(sanitize(&e.to_string())))?;
         if old.get("oauth").is_some() {
-            return Err(invalid(format!(
-                "{} signs in with OAuth; it is changed through Claude Code's own command, which Klefki does not run yet",
-                sanitize(name)
-            )));
+            return Err(invalid(oauth_refusal(name)));
         }
         if removed.contains(&index) || splices.iter().any(|(r, _)| *r == member.value) {
             return Err(invalid(format!(
@@ -1013,6 +1192,7 @@ fn edit_servers<'o>(
             )));
         }
         found.push(*op);
+        changed_existing = true;
         lines.push(header.clone());
         match op {
             Op::RemoveServer { .. } => {
@@ -1044,7 +1224,167 @@ fn edit_servers<'o>(
     if let (Some(object), false) = (object, removed.is_empty()) {
         splices.extend(remove_members(object, &removed));
     }
+    if !added.is_empty() {
+        if changed_existing {
+            return Err(invalid(
+                "adding a server and changing another in the same list is not supported in one plan".to_owned(),
+            ));
+        }
+        let keyed = |(name, value): (&str, Value)| -> Result<(String, Value), StoreError> {
+            Ok((
+                serde_json::to_string(name).map_err(|e| invalid(e.to_string()))?,
+                value,
+            ))
+        };
+        splices.push(match (servers, object) {
+            (Some(m), Some(object)) => {
+                let members = added
+                    .into_iter()
+                    .map(keyed)
+                    .collect::<Result<Vec<_>, _>>()?;
+                insert_members(
+                    text,
+                    object,
+                    jsonspan::line_indent(text, m.key_start),
+                    &members,
+                    nl,
+                )?
+            }
+            // No server list yet: it is added to the owner with the new servers in it.
+            _ => {
+                let list: serde_json::Map<String, Value> =
+                    added.into_iter().map(|(n, v)| (n.to_owned(), v)).collect();
+                insert_members(
+                    text,
+                    owner.0,
+                    owner.1,
+                    &[("\"mcpServers\"".to_owned(), Value::Object(list))],
+                    nl,
+                )?
+            }
+        });
+    }
     Ok(found)
+}
+
+fn oauth_refusal(name: &str) -> String {
+    format!(
+        "{} signs in with OAuth; it is changed through Claude Code's own command, which Klefki does not run yet",
+        sanitize(name)
+    )
+}
+
+/// Turns each [`Op::CopyServer`] into an [`Op::AddServer`] with the definition as `text` has it now. When checking,
+/// a copy whose original is gone is left out: there is nothing to put back.
+fn expand_copies<'a>(
+    text: &str,
+    start: usize,
+    ops: &'a [Op],
+    purpose: Purpose,
+) -> Result<std::borrow::Cow<'a, [Op]>, StoreError> {
+    if !ops.iter().any(|op| matches!(op, Op::CopyServer { .. })) {
+        return Ok(std::borrow::Cow::Borrowed(ops));
+    }
+    let invalid = |why: String| StoreError::Invalid(why);
+    let sources: Vec<String> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::CopyServer { from: Some(p), .. } => Some(normalise_project(p)),
+            _ => None,
+        })
+        .collect();
+    let root = jsonspan::object_with(text, start, &mut |level, key| match level {
+        0 => key == "mcpServers" || (key == "projects" && !sources.is_empty()),
+        1 => sources.iter().any(|s| *s == normalise_project(key)),
+        2 => key == "mcpServers",
+        _ => false,
+    })
+    .map_err(invalid)?;
+    // The server lists a copy can come from: the user's, or those of every spelling of a project.
+    let lists = |from: &Option<String>| -> Result<Vec<&jsonspan::Object>, StoreError> {
+        let mut members: Vec<&jsonspan::Member> = Vec::new();
+        match from {
+            None => members.extend(single(&root, "mcpServers", "the configuration")?),
+            Some(project) => {
+                let project = normalise_project(project);
+                let projects = single(&root, "projects", "the configuration")?;
+                for member in projects
+                    .and_then(|p| p.object.as_ref())
+                    .map_or(&[][..], |p| &p.members)
+                {
+                    if normalise_project(&member.key) == project
+                        && let Some(entry) = &member.object
+                    {
+                        members.extend(single(entry, "mcpServers", "a project entry")?);
+                    }
+                }
+            }
+        }
+        let out = members
+            .into_iter()
+            .map(|m| {
+                m.object
+                    .as_ref()
+                    .ok_or_else(|| invalid("mcpServers is not an object".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    };
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        let Op::CopyServer {
+            from,
+            name,
+            to,
+            new_name,
+        } = op
+        else {
+            out.push(op.clone());
+            continue;
+        };
+        let mut definitions: Vec<Value> = Vec::new();
+        for list in lists(from)? {
+            let mut hits = list.members.iter().filter(|m| m.key == *name);
+            if let Some(m) = hits.next() {
+                if hits.next().is_some() {
+                    return Err(invalid(format!(
+                        "{} is defined twice; refusing to guess which one Claude Code uses",
+                        sanitize(name)
+                    )));
+                }
+                let value: Value = serde_json::from_str(&text[m.value.clone()])
+                    .map_err(|e| invalid(sanitize(&e.to_string())))?;
+                if !definitions.contains(&value) {
+                    definitions.push(value);
+                }
+            }
+        }
+        let definition = match definitions.len() {
+            1 => definitions.pop().expect("one"),
+            0 if purpose == Purpose::Verify => continue,
+            0 => {
+                return Err(invalid(format!(
+                    "{} is no longer in the configuration",
+                    sanitize(name)
+                )));
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "{} is defined differently in two spellings of the project; refusing to guess which one Claude Code uses",
+                    sanitize(name)
+                )));
+            }
+        };
+        if definition.get("oauth").is_some() {
+            return Err(invalid(oauth_refusal(name)));
+        }
+        out.push(Op::AddServer {
+            project: to.clone(),
+            name: new_name.clone(),
+            entry: definition,
+        });
+    }
+    Ok(std::borrow::Cow::Owned(out))
 }
 
 /// The splices that delete the members at `removed` from `object`, commas included, without overlapping: a member
@@ -1128,37 +1468,66 @@ fn add_member(
     nl: &str,
 ) -> Result<(std::ops::Range<usize>, String), StoreError> {
     let key = serde_json::to_string(list).map_err(|e| StoreError::Invalid(e.to_string()))?;
-    match entry.members.last() {
-        Some(last) => match jsonspan::line_indent(text, last.key_start) {
-            Some(indent) => Ok((
-                last.value.end..last.value.end,
-                format!(
-                    ",{nl}{indent}{key}: {}",
-                    render_list(items, Some(indent), nl)?
-                ),
-            )),
-            None => Ok((
-                last.value.end..last.value.end,
-                format!(",{key}:{}", render_list(items, None, nl)?),
-            )),
-        },
-        // An empty entry, `{}`: written out like Claude would, two spaces deeper than the project's key.
-        None => match jsonspan::line_indent(text, member.key_start) {
-            Some(outer) => {
-                let inner = format!("{outer}  ");
-                Ok((
-                    entry.open..entry.close + 1,
-                    format!(
-                        "{{{nl}{inner}{key}: {}{nl}{outer}}}",
-                        render_list(items, Some(&inner), nl)?
-                    ),
-                ))
+    insert_members(
+        text,
+        entry,
+        jsonspan::line_indent(text, member.key_start),
+        &[(key, Value::Array(items.to_vec()))],
+        nl,
+    )
+}
+
+/// The splice that adds `members` (keys already written as JSON strings) after the last member of `object`, styled
+/// like it. An empty `object` is written out like Claude would, two spaces deeper than `outer`, the indentation of
+/// the line its key is on; on one line when that key shares its line with other text (`outer` is `None`).
+fn insert_members(
+    text: &str,
+    object: &jsonspan::Object,
+    outer: Option<&str>,
+    members: &[(String, Value)],
+    nl: &str,
+) -> Result<(std::ops::Range<usize>, String), StoreError> {
+    let mut out = String::new();
+    match object.members.last() {
+        Some(last) => {
+            let indent = jsonspan::line_indent(text, last.key_start);
+            for (key, value) in members {
+                out.push(',');
+                match indent {
+                    Some(indent) => {
+                        out.push_str(&format!(
+                            "{nl}{indent}{key}: {}",
+                            render_value(value, Some(indent), nl)?
+                        ));
+                    }
+                    None => out.push_str(&format!("{key}:{}", render_value(value, None, nl)?)),
+                }
             }
-            None => Ok((
-                entry.open..entry.close + 1,
-                format!("{{{key}:{}}}", render_list(items, None, nl)?),
-            )),
-        },
+            Ok((last.value.end..last.value.end, out))
+        }
+        None => {
+            out.push('{');
+            for (i, (key, value)) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match outer {
+                    Some(outer) => {
+                        let inner = format!("{outer}  ");
+                        out.push_str(&format!(
+                            "{nl}{inner}{key}: {}",
+                            render_value(value, Some(&inner), nl)?
+                        ));
+                    }
+                    None => out.push_str(&format!("{key}:{}", render_value(value, None, nl)?)),
+                }
+            }
+            if let Some(outer) = outer {
+                out.push_str(&format!("{nl}{outer}"));
+            }
+            out.push('}');
+            Ok((object.open..object.close + 1, out))
+        }
     }
 }
 
@@ -1863,6 +2232,107 @@ mod tests {
         );
     }
 
+    // ---- the write path as a log: redo in order, and validation before the rename
+
+    #[test]
+    fn verify_replays_every_logged_change_in_order() {
+        // Two changes, then Claude saves a copy it read before both: verify of the log puts both back.
+        let f = Fixture::new(&pretty(&sample()));
+        let first = apply_ops(&f, vec![disable("C:/work/app", "gateway")]);
+        let second = apply_ops(&f, vec![disable("C:/work/app", "other")]);
+        let mut theirs = sample();
+        theirs["numStartups"] = json!(99);
+        std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
+        assert_eq!(f.store.verify(&[first, second], &|| false), Ok(true));
+        let j = f.json();
+        assert_eq!(j["numStartups"], 99);
+        assert_eq!(
+            j["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway", "other"])
+        );
+    }
+
+    #[test]
+    fn replaying_keeps_the_users_last_word() {
+        // Off, then on again: Claude saves the copy from in between. The log ends with "on", so on it is.
+        let f = Fixture::new(&pretty(&sample()));
+        let off = apply_ops(&f, vec![disable("C:/work/app", "gateway")]);
+        let in_between = f.text();
+        let on = apply_ops(&f, vec![enable("C:/work/app", "gateway")]);
+        std::fs::write(&f.store.path, &in_between).unwrap();
+        assert_eq!(f.store.verify(&[off, on], &|| false), Ok(true));
+        assert_eq!(
+            f.json()["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old"])
+        );
+    }
+
+    #[test]
+    fn replaying_two_edits_of_one_server_ends_with_the_second() {
+        // Each change is applied to the result of the one before, not all at once to the file.
+        let f = Fixture::new(&pretty(&sample()));
+        let a = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "a"}))]);
+        let b = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "b"}))]);
+        std::fs::write(&f.store.path, pretty(&sample())).unwrap();
+        assert_eq!(f.store.verify(&[a, b], &|| false), Ok(true));
+        assert_eq!(f.json()["mcpServers"]["gateway"], json!({"command": "b"}));
+        assert_eq!(f.store.verify(&[], &|| false), Ok(false));
+    }
+
+    #[test]
+    fn a_write_landing_between_our_read_and_our_rename_is_not_overwritten() {
+        // Claude writes without the lock while we hold it. Checked just before the rename (validation, as in
+        // optimistic concurrency control), the change is redone on Claude's version instead of replacing it.
+        let mut f = Fixture::new(&pretty(&sample()));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (path, seen) = (f.store.path.clone(), Arc::clone(&calls));
+        f.store.before_replace = Some(Arc::new(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut theirs = sample();
+                theirs["numStartups"] = json!(99);
+                std::fs::write(&path, pretty(&theirs)).unwrap();
+            }
+        }));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let j = f.json();
+        assert_eq!(j["numStartups"], 99, "Claude's write survives");
+        assert_eq!(
+            j["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway"]),
+            "and so does ours"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
+    #[test]
+    fn a_file_that_never_holds_still_is_given_up_on() {
+        let mut f = Fixture::new(&pretty(&sample()));
+        let (path, n) = (
+            f.store.path.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = Arc::clone(&n);
+        f.store.before_replace = Some(Arc::new(move || {
+            let i = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut theirs = sample();
+            theirs["numStartups"] = json!(100 + i);
+            std::fs::write(&path, pretty(&theirs)).unwrap();
+        }));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        assert_eq!(f.store.apply(&plan), Err(StoreError::Locked));
+        assert!(f.json()["projects"]["C:/work/app"]["disabledMcpServers"] == json!(["old"]));
+        assert!(f.backups().is_empty(), "{:?}", f.backups());
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
     #[test]
     fn verify_puts_the_change_back_when_claude_overwrote_it() {
         let f = Fixture::new(&pretty(&sample()));
@@ -1875,7 +2345,10 @@ mod tests {
         let mut theirs = sample();
         theirs["numStartups"] = json!(99);
         std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
-        assert_eq!(f.store.verify(&plan, &|| false), Ok(true));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(true)
+        );
         let j = f.json();
         assert_eq!(j["numStartups"], 99);
         assert_eq!(
@@ -1894,7 +2367,10 @@ mod tests {
         f.store.apply(&plan).unwrap();
         let newer = sample();
         std::fs::write(&f.store.path, pretty(&newer)).unwrap();
-        assert_eq!(f.store.verify(&plan, &|| true), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| true),
+            Ok(false)
+        );
         assert_eq!(f.text(), pretty(&newer));
         // Superseded only once the lock is held: still nothing written.
         let calls = std::cell::Cell::new(0);
@@ -1902,7 +2378,10 @@ mod tests {
             calls.set(calls.get() + 1);
             calls.get() > 1
         };
-        assert_eq!(f.store.verify(&plan, &late), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &late),
+            Ok(false)
+        );
         assert_eq!(f.text(), pretty(&newer));
     }
 
@@ -1915,7 +2394,10 @@ mod tests {
             .unwrap();
         f.store.apply(&plan).unwrap();
         let backups = f.backups().len();
-        assert_eq!(f.store.verify(&plan, &|| false), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
         assert_eq!(f.backups().len(), backups);
     }
 
@@ -1934,7 +2416,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            f.store.verify(&plan, &|| false),
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
             Err(StoreError::Invalid(_))
         ));
     }
@@ -2486,11 +2968,15 @@ mod tests {
                         Op::ClearRejection { project, name } => {
                             clear_rejection(&mut expected, project, name, &mut expected_lines)
                         }
-                        Op::Approve { .. } | Op::RemoveServer { .. } | Op::ReplaceServer { .. } => {
+                        Op::Approve { .. }
+                        | Op::RemoveServer { .. }
+                        | Op::ReplaceServer { .. }
+                        | Op::AddServer { .. }
+                        | Op::CopyServer { .. } => {
                             unreachable!("not generated")
                         }
                     });
-                let got = edit_claude_json(&text, &ops);
+                let got = edit_claude_json(&text, &ops, Purpose::Change);
                 match (oracle, got) {
                     (Ok(()), Ok((splices, mut lines))) => {
                         let mut new_text = text.clone();
@@ -2529,7 +3015,10 @@ mod tests {
         f.store.apply(&plan).unwrap();
         // Claude is busy saving: an intact change needs nothing from it, so verify must not wait or fail.
         std::fs::create_dir(f.lock()).unwrap();
-        assert_eq!(f.store.verify(&plan, &|| false), Ok(false));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
         assert!(f.lock().is_dir(), "someone else's lock is left alone");
     }
 
@@ -2544,7 +3033,10 @@ mod tests {
         let before = pretty(&sample());
         std::fs::write(&f.store.path, &before).unwrap();
         std::fs::create_dir(f.lock()).unwrap();
-        assert_eq!(f.store.verify(&plan, &|| false), Err(StoreError::Locked));
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Err(StoreError::Locked)
+        );
         assert_eq!(f.text(), before, "nothing written without the lock");
     }
 
@@ -2620,6 +3112,174 @@ mod tests {
         let plan = f.store.prepare(ops).unwrap();
         f.store.apply(&plan).unwrap();
         plan
+    }
+
+    #[test]
+    fn verify_after_a_delete_accepts_the_server_being_gone() {
+        // Reproducer: verify re-runs the ops on the written file, where the deleted server no longer exists.
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = apply_ops(&f, vec![remove(None, "gateway")]);
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
+        // A local server too, and one deleted from every spelling of its project.
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["mcpServers"] = json!({"x": {"command": "a"}});
+        doc["projects"]["c:\\work\\app"] = json!({"mcpServers": {"x": {"command": "a"}}});
+        let f = Fixture::new(&pretty(&doc));
+        let plan = apply_ops(&f, vec![remove(Some("C:/work/app"), "x")]);
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
+    }
+
+    fn copy(from: Option<&str>, name: &str, to: Option<&str>, new_name: &str) -> Op {
+        Op::CopyServer {
+            from: from.map(str::to_owned),
+            name: name.to_owned(),
+            to: to.map(str::to_owned),
+            new_name: new_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn copying_a_user_server_into_a_project_creates_its_server_list() {
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = apply_ops(
+            &f,
+            vec![copy(None, "gateway", Some("C:/work/other"), "gateway_copy")],
+        );
+        let mut expected = sample();
+        expected["projects"]["C:/work/other"]["mcpServers"] =
+            json!({"gateway_copy": {"command": "node", "env": {"TOKEN": "s3cret"}}});
+        // Byte for byte what Claude would write: the rest of the file untouched, the new list pretty like it.
+        assert_eq!(f.text(), pretty(&expected));
+        // The plan names what is added and never shows a secret.
+        let lines = &plan.changes()[0].lines;
+        assert!(lines.iter().any(|l| l == "+ gateway_copy"), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("s3cret")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("<hidden>")), "{lines:?}");
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn copying_into_existing_lists_and_to_several_places_at_once() {
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["mcpServers"] =
+            json!({"loc": {"type": "http", "url": "https://x.example/mcp"}});
+        doc["projects"]["C:/work/other"]["mcpServers"] = json!({});
+        let f = Fixture::new(&pretty(&doc));
+        apply_ops(
+            &f,
+            vec![
+                copy(Some("C:/work/app"), "loc", None, "loc"),
+                copy(Some("C:/work/app"), "loc", Some("C:/work/other"), "loc"),
+                copy(Some("C:/work/app"), "loc", Some("C:/work/app"), "loc_copy"),
+                copy(None, "gateway", Some("C:/work/app"), "gw2"),
+            ],
+        );
+        let loc = json!({"type": "http", "url": "https://x.example/mcp"});
+        let mut expected = doc.clone();
+        expected["mcpServers"]["loc"] = loc.clone();
+        expected["projects"]["C:/work/other"]["mcpServers"]["loc"] = loc.clone();
+        expected["projects"]["C:/work/app"]["mcpServers"]["loc_copy"] = loc.clone();
+        expected["projects"]["C:/work/app"]["mcpServers"]["gw2"] =
+            doc["mcpServers"]["gateway"].clone();
+        assert_eq!(f.text(), pretty(&expected));
+    }
+
+    #[test]
+    fn copying_works_in_a_file_on_one_line_and_into_every_spelling_of_a_project() {
+        let doc = json!({
+            "mcpServers": {"a": {"command": "x"}},
+            "projects": {"C:/work/app": {"mcpServers": {}}, "c:\\work\\app\\": {}}
+        });
+        let f = Fixture::new(&doc.to_string());
+        apply_ops(&f, vec![copy(None, "a", Some("C:/work/app"), "b")]);
+        assert!(!f.text().contains('\n'));
+        let j = f.json();
+        assert_eq!(
+            j["projects"]["C:/work/app"]["mcpServers"]["b"],
+            json!({"command": "x"})
+        );
+        assert_eq!(
+            j["projects"]["c:\\work\\app\\"]["mcpServers"]["b"],
+            json!({"command": "x"})
+        );
+        assert_eq!(j["mcpServers"], doc["mcpServers"]);
+    }
+
+    #[test]
+    fn copies_that_cannot_be_made_are_refused_and_write_nothing() {
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["mcpServers"] = json!({"taken": {"command": "y"}});
+        doc["projects"]["C:/work/other"]["mcpServers"] = json!({"auth": {"type": "http", "url": "https://x.example", "oauth": {"clientId": "c"}}});
+        doc["projects"]["c:\\work\\app"] = json!({"mcpServers": {"taken": {"command": "z"}}});
+        let f = Fixture::new(&pretty(&doc));
+        for (op, why) in [
+            (
+                copy(None, "gateway", Some("C:/work/app"), "taken"),
+                "already",
+            ),
+            (copy(None, "gateway", None, "gateway"), "already"),
+            (
+                copy(None, "gateway", Some("C:/work/other"), "bad name"),
+                "name",
+            ),
+            (copy(None, "gateway", Some("C:/work/other"), ""), "name"),
+            (
+                copy(None, "gateway", Some("C:/work/other"), &"x".repeat(65)),
+                "name",
+            ),
+            (
+                copy(None, "missing", Some("C:/work/other"), "m"),
+                "no longer",
+            ),
+            (copy(Some("C:/work/other"), "auth", None, "auth2"), "OAuth"),
+            (copy(Some("C:/work/app"), "taken", None, "t2"), "differ"),
+            (
+                copy(None, "gateway", Some("C:/nowhere"), "g"),
+                "not a project",
+            ),
+        ] {
+            let err = f.store.prepare(vec![op.clone()]).unwrap_err().to_string();
+            assert!(err.contains(why), "{op:?}: {err}");
+        }
+        // The same new name twice in one place.
+        let err = f
+            .store
+            .prepare(vec![
+                copy(None, "gateway", Some("C:/work/other"), "g"),
+                copy(None, "gateway", Some("C:/work/other"), "g"),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("twice"), "{err}");
+        assert_eq!(f.text(), pretty(&doc));
+    }
+
+    #[test]
+    fn verify_puts_a_copy_back_when_claude_overwrote_it() {
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = apply_ops(&f, vec![copy(None, "gateway", None, "gw2")]);
+        std::fs::write(&f.store.path, pretty(&sample())).unwrap();
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(true)
+        );
+        assert_eq!(
+            f.json()["mcpServers"]["gw2"],
+            sample()["mcpServers"]["gateway"]
+        );
+        assert_eq!(
+            f.store.verify(std::slice::from_ref(&plan), &|| false),
+            Ok(false)
+        );
     }
 
     #[test]

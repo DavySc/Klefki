@@ -61,6 +61,12 @@ pub enum Change {
     /// Replace the definition of a user or local server with `json`, as edited from [`Event::Entry`]: values shown
     /// as `<hidden>` keep the value they had.
     Replace { id: ServerId, json: String },
+    /// Copy a user or local server, definition and secrets included, to each of `targets` as `name`.
+    Duplicate {
+        id: ServerId,
+        name: String,
+        targets: Vec<crate::model::Target>,
+    },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -378,9 +384,8 @@ struct Shared {
     /// The CLI's version, for the program file it was read from. Asking costs a process start (Claude Code is a
     /// large Node program), so it is only asked again when the file changes.
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
-    /// Per file, how many changes klefki has started writing to it. A verify of an older change stands down once a
-    /// newer one exists, so it never mistakes that change for Claude overwriting its own.
-    writes: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    /// Per file, the redo log of klefki's changes whose check is still due.
+    journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
     /// For threads that need the engine thread to do something (read the files again).
     input: Sender<Input>,
@@ -419,7 +424,7 @@ fn engine_main(
         generation: AtomicU64::new(0),
         claude: RwLock::new(None),
         version: Mutex::new(None),
-        writes: Arc::default(),
+        journals: Arc::default(),
         emitter,
         input: input_tx.clone(),
     });
@@ -603,18 +608,24 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     }
     let mut written = Vec::new();
     let mut backups = Vec::new();
+    // Every file this change starts on, with its sequence number there; each gets checked afterwards, written or not.
+    let mut started = Vec::new();
     for (plan, store) in &parts {
-        // Marked before the write, so an earlier change's verify that takes the lock after it already knows.
-        let generation = {
-            let mut writes = lock(&shared.writes);
-            let n = writes.entry(store.path.clone()).or_default();
-            *n += 1;
-            *n
-        };
+        // Numbered before the write, so an earlier change's check that takes the lock after it already knows.
+        let lsn = lock(&shared.journals)
+            .entry(store.path.clone())
+            .or_default()
+            .start();
+        started.push((store.clone(), lsn));
         match store.apply(plan) {
             Ok(applied) => {
                 if applied.wrote {
-                    written.push((plan.clone(), store.clone(), generation));
+                    lock(&shared.journals)
+                        .entry(store.path.clone())
+                        .or_default()
+                        .pending
+                        .push((lsn, plan.clone()));
+                    written.push(plan.clone());
                 }
                 backups.extend(applied.backup);
             }
@@ -623,7 +634,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                 if !written.is_empty() {
                     let done: Vec<String> = written
                         .iter()
-                        .flat_map(|(p, _, _)| p.changes().iter().map(|c| c.path.clone()))
+                        .flat_map(|p| p.changes().iter().map(|c| c.path.clone()))
                         .collect();
                     message.push_str(&format!(
                         " Already saved: {}. The rest was not changed.",
@@ -631,6 +642,8 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                     ));
                     reload_after_change(shared, state);
                 }
+                // This change now numbers last on the file, so the earlier ones' checks stand down for it.
+                check_later(shared, id, started);
                 return fail(message);
             }
         }
@@ -638,31 +651,8 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     let changed = !written.is_empty();
     if changed {
         reload_after_change(shared, state);
-        // Claude Code can write without our lock; look again shortly, off the engine thread.
-        let emitter = shared.emitter.clone();
-        let input = shared.input.clone();
-        let writes = Arc::clone(&shared.writes);
-        std::thread::spawn(move || {
-            let mut reapplied = false;
-            for (plan, store, generation) in &written {
-                let superseded = || lock(&writes).get(&store.path) != Some(generation);
-                match store.verify(plan, &superseded) {
-                    Ok(again) => reapplied |= again,
-                    Err(e) => {
-                        return emitter.emit(Event::ApplyFailed {
-                            plan: id,
-                            error: e.to_string(),
-                        });
-                    }
-                }
-            }
-            if reapplied {
-                // The engine thread reads the files again, as for any change on disk.
-                let _ = input.send(Input::FilesChanged);
-                emitter.emit(Event::Reapplied { plan: id });
-            }
-        });
     }
+    check_later(shared, id, started);
     shared.emitter.emit(Event::Applied {
         plan: id,
         changed,
@@ -675,6 +665,74 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                     .join(", "),
             )
         }),
+    });
+}
+
+/// The changes klefki wrote to one file and has not yet checked, oldest first: a small redo log. Claude Code may
+/// write without our lock from a copy it read earlier; replaying the log in order puts every overwritten change
+/// back, and two changes to the same thing end the way the later one says.
+#[derive(Default)]
+struct Journal {
+    /// The sequence number of the latest change started on the file.
+    latest: u64,
+    pending: Vec<(u64, Plan)>,
+}
+
+impl Journal {
+    fn start(&mut self) -> u64 {
+        self.latest += 1;
+        self.latest
+    }
+}
+
+/// Shortly after a change, off the engine thread, checks each file it started on against that file's whole log.
+/// Only the latest change on a file checks it (older ones stand down, the newest log covers theirs), the way a
+/// database groups commits; once checked, the logged changes are retired.
+fn check_later(shared: &Shared, id: u64, started: Vec<(Docstore, u64)>) {
+    let journals = Arc::clone(&shared.journals);
+    let logs: Vec<_> = {
+        let j = lock(&journals);
+        started
+            .into_iter()
+            .filter_map(|(store, lsn)| {
+                let pending = &j.get(&store.path)?.pending;
+                let last = pending.last()?.0;
+                let log: Vec<Plan> = pending.iter().map(|(_, p)| p.clone()).collect();
+                Some((store, lsn, last, log))
+            })
+            .collect()
+    };
+    if logs.is_empty() {
+        return;
+    }
+    let emitter = shared.emitter.clone();
+    let input = shared.input.clone();
+    std::thread::spawn(move || {
+        let mut reapplied = false;
+        for (store, lsn, last, log) in &logs {
+            let superseded = || lock(&journals).get(&store.path).map(|j| j.latest) != Some(*lsn);
+            let result = store.verify(log, &superseded);
+            // Retired whatever the outcome: a log that cannot be put back is reported now, not retried forever.
+            if let Some(j) = lock(&journals).get_mut(&store.path)
+                && j.latest == *lsn
+            {
+                j.pending.retain(|(n, _)| n > last);
+            }
+            match result {
+                Ok(again) => reapplied |= again,
+                Err(e) => {
+                    return emitter.emit(Event::ApplyFailed {
+                        plan: id,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+        if reapplied {
+            // The engine thread reads the files again, as for any change on disk.
+            let _ = input.send(Input::FilesChanged);
+            emitter.emit(Event::Reapplied { plan: id });
+        }
     });
 }
 
@@ -1137,6 +1195,7 @@ fn hint(kind: HintKind, said: &str) -> Hint {
 mod tests {
     use super::*;
     use crate::cli::testutil::{fake_claude, write_scenario};
+    use crate::model::Target;
     use std::time::Instant;
 
     const WAIT: Duration = Duration::from_secs(15);
@@ -2430,6 +2489,75 @@ mod tests {
     }
 
     #[test]
+    fn claude_overwriting_after_two_quick_changes_loses_neither() {
+        // Found reviewing main: the first change's check stood down for the second, whose check only put its own
+        // change back, so the first was silently lost.
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        // Claude saves a copy it read before either change, without the lock.
+        let mut theirs = two_projects("end");
+        theirs["numStartups"] = serde_json::json!(9);
+        write_config(&env, &theirs);
+        let events = events_for(&core, Duration::from_millis(3000));
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Reapplied { .. })),
+            "{events:#?}"
+        );
+        let now = config_json(&env);
+        assert_eq!(now["numStartups"], 9, "Claude's own change stays");
+        assert_eq!(
+            now["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!(["loc", "gw"])
+        );
+    }
+
+    #[test]
+    fn a_later_change_that_writes_nothing_still_has_the_earlier_one_checked() {
+        // The variant: the second change finds nothing to write, yet it numbers last on the file.
+        let env = quiet_env(&two_projects("end"));
+        let mut config = env.config();
+        config.verify_delay = Duration::from_millis(600);
+        let core = start_with(config, || {});
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        // Already off: nothing to write.
+        apply_now(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        write_config(&env, &two_projects("end"));
+        events_for(&core, Duration::from_millis(3000));
+        assert_eq!(
+            config_json(&env)["projects"]["/work/a"]["disabledMcpServers"],
+            serde_json::json!(["loc"])
+        );
+    }
+
+    #[test]
     fn a_later_change_to_another_server_still_leaves_both_in_place() {
         let env = quiet_env(&two_projects("end"));
         let mut config = env.config();
@@ -2512,6 +2640,19 @@ mod tests {
             e.iter()
                 .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
         })
+    }
+
+    /// The verify that runs shortly after a write (50 ms in tests) reports no failure.
+    fn verify_passes(core: &Core) {
+        std::thread::sleep(Duration::from_millis(400));
+        let mut late = Vec::new();
+        while let Some(e) = core.try_recv() {
+            late.push(e);
+        }
+        assert!(
+            !late.iter().any(|e| matches!(e, Event::ApplyFailed { .. })),
+            "{late:#?}"
+        );
     }
 
     #[test]
@@ -3110,6 +3251,147 @@ mod tests {
                 .iter()
                 .all(|r| r.name != "gw")
         );
+        verify_passes(&core);
+    }
+
+    fn duplicate(id: ServerId, name: &str, targets: Vec<Target>) -> Change {
+        Change::Duplicate {
+            id,
+            name: name.to_owned(),
+            targets,
+        }
+    }
+
+    #[test]
+    fn duplicating_a_user_server_into_projects_copies_it_secrets_and_all() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![duplicate(
+                user_id("gw"),
+                "gw_copy",
+                vec![
+                    Target::Local("/work/a".into()),
+                    Target::Local("/work/b".into()),
+                ],
+            )],
+        );
+        assert_eq!(plan.summary, ["Duplicate gw as gw_copy in a and b"]);
+        assert_eq!(plan.action, "Duplicate");
+        assert!(!plan.destructive);
+        let shown = format!("{plan:?}");
+        assert!(!shown.contains("s3cret-value"), "{shown}");
+        assert!(shown.contains("+ gw_copy"), "{shown}");
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. }))
+        );
+        let now = config_json(&env);
+        let gw = two_projects("end")["mcpServers"]["gw"].clone();
+        assert_eq!(now["projects"]["/work/a"]["mcpServers"]["gw_copy"], gw);
+        assert_eq!(now["projects"]["/work/b"]["mcpServers"]["gw_copy"], gw);
+        assert_eq!(now["mcpServers"], two_projects("end")["mcpServers"]);
+        let rows = &snapshots(&events).last().unwrap().servers;
+        assert_eq!(rows.iter().filter(|r| r.name == "gw_copy").count(), 2);
+        verify_passes(&core);
+    }
+
+    #[test]
+    fn duplicating_a_local_server_to_the_user_and_its_own_project() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![duplicate(
+                local_id("loc", "/work/a"),
+                "loc2",
+                vec![Target::User, Target::Local("/work/a".into())],
+            )],
+        );
+        assert_eq!(
+            plan.summary,
+            ["Duplicate loc as loc2 for the user and in a"]
+        );
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        let loc = serde_json::json!({"type": "stdio", "command": "x"});
+        assert_eq!(now["mcpServers"]["loc2"], loc);
+        assert_eq!(now["projects"]["/work/a"]["mcpServers"]["loc2"], loc);
+        assert_eq!(now["projects"]["/work/a"]["mcpServers"]["loc"], loc);
+    }
+
+    #[test]
+    fn a_copy_under_a_name_used_elsewhere_warns_which_one_claude_uses() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        // A user server called loc: in /work/a the local loc wins.
+        let plan = plan_for(
+            &core,
+            vec![duplicate(
+                local_id("loc", "/work/a"),
+                "loc",
+                vec![Target::User],
+            )],
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("local") && w.contains("a")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn duplicates_that_cannot_be_made_say_why() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        for (change, why) in [
+            (
+                duplicate(user_id("gw"), "gw", vec![Target::User]),
+                "already",
+            ),
+            (
+                duplicate(user_id("gw"), "loc", vec![Target::Local("/work/a".into())]),
+                "already",
+            ),
+            (
+                duplicate(user_id("gw"), "bad name", vec![Target::User]),
+                "name",
+            ),
+            (duplicate(user_id("gw"), "-x", vec![Target::User]), "name"),
+            (duplicate(user_id("gw"), "ok", vec![]), "where"),
+            (
+                duplicate(
+                    user_id("gw"),
+                    "ok",
+                    vec![Target::Local("/elsewhere".into())],
+                ),
+                "project",
+            ),
+            (
+                duplicate(user_id("ghost"), "ok", vec![Target::User]),
+                "no longer",
+            ),
+        ] {
+            let refused = plan_failure(&core, vec![change.clone()]);
+            assert!(refused.contains(why), "{change:?}: {refused}");
+        }
+        assert_eq!(config_json(&env), two_projects("end"));
+    }
+
+    #[test]
+    fn a_project_server_is_not_duplicated_yet() {
+        let (env, key, _repo) = repo_env(serde_json::json!({}));
+        let core = env.start();
+        let refused = plan_failure(
+            &core,
+            vec![duplicate(project_id(&key, "ps"), "ps2", vec![Target::User])],
+        );
+        assert!(refused.contains(".mcp.json"), "{refused}");
     }
 
     #[test]
@@ -3127,6 +3409,7 @@ mod tests {
             config_json(&env)["projects"]["/work/a"]["mcpServers"],
             serde_json::json!({})
         );
+        verify_passes(&core);
     }
 
     #[test]

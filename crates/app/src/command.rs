@@ -20,6 +20,7 @@ pub enum Action {
     Theme(crate::theme::ThemeChoice),
     Tone(crate::theme::Tone),
     Settings,
+    Duplicate,
 }
 
 pub struct Entry {

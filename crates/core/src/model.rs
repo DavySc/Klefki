@@ -1,5 +1,13 @@
-//! Domain types. Targets for writes will be `User | Local` only; project scope is not expressible.
+//! Domain types. Targets for writes are `User | Local` only; project scope is not expressible.
 use std::fmt;
+
+/// Where klefki may create a server: for the user, or locally in a project Claude Code knows (by its path). There
+/// is deliberately no project scope: that lives in the repository's `.mcp.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    User,
+    Local(String),
+}
 
 const RESERVED: &[&str] = &[
     "__proto__",
