@@ -73,6 +73,7 @@ pub(crate) fn resolve(
             Change::Replace { .. } => "Save",
             Change::Rename { .. } => "Rename",
             Change::Duplicate { .. } => "Duplicate",
+            Change::MigrateLegacyDisabled { .. } => "Migrate",
             Change::Add { .. } => "Add",
         };
         if !verbs.contains(&verb) {
@@ -91,6 +92,9 @@ pub(crate) fn resolve(
             Change::Duplicate { id, name, targets } => {
                 duplicate(id, name, targets, snapshot, keys, &mut out)?;
             }
+            Change::MigrateLegacyDisabled { project } => {
+                migrate_legacy(project, snapshot, &mut out)?;
+            }
             Change::Add {
                 name,
                 json,
@@ -107,7 +111,11 @@ pub(crate) fn resolve(
             "A running Claude Code session may need a restart before it notices this.".to_owned(),
         );
     }
-    out.warnings.dedup();
+    // Several changes can raise the same point; it is said once, where it first came up.
+    for said in [&mut out.warnings, &mut out.notes] {
+        let mut seen = std::collections::HashSet::new();
+        said.retain(|s| seen.insert(s.clone()));
+    }
     Ok(out)
 }
 
@@ -133,6 +141,20 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
                 (_, None) => String::new(),
             };
             return format!("Rename {old} to {}{place}", sanitize(name));
+        }
+        Change::MigrateLegacyDisabled { project } => {
+            let legacy = snapshot
+                .legacy_disabled
+                .iter()
+                .find(|l| l.project == *project);
+            let folder = sanitize(&folder_name(project));
+            return match legacy.map(|l| l.turns_off.as_slice()) {
+                Some([]) | None => format!("Remove the old switch-off list in {folder}"),
+                Some(names) => format!(
+                    "Turn off {} in {folder}, as the old switch-off list says",
+                    some_of(names)
+                ),
+            };
         }
         Change::Duplicate { id, name, targets } => {
             return format!(
@@ -184,6 +206,20 @@ fn and_list(items: &[String]) -> String {
         [one] => one.clone(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+/// Like [`and_list`], naming the first few and counting the rest, so a long list keeps the summary one line.
+/// The app's notice cuts names the same way (`shell::some_names`, which cannot call this); keep the two alike.
+fn some_of(items: &[String]) -> String {
+    const NAMED: usize = 5;
+    if items.len() <= NAMED + 1 {
+        return and_list(items);
+    }
+    format!(
+        "{} and {} more",
+        items[..NAMED].join(", "),
+        items.len() - NAMED
+    )
 }
 
 /// `1 project`, `3 projects`.
@@ -427,6 +463,33 @@ fn rename(
     if matches!(row.transport, TransportKind::Http | TransportKind::Sse) {
         out.warnings.push(
             "A sign-in Claude Code keeps for this server is under the old name and is not moved."
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Moves a project's old switch-off list into the one Claude Code reads.
+fn migrate_legacy(project: &str, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
+    let folder = sanitize(&folder_name(project));
+    let legacy = snapshot
+        .legacy_disabled
+        .iter()
+        .find(|l| l.project == project)
+        .ok_or_else(|| {
+            format!("{folder} has no old switch-off list any more. Refresh and try again.")
+        })?;
+    if legacy.malformed {
+        return Err(format!(
+            "The old switch-off list in {folder} holds something other than server names. Klefki leaves it alone; edit it in .claude.json by hand."
+        ));
+    }
+    out.claude.push(Op::MigrateLegacyDisabled {
+        project: project.to_owned(),
+    });
+    if !legacy.turns_off.is_empty() {
+        out.notes.push(
+            "Older Claude Code versions kept this list; current ones ignore it, so these servers have been on since."
                 .to_owned(),
         );
     }
@@ -928,6 +991,14 @@ fn ignored_by_git(project: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_long_list_of_names_is_cut_to_the_first_few() {
+        let names = |n: usize| (0..n).map(|i| format!("s{i}")).collect::<Vec<_>>();
+        assert_eq!(some_of(&names(1)), "s0");
+        assert_eq!(some_of(&names(6)), "s0, s1, s2, s3, s4 and s5");
+        assert_eq!(some_of(&names(9)), "s0, s1, s2, s3, s4 and 4 more");
+    }
 
     fn d(v: Value) -> Result<Vec<String>, String> {
         describe(&v)
