@@ -36,6 +36,9 @@ pub struct PastedServer {
     /// The command asks for a client secret (`--client-secret`), which is never pasted: the dialog has it finished
     /// in the form, where the secret is typed.
     pub asks_secret: bool,
+    /// The word after `--client-secret` was left out, as it may be the secret, and the name with it: the dialog says
+    /// so where it offers the form.
+    pub word_left_out: bool,
 }
 
 /// Pasted text larger than this is refused: a few servers are a few KiB.
@@ -44,7 +47,6 @@ const MAX_SERVERS: usize = 100;
 /// A summary longer than this is cut; the review shows everything in full.
 const MAX_SUMMARY_CHARS: usize = 300;
 const SECRET_AFTER_OPTION: &str = "--client-secret takes no value: Claude Code asks for the secret. The word after it may be the secret, so nothing of this command is shown. Paste it with the name before --client-secret and no secret, and type the secret in the form.";
-const SECRET_LEFT_OUT: &str = "The word after --client-secret may be the secret (the option takes no value), so it is left out, and the server's name with it: finish it in the form, and type its name and the secret there.";
 const PROJECT_SCOPE: &str = "Klefki does not add project servers: they live in the repository's .mcp.json. Choose the user or a project's own list instead.";
 
 impl Pasted {
@@ -92,6 +94,7 @@ impl PastedServer {
             hints: Vec::new(),
             oauth: false,
             asks_secret: false,
+            word_left_out: false,
         }
     }
 
@@ -314,6 +317,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     let mut asks_secret = false;
     // A word that may be the secret was left out: nothing but the address is used of the rest.
     let mut hidden = false;
+    let mut left_out = false;
     let mut problem: Option<String> = None;
     let mut i = 0;
     let mut rest_are_args = false;
@@ -446,7 +450,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
         let Some(url) = positional.iter().copied().find(|w| w.contains("://")) else {
             return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
         };
-        notes.push(SECRET_LEFT_OUT.to_owned());
+        left_out = true;
         positional = vec!["", url];
     }
     if asks_secret && positional.len() != 2 {
@@ -536,6 +540,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     };
     server.scope = scope;
     server.asks_secret = asks_secret && server.problem.is_none();
+    server.word_left_out = left_out && server.asks_secret;
     server
 }
 
@@ -545,6 +550,7 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     let mut positional = Vec::new();
     let mut asks_secret = false;
     let mut hidden = false;
+    let mut left_out = false;
     let mut i = 0;
     while i < words.len() {
         let word = words[i];
@@ -595,7 +601,7 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
         else {
             return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
         };
-        notes.push(SECRET_LEFT_OUT.to_owned());
+        left_out = true;
         positional = vec!["", json];
     }
     if asks_secret && positional.len() != 2 {
@@ -626,6 +632,7 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     };
     server.scope = scope;
     server.asks_secret = asks_secret && server.problem.is_none();
+    server.word_left_out = left_out && server.asks_secret;
     server
 }
 
@@ -1178,7 +1185,9 @@ mod tests {
             "claude mcp add --transport http --client-id abc123 --client-secret --callback-port 8080 corp https://corp.example/mcp",
         );
         assert_eq!(s.problem, None, "{s:?}");
-        assert!(s.oauth && s.asks_secret);
+        // Followed by an option, nothing was left out: the name is kept.
+        assert!(s.oauth && s.asks_secret && !s.word_left_out);
+        assert_eq!(s.name, "corp");
         assert_eq!(
             json_of(&s),
             json!({"type": "http", "url": "https://corp.example/mcp", "oauth": {"clientId": "abc123", "callbackPort": 8080}})
@@ -1191,7 +1200,10 @@ mod tests {
             r#"claude mcp add-json --client-secret -s user o '{"type":"sse","url":"https://o.example"}'"#,
         );
         assert_eq!(json_of(&s)["oauth"], json!({}));
-        assert!(s.oauth && s.asks_secret && s.problem.is_none(), "{s:?}");
+        assert!(
+            s.oauth && s.asks_secret && !s.word_left_out && s.problem.is_none(),
+            "{s:?}"
+        );
         assert!(!one("claude mcp add -s user plain node").oauth);
         // Without --client-secret nothing is asked for: it can be added as pasted.
         let s = one("claude mcp add -t http --client-id abc x https://x.example/mcp");
@@ -1249,8 +1261,10 @@ mod tests {
                     json_of(s)["url"].as_str().unwrap().starts_with("https://"),
                     "{text}"
                 );
+                // Said once, by the dialog, where it offers the form: not again among the notes.
+                assert!(s.word_left_out, "{text}: {s:?}");
                 assert!(
-                    pasted.notes.iter().any(|n| n.contains("type its name")),
+                    !pasted.notes.iter().any(|n| n.contains("--client-secret")),
                     "{pasted:?}"
                 );
             } else {
@@ -1266,7 +1280,7 @@ mod tests {
             "claude mcp add --transport http --client-id abc --client-secret corp https://mcp.corp.example/mcp",
         );
         assert!(
-            s.asks_secret && s.problem.is_none() && s.name.is_empty(),
+            s.asks_secret && s.word_left_out && s.problem.is_none() && s.name.is_empty(),
             "{s:?}"
         );
         assert_eq!(

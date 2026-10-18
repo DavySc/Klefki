@@ -1569,20 +1569,26 @@ impl ShellApp {
                         })
                         .color(pal.text_muted),
                     );
-                    if form
-                        .places
-                        .ui(ui, 6.0 * (PLACE_ROW + PLACE_GAP), Some("selected"))
-                    {
+                    // At its full length: the body scrolls, and one scroll is all there is under the wheel.
+                    if form.places.ui(ui, f32::INFINITY, Some("selected")) {
                         form.places_chosen = true;
                     }
                 });
             let body_height = ui.min_rect().bottom() - body_top;
             ui.separator();
             if let Some(failed) = &form.failed {
+                // What happened and what to do first; the rest (what a tool said) small and muted, under it.
+                let (plain, detail) = failed.split_once('\n').unwrap_or((failed, ""));
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(icon::WARNING_CIRCLE).color(pal.danger));
-                    ui.add(egui::Label::new(RichText::new(failed).color(pal.danger)).wrap());
+                    ui.add(egui::Label::new(RichText::new(plain).color(pal.danger)).wrap());
                 });
+                if !detail.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(detail).small().color(pal.text_muted))
+                            .wrap(),
+                    );
+                }
             }
             // What Review will lead to, or why it cannot yet.
             let count = |f: fn(&Check) -> bool| checked.iter().filter(|c| f(c)).count();
@@ -3400,10 +3406,12 @@ impl AddForm {
                         }
                         if server.asks_secret {
                             return if ServerFields::from_definition(&server.json).is_some() {
-                                Check::FillIn(
+                                Check::FillIn(if server.word_left_out {
+                                    "The word after --client-secret was left out, as it may be the secret, and the name with it. Fill it in: type the secret there, and check the name."
+                                } else {
                                     "It asks for a client secret. Fill it in to add it, and type the secret there."
-                                        .to_owned(),
-                                )
+                                }
+                                .to_owned())
                             } else {
                                 Check::Skipped(
                                     "It asks for a client secret and has settings the form does not show. Add it with Claude Code's own command, which asks for the secret."
@@ -3565,21 +3573,18 @@ impl AddForm {
                                     .wrap(),
                             );
                         }
+                        // The button under the text, so a long line wraps rather than widening the dialog.
                         Check::FillIn(why) => {
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(why).small().color(pal.text_muted),
-                                    )
+                            ui.add(
+                                egui::Label::new(RichText::new(why).small().color(pal.text_muted))
                                     .wrap(),
-                                );
-                                if ui
-                                    .button(format!("{} Fill in", icon::PENCIL_SIMPLE))
-                                    .clicked()
-                                {
-                                    fill_in = Some(i);
-                                }
-                            });
+                            );
+                            if ui
+                                .button(format!("{} Fill in", icon::PENCIL_SIMPLE))
+                                .clicked()
+                            {
+                                fill_in = Some(i);
+                            }
                         }
                         Check::Ready => {}
                     }
@@ -8308,7 +8313,9 @@ mod tests {
             &mut h,
             "claude mcp add -s user --transport http --client-id abc --client-secret corp https://mcp.corp.example/mcp",
         );
-        h.get_by_label_contains("type its name and the secret there");
+        // Said once, with what to do.
+        h.get_by_label_contains("may be the secret, and the name with it. Fill it in");
+        assert_eq!(h.query_all_by_label_contains("--client-secret").count(), 1);
         h.get_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE))
             .click();
         h.run();
@@ -8521,6 +8528,78 @@ mod tests {
                 "{mode}: {below} left under the buttons, {top} above the dialog"
             );
         }
+    }
+
+    #[test]
+    fn the_wheel_over_the_places_scrolls_the_add_dialog_as_one() {
+        let (mut h, _engine) = duplicate_harness_with_many_projects();
+        h.set_size(egui::vec2(960.0, 600.0));
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        h.run();
+        // Over the list of projects, the wheel moves the dialog's body, not a list of its own inside it.
+        let heading = h.get_by_label_contains("Projects (42").rect();
+        let over = h.get_by_label("project-01").rect().center();
+        h.event(egui::Event::PointerMoved(over));
+        h.run();
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        for _ in 0..30 {
+            h.step();
+        }
+        let moved = h.get_by_label_contains("Projects (42").rect();
+        assert!(
+            moved.top() < heading.top() - 20.0,
+            "the heading was at {}, now {}",
+            heading.top(),
+            moved.top()
+        );
+    }
+
+    #[test]
+    fn a_pasted_server_to_finish_does_not_widen_the_dialog() {
+        for text in [
+            "claude mcp add --transport http --client-id abc --client-secret corp https://mcp.corp.example/mcp",
+            "claude mcp add -t http --client-id c-1 --client-secret --callback-port 8080 corp https://corp.example/mcp",
+        ] {
+            let (mut h, _engine) = duplicate_harness();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+            h.run();
+            let tabs = h.get_by_label("Paste").rect();
+            paste(&mut h, text);
+            h.run();
+            h.get_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE));
+            assert_eq!(h.get_by_label("Paste").rect(), tabs, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_failure_in_the_add_dialog_says_the_plain_part_first_and_the_detail_apart() {
+        let (mut h, _engine) = duplicate_harness();
+        sso_filled(&mut h);
+        add_form(&mut h).failed = Some(
+            "Klefki can't use your system's secret store. Press Review again.\nThe system's secret store is not available (org.freedesktop.DBus.Error.ServiceUnknown)."
+                .into(),
+        );
+        h.run();
+        let plain = h
+            .get_by_label("Klefki can't use your system's secret store. Press Review again.")
+            .rect();
+        let detail = h
+            .get_by_label(
+                "The system's secret store is not available (org.freedesktop.DBus.Error.ServiceUnknown).",
+            )
+            .rect();
+        assert!(detail.top() >= plain.bottom(), "{plain:?} then {detail:?}");
+        // A failure of one line is said as it is.
+        add_form(&mut h).failed = Some("Claude Code refused it.".into());
+        h.run();
+        h.get_by_label("Claude Code refused it.");
     }
 
     #[test]

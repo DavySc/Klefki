@@ -168,6 +168,15 @@ The re-review's four optional findings, in a new pull request from main, same br
   - "Show" turns into "Hide" and shows the typed text.
 - **Checks:** `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo clippy -p klefki -- -D warnings` 0; `cargo test --workspace` 412 core + 191 app passed; `cargo deny check` 0.
 
+## Last polish (#19 review nits; #19 merged as `b9682b1`)
+The coordinator asked for one last small pull request with the four nits from the #19 review, then a stop with no further round.
+- **Width:** the "Fill in" button now sits under its note, so the note wraps rather than widening the dialog past 640 px. Test `a_pasted_server_to_finish_does_not_widen_the_dialog` covers both secret pastes. Before the fix the tabs moved 20 px.
+- **One note:** core no longer adds a separate note when the word after `--client-secret` is left out. `PastedServer::word_left_out` says so instead, and the dialog gives one sentence where it offers the form. Core tests check the flag, that no note repeats it, and that it stays false when an option follows `--client-secret`.
+- **Store error:** the error now starts "Klefki can't use your system's secret store. Start or unlock it (GNOME Keyring or KWallet, on Linux only) and press Review again, or leave the client secret empty…". The store's own words follow on the next line, small and muted, following NN/g's error-message guidelines. The engine test checks the order, the Linux-only hint and the detail line. The app test checks the two parts are shown apart.
+- **One scroll:** the Add dialog's places list is now as long as it needs to be, and the body scrolls it. Test `the_wheel_over_the_places_scrolls_the_add_dialog_as_one` failed before (the heading stayed at 340). Duplicate keeps its own list height.
+- **Real window** (960×600): the dialog stays at 153–806 with one note and the button under it.
+- **Checks:** `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo clippy -p klefki -- -D warnings` 0; `cargo test --workspace` 412 core + 194 app passed; `cargo deny check` 0.
+
 ## Open / known limits
 - For OAuth servers, typed env and header values that do not look like secrets still travel in `add-json`'s argv, as Claude Code's own command takes them. Those that do are refused (B3).
 - Not tried on Windows or macOS. In particular, the cwd-based project key for `-s local` on Windows is unverified.
@@ -176,4 +185,4 @@ The re-review's four optional findings, in a new pull request from main, same br
 - The plan's free-port check for the callback port is not done. Neither is sign-in itself (PTY login): the user signs in from Claude Code's `/mcp`.
 
 ## Next
-Cross-review of the follow-ups pull request, then merge once CI is green on all 3 OSes. After that: PTY sign-in and re-authorise (the callback-port spike), and the free-port check.
+Merge the polish pull request once CI is green; the add wizard slice then stops here. After that: PTY sign-in and re-authorise (the callback-port spike), and the free-port check.
