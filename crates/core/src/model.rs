@@ -17,6 +17,99 @@ const RESERVED: &[&str] = &[
     "hasOwnProperty",
 ];
 
+/// Which server a secret or a piece of metadata belongs to: its scope, the project as `.claude.json` spells it,
+/// and its name, as they are on disk (not as shown). The same encoding as v1 of the MCP manager this replaces, so
+/// what v1 stored can be found again: base64url, without padding, of `{"s":<scope>,"p":<project or null>,"n":<name>}`
+/// written as JavaScript's `JSON.stringify` writes it. Opaque and safe as a key: only `A-Z a-z 0-9 - _`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ConnectionId(String);
+
+impl ConnectionId {
+    /// An empty project is no project, as in v1.
+    pub fn new(scope: crate::api::Scope, project: Option<&str>, name: &str) -> Self {
+        #[derive(serde::Serialize)]
+        struct Parts<'a> {
+            s: &'a str,
+            p: Option<&'a str>,
+            n: &'a str,
+        }
+        let payload = serde_json::to_string(&Parts {
+            s: scope_word(scope),
+            p: project.filter(|p| !p.is_empty()),
+            n: name,
+        })
+        .unwrap_or_default();
+        Self(base64url(payload.as_bytes()))
+    }
+
+    /// The scope, project and name an id was made from; `None` for anything that is not a Claude Code id.
+    pub fn parse(id: &str) -> Option<(crate::api::Scope, Option<String>, String)> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Parts {
+            s: String,
+            p: Option<String>,
+            n: String,
+        }
+        let parts: Parts = serde_json::from_slice(&unbase64url(id)?).ok()?;
+        let scope = match parts.s.as_str() {
+            "user" => crate::api::Scope::User,
+            "local" => crate::api::Scope::Local,
+            "project" => crate::api::Scope::Project,
+            _ => return None,
+        };
+        (!parts.n.is_empty()).then_some((scope, parts.p.filter(|p| !p.is_empty()), parts.n))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn scope_word(scope: crate::api::Scope) -> &'static str {
+    match scope {
+        crate::api::Scope::User => "user",
+        crate::api::Scope::Local => "local",
+        crate::api::Scope::Project => "project",
+    }
+}
+
+const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// RFC 4648 base64url without padding, as Node's `Buffer.toString('base64url')` writes it.
+fn base64url(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..=chunk.len() {
+            out.push(BASE64URL[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+/// The bytes of unpadded base64url; `None` for anything else.
+fn unbase64url(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    for chunk in text.as_bytes().chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            let v = BASE64URL.iter().position(|&a| a == c)? as u32;
+            n |= v << (18 - 6 * i);
+        }
+        for i in 0..chunk.len() - 1 {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// A server name that is safe to pass to the Claude CLI: `^[A-Za-z0-9_-]{1,64}$`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServerName(String);
@@ -74,6 +167,116 @@ impl ServerName {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Made by v1's own `makeId` (Source code/src/main/services/connections.js), run with Node 22.
+    const V1_IDS: [(&str, Option<&str>, &str, &str); 8] = [
+        (
+            "user",
+            None,
+            "github",
+            "eyJzIjoidXNlciIsInAiOm51bGwsIm4iOiJnaXRodWIifQ",
+        ),
+        (
+            "local",
+            Some("C:\\Users\\me\\Source\\Repos\\x"),
+            "REMOTE_1",
+            "eyJzIjoibG9jYWwiLCJwIjoiQzpcXFVzZXJzXFxtZVxcU291cmNlXFxSZXBvc1xceCIsIm4iOiJSRU1PVEVfMSJ9",
+        ),
+        (
+            "local",
+            Some("C:/Users/me/work"),
+            "acme-prod",
+            "eyJzIjoibG9jYWwiLCJwIjoiQzovVXNlcnMvbWUvd29yayIsIm4iOiJhY21lLXByb2QifQ",
+        ),
+        (
+            "project",
+            Some("/home/me/work/app"),
+            "docs",
+            "eyJzIjoicHJvamVjdCIsInAiOiIvaG9tZS9tZS93b3JrL2FwcCIsIm4iOiJkb2NzIn0",
+        ),
+        (
+            "local",
+            Some("/home/me/wörk/日本"),
+            "naïve \"quoted\" \\ name",
+            "eyJzIjoibG9jYWwiLCJwIjoiL2hvbWUvbWUvd8O2cmsv5pel5pysIiwibiI6Im5hw692ZSBcInF1b3RlZFwiIFxcIG5hbWUifQ",
+        ),
+        (
+            "user",
+            None,
+            "tab\there\nnewline\u{1}\u{7f}\u{2028}/slash",
+            "eyJzIjoidXNlciIsInAiOm51bGwsIm4iOiJ0YWJcdGhlcmVcbm5ld2xpbmVcdTAwMDF_4oCoL3NsYXNoIn0",
+        ),
+        (
+            "local",
+            Some(""),
+            "empty-project",
+            "eyJzIjoibG9jYWwiLCJwIjpudWxsLCJuIjoiZW1wdHktcHJvamVjdCJ9",
+        ),
+        (
+            "user",
+            None,
+            "🦀",
+            "eyJzIjoidXNlciIsInAiOm51bGwsIm4iOiLwn6aAIn0",
+        ),
+    ];
+
+    fn scope(s: &str) -> crate::api::Scope {
+        match s {
+            "user" => crate::api::Scope::User,
+            "local" => crate::api::Scope::Local,
+            _ => crate::api::Scope::Project,
+        }
+    }
+
+    #[test]
+    fn connection_ids_are_the_ones_v1_made() {
+        // The same id keeps v1's stored secrets and metadata usable (PLAN.md: "the same encoding as v1").
+        for (s, project, name, want) in V1_IDS {
+            assert_eq!(
+                ConnectionId::new(scope(s), project, name).as_str(),
+                want,
+                "{s} {project:?} {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connection_id_reads_back_into_its_parts() {
+        for (s, project, name, id) in V1_IDS {
+            let parts = ConnectionId::parse(id).unwrap();
+            assert_eq!(
+                parts,
+                (
+                    scope(s),
+                    project.filter(|p| !p.is_empty()).map(str::to_owned),
+                    name.to_owned()
+                )
+            );
+        }
+        // Not ids: other alphabets, padding, missing parts, an unknown scope, a Codex id (v1's other target).
+        for bad in [
+            "",
+            "not base64!",
+            "eyJzIjoidXNlciJ9",
+            "eyJzIjoidXNlciIsInAiOm51bGwsIm4iOiJnaXRodWIifQ==",
+            "eyJ0IjoiY29kZXgiLCJzIjoidXNlciIsInAiOm51bGwsIm4iOiJ4In0",
+        ] {
+            assert_eq!(ConnectionId::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_connection_id_is_safe_to_use_as_a_key() {
+        for (s, project, name, _) in V1_IDS {
+            let id = ConnectionId::new(scope(s), project, name);
+            assert!(
+                id.as_str()
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{id:?}"
+            );
+        }
+    }
 
     #[test]
     fn accepts_valid_names() {

@@ -41,12 +41,13 @@ pub(crate) fn load() -> Snapshot {
             .servers
             .into_iter()
             .map(|s| ServerRow {
+                connection: crate::model::ConnectionId::new(
+                    scope_of(&s.scope),
+                    s.project.as_deref(),
+                    &s.name,
+                ),
                 name: sanitize(&s.name),
-                scope: match s.scope.as_str() {
-                    "user" => Scope::User,
-                    "local" => Scope::Local,
-                    _ => Scope::Project,
-                },
+                scope: scope_of(&s.scope),
                 project: s.project.map(|p| sanitize(&p)),
                 transport: match s.transport.as_str() {
                     "stdio" => TransportKind::Stdio,
@@ -79,5 +80,13 @@ pub(crate) fn load() -> Snapshot {
             })
             .collect(),
         warnings: Vec::new(),
+    }
+}
+
+fn scope_of(word: &str) -> Scope {
+    match word {
+        "user" => Scope::User,
+        "local" => Scope::Local,
+        _ => Scope::Project,
     }
 }
