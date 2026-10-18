@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 const LOCK_STALE: Duration = Duration::from_secs(10);
 const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
 const MAX_VERIFY_ROUNDS: usize = 3;
+/// Waits between attempts to replace the file while Windows refuses because someone has it open.
+const DENIED_RETRY_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
 const BOM: &str = "\u{feff}";
 
 /// One edit to the document. Idempotent: applying it twice changes nothing the second time.
@@ -374,7 +376,14 @@ impl Docstore {
         } else {
             Some(self.backup(current)?)
         };
-        tmp.persist(&self.path).map_err(|e| e.error)?;
+        let mut tmp = Some(tmp);
+        retry_denied(|| {
+            let file = tmp.take().expect("put back after every failed attempt");
+            file.persist(&self.path).map(drop).map_err(|e| {
+                tmp = Some(e.file);
+                e.error
+            })
+        })?;
         if let Some(backup) = &backup {
             // A hard link shares the old file's permissions until now; it is the only name of that file left.
             make_private(backup);
@@ -635,6 +644,21 @@ fn edit_claude_json(text: &str, ops: &[Op]) -> Result<(Option<Splices>, Vec<Stri
         ))
     })?;
     edited
+}
+
+/// Runs `attempt` until it does not fail with "permission denied", waiting a little longer each time. Windows refuses
+/// to replace a file that another process has open, even for a moment (Claude Code reading it, a virus scanner,
+/// klefki's own reload), and says so with that error. Other errors, and a refusal that lasts, are returned.
+fn retry_denied<T>(mut attempt: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    for wait in DENIED_RETRY_MS {
+        match attempt() {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(Duration::from_millis(wait));
+            }
+            done => return done,
+        }
+    }
+    attempt()
 }
 
 /// Below this size a second thread costs more than it saves.
@@ -1703,6 +1727,58 @@ mod tests {
         std::fs::write(&f.store.path, &text).unwrap();
         assert_eq!(f.store.apply(&plan), Err(StoreError::Changed));
         assert_eq!(f.text(), text);
+    }
+
+    #[test]
+    fn a_brief_refusal_to_replace_the_file_is_retried() {
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let mut calls = 0;
+        assert_eq!(
+            retry_denied(|| {
+                calls += 1;
+                if calls < 3 { Err(denied()) } else { Ok(calls) }
+            })
+            .unwrap(),
+            3
+        );
+        // A refusal that lasts is given up on, after every wait.
+        let mut calls = 0;
+        let err = retry_denied::<()>(|| {
+            calls += 1;
+            Err(denied())
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, DENIED_RETRY_MS.len() + 1);
+        // Any other error is returned at once.
+        let mut calls = 0;
+        let err = retry_denied::<()>(|| {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        })
+        .unwrap_err();
+        assert_eq!((err.kind(), calls), (io::ErrorKind::NotFound, 1));
+    }
+
+    #[test]
+    fn the_file_is_replaced_even_while_someone_has_it_open_for_a_moment() {
+        // Windows refuses to replace an open file; elsewhere this passes either way.
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        let reader = std::fs::File::open(&f.store.path).unwrap();
+        let held = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(reader);
+        });
+        f.store.apply(&plan).unwrap();
+        held.join().unwrap();
+        assert_eq!(
+            f.json()["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway"])
+        );
     }
 
     #[test]
