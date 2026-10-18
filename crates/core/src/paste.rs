@@ -44,6 +44,7 @@ const MAX_SERVERS: usize = 100;
 /// A summary longer than this is cut; the review shows everything in full.
 const MAX_SUMMARY_CHARS: usize = 300;
 const SECRET_AFTER_OPTION: &str = "--client-secret takes no value: Claude Code asks for the secret. The word after it may be the secret, so nothing of this command is shown. Paste it with the name before --client-secret and no secret, and type the secret in the form.";
+const SECRET_LEFT_OUT: &str = "The word after --client-secret may be the secret (the option takes no value), so it is left out, and the server's name with it: finish it in the form, and type its name and the secret there.";
 const PROJECT_SCOPE: &str = "Klefki does not add project servers: they live in the repository's .mcp.json. Choose the user or a project's own list instead.";
 
 impl Pasted {
@@ -311,6 +312,8 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     let mut positional: Vec<&str> = Vec::new();
     let mut oauth: Option<Map<String, Value>> = None;
     let mut asks_secret = false;
+    // A word that may be the secret was left out: nothing but the address is used of the rest.
+    let mut hidden = false;
     let mut problem: Option<String> = None;
     let mut i = 0;
     let mut rest_are_args = false;
@@ -421,8 +424,11 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             }
             // Claude Code asks for the secret itself; the option takes no value.
             "--client-secret" => {
-                if inline.is_some() || words.get(i).is_some_and(|w| may_be_secret(w, "://")) {
-                    return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+                if inline.is_some() {
+                    hidden = true;
+                } else if words.get(i).is_some_and(|w| may_be_secret(w, "://")) {
+                    hidden = true;
+                    i += 1;
                 }
                 oauth.get_or_insert_default();
                 asks_secret = true;
@@ -434,6 +440,14 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 ));
             }
         }
+    }
+    if hidden {
+        // The name may be the word left out, or the secret itself: only the address is kept.
+        let Some(url) = positional.iter().copied().find(|w| w.contains("://")) else {
+            return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+        };
+        notes.push(SECRET_LEFT_OUT.to_owned());
+        positional = vec!["", url];
     }
     if asks_secret && positional.len() != 2 {
         // Nothing of it is shown: a secret may have been typed after --client-secret, among the words.
@@ -457,7 +471,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 None if remote => {
                     notes.push(format!(
                         "{} is read as an http server: an address needs --transport http when you give it to Claude Code.",
-                        sanitize(name)
+                        if name.is_empty() { "It".to_owned() } else { sanitize(name) }
                     ));
                     "http"
                 }
@@ -530,6 +544,7 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
     let mut scope = None;
     let mut positional = Vec::new();
     let mut asks_secret = false;
+    let mut hidden = false;
     let mut i = 0;
     while i < words.len() {
         let word = words[i];
@@ -541,11 +556,13 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 i += 1;
             }
             Some(("--client-secret", _)) => {
-                return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+                hidden = true;
+                asks_secret = true;
             }
             _ if word == "--client-secret" => {
                 if words.get(i).is_some_and(|w| may_be_secret(w, "{")) {
-                    return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+                    hidden = true;
+                    i += 1;
                 }
                 asks_secret = true;
             }
@@ -569,6 +586,18 @@ fn add_json(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             );
         }
     };
+    if hidden {
+        // The name may be the word left out, or the secret itself: only the definition is kept.
+        let Some(json) = positional
+            .iter()
+            .copied()
+            .find(|w| w.trim_start().starts_with('{'))
+        else {
+            return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+        };
+        notes.push(SECRET_LEFT_OUT.to_owned());
+        positional = vec!["", json];
+    }
     if asks_secret && positional.len() != 2 {
         return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
     }
@@ -1167,27 +1196,83 @@ mod tests {
         // Without --client-secret nothing is asked for: it can be added as pasted.
         let s = one("claude mcp add -t http --client-id abc x https://x.example/mcp");
         assert!(s.oauth && !s.asks_secret && s.problem.is_none(), "{s:?}");
-        // A secret typed after --client-secret (it takes none) is never shown, not even as the name: also when the
-        // name is left out, so the secret would be taken for it, or with the secret after `=`.
-        for text in [
-            "claude mcp add -t http --client-secret Sup3rSecret corp https://corp.example/mcp",
-            r#"claude mcp add-json --client-secret Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
-            "claude mcp add --transport http --client-secret Sup3rSecret https://mcp.linear.app/mcp",
-            "claude mcp add-json --client-secret Sup3rSecret sso",
-            "claude mcp add-json --client-secret Sup3rSecret",
-            "claude mcp add -t http corp --client-secret Sup3rSecret https://corp.example/mcp",
-            "claude mcp add -t http corp https://corp.example/mcp --client-secret Sup3rSecret",
-            "claude mcp add -t http --client-secret=Sup3rSecret corp https://corp.example/mcp",
-            r#"claude mcp add-json --client-secret=Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
-            r#"claude mcp add-json o --client-secret Sup3rSecret '{"type":"http","url":"https://o.example"}'"#,
+        // A word typed after --client-secret (it takes none) may be the secret: it is never shown, not even as
+        // the name, which may be that word. What can be told apart (the address, the JSON, the options) is kept,
+        // to be finished in the form with the name typed again; without an address or definition it is refused.
+        for (text, finish) in [
+            (
+                "claude mcp add -t http --client-secret Sup3rSecret corp https://corp.example/mcp",
+                true,
+            ),
+            (
+                r#"claude mcp add-json --client-secret Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
+                true,
+            ),
+            (
+                "claude mcp add --transport http --client-secret Sup3rSecret https://mcp.linear.app/mcp",
+                true,
+            ),
+            ("claude mcp add-json --client-secret Sup3rSecret sso", false),
+            ("claude mcp add-json --client-secret Sup3rSecret", false),
+            (
+                "claude mcp add --client-secret Sup3rSecret corp node server.js",
+                false,
+            ),
+            (
+                "claude mcp add -t http corp --client-secret Sup3rSecret https://corp.example/mcp",
+                true,
+            ),
+            (
+                "claude mcp add -t http corp https://corp.example/mcp --client-secret Sup3rSecret",
+                true,
+            ),
+            (
+                "claude mcp add -t http --client-secret=Sup3rSecret corp https://corp.example/mcp",
+                true,
+            ),
+            (
+                r#"claude mcp add-json --client-secret=Sup3rSecret o '{"type":"http","url":"https://o.example"}'"#,
+                true,
+            ),
+            (
+                r#"claude mcp add-json o --client-secret Sup3rSecret '{"type":"http","url":"https://o.example"}'"#,
+                true,
+            ),
         ] {
-            let s = one(text);
-            assert!(
-                s.problem.as_deref().unwrap().contains("takes no value"),
-                "{s:?}"
-            );
-            assert!(!format!("{s:?}").contains("Sup3rSecret"), "{s:?}");
+            let pasted = Pasted::parse(text).unwrap();
+            let s = &pasted.servers[0];
+            assert!(!format!("{pasted:?}").contains("Sup3rSecret"), "{pasted:?}");
+            if finish {
+                assert!(s.problem.is_none() && s.asks_secret, "{text}: {s:?}");
+                assert_eq!(s.name, "", "{text}");
+                assert!(
+                    json_of(s)["url"].as_str().unwrap().starts_with("https://"),
+                    "{text}"
+                );
+                assert!(
+                    pasted.notes.iter().any(|n| n.contains("type its name")),
+                    "{pasted:?}"
+                );
+            } else {
+                assert!(
+                    s.problem.as_deref().unwrap().contains("takes no value"),
+                    "{s:?}"
+                );
+            }
         }
+        // `--client-secret <name> <address>` is Claude Code's own syntax: it is finished in the form, with the client
+        // id kept and the name typed there.
+        let s = one(
+            "claude mcp add --transport http --client-id abc --client-secret corp https://mcp.corp.example/mcp",
+        );
+        assert!(
+            s.asks_secret && s.problem.is_none() && s.name.is_empty(),
+            "{s:?}"
+        );
+        assert_eq!(
+            json_of(&s),
+            json!({"type": "http", "url": "https://mcp.corp.example/mcp", "oauth": {"clientId": "abc"}})
+        );
         // The option itself, before the address or the definition, is fine.
         for text in [
             "claude mcp add -t http corp --client-secret https://corp.example/mcp",

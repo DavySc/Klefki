@@ -1510,9 +1510,13 @@ impl ShellApp {
         // as one, between the tabs and the buttons, which stay in view.
         let screen = ctx.content_rect().height();
         let top = (screen * 0.06).clamp(12.0, 48.0);
-        // What the tabs, the line above the buttons and the buttons take, and a failure said there.
-        let fixed = 230.0 + if form.failed.is_some() { 88.0 } else { 0.0 };
-        let body = (screen - 2.0 * top - fixed).max(120.0);
+        // The body gets the window's height less what the rest of the dialog took on the last frame: the tabs, a
+        // failure said above the buttons, the line there and the buttons.
+        let overhead_id = egui::Id::new("add_dialog_overhead");
+        let overhead = ctx
+            .data(|d| d.get_temp::<f32>(overhead_id))
+            .unwrap_or(150.0);
+        let body = (screen - 2.0 * top - overhead).max(120.0);
         let id = egui::Id::new("add_dialog");
         let area =
             egui::Modal::default_area(id).anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, top));
@@ -1544,8 +1548,12 @@ impl ShellApp {
                 foreground_color: true,
                 ..egui::style::ScrollStyle::solid()
             };
+            let body_top = ui.min_rect().bottom();
             egui::ScrollArea::vertical()
                 .id_salt("add_body")
+                // Both, so it takes its height in one frame rather than growing into the dialog's last size; it still
+                // shrinks to what it holds.
+                .min_scrolled_height(body)
                 .max_height(body)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
@@ -1568,6 +1576,7 @@ impl ShellApp {
                         form.places_chosen = true;
                     }
                 });
+            let body_height = ui.min_rect().bottom() - body_top;
             ui.separator();
             if let Some(failed) = &form.failed {
                 ui.horizontal(|ui| {
@@ -1643,8 +1652,19 @@ impl ShellApp {
                     .on_hover_text("Esc")
                     .clicked();
             });
+            // Measured in this frame: the area's own rect is the one from the last frame.
+            (ui.min_rect().height() - body_height, body_height)
         });
         settle(ctx, &modal.response);
+        let (taken, body_height) = modal.inner;
+        if (taken - overhead).abs() > 0.5 {
+            ctx.data_mut(|d| d.insert_temp(overhead_id, taken));
+            // Laid out again within this frame, only if the body is, or would now be, held to the height it may take.
+            let held = body_height >= body - 0.5;
+            if held || body_height > (screen - 2.0 * top - taken).max(120.0) {
+                ctx.request_discard("the Add dialog's body height");
+            }
+        }
         self.add_mode = form.mode;
         // The text and names may have changed in this frame: what is sent is checked again as it is now.
         let changes = review
@@ -3128,6 +3148,7 @@ enum AddMode {
 enum Field {
     Name,
     Part(Part),
+    Secret,
 }
 
 fn field_id(field: Field) -> egui::Id {
@@ -3477,10 +3498,12 @@ impl AddForm {
         };
         self.fields = fields;
         self.name = self.names[i].clone();
-        self.name_edited = true;
+        // A paste whose name was left out (it may have been the secret) gets one from its address, as typed does.
+        self.name_edited = !self.name.is_empty();
         self.secret = Secret::new(String::new());
         self.mode = AddMode::Fill;
-        self.focus_on = Some(Field::Part(Part::ClientId));
+        // Offered only when the secret is asked for: the keyboard goes there.
+        self.focus_on = Some(Field::Secret);
         self.reveal_oauth = true;
         true
     }
@@ -3593,6 +3616,8 @@ impl AddForm {
                 .iter()
                 .find(|(p, _)| *p == part)
                 .map(|(_, why)| why.as_str()),
+            // Optional, and anything typed is kept as it is.
+            Field::Secret => None,
         }
     }
 
@@ -3791,22 +3816,34 @@ impl AddForm {
 
     /// The client secret: typed hidden, with a button to show it while checking a paste.
     fn secret_row(&mut self, ui: &mut Ui, pal: &Palette, label_width: f32, width: f32) {
+        let focus = self.focus_on.take_if(|f| *f == Field::Secret).is_some();
         let show = &mut self.show_secret;
         let secret = &mut self.secret;
         field_row(ui, pal, "Client secret", label_width, |ui| {
-            ui.add(
+            let field = ui.add(
                 egui::TextEdit::singleline(secret.edit())
                     .id(secret_id())
                     .password(!*show)
                     .hint_text("optional")
                     .desired_width(width),
             );
-            let (glyph, label) = if *show {
-                (icon::EYE_SLASH, "Hide the client secret")
+            if focus {
+                field.request_focus();
+                field.scroll_to_me(Some(Align::Center));
+            }
+            // Named in words too: an eye alone is read many ways, and the name read out starts with what is shown.
+            let (glyph, word) = if *show {
+                (icon::EYE_SLASH, "Hide")
             } else {
-                (icon::EYE, "Show the client secret")
+                (icon::EYE, "Show")
             };
-            if icon_button(ui, glyph, label) {
+            let label = format!("{word} the client secret");
+            let response = ui
+                .small_button(format!("{glyph} {word}"))
+                .on_hover_text(&label);
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+            if response.clicked() {
                 *show = !*show;
             }
         });
@@ -7899,6 +7936,9 @@ mod tests {
         assert!(f.fields.oauth);
         assert_eq!(f.fields.client_id, "c-1");
         assert_eq!(f.fields.callback_port, "8080");
+        h.run();
+        assert_eq!(h.ctx.memory(|m| m.focused()), Some(secret_id()));
+        let f = add_form(&mut h);
         *f.secret.edit() = "pasted-later".into();
         h.run();
         h.get_by_label("Review").click();
@@ -8260,6 +8300,41 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_option_followed_by_the_name_is_finished_in_the_form_with_the_name_typed_there() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(
+            &mut h,
+            "claude mcp add -s user --transport http --client-id abc --client-secret corp https://mcp.corp.example/mcp",
+        );
+        h.get_by_label_contains("type its name and the secret there");
+        h.get_by_label(&format!("{} Fill in", icon::PENCIL_SIMPLE))
+            .click();
+        h.run();
+        let f = add_form(&mut h);
+        assert_eq!(f.mode, AddMode::Fill);
+        assert_eq!(f.fields.url, "https://mcp.corp.example/mcp");
+        assert_eq!(f.fields.client_id, "abc");
+        // The name comes from the address, like a typed one, until it is typed.
+        assert_eq!(f.name, "corp");
+        assert!(!f.name_edited);
+        // The keyboard is where it is asked for: in the secret.
+        h.run();
+        assert_eq!(h.ctx.memory(|m| m.focused()), Some(secret_id()));
+        let f = add_form(&mut h);
+        *f.secret.edit() = "typed-here".into();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert!(
+            matches!(&changes[..], [Change::Add { name, secret: Some(_), .. }] if name == "corp"),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
     fn the_client_secret_can_be_shown_and_is_forgotten_with_the_dialog() {
         let (mut h, _engine) = duplicate_harness();
         sso_filled(&mut h);
@@ -8406,6 +8481,66 @@ mod tests {
                 "{label} at {r:?}, view {top}..{bottom}"
             );
         }
+    }
+
+    #[test]
+    fn in_a_small_window_the_add_body_takes_the_height_the_window_has() {
+        for (mode, failed) in [("Paste", false), ("Fill in", false), ("Fill in", true)] {
+            let (mut h, _engine) = duplicate_harness_with_many_projects();
+            h.set_size(egui::vec2(960.0, 600.0));
+            h.run();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+            h.run();
+            h.get_by_label(mode).click();
+            h.run();
+            if failed {
+                add_form(&mut h).failed = Some("The secret store is locked. ".repeat(12));
+                // Already in the first frame that says it, not one later.
+                h.step();
+                let bottom = h.get_by_label("Review").rect().bottom();
+                assert!(
+                    bottom <= h.ctx.content_rect().bottom(),
+                    "the buttons end at {bottom} as the failure shows"
+                );
+            }
+            for _ in 0..4 {
+                h.run();
+            }
+            // The places list is longer than the window, so the body is as tall as it may be: the buttons end near
+            // the bottom of the window, with the same margin as above the dialog, not far above it.
+            let window = h.ctx.content_rect();
+            let top = h.get_by_label("Paste").rect().top();
+            let bottom = h.get_by_label("Review").rect().bottom();
+            let below = window.bottom() - bottom;
+            assert!(
+                below >= 0.0,
+                "{mode}: the buttons end at {bottom}, out of the window"
+            );
+            assert!(
+                below <= top + 24.0,
+                "{mode}: {below} left under the buttons, {top} above the dialog"
+            );
+        }
+    }
+
+    #[test]
+    fn the_client_secret_toggle_says_in_words_what_it_does() {
+        let (mut h, _engine) = duplicate_harness();
+        fill_in(&mut h);
+        h.get_by_label("HTTP").click();
+        h.run();
+        h.get_by_label(OAUTH_TOGGLE).click();
+        h.run();
+        h.run();
+        // Much wider than tall, as the word stands next to the eye (the eye alone is about twice as wide as
+        // tall); the name read out starts with that word.
+        let tall = h.get_by_label("Show the client secret").rect().height();
+        let show = h.get_by_label("Show the client secret").rect().width();
+        assert!(show > 3.0 * tall, "{show} wide, {tall} tall");
+        h.get_by_label("Show the client secret").click();
+        h.run();
+        let hide = h.get_by_label("Hide the client secret").rect().width();
+        assert!(hide > 3.0 * tall, "{hide} wide, {tall} tall");
     }
 
     #[test]

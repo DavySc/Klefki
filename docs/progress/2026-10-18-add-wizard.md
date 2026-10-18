@@ -147,6 +147,27 @@ Each fix below has a test, and every app test was seen failing with its fix undo
   - With the secret cleared: Review, then Back, then Review, then Add. `.claude.json` held `linear` with `oauth.clientId`, and the row was selected.
 - Checks after the round: `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo clippy -p klefki -- -D warnings` 0; `cargo test --workspace` 412 core + 188 app passed; `cargo deny check` 0. No IO calls in `crates/app/src`.
 
+## Follow-ups after merge (#18 merged as `0a168f1`)
+The re-review's four optional findings, in a new pull request from main, same branch name.
+- **Paste with `--client-secret <name> <url>`:** this is valid Claude Code syntax (the option takes no value), but it was refused. Now the word after the option is dropped, since it may be the secret, and so is the server's name with it. The paste is then offered as Fill in, with the address and client ID filled. The name follows the address until typed. Never shown anywhere: the dropped word (tested with `Sup3rSecret`). `claude mcp add-json` does the same with the definition kept. With no address to keep, it is still refused.
+- **Secret store failure:** the message now says what to do next. Start the system's secret store (on Linux, GNOME Keyring or KWallet) and press Review again, or leave the client secret empty. This covers both an unavailable store and a failed read.
+- **Small windows:** the body's height is the window less what the rest of the dialog measured, in the same frame, rather than a fixed 230 px reserve. If that differs from the last frame while the body is held to its cap, egui lays the frame out again (`request_discard`). `min_scrolled_height` makes the body take its height at once, rather than growing ~94 px a frame into the area's last size. At 960×600, Paste had 117 px unused under the buttons before; now it ends at the bottom margin.
+- **Eye toggle:** the client-secret toggle now reads "👁 Show" / "Hide". Its accessible name, "Show the client secret", starts with that word (WCAG 2.5.3, label in name). The env and header rows keep icon-only eyes with accessible names ("Show TOKEN"), since their rows have no room for words.
+- **Found in a real window:** after Fill in, the keyboard went to Client ID, but the note asks for the secret. Fill in is offered only when the secret is asked for, so the keyboard now goes to the secret.
+- **Tests**, each seen failing first or against a mutation:
+  - Paste `(text, finish)` cases, including the new http case.
+  - Engine: both secret store errors say the next step.
+  - `a_secret_option_followed_by_the_name_is_finished_in_the_form_with_the_name_typed_there`.
+  - `in_a_small_window_the_add_body_takes_the_height_the_window_has`: Paste, Fill in, and Fill in with a long failure, including the first frame that shows it. It fails with the old reserve, with the measure not kept, and without the discard.
+  - `the_client_secret_toggle_says_in_words_what_it_does`: fails with the icon alone.
+  - Focus on the secret is asserted in both Fill in tests.
+  - Removing `min_scrolled_height` fails 2 tests by frames.
+- **Real window** (Xvfb 960×600):
+  - Paste shows its places in full.
+  - The `--client-secret corp <url>` paste offers Fill in. It then shows `abc` as the client ID, "Adds corp for the user", and the keyboard in the secret.
+  - "Show" turns into "Hide" and shows the typed text.
+- **Checks:** `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo clippy -p klefki -- -D warnings` 0; `cargo test --workspace` 412 core + 191 app passed; `cargo deny check` 0.
+
 ## Open / known limits
 - For OAuth servers, typed env and header values that do not look like secrets still travel in `add-json`'s argv, as Claude Code's own command takes them. Those that do are refused (B3).
 - Not tried on Windows or macOS. In particular, the cwd-based project key for `-s local` on Windows is unverified.
@@ -155,4 +176,4 @@ Each fix below has a test, and every app test was seen failing with its fix undo
 - The plan's free-port check for the callback port is not done. Neither is sign-in itself (PTY login): the user signs in from Claude Code's `/mcp`.
 
 ## Next
-Re-review of the round-1 fixes, then merge once nothing blocking is open and CI is green on all 3 OSes. After that: PTY sign-in and re-authorise (the callback-port spike), and the free-port check.
+Cross-review of the follow-ups pull request, then merge once CI is green on all 3 OSes. After that: PTY sign-in and re-authorise (the callback-port spike), and the free-port check.

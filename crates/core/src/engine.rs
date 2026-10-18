@@ -762,7 +762,12 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             )?;
             // Asked now, so a store that is missing or locked stops the change before anything runs.
             let store = if resolved.cli.iter().any(|a| a.secret.is_some()) {
-                let store = secret_store(shared).map_err(|e| e.to_string())?;
+                let next = |e: crate::secrets::SecretError| {
+                    format!(
+                        "{e} To add it with its client secret, start your system's secret store (on Linux, GNOME Keyring or KWallet) and press Review again; or leave the client secret empty if the server does not need one."
+                    )
+                };
+                let store = secret_store(shared).map_err(next)?;
                 let first = &resolved.cli[0];
                 let id = crate::model::ConnectionId::new(
                     if first.project.is_some() {
@@ -773,7 +778,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     first.project.as_deref(),
                     &first.name,
                 );
-                store.get(&id).map_err(|e| e.to_string())?;
+                store.get(&id).map_err(next)?;
                 Some(store)
             } else {
                 None
@@ -5503,6 +5508,27 @@ mod tests {
             vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
         );
         assert!(refused.contains("no plaintext copy"), "{refused}");
+        // And what to do about it.
+        assert!(
+            refused.contains("start your system's secret store"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("leave the client secret empty"),
+            "{refused}"
+        );
+        assert!(env.add_json_runs().is_empty());
+        // A store that is there but refuses says the same next step.
+        *store.fail.lock().unwrap() = Some(crate::secrets::SecretError::Failed("denied".into()));
+        let refused = plan_failure(
+            &core,
+            vec![oauth_add("sso2", vec![Target::User], Some(CLIENT_SECRET))],
+        );
+        assert!(refused.contains("denied"), "{refused}");
+        assert!(
+            refused.contains("leave the client secret empty"),
+            "{refused}"
+        );
         assert!(env.add_json_runs().is_empty());
     }
 
