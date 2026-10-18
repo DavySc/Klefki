@@ -1,13 +1,17 @@
 # Progress
 
 ## Current slice
-`docstore`, the enable/disable write path, `deny.toml` + cargo-deny (2026-10-17). Done except the open items under "Docstore and enable/disable". Next: run the real window on a machine with a display.
+File watcher, delete and edit (2026-10-18). Done; see the section below. Next: run the real window on a machine with a display; then the edit form (a structured editor next to Raw JSON), keyring secrets.
 
-Earlier slice: Live status checks (CLI locate/runner/parse, status engine, UI wiring), see "Live status" below.
-
-Earlier slice: M1 day-1 spikes done and recorded (below). Next: fix the inventory's enabled/disabled semantics, then `docstore`.
-
-Previous slice: Read-only inventory of the real Claude Code config, restyle (Catppuccin Mocha, JetBrains Mono, bigger controls), and a light theme (Latte-based) with a System option.
+## File watcher, delete and edit (2026-10-18)
+- `watch.rs`: polls the stamps (size, modification time, and the inode on Unix) of `.claude.json`, the two Claude caches, and each known project's `.mcp.json` and `.claude/settings.local.json`, once a second; reports a change once the files have held still for 300 ms, so a burst of saves is one reload. Polling instead of OS notifications: a few dozen `stat` calls a second, the same on every platform and on network drives, no new dependency. UNC and relative project paths are not watched (like the inventory). The baseline is taken right before every reload, so Klefki's own saves are not read twice and a change made during a read is noticed afterwards.
+- Engine: the watcher and the UI feed one input channel (a small relay thread passes the UI's commands on and says when the UI is gone). A change on disk reloads like a save does: new snapshot, checks only for servers that became enabled. The verify thread no longer reads the inventory itself; it asks the engine thread to reload.
+- Delete: `Change::Delete` for user and local servers (every spelling of the project). `docstore` removes the members in place, commas included, for any set of members (checked against the parsed result for every subset of up to six members, pretty and on one line). Project servers are refused: they live in the repository's `.mcp.json`. OAuth servers are refused (they are changed through Claude's own command, M2). The plan warns that a sign-in Claude keeps is not removed. Toolbar button and the Del key (not while typing).
+- Edit: Raw JSON tab. `Command::Inspect` sends the definition with every env and header value shown as `<hidden>`; left as `<hidden>` they keep their value, a new value replaces it, `<hidden>` for a name that had no value is refused. `Change::Replace` is validated (types, url schemes per type, no line breaks in commands, arguments, env or header values, valid env/header names, no `oauth`), size-limited (64 KiB), and the plan shows a line diff of the hidden view (a changed hidden value is reported as such, never shown). Project servers are shown read-only. Toolbar Edit button and Ctrl+E open the tab; Review and save / Revert.
+- Bug found by a test and fixed: with a row selected, the detail panel took the toolbar's right half and the buttons past its edge (Delete and later) were cut off and unclickable. The toolbar now wraps; a test checks every button stays left of the detail panel.
+- Not done: the structured edit form (Raw JSON only), rename (M2 move), deleting a project server (by design), a sign-out on delete.
+- Server names are written as the inventory shows them (sanitised, clipped to 512 characters); a name with control characters or longer than that cannot be deleted or edited from Klefki (the plan reports it as not found).
+- Checks: fmt 0; clippy workspace and `-p klefki` 0; `cargo test --workspace` 246 core + 78 app passed, twice; `cargo deny check` 0. Tests were written before the code and failed first where there was a behaviour to miss (watcher off, no rebase, tail-removal rule, toolbar overflow).
 
 ## Performance pass 2 (2026-10-17)
 Measured with a throwaway release benchmark (median of 5-9 runs, counting allocator; not committed, saved outside the repo). Synthetic configs, Linux, local disk.

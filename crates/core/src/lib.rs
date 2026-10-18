@@ -8,3 +8,4 @@ mod fixtures;
 mod model;
 mod ops;
 mod sanitize;
+mod watch;

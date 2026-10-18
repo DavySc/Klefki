@@ -56,6 +56,25 @@ impl DetailTab {
     ];
 }
 
+/// The Raw JSON tab's editor, for one server.
+struct Editor {
+    id: ServerId,
+    state: EditorState,
+}
+
+enum EditorState {
+    /// Asked the engine for the definition.
+    Loading,
+    Failed(String),
+    Ready {
+        /// As the engine sent it, to tell whether anything was edited.
+        original: String,
+        text: String,
+        /// Project servers are shown but not edited (they live in the repository).
+        editable: bool,
+    },
+}
+
 /// What happened to the last change, for the banner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Outcome {
@@ -85,6 +104,8 @@ pub struct ShellApp {
     plan: Option<PlanView>,
     /// Apply was pressed and the engine has not answered yet.
     applying: bool,
+    /// The definition being viewed or edited in the Raw JSON tab.
+    editor: Option<Editor>,
     /// The outcome of the last change, shown until dismissed.
     outcome: Option<Outcome>,
     pub page: Page,
@@ -105,6 +126,7 @@ impl ShellApp {
             cli_problem: None,
             plan: None,
             applying: false,
+            editor: None,
             outcome: None,
             snapshot,
             page: Page::Connections,
@@ -176,6 +198,15 @@ impl ShellApp {
                 });
                 self.selected = selected;
                 self.live = live;
+                if self.editor.as_ref().is_some_and(|e| {
+                    !new_index.contains_key(&(
+                        e.id.scope,
+                        e.id.project.as_deref(),
+                        e.id.name.as_str(),
+                    ))
+                }) {
+                    self.editor = None;
+                }
                 self.grid_cache = None;
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
@@ -202,11 +233,15 @@ impl ShellApp {
                 changed,
                 backup,
             } => {
+                if changed {
+                    self.editor = None;
+                }
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.plan = None;
                     self.applying = false;
                 }
                 self.outcome = Some(Outcome {
+                    // What was saved is read again next time it is shown.
                     text: match (changed, backup) {
                         (false, _) => "Nothing needed to change.".to_owned(),
                         (true, Some(b)) => format!("Saved. The previous file is kept in {b}"),
@@ -231,6 +266,21 @@ impl ShellApp {
                         .to_owned(),
                     ok: false,
                 });
+            }
+            Event::Entry { id, json, editable } => {
+                if let Some(editor) = &mut self.editor
+                    && editor.id == id
+                    && matches!(editor.state, EditorState::Loading)
+                {
+                    editor.state = match json {
+                        Ok(text) => EditorState::Ready {
+                            original: text.clone(),
+                            text,
+                            editable,
+                        },
+                        Err(why) => EditorState::Failed(why),
+                    };
+                }
             }
             Event::CliVersion(version) => self.cli_version = version,
             Event::CliProblem(problem) => self.cli_problem = Some(problem),
@@ -303,6 +353,17 @@ impl ShellApp {
         self.poll_core();
         if ui.input(|i| i.key_pressed(egui::Key::F5)) {
             self.refresh();
+        }
+        // Del and Ctrl+E act on the selection, unless a text field has the keyboard (Del edits text there).
+        if !ui.ctx().egui_wants_keyboard_input() && self.plan.is_none() && self.core.is_some() {
+            if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+                self.prepare_delete();
+            }
+            if self.selected.len() == 1
+                && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E))
+            {
+                self.tab = DetailTab::RawJson;
+            }
         }
         let pal = theme::palette(ui.ctx());
         egui::Panel::top("top_bar")
@@ -493,29 +554,31 @@ impl ShellApp {
             (icon::DOWNLOAD_SIMPLE, "Import"),
         ];
         let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.plan.is_none();
-        ui.horizontal(|ui| {
+        let can_edit = self.core.is_some() && self.selected.len() == 1;
+        // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
+        ui.horizontal_wrapped(|ui| {
             for (glyph, tip) in ACTIONS {
-                let toggle = match glyph {
-                    g if g == icon::TOGGLE_RIGHT => Some(true),
-                    g if g == icon::TOGGLE_LEFT => Some(false),
-                    _ => None,
-                };
-                // The other operations arrive later in M1; they are shown disabled so the layout can be judged.
+                // Operations not built yet are shown disabled so the layout can be judged.
                 let button = egui::Button::new(RichText::new(glyph).size(20.0))
                     .min_size(egui::vec2(44.0, 38.0));
-                match toggle {
-                    Some(enabled) => {
-                        if ui
-                            .add_enabled(can_toggle, button)
-                            .on_hover_text(tip)
-                            .on_disabled_hover_text(format!("{tip}: select a server first"))
-                            .clicked()
-                        {
-                            self.prepare_toggle(enabled);
-                        }
+                let (enabled, needs) = match glyph {
+                    g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
+                        (can_toggle, "select a server first")
                     }
-                    None => {
-                        ui.add_enabled(false, button).on_disabled_hover_text(tip);
+                    g if g == icon::PENCIL_SIMPLE => (can_edit, "select one server"),
+                    _ => (false, "not built yet"),
+                };
+                let clicked = ui
+                    .add_enabled(enabled, button)
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text(format!("{tip}: {needs}"))
+                    .clicked();
+                if clicked {
+                    match glyph {
+                        g if g == icon::TOGGLE_RIGHT => self.prepare_toggle(true),
+                        g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
+                        g if g == icon::TRASH => self.prepare_delete(),
+                        _ => self.tab = DetailTab::RawJson,
                     }
                 }
             }
@@ -524,6 +587,20 @@ impl ShellApp {
                 RichText::new(format!("{} selected", self.selected.len())).color(pal.text_muted),
             );
         });
+    }
+
+    /// Asks the engine what deleting the selected servers would change. Nothing is written yet.
+    fn prepare_delete(&mut self) {
+        let changes: Vec<Change> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .map(|row| Change::Delete { id: row.id() })
+            .collect();
+        if !changes.is_empty() {
+            self.outcome = None;
+            self.send(Command::Prepare(changes));
+        }
     }
 
     /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
@@ -872,9 +949,98 @@ impl ShellApp {
                     diagnosis_panel(ui, s, d);
                 }
             }
+            DetailTab::RawJson => self.raw_json(ui, s),
             _ => {
-                ui.label(RichText::new("Available from M1.").color(pal.text_muted));
+                ui.label(RichText::new("Not built yet.").color(pal.text_muted));
             }
+        }
+    }
+
+    /// The server's definition as JSON: editable for user and local servers, then saved through a reviewed plan.
+    fn raw_json(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        if self.core.is_none() {
+            ui.label(RichText::new("Not available for sample data.").color(pal.text_muted));
+            return;
+        }
+        if !self.editor.as_ref().is_some_and(|e| s.is(&e.id)) {
+            self.editor = Some(Editor {
+                id: s.id(),
+                state: EditorState::Loading,
+            });
+            self.send(Command::Inspect(s.id()));
+        }
+        let can_review = self.plan.is_none();
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        let mut review = None;
+        match &mut editor.state {
+            EditorState::Loading => {
+                ui.label(RichText::new("Loading…").color(pal.text_muted));
+            }
+            EditorState::Failed(why) => {
+                ui.add(egui::Label::new(RichText::new(why.as_str()).color(pal.danger)).wrap());
+            }
+            EditorState::Ready {
+                original,
+                editable: false,
+                ..
+            } => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Defined in the repository's .mcp.json. Klefki shows it but does not edit files in a repository.")
+                            .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut original.as_str())
+                        .code_editor()
+                        .desired_width(f32::INFINITY),
+                );
+            }
+            EditorState::Ready {
+                original,
+                text,
+                editable: true,
+            } => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("Values shown as <hidden> keep what they are now. Type a new value to change one.")
+                            .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(text)
+                        .code_editor()
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(14),
+                );
+                let edited = text != original;
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(edited && can_review, egui::Button::new("Review and save…"))
+                        .clicked()
+                    {
+                        review = Some(text.clone());
+                    }
+                    if ui
+                        .add_enabled(edited, egui::Button::new("Revert"))
+                        .clicked()
+                    {
+                        *text = original.clone();
+                    }
+                });
+            }
+        }
+        if let Some(json) = review {
+            self.outcome = None;
+            self.send(Command::Prepare(vec![Change::Replace { id: s.id(), json }]));
         }
     }
 }
@@ -2324,5 +2490,210 @@ mod tests {
         h.state_mut().search.clear();
         h.run();
         h.get_by_label("omega");
+    }
+
+    // ---- delete and edit
+
+    #[test]
+    fn delete_asks_the_engine_for_a_plan_for_each_selected_server() {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        h.run();
+        h.get_by_label(icon::TRASH).click();
+        h.run();
+        assert!(drain(&engine).is_empty(), "nothing selected, nothing asked");
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label(icon::TRASH).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Delete { id: a.id() }])]
+        );
+    }
+
+    #[test]
+    fn the_delete_key_deletes_the_selection_but_not_while_typing() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.key_press(egui::Key::Delete);
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Delete { id: a.id() }])]
+        );
+        // With the search field focused, Del edits the text.
+        h.get_by_role(egui::accesskit::Role::TextInput).click();
+        h.run();
+        h.key_press(egui::Key::Delete);
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    fn open_raw_json(h: &mut Harness<'static, ShellApp>, name: &str) {
+        h.get_by_label(name).click();
+        h.run();
+        h.get_by_label(icon::PENCIL_SIMPLE).click();
+        h.run();
+    }
+
+    #[test]
+    fn edit_opens_the_raw_json_and_asks_for_the_definition() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        open_raw_json(&mut h, "alpha");
+        assert_eq!(h.state().tab, DetailTab::RawJson);
+        assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+        h.get_by_label_contains("Loading");
+        // Asked once, not every frame.
+        h.run();
+        assert!(drain(&engine).is_empty());
+    }
+
+    fn entry_event(row: &ServerRow, json: &str, editable: bool) -> Event {
+        Event::Entry {
+            id: row.id(),
+            json: Ok(json.to_owned()),
+            editable,
+        }
+    }
+
+    #[test]
+    fn an_edited_definition_is_sent_for_review_and_revert_undoes_it() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        open_raw_json(&mut h, "alpha");
+        drain(&engine);
+        let original =
+            "{\n  \"command\": \"node\",\n  \"env\": {\n    \"TOKEN\": \"<hidden>\"\n  }\n}";
+        engine.events.send(entry_event(&a, original, true)).unwrap();
+        h.run();
+        h.get_by_label_contains("keep what they are now");
+        // Unchanged: nothing to review.
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+        let edited = original.replace("node", "node22");
+        if let Some(Editor {
+            state: EditorState::Ready { text, .. },
+            ..
+        }) = &mut h.state_mut().editor
+        {
+            *text = edited.clone();
+        }
+        h.run();
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Replace {
+                id: a.id(),
+                json: edited
+            }])]
+        );
+        h.get_by_label("Revert").click();
+        h.run();
+        match &h.state().editor {
+            Some(Editor {
+                state: EditorState::Ready { text, .. },
+                ..
+            }) => assert_eq!(text, original),
+            _ => panic!("editor gone"),
+        }
+    }
+
+    #[test]
+    fn a_project_server_is_shown_read_only() {
+        let (mut h, engine) = live_harness();
+        let p = live_row("docs", Scope::Project, Some("C:/Repos/WebApp"));
+        engine.events.send(snapshot_of(vec![p.clone()])).unwrap();
+        h.run();
+        open_raw_json(&mut h, "docs");
+        engine
+            .events
+            .send(entry_event(&p, "{\n  \"command\": \"x\"\n}", false))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("does not edit files in a repository");
+        assert!(h.query_by_label("Review and save…").is_none());
+    }
+
+    #[test]
+    fn a_definition_that_cannot_be_read_says_why() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        open_raw_json(&mut h, "alpha");
+        engine
+            .events
+            .send(Event::Entry {
+                id: a.id(),
+                json: Err("the server is no longer in the configuration".into()),
+                editable: true,
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("no longer in the configuration");
+    }
+
+    #[test]
+    fn after_a_save_the_definition_is_read_again() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        open_raw_json(&mut h, "alpha");
+        engine.events.send(entry_event(&a, "{}", true)).unwrap();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 1,
+                changed: true,
+                backup: None,
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+    }
+
+    #[test]
+    fn every_toolbar_button_stays_reachable_next_to_the_detail_panel() {
+        // Found while testing Delete: with a row selected the detail panel took the toolbar's right half, and the
+        // buttons past its edge were cut off and could not be clicked.
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        let detail_left = h.get_by_label("General").rect().min.x;
+        for glyph in [
+            icon::PLUS,
+            icon::PENCIL_SIMPLE,
+            icon::TOGGLE_LEFT,
+            icon::TRASH,
+            icon::DOWNLOAD_SIMPLE,
+        ] {
+            let r = h.get_by_label(glyph).rect();
+            assert!(
+                r.max.x <= detail_left,
+                "{glyph:?} at {r:?}, detail panel from x={detail_left}"
+            );
+        }
     }
 }
