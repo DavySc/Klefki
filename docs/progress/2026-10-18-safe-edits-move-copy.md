@@ -36,12 +36,40 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
 - **Changed tests (behaviour changed on purpose):** `definition.rs` OAuth definitions now have no problem (they are
   saved through Claude Code); the app test that OAuth servers are not edited in the form is split into one for
   project servers (unchanged) and one that an OAuth server is edited and says it signs in again.
-- Checks (after merging main with the process-tree kill, #24): see the PR; last run `cargo fmt --check` 0, clippy
-  workspace and `-p klefki` 0, `cargo test --workspace` 460 core + 221 app passed, `cargo deny check` 0, no IO in
+- Checks after cross-review round 1 (before merging the free-port check): `cargo fmt --check` 0, clippy workspace
+  and `-p klefki` 0, `cargo test --workspace` 475 core + 222 app passed, `cargo deny check` 0, no IO in
   `crates/app/src`.
 - **Open / for human review:** OAuth servers are now removed through `claude mcp remove` (invariant area). A move or
   edit of an OAuth server signs it out (Claude deletes its credentials). Proposals in decision 006: letting the
   docstore remove OAuth entries (keeps the sign-in), and a fake-claude mode that writes the config. The OAuth move
   was not tried in the real app (no keyring here).
-- **Next:** cross-review; merge after the free-port check lands (merge order set by the coordinator). Not merged by
-  this session: the merge is left for Davy.
+- **Cross-review round 1** (PR comment 6255733102, head d9d9ed4), each with a reproducer that failed before its fix:
+  - B1 Put back and Forget always said the definition was gone (the plan read kept definitions from a fresh read
+    that never lists them): `a_kept_definition_can_be_put_back` / `_forgotten`; the model test now fails on a refused
+    Put back or Forget (reverting the fix fails it; seed kept).
+  - B2 a missing project folder was found only after the remove signed the server out: checked at review and before
+    the first command (`a_move_into_a_missing_folder_…`, `a_move_out_of_a_missing_folder_…`).
+  - B3 the review diff showed `alwaysAllow` kept: the preview now shows what `add-json` writes and warns what it
+    drops (`the_review_shows_what_claude_code_writes_and_warns_what_it_drops`, plus edit-in-place variant).
+  - S1 stale recovery after a change that got through: reconciled on listing (`a_kept_definition_whose_change_got_through_is_not_offered`).
+  - S2 Klefki's keyring copy: moved before the recovery file goes; set/delete failures are notes; model test has
+    keyring faults and checks Klefki's secrets exactly.
+  - S3 project key through a link (unix): refused (`a_project_reached_through_a_link_…`).
+  - S4 progress per command (`a_slow_change_says_what_claude_code_is_doing`, app `…says_each_step_while_it_runs`).
+  - S5 moving a user server into one project warns where it is no longer (`moving_a_user_server_into_one_project_…`).
+  - S6 Undo after a plain move, warning tone that stays when settings were dropped (app test); S7 OAuth warning by
+    the places in warning colour.
+  - Polish 1–7 and 9 folded in (wording, full stops and line breaks in errors, kept notice name first, diff scroll per
+    plan, clearer icon plus Ctrl+Shift+M, faded disabled radio, "In a project, just for you", decision 006 line on
+    `.credentials.json`). Polish 8 (backup path behind a link) left: the path is the way back, and a warning toast
+    no longer fades.
+  - Found by a 3000-case soak: a delete's journal replay undid a later move back into that place (pre-existing on
+    main): plans now store copies expanded; docstore test and machine `an_earlier_deletes_check_does_not_undo_a_move_back_into_its_place` (+ copy variant).
+  - Then found by a 4000-case soak: a move then a rename, checked together, failed ("q_r already exists there"):
+    the move's add found its server missing and added it back. A replay now treats a server added by one plan and
+    deleted or renamed by a later one as it ended (`as_they_ended`): docstore
+    `an_earlier_moves_check_does_not_add_back_a_server_renamed_since` (+ edit between), `…_deleted_since` (+ rename
+    into the name), machine `an_earlier_moves_check_…`; each failed before the fix.
+  - Soak after both: 3 × 4000 cases passed (~112 s each).
+- **Next:** re-review round; merge main after the free-port check lands and re-verify. Not merged by this session:
+  the merge is left for Davy.

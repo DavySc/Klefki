@@ -176,6 +176,10 @@ struct Outcome {
     shown_at: Option<f64>,
     /// A server just added that signs in: the card offers to sign in to it now, and stays until used or dismissed.
     sign_in: Option<ServerId>,
+    /// It worked, with something to take in (settings Claude Code left out, say): drawn as a warning, and it stays.
+    warn: bool,
+    /// What undoes it (a move back), offered on the card, which then stays until used or dismissed.
+    undo: Option<Change>,
 }
 
 /// How long a success message stays.
@@ -243,6 +247,10 @@ pub struct ShellApp {
     adding_verb: &'static str,
     /// The Move dialog, while open.
     moving: Option<MoveForm>,
+    /// The server a move under review takes away, and whether it signs in: what Undo moves back.
+    moved_from: Option<(ServerId, bool)>,
+    /// What a slow change (through Claude Code's commands) is doing now, while it is applied.
+    applying_step: Option<String>,
     /// egui still remembers text typed into the closed Add dialog (undo steps of secrets): forget it.
     forget_typed: bool,
     /// A server to bring into view in the list, once.
@@ -291,6 +299,8 @@ impl ShellApp {
             adding_signs_in: false,
             adding_verb: "Added",
             moving: None,
+            moved_from: None,
+            applying_step: None,
             forget_typed: false,
             reveal: None,
             casing: None,
@@ -413,6 +423,8 @@ impl ShellApp {
                             text: why,
                             ok: false,
                             shown_at: None,
+                            warn: false,
+                            undo: None,
                             sign_in: None,
                         })
                     }
@@ -442,6 +454,7 @@ impl ShellApp {
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.plan = None;
                     self.applying = false;
+                    self.applying_step = None;
                 }
                 let added = self.added_in_words();
                 if self.add.as_ref().is_some_and(|f| f.reviewing) {
@@ -465,6 +478,7 @@ impl ShellApp {
                     (None, false) => "",
                 };
                 // How it went, when there is more to say (settings Claude Code left out, say), then the backup.
+                let warn = changed && !notes.is_empty();
                 let mut kept: String = notes.iter().map(|n| format!(" {n}")).collect();
                 if let Some(b) = backup {
                     kept.push_str(&format!(" The previous file is kept in {b}"));
@@ -479,13 +493,22 @@ impl ShellApp {
                     },
                     ok: true,
                     shown_at: None,
+                    warn,
+                    undo: self.undo_move(changed),
                     sign_in,
                 });
             }
+            Event::Applying { plan, step } => {
+                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+                    self.applying_step = Some(step);
+                }
+            }
             Event::ApplyFailed { plan, error } => {
+                self.moved_from = None;
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.plan = None;
                     self.applying = false;
+                    self.applying_step = None;
                 }
                 // Claude Code may have added some before one failed.
                 self.select_added();
@@ -499,6 +522,8 @@ impl ShellApp {
                     text: error,
                     ok: false,
                     shown_at: None,
+                    warn: false,
+                    undo: None,
                     sign_in: None,
                 });
             }
@@ -508,6 +533,8 @@ impl ShellApp {
                         .to_owned(),
                     ok: false,
                     shown_at: None,
+                    warn: false,
+                    undo: None,
                     sign_in: None,
                 });
             }
@@ -540,6 +567,8 @@ impl ShellApp {
                         text: format!("Signed in to {}.", id.name),
                         ok: true,
                         shown_at: None,
+                        warn: false,
+                        undo: None,
                         sign_in: None,
                     });
                 }
@@ -692,6 +721,11 @@ impl ShellApp {
             }
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
                 self.open_duplicate();
+            }
+            // Not Ctrl+M: on macOS, Cmd+M minimizes the window.
+            if ui.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::M))
+            {
+                self.open_move();
             }
             if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
                 self.open_add();
@@ -1003,50 +1037,51 @@ impl ShellApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 let title = if count == 1 {
-                    "1 server could not be put back".to_owned()
+                    "A server is out of the configuration".to_owned()
                 } else {
-                    format!("{count} servers could not be put back")
+                    format!("{count} servers are out of the configuration")
                 };
                 ui.label(RichText::new(title).color(pal.warn));
                 ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "Claude Code's command failed while changing them, and again while putting them back. Klefki kept what they were, client secrets included, so you can add them back where they were.",
+                            "A change took them out and Claude Code could not put them back. Klefki kept each definition, with its client secret, so you can add it back where it was.",
                         )
                         .color(pal.text_muted),
                     )
                     .wrap(),
                 );
+                let wait = "Wait for the open change to finish";
                 for kept in &self.snapshot.kept {
                     ui.horizontal(|ui| {
-                        let wait = "Wait for the open change to finish";
-                        if ui
-                            .add_enabled(can, egui::Button::new("Put back"))
-                            .on_hover_text("Review the change before anything is written")
-                            .on_disabled_hover_text(wait)
-                            .clicked()
-                        {
-                            chosen = Some(Change::PutBack {
-                                kept: kept.id.clone(),
-                            });
-                        }
-                        if ui
-                            .add_enabled(can, egui::Button::new("Forget\u{2026}"))
-                            .on_hover_text("Delete Klefki's copy; the review says what is lost")
-                            .on_disabled_hover_text(wait)
-                            .clicked()
-                        {
-                            chosen = Some(Change::ForgetKept {
-                                kept: kept.id.clone(),
-                            });
-                        }
-                        let what = format!("{} {}", kept.name, kept.place);
-                        ui.add(egui::Label::new(what).truncate());
+                        // The server first, then what can be done with it.
+                        let mut what = format!("{} {}", kept.name, kept.place);
                         if kept.signs_in {
-                            ui.label(
-                                RichText::new("signs in with OAuth").small().color(pal.text_muted),
-                            );
+                            what.push_str(" (signs in with OAuth)");
                         }
+                        ui.add(egui::Label::new(what).truncate());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(can, egui::Button::new("Forget\u{2026}"))
+                                .on_hover_text("Delete Klefki's copy; the review says what is lost")
+                                .on_disabled_hover_text(wait)
+                                .clicked()
+                            {
+                                chosen = Some(Change::ForgetKept {
+                                    kept: kept.id.clone(),
+                                });
+                            }
+                            if ui
+                                .add_enabled(can, egui::Button::new("Put back"))
+                                .on_hover_text("Add it back where it was, after a review")
+                                .on_disabled_hover_text(wait)
+                                .clicked()
+                            {
+                                chosen = Some(Change::PutBack {
+                                    kept: kept.id.clone(),
+                                });
+                            }
+                        });
                     });
                 }
             });
@@ -1079,7 +1114,7 @@ impl ShellApp {
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
                     }
-                    g if g == icon::COPY || g == icon::ARROW_BEND_UP_RIGHT => {
+                    g if g == icon::COPY || g == icon::ARROW_FAT_LINES_RIGHT => {
                         (can_duplicate, "select one user or local server")
                     }
                     g if g == icon::SIGN_IN => {
@@ -1099,7 +1134,7 @@ impl ShellApp {
                         g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
                         g if g == icon::TRASH => self.prepare_delete(),
                         g if g == icon::COPY => self.open_duplicate(),
-                        g if g == icon::ARROW_BEND_UP_RIGHT => self.open_move(),
+                        g if g == icon::ARROW_FAT_LINES_RIGHT => self.open_move(),
                         g if g == icon::PLUS => self.open_add(),
                         g if g == icon::SIGN_IN => {
                             if let Some(s) = self.single_selected().cloned() {
@@ -1185,10 +1220,10 @@ impl ShellApp {
                         command::Action::Duplicate,
                     );
                     add(
-                        icon::ARROW_BEND_UP_RIGHT,
+                        icon::ARROW_FAT_LINES_RIGHT,
                         format!("Move {}", s.name),
                         "To another project or the user".into(),
-                        None,
+                        Some(shortcut("Shift+M")),
                         command::Action::Move,
                     );
                 }
@@ -1685,7 +1720,6 @@ impl ShellApp {
         };
         let name = form.source.name.clone();
         let taken = form.places.taken(&name, &self.snapshot.servers);
-        let places = form.places.in_words();
         let ready = taken.is_none() && form.places.targets().len() == 1;
         let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
@@ -1698,6 +1732,20 @@ impl ShellApp {
                     .truncate(),
             );
             ui.add_space(12.0);
+            // What it costs, where the place is chosen.
+            if form.signs_in {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "{} It signs in with OAuth: Claude Code removes it and adds it again, so you will need to sign in to it again afterwards.",
+                            icon::WARNING
+                        ))
+                        .color(pal.warn),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+            }
             ui.label(RichText::new("Move it to").color(pal.text_muted));
             form.places.ui(ui, list_height, None);
             ui.add_space(10.0);
@@ -1712,19 +1760,21 @@ impl ShellApp {
                     )
                     .wrap(),
                 );
-            } else if let Some(places) = &places {
+            } else if let Some(places) = form.places.one_in_words() {
                 ui.add(egui::Label::new(format!("Moves {name} {places}.")).wrap());
             } else {
                 ui.label(RichText::new("Choose where it goes.").color(pal.text_muted));
             }
-            let keeps = if form.signs_in {
-                "It signs in with OAuth: Claude Code removes it and adds it again, so you sign in to it again afterwards."
-            } else {
-                "It keeps its settings, environment and header values."
-            };
-            ui.add(
-                egui::Label::new(RichText::new(keeps).small().color(pal.text_muted)).wrap(),
-            );
+            if !form.signs_in {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new("It keeps its settings, environment and header values.")
+                            .small()
+                            .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let confirm =
@@ -1749,9 +1799,11 @@ impl ShellApp {
                 to,
             };
             let signs_in = form.signs_in;
+            let from = form.source.clone();
             self.moving = None;
             self.prepare(vec![change]);
             self.adding_signs_in = signs_in;
+            self.moved_from = Some((from, signs_in));
         } else if cancel || modal.should_close() {
             self.moving = None;
         }
@@ -2097,6 +2149,7 @@ impl ShellApp {
             self.outcome = None;
             self.preparing = true;
             self.adding_signs_in = false;
+            self.moved_from = None;
             // What will be in the list afterwards, selected once it is there.
             self.adding = changes
                 .iter()
@@ -2115,6 +2168,20 @@ impl ShellApp {
             };
             self.send(Command::Prepare(changes));
         }
+    }
+
+    /// Undo for a move just made: moving it back. Not for a server that signs in, which a move back signs out again.
+    fn undo_move(&mut self, changed: bool) -> Option<Change> {
+        let (from, signs_in) = self.moved_from.take()?;
+        if !changed || signs_in {
+            return None;
+        }
+        let row = self.single_selected()?;
+        let to = match (from.scope, from.project) {
+            (Scope::Local, Some(project)) => Target::Local(project),
+            _ => Target::User,
+        };
+        Some(Change::Move { id: row.id(), to })
     }
 
     /// What was just added and where, as the success message says it, with what to do next for OAuth. `None`
@@ -2191,7 +2258,7 @@ impl ShellApp {
         let shown_at = *outcome.shown_at.get_or_insert(now);
         // A card that offers something to do stays until it is used or dismissed: time limits on a choice exclude
         // whoever reads slowly.
-        if outcome.ok && outcome.sign_in.is_none() {
+        if outcome.ok && !outcome.warn && outcome.sign_in.is_none() && outcome.undo.is_none() {
             let left = SUCCESS_SECONDS - (now - shown_at);
             if left <= 0.0 {
                 self.outcome = None;
@@ -2200,13 +2267,16 @@ impl ShellApp {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
         }
         let outcome = outcome.clone();
-        let (color, glyph) = if outcome.ok {
+        let (color, glyph) = if outcome.ok && outcome.warn {
+            (pal.warn, icon::WARNING)
+        } else if outcome.ok {
             (pal.success, icon::CHECK_CIRCLE)
         } else {
             (pal.danger, icon::WARNING_CIRCLE)
         };
         let mut dismiss = false;
         let mut sign_in = false;
+        let mut undo = false;
         egui::Area::new(egui::Id::new("outcome"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .order(egui::Order::Foreground)
@@ -2235,6 +2305,12 @@ impl ShellApp {
                             if ui.small_button("Dismiss").clicked() {
                                 dismiss = true;
                             }
+                            if outcome.undo.is_some() {
+                                undo = ui
+                                    .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
+                                    .on_hover_text("Move it back, after a review")
+                                    .clicked();
+                            }
                             if outcome.sign_in.is_some() && self.sign_in.is_none() {
                                 let button = egui::Button::new(
                                     RichText::new("Sign in").strong().color(pal.on_bright),
@@ -2252,6 +2328,9 @@ impl ShellApp {
         {
             self.outcome = None;
             self.start_sign_in(&row);
+        } else if undo && let Some(change) = outcome.undo {
+            self.outcome = None;
+            self.prepare(vec![change]);
         } else if dismiss {
             self.outcome = None;
         }
@@ -2274,7 +2353,7 @@ impl ShellApp {
             // so the buttons always stay in view.
             let room = (ctx.content_rect().height() - 140.0).max(160.0);
             egui::ScrollArea::vertical()
-                .id_salt("plan_body")
+                .id_salt(("plan_body", plan.id))
                 .max_height(room)
                 .min_scrolled_height(room)
                 .show(ui, |ui| {
@@ -2335,7 +2414,9 @@ impl ShellApp {
                             .inner_margin(Margin::same(10))
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
+                                // Its own scroll position per plan and file: each review opens at the top.
                                 egui::ScrollArea::vertical()
+                                    .id_salt(("plan_diff", plan.id, &file.path))
                                     .max_height(220.0)
                                     .show(ui, |ui| {
                                         for line in &file.lines {
@@ -2418,8 +2499,23 @@ impl ShellApp {
                     cancel = true;
                 }
                 if applying {
-                    // Text, not a spinner: an animation would repaint every frame for a write that takes milliseconds.
-                    ui.label(RichText::new("Saving…").color(pal.text_muted));
+                    // Text, not a spinner: an animation would repaint every frame. A write takes milliseconds;
+                    // Claude Code's commands take seconds each, so each one is named as it starts.
+                    match &self.applying_step {
+                        None => {
+                            ui.label(RichText::new("Saving…").color(pal.text_muted));
+                        }
+                        Some(step) => {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(step).color(pal.text));
+                                ui.label(
+                                    RichText::new("Keep Klefki open until this is done.")
+                                        .small()
+                                        .color(pal.text_muted),
+                                );
+                            });
+                        }
+                    }
                 }
                 // Enter confirms, as in any dialog; not while a field would take it.
                 if enabled
@@ -4443,10 +4539,7 @@ const ACTIONS: [(&str, &str); 8] = [
     (icon::PLUS, "Add (Ctrl+N)"),
     (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
     (icon::COPY, "Duplicate (Ctrl+D)"),
-    (
-        icon::ARROW_BEND_UP_RIGHT,
-        "Move to another project or the user",
-    ),
+    (icon::ARROW_FAT_LINES_RIGHT, "Move (Ctrl+Shift+M)"),
     (icon::SIGN_IN, "Sign in"),
     (icon::TOGGLE_RIGHT, "Turn on"),
     (icon::TOGGLE_LEFT, "Turn off"),
@@ -4547,6 +4640,16 @@ impl Places {
         places_in_words(self.user, &folders)
     }
 
+    /// The one place chosen, as a move says it: `to the user`, `to app`. None when nothing is chosen.
+    fn one_in_words(&self) -> Option<String> {
+        if self.user {
+            return Some("to the user".to_owned());
+        }
+        self.ticked()
+            .next()
+            .map(|p| format!("to {}", folder_name(p)))
+    }
+
     /// The ticked places that already have a server called `name`, in words. Only the lists a new server is written
     /// to count: the engine refuses those, while a name in a project's `.mcp.json` is only hidden by it, which the
     /// review warns about.
@@ -4596,7 +4699,8 @@ impl Places {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let ticked = self.projects.iter().filter(|(_, on)| *on).count();
-            let mut heading = format!("Projects ({})", self.projects.len());
+            // Local scope, as the list's groups say it; not the shared .mcp.json, which Klefki never writes.
+            let mut heading = format!("In a project, just for you ({})", self.projects.len());
             if ticked > 0 && !self.one {
                 heading.push_str(&format!(", {ticked} ticked"));
             }
@@ -4750,6 +4854,12 @@ fn place_mark(
     let text = if enabled { pal.text } else { pal.text_muted };
     if mark == Mark::Radio {
         let stroke = if ticked { pal.primary } else { pal.text_muted };
+        // Where it is now cannot be chosen: faded, ring and all.
+        let stroke = if enabled {
+            stroke
+        } else {
+            stroke.gamma_multiply(0.4)
+        };
         painter.circle_stroke(tick.center(), 8.25, egui::Stroke::new(1.5, stroke));
         if ticked {
             painter.circle_filled(tick.center(), 4.5, pal.primary);
@@ -7610,7 +7720,7 @@ mod tests {
         for glyph in [
             icon::PENCIL_SIMPLE,
             icon::COPY,
-            icon::ARROW_BEND_UP_RIGHT,
+            icon::ARROW_FAT_LINES_RIGHT,
             icon::TOGGLE_RIGHT,
             icon::TOGGLE_LEFT,
             icon::TRASH,
@@ -9035,7 +9145,7 @@ mod tests {
         h.run();
         h.run();
         // Over the list of projects, the wheel moves the dialog's body, not a list of its own inside it.
-        let heading = h.get_by_label_contains("Projects (42").rect();
+        let heading = h.get_by_label_contains("just for you (42").rect();
         let over = h.get_by_label("project-01").rect().center();
         h.event(egui::Event::PointerMoved(over));
         h.run();
@@ -9048,7 +9158,7 @@ mod tests {
         for _ in 0..30 {
             h.step();
         }
-        let moved = h.get_by_label_contains("Projects (42").rect();
+        let moved = h.get_by_label_contains("just for you (42").rect();
         assert!(
             moved.top() < heading.top() - 20.0,
             "the heading was at {}, now {}",
@@ -10163,7 +10273,7 @@ mod tests {
     fn open_move_of(h: &mut Harness<'static, ShellApp>, name: &str) {
         h.get_by_label(name).click();
         h.run();
-        h.get_by_label(icon::ARROW_BEND_UP_RIGHT).click();
+        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
         h.run();
         assert!(h.state().moving.is_some());
         h.get_by_label(&format!("Move {name}"));
@@ -10183,7 +10293,7 @@ mod tests {
         assert!(h.get_by_label("Review").accesskit_node().is_disabled());
         h.get_by_label("For the user, in every project").click();
         h.run();
-        h.get_by_label("Moves beta for the user.");
+        h.get_by_label("Moves beta to the user.");
         h.get_by_label_contains("keeps its settings");
         h.get_by_label("Review").click();
         h.run();
@@ -10220,7 +10330,7 @@ mod tests {
             .map(|n| n.accesskit_node().label().unwrap_or_default())
             .collect();
         assert_eq!(chosen, vec!["WebApp".to_owned()]);
-        h.get_by_label("Moves alpha in WebApp.");
+        h.get_by_label("Moves alpha to WebApp.");
         h.key_press(egui::Key::Enter);
         h.run();
         assert_eq!(
@@ -10249,7 +10359,7 @@ mod tests {
         h.run();
         h.state_mut().selected = BTreeSet::from([0]);
         h.run();
-        h.get_by_label(icon::ARROW_BEND_UP_RIGHT).click();
+        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
         h.run();
         h.get_by_label("notes").click();
         h.run();
@@ -10270,7 +10380,7 @@ mod tests {
         h.get_by_label("gamma").click();
         h.run();
         assert!(
-            h.get_by_label(icon::ARROW_BEND_UP_RIGHT)
+            h.get_by_label(icon::ARROW_FAT_LINES_RIGHT)
                 .accesskit_node()
                 .is_disabled()
         );
@@ -10329,6 +10439,46 @@ mod tests {
         h.run();
         assert_eq!(h.state().selected, BTreeSet::from([1]));
         h.get_by_label("Moved beta to notes. Claude Code left out alwaysAllow.");
+        // Something was left out: said as a warning, which stays until it is closed.
+        assert!(h.state().outcome.as_ref().is_some_and(|o| o.warn));
+        // Undo moves it back where it was.
+        drain(&engine);
+        h.get_by_label("Undo").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            [Change::Move {
+                id: ServerId::new(Scope::Local, Some("/home/me/notes"), "beta"),
+                to: Target::Local("C:/Repos/WebApp".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_change_made_with_claude_code_says_each_step_while_it_runs() {
+        let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
+        h.get_by_label("Apply").click();
+        h.run();
+        h.get_by_label("Saving…");
+        // A step of another plan is not this one's.
+        for (plan, step) in [
+            (8, "Claude Code is adding beta for the user…"),
+            (7, "Claude Code is removing alpha for the user…"),
+        ] {
+            engine
+                .events
+                .send(Event::Applying {
+                    plan,
+                    step: step.into(),
+                })
+                .unwrap();
+        }
+        h.run();
+        assert!(h.query_by_label("Saving…").is_none());
+        assert!(h.query_by_label_contains("adding beta").is_none());
+        h.get_by_label("Claude Code is removing alpha for the user…");
+        h.get_by_label("Keep Klefki open until this is done.");
+        drain(&engine);
     }
 
     #[test]
@@ -10351,7 +10501,7 @@ mod tests {
             .unwrap();
         h.run();
         open_move_of(&mut h, "sso");
-        h.get_by_label_contains("so you sign in to it again afterwards");
+        h.get_by_label_contains("so you will need to sign in to it again afterwards");
         h.get_by_label("WebApp").click();
         h.run();
         h.get_by_label("Review").click();
@@ -10395,6 +10545,8 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label("Moved sso to WebApp. Sign in now, or later from its Status tab.");
+        // Moving it back would sign it out again: no Undo.
+        assert!(h.query_by_label("Undo").is_none());
     }
 
     // ---- kept
@@ -10422,8 +10574,8 @@ mod tests {
     #[test]
     fn a_server_that_could_not_be_put_back_is_shown_and_can_be_put_back() {
         let (mut h, engine) = kept_harness();
-        h.get_by_label("1 server could not be put back");
-        h.get_by_label("sso in WebApp");
+        h.get_by_label("A server is out of the configuration");
+        h.get_by_label("sso in WebApp (signs in with OAuth)");
         h.get_by_label("Put back").click();
         h.run();
         assert_eq!(
@@ -10450,7 +10602,10 @@ mod tests {
     #[test]
     fn nothing_kept_shows_no_notice() {
         let (h, _engine) = duplicate_harness();
-        assert!(h.query_by_label_contains("could not be put back").is_none());
+        assert!(
+            h.query_by_label_contains("out of the configuration")
+                .is_none()
+        );
     }
 
     #[test]

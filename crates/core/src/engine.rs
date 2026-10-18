@@ -318,6 +318,11 @@ pub enum Event {
         /// Good to know about how it went (settings Claude Code left out, say). Sanitised.
         notes: Vec<String>,
     },
+    /// A change is under way, slowly (Claude Code's own commands take seconds each): what it does now. Sanitised.
+    Applying {
+        plan: u64,
+        step: String,
+    },
     /// Nothing was written, or the change could not be kept.
     ApplyFailed {
         plan: u64,
@@ -855,6 +860,8 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 Err(e) => Err(e.to_string()),
             },
         );
+        let mut fresh = fresh;
+        fresh.snapshot.kept = kept_list(shared);
         let mut resolved = ops::resolve(changes, &fresh.snapshot, &fresh.keys)?;
         // What a swap does to other servers' sign-ins depends on what else is in the file.
         let root: serde_json::Value = if resolved.swaps.is_empty() {
@@ -901,13 +908,9 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             // What putting a kept definition back adds, shown like any add.
             for id in &resolved.put_back {
                 let kept = swap::Recovery::find(&backup_dir(shared)?, id)?;
-                resolved
-                    .preview
-                    .push(crate::config::docstore::Op::AddServer {
-                        project: kept.project.clone(),
-                        name: kept.name.clone(),
-                        entry: kept.entry.clone(),
-                    });
+                let (op, warning) = swap::preview_put_back(&kept);
+                resolved.preview.push(op);
+                resolved.warnings.extend(warning);
             }
             let involves_secrets = !resolved.swaps.is_empty() || !resolved.put_back.is_empty();
             // Asked now, so a store that is missing or locked stops the change before anything runs.
@@ -922,6 +925,8 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     }
                     resolved.warnings.extend(review.warnings);
                     resolved.notes.extend(review.notes);
+                    // What the review shows: what Claude Code will write.
+                    resolved.preview.extend(swap::preview(&root, &s));
                     kept.push(s);
                 }
                 resolved.swaps = kept;
@@ -1052,7 +1057,15 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         let done = settle(shared)
             .and_then(|()| add_with_claude(shared, state, steps, &mut added))
             .and_then(|()| {
-                change_with_claude(shared, state, steps, &mut added, &mut backups, &mut notes)
+                change_with_claude(
+                    shared,
+                    state,
+                    id,
+                    steps,
+                    &mut added,
+                    &mut backups,
+                    &mut notes,
+                )
             });
         if let Err(e) = done {
             return fail(e);
@@ -1171,6 +1184,7 @@ fn settle(shared: &Shared) -> Result<(), String> {
 fn change_with_claude(
     shared: &Shared,
     state: &mut State,
+    plan: u64,
     steps: &CliSteps,
     done: &mut Vec<String>,
     backups: &mut Vec<PathBuf>,
@@ -1191,6 +1205,12 @@ fn change_with_claude(
         claude: steps.claude.as_ref(),
         store: steps.store.as_deref(),
         home: shared.config.home.as_deref(),
+        progress: &|step| {
+            shared.emitter.emit(Event::Applying {
+                plan,
+                step: sanitize(&step),
+            })
+        },
     };
     let earlier = |done: &[String]| {
         if done.is_empty() {
@@ -1450,23 +1470,29 @@ impl State {
         };
         self.keys = next.keys;
         let mut snapshot = next.snapshot;
-        if let Some(dir) = &shared.config.backup_dir {
-            snapshot.kept = swap::Recovery::list(dir)
-                .into_iter()
-                .map(|r| crate::api::Kept {
-                    id: r.id,
-                    name: sanitize(&r.name),
-                    place: swap::place(r.project.as_deref()),
-                    signs_in: swap::signs_in(&r.entry),
-                })
-                .collect();
-        }
+        snapshot.kept = kept_list(shared);
         let before = std::mem::replace(&mut self.snapshot, Arc::new(snapshot));
         shared
             .emitter
             .emit(Event::Snapshot(Arc::clone(&self.snapshot)));
         before
     }
+}
+
+/// The definitions Klefki kept because a change could not put them back, as the snapshot lists them.
+fn kept_list(shared: &Shared) -> Vec<crate::api::Kept> {
+    let (Some(dir), Some(paths)) = (&shared.config.backup_dir, &shared.config.paths) else {
+        return Vec::new();
+    };
+    swap::Recovery::list(dir, &paths.claude_json)
+        .into_iter()
+        .map(|r| crate::api::Kept {
+            id: r.id,
+            name: sanitize(&r.name),
+            place: swap::place(r.project.as_deref()),
+            signs_in: swap::signs_in(&r.entry),
+        })
+        .collect()
 }
 
 fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
@@ -4582,7 +4608,11 @@ mod tests {
             }],
         );
         assert_eq!(plan.summary, ["Move gw to b"]);
-        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("used instead")),
+            "{:?}",
+            plan.warnings
+        );
         apply_and_wait(&core, &plan);
         let now = config_json(&env);
         let gw = two_projects("end")["mcpServers"]["gw"].clone();
@@ -5687,8 +5717,7 @@ mod tests {
                 ("added.txt", b"Added http MCP server sso to local config\n"),
             ],
         );
-        let repo = env.dir.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
+        let repo = real(&env.dir.path().join("repo"));
         let key = repo.to_string_lossy().replace('\\', "/");
         let entry: serde_json::Value = serde_json::from_str(SSO_ENTRY).unwrap();
         write_config(
@@ -5740,6 +5769,331 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         }
+    }
+
+    /// Makes the folder `path` and spells it as Claude Code keys a project: the folder itself, not a link to it
+    /// (macOS's temporary folder is one).
+    fn real(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        #[cfg(unix)]
+        return std::fs::canonicalize(path).unwrap();
+        #[cfg(not(unix))]
+        return path.to_path_buf();
+    }
+
+    /// Moves sso for the user to the project; Claude Code's remove works (the test plays its part) and every add
+    /// fails, so putting it back fails too and Klefki keeps its definition. Returns the kept definition's id.
+    fn keep_sso(env: &Env, core: &Core, key: &str) -> String {
+        let plan = plan_for(
+            core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key.to_owned()),
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        env.wait_for_run(1);
+        let mut config = config_json(env);
+        config["mcpServers"].as_object_mut().unwrap().remove("sso");
+        write_config(env, &config);
+        let events = collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:#?}"));
+        assert!(error.contains("Klefki kept"), "{error}");
+        let kept = &snapshots(&events).last().unwrap().kept;
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        kept[0].id.clone()
+    }
+
+    const REMOVE_THEN_ADDS_FAIL: &str = r#"{"rules":[
+        {"args":["mcp","remove"],"delay_ms":600,"stdout_file":"removed.txt"},
+        {"args":["mcp","add-json"],"exit_code":1,"stdout_file":"failed.txt"}]}"#;
+
+    #[test]
+    fn a_kept_definition_can_be_put_back() {
+        // Cross-review B1: the plan looked for the kept definition in a fresh read of the configuration, which
+        // never lists them, so Put back always said it was gone.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let kept = keep_sso(&env, &core, &key);
+        assert!(config_json(&env)["mcpServers"].get("sso").is_none());
+        // Claude Code works again.
+        write_scenario(
+            env.dir.path(),
+            r#"{"rules":[{"args":["mcp","add-json"],"delay_ms":600,"stdout_file":"added.txt"}]}"#,
+            &[],
+        );
+        let plan = plan_for(&core, vec![Change::PutBack { kept: kept.clone() }]);
+        assert_eq!(plan.summary, ["Put back sso for the user"]);
+        let runs = env.changes_run().len();
+        core.send(Command::Apply(plan.id));
+        env.wait_for_run(runs + 1);
+        let mut config = config_json(&env);
+        config["mcpServers"]["sso"] = serde_json::from_str(SSO_ENTRY).unwrap();
+        write_config(&env, &config);
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        assert!(snapshots(&events).last().unwrap().kept.is_empty());
+        let last = &env.changes_run()[runs];
+        assert_eq!(
+            last.0[..5],
+            ["mcp", "add-json", "-s", "user", "--client-secret"]
+        );
+        assert_eq!(last.2.as_deref(), Some(sha256(CLIENT_SECRET).as_str()));
+    }
+
+    #[test]
+    fn a_kept_definition_can_be_forgotten() {
+        // The variant: Forget, which also said it was gone.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let kept = keep_sso(&env, &core, &key);
+        let plan = plan_for(&core, vec![Change::ForgetKept { kept }]);
+        assert!(plan.destructive);
+        let events = apply_and_wait(&core, &plan);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        assert!(snapshots(&events).last().unwrap().kept.is_empty());
+    }
+
+    #[test]
+    fn a_move_into_a_missing_folder_is_refused_before_anything_runs() {
+        // Cross-review B2: the folder was checked only when the add ran, after the remove had signed sso out.
+        let (env, store, key, repo) =
+            oauth_move_env(r#"{"rules":[{"args":["mcp","remove"],"stdout_file":"removed.txt"}]}"#);
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        std::fs::remove_dir(&repo).unwrap();
+        let refused = plan_failure(
+            &core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key.clone()),
+            }],
+        );
+        assert!(refused.contains("is not there"), "{refused}");
+        // Gone after the review: stopped before the remove.
+        std::fs::create_dir(&repo).unwrap();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key),
+            }],
+        );
+        std::fs::remove_dir(&repo).unwrap();
+        let events = apply_and_wait(&core, &plan);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{events:#?}"));
+        assert!(error.contains("Nothing was changed"), "{error}");
+        assert!(env.changes_run().is_empty(), "{:?}", env.changes_run());
+        assert!(config_json(&env)["mcpServers"].get("sso").is_some());
+    }
+
+    #[test]
+    fn a_move_out_of_a_missing_folder_is_refused_before_anything_runs() {
+        // The variant: the folder the server is in is gone.
+        let (env, store, key, repo) = oauth_move_env(r#"{"rules":[]}"#);
+        let mut config = config_json(&env);
+        let sso = config["mcpServers"]["sso"].take();
+        config["mcpServers"] = serde_json::json!({});
+        config["projects"][&key]["mcpServers"] = serde_json::json!({ "sso": sso });
+        write_config(&env, &config);
+        store
+            .set(
+                &crate::model::ConnectionId::new(Scope::Local, Some(&key), "sso"),
+                &crate::secrets::Secret::new(CLIENT_SECRET.to_owned()),
+            )
+            .unwrap();
+        std::fs::remove_dir(&repo).unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let refused = plan_failure(
+            &core,
+            vec![Change::Move {
+                id: local_id("sso", &key),
+                to: Target::User,
+            }],
+        );
+        assert!(refused.contains("is not there"), "{refused}");
+        assert!(env.changes_run().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_reached_through_a_link_is_refused_before_anything_runs() {
+        // Cross-review S3: Claude Code files a local server under the folder itself, so one added from a link
+        // would land under another key, and Klefki would not find it.
+        let (env, store, _, repo) = oauth_move_env(r#"{"rules":[]}"#);
+        let link = env.dir.path().join("link");
+        std::os::unix::fs::symlink(&repo, &link).unwrap();
+        let key = link.to_string_lossy().into_owned();
+        let mut config = config_json(&env);
+        config["projects"][&key] = serde_json::json!({});
+        write_config(&env, &config);
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let refused = plan_failure(
+            &core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key),
+            }],
+        );
+        assert!(refused.contains("through a link"), "{refused}");
+        assert!(env.changes_run().is_empty());
+    }
+
+    #[test]
+    fn the_review_shows_what_claude_code_writes_and_warns_what_it_drops() {
+        // Cross-review B3: the diff showed alwaysAllow kept, and Claude Code dropped it.
+        let (env, store, key, _) = oauth_move_env(r#"{"rules":[]}"#);
+        let mut config = config_json(&env);
+        config["mcpServers"]["sso"]["alwaysAllow"] = serde_json::json!(["search"]);
+        write_config(&env, &config);
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key),
+            }],
+        );
+        let shown: Vec<&String> = plan.files.iter().flat_map(|f| &f.lines).collect();
+        assert!(
+            !shown.iter().any(|l| l.contains("alwaysAllow")),
+            "{shown:?}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("loses alwaysAllow")),
+            "{:?}",
+            plan.warnings
+        );
+        // The variant: an edit in place.
+        let mut edited: serde_json::Value = serde_json::from_str(SSO_ENTRY).unwrap();
+        edited["url"] = serde_json::json!("https://sso.example.com/v2");
+        edited["alwaysAllow"] = serde_json::json!(["search"]);
+        let plan = plan_for(
+            &core,
+            vec![Change::Replace {
+                id: user_id("sso"),
+                json: edited.to_string(),
+            }],
+        );
+        let shown: Vec<&String> = plan.files.iter().flat_map(|f| &f.lines).collect();
+        assert!(
+            !shown
+                .iter()
+                .any(|l| l.contains("+") && l.contains("alwaysAllow")),
+            "{shown:?}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("loses alwaysAllow"))
+        );
+    }
+
+    #[test]
+    fn a_kept_definition_whose_change_got_through_is_not_offered() {
+        // Cross-review S1: Klefki stopped after the add but before deleting the recovery file. The next listing
+        // must not offer to put back a server that was moved after all.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        keep_sso(&env, &core, &key);
+        // The move landed after all (as if Klefki stopped before it could tidy up).
+        let mut config = config_json(&env);
+        config["projects"][&key]["mcpServers"] = serde_json::json!({"sso": serde_json::from_str::<serde_json::Value>(SSO_ENTRY).unwrap()});
+        write_config(&env, &config);
+        core.send(Command::Refresh { live_all: false });
+        let events = collect(&core, |e| !snapshots(e).is_empty());
+        assert!(snapshots(&events).last().unwrap().kept.is_empty());
+        assert_eq!(
+            std::fs::read_dir(env.dir.path().join("recovery"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn a_slow_change_says_what_claude_code_is_doing() {
+        // Cross-review S4: a swap runs two or three of Claude Code's commands, seconds each.
+        let (env, store, key, _) =
+            oauth_move_env(r#"{"rules":[{"args":["mcp","remove"],"stdout_file":"removed.txt"}]}"#);
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("sso"),
+                to: Target::Local(key),
+            }],
+        );
+        let events = apply_and_wait(&core, &plan);
+        let steps: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Applying { plan: p, step } if *p == plan.id => Some(step),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, ["Claude Code is removing sso for the user\u{2026}"]);
+    }
+
+    #[test]
+    fn moving_a_user_server_into_one_project_says_where_it_is_no_longer() {
+        // Cross-review S5.
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("gw"),
+                to: Target::Local("/work/b".into()),
+            }],
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "gw will only be in b: it is no longer there for you in a."),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     fn same_dir(a: &str, b: &Path) -> bool {

@@ -153,6 +153,8 @@ pub(crate) struct Ctx<'a> {
     pub store: Option<&'a dyn SecretStore>,
     /// Where a command for the user's own servers runs.
     pub home: Option<&'a Path>,
+    /// Told what is under way before each of Claude Code's commands, which can take seconds.
+    pub progress: &'a dyn Fn(String),
 }
 
 impl Ctx<'_> {
@@ -171,6 +173,76 @@ impl Ctx<'_> {
 /// Recovery files live next to the backups, in klefki's private folder.
 pub(crate) fn recovery_dir(backup_dir: &Path) -> PathBuf {
     backup_dir.with_file_name("recovery")
+}
+
+/// The settings Claude Code 2.1.302's `add-json` writes; it drops any other (`alwaysAllow`, `cwd`, unknown keys).
+const CLAUDE_KEEPS: [&str; 9] = [
+    "type",
+    "url",
+    "headers",
+    "headersHelper",
+    "oauth",
+    "command",
+    "args",
+    "env",
+    "timeout",
+];
+
+/// `entry` as Claude Code's `add-json` writes it: without the settings it drops.
+pub(crate) fn as_claude_writes(entry: &Value) -> Value {
+    match entry.as_object() {
+        Some(object) => Value::Object(
+            object
+                .iter()
+                .filter(|(k, _)| CLAUDE_KEEPS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        ),
+        None => entry.clone(),
+    }
+}
+
+/// The settings of `entry` Claude Code's `add-json` drops, cleaned for showing.
+fn dropped(entry: &Value) -> Vec<String> {
+    entry
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !CLAUDE_KEEPS.contains(&k.as_str()))
+        .map(|(k, _)| sanitize(k))
+        .collect()
+}
+
+/// Why Claude Code cannot change a server in `project` from where Klefki would run it, if it cannot: the folder is
+/// gone, or (on Unix) the key reaches the folder through a link, and Claude Code files a server under the folder
+/// itself, so the server would land under another key.
+fn folder_problem(project: &str) -> Option<String> {
+    let folder = sanitize(&crate::ops::folder_name(project));
+    let path = Path::new(project);
+    if !path.is_dir() {
+        return Some(format!(
+            "the folder of {folder} is not there, and Claude Code changes a project's server from inside it."
+        ));
+    }
+    #[cfg(unix)]
+    if let Ok(real) = std::fs::canonicalize(path)
+        && inventory::normalise_project(&real.to_string_lossy())
+            != inventory::normalise_project(project)
+    {
+        return Some(format!(
+            "{folder} is reached through a link ({}), and Claude Code would file the server under the folder it leads to instead.",
+            sanitize(&real.to_string_lossy())
+        ));
+    }
+    None
+}
+
+/// The first spot of `spots` where Claude Code cannot change a server, in words.
+fn folders_problem<'a>(spots: impl IntoIterator<Item = &'a Spot>) -> Option<String> {
+    spots
+        .into_iter()
+        .filter_map(|s| s.project.as_deref())
+        .find_map(folder_problem)
 }
 
 /// What a swap did, when it did what was asked.
@@ -216,6 +288,20 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             swap.to.words()
         ));
     }
+    // Claude Code runs from the project's folder: checked before anything is removed.
+    let removed_by_claude = swap.remove && signs_in(&old);
+    let mut by_claude = Vec::new();
+    if removed_by_claude {
+        by_claude.push(&swap.from);
+    }
+    if signs_in(&new) {
+        by_claude.push(&swap.to);
+    }
+    if let Some(why) = folders_problem(by_claude) {
+        return Err(format!(
+            "{shown} was not {verb}: {why}\nNothing was changed."
+        ));
+    }
     // Klefki's copy of the client secret: handed back to Claude Code with the add, since its remove forgets its own.
     let secret = if signs_in(&old) || signs_in(&new) {
         let store = ctx.store.ok_or_else(|| {
@@ -233,7 +319,7 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
         .map_err(|e| format!("{shown} was not {verb}: {e}"))?;
     let recovery = if swap.remove {
         Some(
-            Recovery::save(ctx, &swap.from, &old)
+            Recovery::save(ctx, &swap.from, &old, Some((&swap.to, &new)))
                 .map_err(|e| format!("{shown} was not {verb}: Klefki could not keep its definition safe first ({}). Nothing was changed.", sanitize(&e.to_string())))?,
         )
     } else {
@@ -249,7 +335,7 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
                     r.discard();
                 }
                 return Err(format!(
-                    "{shown} was not {verb}: {why} Nothing was changed."
+                    "{shown} was not {verb}: {why}\nNothing was changed."
                 ));
             }
             // Gone after all (it timed out at the end, say): carry on.
@@ -286,7 +372,7 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
                         r.discard();
                     }
                     Err(format!(
-                        "{shown} was not {verb}: {why} It was put back as it was{}.",
+                        "{shown} was not {verb}: {why}\nIt was put back as it was{}.",
                         if signs_in(&old) {
                             "; sign in to it again"
                         } else {
@@ -296,11 +382,11 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
                 }
                 // Back, but without settings Claude Code dropped: the recovery file keeps the whole definition.
                 Ok(left_out) => Err(format!(
-                    "{shown} was not {verb}: {why} It was put back, but Claude Code left out {}; Klefki kept the whole definition, so you can put that back from the Connections page.",
+                    "{shown} was not {verb}: {why}\nIt was put back, but Claude Code left out {}; Klefki kept the whole definition, so you can put that back from the Connections page.",
                     left_out.join(", ")
                 )),
                 Err(again) => Err(format!(
-                    "{shown} was not {verb}: {why} Putting it back failed too: {again} Klefki kept its definition{}, so you can put it back from the Connections page once Claude Code works again.",
+                    "{shown} was not {verb}: {why}\nPutting it back failed too: {again}\nKlefki kept its definition{}, so you can put it back from the Connections page once Claude Code works again.",
                     if back.is_some() {
                         " and its client secret"
                     } else {
@@ -310,27 +396,45 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             };
         }
     }
-    if let Some(r) = &recovery {
-        r.discard();
-    }
-    // Klefki's copy goes with the server.
-    if let (Some(secret), Some(store)) = (&handed, ctx.store) {
+    // Klefki's copy goes with the server, before the recovery file goes: a crash in between leaves the file, which
+    // the next listing sees is done (see [`Recovery::list`]). A copy Klefki holds for the new place must be the one
+    // Claude Code was given, or none: one left there from before would claim a secret Claude Code does not have.
+    if let Some(store) = ctx.store.filter(|_| signs_in(&new)) {
         let (from, to) = (swap.from.connection(), swap.to.connection());
         if from != to {
-            let kept = store.set(&to, secret).and_then(|()| {
-                if swap.remove {
-                    store.delete(&from).map(|_| ())
-                } else {
-                    Ok(())
-                }
-            });
-            if let Err(e) = kept {
-                done.notes.push(format!(
-                    "Claude Code has the client secret, but Klefki could not move its own copy: {e} Type it in on the Auth tab of {} to keep one.",
+            let note = |e: crate::secrets::SecretError| {
+                format!(
+                    "Claude Code has what it needs, but Klefki could not update its own copy of the client secret: {e} Type it in on the Auth tab of {} to keep one.",
                     swap.to.words()
-                ));
+                )
+            };
+            match handed {
+                Some(secret) => match store.set(&to, secret) {
+                    Err(e) => {
+                        // Better none than a stale one.
+                        let _ = store.delete(&to);
+                        done.notes.push(note(e));
+                    }
+                    Ok(()) if swap.remove => {
+                        if let Err(e) = store.delete(&from) {
+                            done.notes.push(format!(
+                                "Klefki could not delete its copy of the client secret for {}: {e}",
+                                swap.from.words()
+                            ));
+                        }
+                    }
+                    Ok(()) => {}
+                },
+                None => {
+                    if let Err(e) = store.delete(&to) {
+                        done.notes.push(note(e));
+                    }
+                }
             }
         }
+    }
+    if let Some(r) = &recovery {
+        r.discard();
     }
     Ok(done)
 }
@@ -365,6 +469,27 @@ pub(crate) fn review(root: &Value, swap: &Swap, has_copy: bool) -> Result<Said, 
         return Ok(said);
     }
     let removes_sign_in = swap.remove && signs_in(&old);
+    let mut by_claude = Vec::new();
+    if removes_sign_in {
+        by_claude.push(&swap.from);
+    }
+    if signs_in(&new) {
+        by_claude.push(&swap.to);
+    }
+    if let Some(why) = folders_problem(by_claude) {
+        let why = why[..1].to_uppercase() + &why[1..];
+        return Err(format!("{why} Nothing was changed."));
+    }
+    if signs_in(&new) {
+        let lost = dropped(&new);
+        if !lost.is_empty() {
+            said.warnings.push(format!(
+                "Claude Code keeps only the settings it uses, so {} loses {}.",
+                sanitize(&swap.to.name),
+                lost.join(", ")
+            ));
+        }
+    }
     if removes_sign_in {
         let sharing: Vec<String> = spots_in(root)
             .into_iter()
@@ -437,6 +562,63 @@ pub(crate) fn review(root: &Value, swap: &Swap, has_copy: bool) -> Result<Said, 
         }
     }
     Ok(said)
+}
+
+/// What the review shows for `swap`, on `root` as it is now: what Claude Code will write, without the settings it
+/// drops. Values the user did not change stay hidden (`<hidden>`) as edited.
+pub(crate) fn preview(root: &Value, swap: &Swap) -> Vec<Op> {
+    let Some(old) = entry_in(root, &swap.from) else {
+        return Vec::new();
+    };
+    let new = as_claude_writes(swap.edited.as_ref().unwrap_or(&old));
+    if swap.remove && swap.from.same_place(&swap.to) && swap.from.name == swap.to.name {
+        return vec![Op::ReplaceServer {
+            project: swap.from.project.clone(),
+            name: swap.from.name.clone(),
+            entry: new,
+        }];
+    }
+    let mut ops = Vec::new();
+    if swap.remove {
+        ops.push(Op::RemoveServer {
+            project: swap.from.project.clone(),
+            name: swap.from.name.clone(),
+        });
+    }
+    ops.push(Op::AddServer {
+        project: swap.to.project.clone(),
+        name: swap.to.name.clone(),
+        entry: new,
+    });
+    ops
+}
+
+/// What the review shows for putting `kept` back, and what it warns about.
+pub(crate) fn preview_put_back(kept: &Recovery) -> (Op, Option<String>) {
+    let lost = if signs_in(&kept.entry) {
+        dropped(&kept.entry)
+    } else {
+        Vec::new()
+    };
+    let entry = if signs_in(&kept.entry) {
+        as_claude_writes(&kept.entry)
+    } else {
+        kept.entry.clone()
+    };
+    (
+        Op::AddServer {
+            project: kept.project.clone(),
+            name: kept.name.clone(),
+            entry,
+        },
+        (!lost.is_empty()).then(|| {
+            format!(
+                "Claude Code keeps only the settings it uses, so {} loses {}; Klefki keeps the whole definition until you forget it.",
+                sanitize(&kept.name),
+                lost.join(", ")
+            )
+        }),
+    )
 }
 
 /// What Claude Code keeps a server's sign-in under, besides its name: its type, address and headers.
@@ -522,6 +704,11 @@ pub(crate) fn put_back(ctx: &Ctx, id: &str) -> Result<Done, String> {
             "{shown} was not put back: there is a server by that name there now. Rename or delete it first."
         ));
     }
+    if signs_in(&record.entry)
+        && let Some(why) = folders_problem([&spot])
+    {
+        return Err(format!("{shown} was not put back: {why}"));
+    }
     let secret = if signs_in(&record.entry) {
         let store = ctx
             .store
@@ -589,6 +776,10 @@ fn said(out: &RunOutput) -> String {
     if cut.len() < text.len() {
         cut.push('…');
     }
+    // What follows is another sentence.
+    if !cut.ends_with(['.', '!', '?', '…']) {
+        cut.push('.');
+    }
     cut
 }
 
@@ -602,14 +793,13 @@ fn command(
     json: Option<&str>,
     secret: Option<&Secret>,
 ) -> Result<RunOutput, String> {
-    if let Some(project) = &spot.project
-        && !Path::new(project).is_dir()
-    {
-        return Err(format!(
-            "the folder of {} is not there, and Claude Code changes a project's server from inside it.",
-            sanitize(&crate::ops::folder_name(project))
-        ));
+    if let Some(why) = folders_problem([spot]) {
+        return Err(why);
     }
+    (ctx.progress)(match verb {
+        "remove" => format!("Claude Code is removing {}\u{2026}", spot.words()),
+        _ => format!("Claude Code is adding {}\u{2026}", spot.words()),
+    });
     let mut args = vec![
         "mcp",
         verb,
@@ -738,6 +928,9 @@ pub(crate) struct Recovery {
     pub name: String,
     pub project: Option<String>,
     pub entry: Value,
+    /// Where the server was going, and as what: when that is in the file, the change got through (Klefki stopped
+    /// before it could delete this file) and there is nothing to put back.
+    pub next: Option<(Spot, Value)>,
 }
 
 /// A recovery file larger than this is not read.
@@ -746,19 +939,27 @@ const MAX_RECOVERY_BYTES: u64 = 4 * entry::MAX_ENTRY_BYTES as u64;
 const MAX_RECOVERIES: usize = 50;
 
 impl Recovery {
-    fn save(ctx: &Ctx, spot: &Spot, entry: &Value) -> io::Result<Self> {
+    fn save(
+        ctx: &Ctx,
+        spot: &Spot,
+        entry: &Value,
+        next: Option<(&Spot, &Value)>,
+    ) -> io::Result<Self> {
         let dir = ctx.recovery_dir();
         docstore::create_private_dir(&dir)?;
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let body = json!({
+        let mut body = json!({
             "name": spot.name,
             "project": spot.project,
             "entry": entry,
-        })
-        .to_string();
+        });
+        if let Some((to, new)) = next {
+            body["next"] = json!({"name": to.name, "project": to.project, "entry": new});
+        }
+        let body = body.to_string();
         for n in 0u32.. {
             let id = format!("{ms:016}-{n}");
             let path = dir.join(format!("{id}.json"));
@@ -772,6 +973,7 @@ impl Recovery {
                         name: spot.name.clone(),
                         project: spot.project.clone(),
                         entry: entry.clone(),
+                        next: next.map(|(to, new)| (to.clone(), new.clone())),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -796,28 +998,60 @@ impl Recovery {
             .map_err(|e| sanitize(&e.to_string()))?
             .ok_or_else(gone)?;
         let value: Value = serde_json::from_str(&text).map_err(|_| gone())?;
-        let name = value.get("name").and_then(Value::as_str).ok_or_else(gone)?;
-        ServerName::parse(name).map_err(|_| gone())?;
-        let project = match value.get("project") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(p)) if inventory::is_safe_project_path(p) => Some(p.clone()),
-            Some(_) => return Err(gone()),
-        };
-        let entry = value
-            .get("entry")
-            .filter(|e| e.is_object())
-            .ok_or_else(gone)?;
+        let (spot, entry) = Self::spot_in(&value).ok_or_else(gone)?;
+        // An unreadable `next` only loses the check that the change got through.
+        let next = value.get("next").and_then(Self::spot_in);
         Ok(Self {
             id: id.to_owned(),
             path,
-            name: name.to_owned(),
-            project,
-            entry: entry.clone(),
+            name: spot.name,
+            project: spot.project,
+            entry,
+            next,
         })
     }
 
-    /// Every kept definition, oldest first, as far as it can be read.
-    pub(crate) fn list(backup_dir: &Path) -> Vec<Self> {
+    /// The `name`, `project` and `entry` of a record, checked like any untrusted input.
+    fn spot_in(value: &Value) -> Option<(Spot, Value)> {
+        let name = value.get("name").and_then(Value::as_str)?;
+        ServerName::parse(name).ok()?;
+        let project = match value.get("project") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(p)) if inventory::is_safe_project_path(p) => Some(p.clone()),
+            Some(_) => return None,
+        };
+        let entry = value.get("entry").filter(|e| e.is_object())?;
+        Some((
+            Spot {
+                project,
+                name: name.to_owned(),
+            },
+            entry.clone(),
+        ))
+    }
+
+    /// Every kept definition, oldest first, as far as it can be read. One whose change got through after all (its
+    /// new definition is in `claude_json` and its old one is not) is deleted instead: Klefki stopped between the add
+    /// and deleting the file.
+    pub(crate) fn list(backup_dir: &Path, claude_json: &Path) -> Vec<Self> {
+        let root: Option<Value> = fsx::read_limited(claude_json, inventory::MAX_CLAUDE_JSON)
+            .ok()
+            .flatten()
+            .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok());
+        Self::files(backup_dir)
+            .into_iter()
+            .filter(|r| {
+                let done = root.as_ref().is_some_and(|root| r.got_through(root));
+                if done {
+                    r.discard();
+                }
+                !done
+            })
+            .collect()
+    }
+
+    /// Every recovery file, oldest first, as far as it can be read.
+    pub(crate) fn files(backup_dir: &Path) -> Vec<Self> {
         let dir = recovery_dir(backup_dir);
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
@@ -836,6 +1070,21 @@ impl Recovery {
             .take(MAX_RECOVERIES)
             .filter_map(|id| Self::load(&dir, &id).ok())
             .collect()
+    }
+
+    /// The change this record was kept for is in `root`: the new definition where it was going, and the old one
+    /// gone from where it was (or replaced there by the new one).
+    fn got_through(&self, root: &Value) -> bool {
+        let Some((to, new)) = &self.next else {
+            return false;
+        };
+        let from = Spot {
+            project: self.project.clone(),
+            name: self.name.clone(),
+        };
+        let arrived = entry_in(root, to).is_some_and(|there| same_settings(&there, new));
+        let in_place = from.same_place(to) && from.name == to.name;
+        arrived && (in_place || entry_in(root, &from).is_none())
     }
 
     fn discard(&self) {

@@ -6,7 +6,9 @@
 //! - no server is lost: each is where it was, or where the change put it, or kept in a recovery file, and then its
 //!   client secret is still in Klefki's store under its connection;
 //! - a change that was reported as done did exactly what was asked, and one that was refused changed nothing;
-//! - every server that signs in with OAuth and has a client secret in Klefki's store has the same one in Claude Code's;
+//! - every server that signs in with OAuth and has a client secret in Klefki's store has the same one in Claude Code's,
+//!   also when Klefki's store fails to take or delete a copy part way;
+//! - putting back or forgetting a kept definition works when nothing fails (a refusal would be "safe" and useless);
 //! - a secret never appears in a command's arguments, and travels only with `--client-secret`;
 //! - the configuration is valid JSON, its other keys and their order are kept, and nothing is written in project
 //!   scope (no `.mcp.json`, no settings file).
@@ -38,6 +40,43 @@ enum Fault {
     NeverStarts,
     /// Another program writes the file first; then it works.
     Overtaken,
+}
+
+/// What Klefki's secret store does with the copies a change moves: it reads always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreFault {
+    Works,
+    /// Taking a copy fails.
+    SetFails,
+    /// Deleting a copy fails (after the new one was taken).
+    DeleteFails,
+}
+
+/// Klefki's secret store, failing as told.
+#[derive(Default)]
+struct Flaky {
+    inner: crate::secrets::MemoryStore,
+    fault: Mutex<Option<StoreFault>>,
+}
+
+impl crate::secrets::SecretStore for Flaky {
+    fn get(&self, id: &ConnectionId) -> Result<Option<Secret>, crate::secrets::SecretError> {
+        self.inner.get(id)
+    }
+
+    fn set(&self, id: &ConnectionId, secret: &Secret) -> Result<(), crate::secrets::SecretError> {
+        if *lock(&self.fault) == Some(StoreFault::SetFails) {
+            return Err(crate::secrets::SecretError::Failed("injected".into()));
+        }
+        self.inner.set(id, secret)
+    }
+
+    fn delete(&self, id: &ConnectionId) -> Result<bool, crate::secrets::SecretError> {
+        if *lock(&self.fault) == Some(StoreFault::DeleteFails) {
+            return Err(crate::secrets::SecretError::Failed("injected".into()));
+        }
+        self.inner.delete(id)
+    }
 }
 
 /// The stand-in for Claude Code's `mcp add-json` and `mcp remove`: it changes `.claude.json` as Claude Code does
@@ -290,9 +329,21 @@ fn step() -> impl Strategy<Value = Step> {
     ]
 }
 
-/// A step with what the stand-in does on its next few commands.
-fn case() -> impl Strategy<Value = (Step, Vec<Fault>)> {
-    (step(), proptest::collection::vec(fault(), 0..4))
+fn store_fault() -> impl Strategy<Value = StoreFault> {
+    prop_oneof![
+        6 => Just(StoreFault::Works),
+        1 => Just(StoreFault::SetFails),
+        1 => Just(StoreFault::DeleteFails),
+    ]
+}
+
+/// A step with what the stand-in does on its next few commands, and what Klefki's store does.
+fn case() -> impl Strategy<Value = (Step, Vec<Fault>, StoreFault)> {
+    (
+        step(),
+        proptest::collection::vec(fault(), 0..4),
+        store_fault(),
+    )
 }
 
 /// Everything a change may touch, read back from disk and the two secret stores.
@@ -313,7 +364,7 @@ struct Rig {
     dir: tempfile::TempDir,
     projects: Vec<String>,
     sim: Arc<Sim>,
-    store: Arc<crate::secrets::MemoryStore>,
+    store: Arc<Flaky>,
     core: Core,
 }
 
@@ -334,6 +385,9 @@ fn start_checking_after(delay: Duration) -> Rig {
         .map(|p| {
             let path = dir.path().join(p);
             std::fs::create_dir_all(&path).unwrap();
+            // As Claude Code keys a project: the folder itself, not a link to it (macOS's temp folder is one).
+            #[cfg(unix)]
+            let path = std::fs::canonicalize(&path).unwrap();
             path.to_str().unwrap().to_owned()
         })
         .collect();
@@ -353,7 +407,7 @@ fn start_checking_after(delay: Duration) -> Rig {
     });
     let config = cfg.join(".claude.json");
     std::fs::write(&config, serde_json::to_string_pretty(&root).unwrap()).unwrap();
-    let store = Arc::new(crate::secrets::MemoryStore::default());
+    let store = Arc::new(Flaky::default());
     let sim = Arc::new(Sim {
         config,
         faults: Mutex::default(),
@@ -451,14 +505,14 @@ impl Rig {
             project.remove("mcpServers");
             project.remove("disabledMcpServers");
         }
-        let kept = swap::Recovery::list(&self.dir.path().join("data").join("backups"))
+        let kept = swap::Recovery::files(&self.dir.path().join("data").join("backups"))
             .into_iter()
             .map(|r| (r.id, (r.project, r.name, r.entry)))
             .collect();
         World {
             servers,
             kept,
-            klefki: lock(&self.store.values).clone(),
+            klefki: lock(&self.store.inner.values).clone(),
             creds: lock(&self.sim.creds).clone(),
             rest,
         }
@@ -558,17 +612,51 @@ fn same_place(a: &Option<String>, b: &Option<String>) -> bool {
     a == b
 }
 
+/// What Klefki's store holds once a server that signs in went from `from` to `to` (moved, or copied) and Claude Code
+/// was handed Klefki's copy, if any: the copy at `to` is the one handed or none, as far as the store lets it.
+fn copy_secret(
+    klefki: &mut BTreeMap<String, String>,
+    before: &BTreeMap<String, String>,
+    from: &Key,
+    to: &Key,
+    moved: bool,
+    fault: StoreFault,
+) {
+    let (from, to) = (connection(from), connection(to));
+    if from == to {
+        return;
+    }
+    match (before.get(&from), fault) {
+        (Some(secret), StoreFault::Works) => {
+            klefki.insert(to, secret.clone());
+            if moved {
+                klefki.remove(&from);
+            }
+        }
+        // Taken, and the old one could not be deleted.
+        (Some(secret), StoreFault::DeleteFails) => {
+            klefki.insert(to, secret.clone());
+        }
+        // Not taken; whatever was there is deleted.
+        (Some(_), StoreFault::SetFails) | (None, StoreFault::Works | StoreFault::SetFails) => {
+            klefki.remove(&to);
+        }
+        (None, StoreFault::DeleteFails) => {}
+    }
+}
+
 /// Runs `cases` from the starting configuration, checking everything after each.
-fn check(cases: &[(Step, Vec<Fault>)]) -> Result<(), TestCaseError> {
+fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> {
     let rig = start();
     // The first snapshot.
     while !matches!(rig.next(), Event::Snapshot(_)) {}
     let first = rig.world();
-    for (n, (step, faults)) in cases.iter().enumerate() {
+    for (n, (step, faults, store_fault)) in cases.iter().enumerate() {
         let before = rig.world();
         let keys: Vec<Key> = before.servers.keys().cloned().collect();
         let picked = |pick: usize| keys[pick % keys.len()].clone();
         *lock(&rig.sim.faults) = faults.iter().copied().collect();
+        *lock(&rig.store.fault) = Some(*store_fault);
         let calls_before = lock(&rig.sim.calls).len();
         // What the step asks, and what the world should look like if it is done.
         let mut expected = before.clone();
@@ -605,10 +693,15 @@ fn check(cases: &[(Step, Vec<Fault>)]) -> Result<(), TestCaseError> {
                 let moved = (project, key.1.clone());
                 expected.servers.insert(moved.clone(), entry);
                 // Klefki's copy of a client secret goes with a server that signs in.
-                if entry_signs_in(&before.servers[&key])
-                    && let Some(secret) = expected.klefki.remove(&connection(&key))
-                {
-                    expected.klefki.insert(connection(&moved), secret);
+                if entry_signs_in(&before.servers[&key]) {
+                    copy_secret(
+                        &mut expected.klefki,
+                        &before.klefki,
+                        &key,
+                        &moved,
+                        true,
+                        *store_fault,
+                    );
                 }
                 vec![Change::Move {
                     id: rig.id(&key),
@@ -631,10 +724,15 @@ fn check(cases: &[(Step, Vec<Fault>)]) -> Result<(), TestCaseError> {
                 expected
                     .servers
                     .insert(copy.clone(), before.servers[&key].clone());
-                if let Some(secret) = before.klefki.get(&connection(&key))
-                    && entry_signs_in(&before.servers[&key])
-                {
-                    expected.klefki.insert(connection(&copy), secret.clone());
+                if entry_signs_in(&before.servers[&key]) {
+                    copy_secret(
+                        &mut expected.klefki,
+                        &before.klefki,
+                        &key,
+                        &copy,
+                        false,
+                        *store_fault,
+                    );
                 }
                 vec![Change::Duplicate {
                     id: rig.id(&key),
@@ -685,7 +783,29 @@ fn check(cases: &[(Step, Vec<Fault>)]) -> Result<(), TestCaseError> {
         };
         let outcome = rig.run(changes);
         let after = rig.world();
-        let said = format!("step {n} {step:?} with {faults:?}: {outcome:?}");
+
+        let said = format!("step {n} {step:?} with {faults:?}, {store_fault:?}: {outcome:?}");
+        // Putting back a kept definition, or forgetting it, works when nothing fails: a refusal changes nothing and
+        // would pass every check below.
+        let nothing_fails = faults
+            .iter()
+            .all(|f| matches!(f, Fault::Works | Fault::Overtaken));
+        match step {
+            Step::Forget { .. } if !before.kept.is_empty() => {
+                prop_assert!(matches!(outcome, Outcome::Done), "{}", said);
+            }
+            Step::PutBack { pick } if nothing_fails && !before.kept.is_empty() => {
+                let (_, (project, name, _)) =
+                    before.kept.iter().nth(pick % before.kept.len()).unwrap();
+                let free = !before
+                    .servers
+                    .contains_key(&(project.clone(), name.clone()));
+                if free {
+                    prop_assert!(matches!(outcome, Outcome::Done), "{}", said);
+                }
+            }
+            _ => {}
+        }
 
         // The configuration's other keys, their values and their order.
         prop_assert_eq!(&after.rest, &first.rest, "{}", said);
@@ -721,9 +841,7 @@ fn check(cases: &[(Step, Vec<Fault>)]) -> Result<(), TestCaseError> {
             Outcome::Done => {
                 prop_assert_eq!(&after.servers, &expected.servers, "{}", said);
                 prop_assert_eq!(&after.kept, &expected.kept, "{}", said);
-                for (conn, secret) in &expected.klefki {
-                    prop_assert_eq!(after.klefki.get(conn), Some(secret), "{}", said);
-                }
+                prop_assert_eq!(&after.klefki, &expected.klefki, "{}", said);
             }
             Outcome::Refused(why) => {
                 prop_assert!(!why.is_empty() && sanitize(why) == *why, "{}", said);
@@ -896,4 +1014,105 @@ fn saving_a_server_that_signs_in_unchanged_runs_nothing() {
     }]);
     assert!(matches!(outcome, Outcome::Unchanged), "{outcome:?}");
     assert!(lock(&rig.sim.calls).is_empty());
+}
+
+#[test]
+fn an_earlier_deletes_check_does_not_undo_a_move_back_into_its_place() {
+    // Found by the model-based test. Delete p in a project, then move the user's p into that project: the delete's
+    // check replayed the move's copy from its source, which was gone, and then the delete, so p was lost.
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let pa = rig.projects[0].clone();
+    let p = (None, "p".to_owned());
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&p),
+        name: "p".into(),
+        targets: vec![Target::Local(pa.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let in_pa = (Some(pa.clone()), "p".to_owned());
+    let outcome = rig.run(vec![Change::Delete { id: rig.id(&in_pa) }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let moved = rig.world().servers[&p].clone();
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&p),
+        to: Target::Local(pa.clone()),
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    quiet_for(&rig, Duration::from_millis(1200));
+    let world = rig.world();
+    assert_eq!(world.servers.get(&in_pa), Some(&moved));
+    assert!(!world.servers.contains_key(&p));
+}
+
+#[test]
+fn an_earlier_moves_check_does_not_add_back_a_server_renamed_since() {
+    // Found by the model-based test: move q to another project, rename it there, then move it on. The move's
+    // check added q back where it had gone, and the rename's check then failed on its new name.
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let (pa, pb) = (rig.projects[0].clone(), rig.projects[1].clone());
+    let q = (Some(pa.clone()), "q".to_owned());
+    let definition = rig.world().servers[&q].clone();
+    let in_pb = (Some(pb.clone()), "q".to_owned());
+    let renamed = (Some(pb.clone()), "q_r".to_owned());
+    let steps = [
+        Change::Move {
+            id: rig.id(&q),
+            to: Target::Local(pb.clone()),
+        },
+        Change::Rename {
+            id: rig.id(&in_pb),
+            name: "q_r".into(),
+        },
+        Change::Move {
+            id: rig.id(&renamed),
+            to: Target::Local(pa.clone()),
+        },
+    ];
+    for (n, change) in steps.into_iter().enumerate() {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+        // The move and the rename are checked together, before the last move.
+        if n == 1 {
+            quiet_for(&rig, Duration::from_millis(600));
+        }
+    }
+    let world = rig.world();
+    assert_eq!(
+        world.servers.get(&(Some(pa), "q_r".to_owned())),
+        Some(&definition)
+    );
+    assert!(!world.servers.contains_key(&in_pb) && !world.servers.contains_key(&renamed));
+}
+
+#[test]
+fn an_earlier_deletes_check_does_not_undo_a_copy_back_into_its_place() {
+    // The variant: copy it back instead of moving it.
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let pa = rig.projects[0].clone();
+    let p = (None, "p".to_owned());
+    let in_pa = (Some(pa.clone()), "p".to_owned());
+    for change in [
+        Change::Duplicate {
+            id: rig.id(&p),
+            name: "p".into(),
+            targets: vec![Target::Local(pa.clone())],
+        },
+        Change::Delete { id: rig.id(&in_pa) },
+    ] {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    }
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&p),
+        name: "p".into(),
+        targets: vec![Target::Local(pa.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    quiet_for(&rig, Duration::from_millis(1200));
+    let world = rig.world();
+    assert_eq!(world.servers.get(&in_pa), world.servers.get(&p));
+    assert!(world.servers.contains_key(&p));
 }

@@ -15,11 +15,18 @@ and local scope, and PLAN's model-based test as the acceptance bar.
 - `add-json` writes only the keys it knows: `alwaysAllow`, `cwd` on stdio and unknown keys are dropped; `timeout`
   is kept.
 - `claude mcp remove` without `-s` removes the user server silently; `-s local` takes the project from the cwd.
+- A local server is filed under the physical folder of the cwd (on Linux; a symlinked project key is not found
+  again). On Linux the client secret is kept in plain text in `$CLAUDE_CONFIG_DIR/.credentials.json`: Klefki never
+  writes it there or reads it, but handing the secret to `add-json` puts it there. That is Claude Code's choice.
 
 ## Decision
 - **OAuth servers** (edit, move, copy) go through `claude mcp remove` then `claude mcp add-json --client-secret`, with
   Klefki's keyring copy of the secret passed only in `MCP_CLIENT_SECRET`. `-s` is always given; the cwd is the project
-  folder for local, the home folder for user. A missing project folder is refused before Claude Code runs.
+  folder for local, the home folder for user. A missing project folder, or (unix) a project key reached through a
+  link, is refused at review and checked again before the first command runs, so nothing is removed for an add that
+  cannot work.
+- **The review shows what Claude Code writes**, not the whole definition: only the keys `add-json` keeps, with a
+  warning naming the ones it drops (`alwaysAllow`, `cwd`, unknown keys). The recovery file keeps the whole definition.
 - **Rollback:** before the remove, the old definition goes to a private recovery file next to the backups
   (`recovery/<ms>-<n>.json`, private folder and file). If the add fails, the old definition is added back with the
   same secret, and the recovery file is deleted once it is back. If putting it back fails too, the file stays: the
@@ -36,6 +43,17 @@ and local scope, and PLAN's model-based test as the acceptance bar.
 - **Settling the journal:** before Claude Code's commands run, Klefki's own pending verify for `.claude.json` is
   replayed now and retired; otherwise a late replay of an earlier plan could undo what Claude Code just wrote. Found
   by the model test; two regression tests.
+- **A change that got through is not offered back:** a recovery file also records where the server was going; on
+  listing, one whose server arrived there (and left where it was) is discarded. Covers Klefki stopping between the
+  add and tidying up.
+- **Klefki's keyring copy** is moved (or a stale copy at the new place deleted) before the recovery file is
+  discarded; a keyring failure after Claude Code succeeded is a note, not a failure.
+- **Progress:** each of Claude Code's commands is announced (`Event::Applying`), and the dialog asks to keep Klefki
+  open until it is done.
+- **Journal replay with copies:** the pending verify stores copies already expanded to the definition, so a later
+  move back into a place an earlier plan deleted is not undone when the copy's source is gone. Found by the model
+  test (soak); docstore and machine regression tests. Likewise, a replay treats a server added by one plan and
+  deleted or renamed by a later one as it ended, so the add does not bring it back under its old name.
 - **Docstore keeps its OAuth refusal.** Only `Purpose::Preview` (diff for the review, never applied) may name OAuth
   entries.
 
@@ -46,7 +64,9 @@ an outside write overtakes it. The engine runs with an in-process stand-in for C
 `swap::Claude` trait) that keeps credentials by the real sign-in key and drops unknown keys like 2.1.302. After every
 step the whole world is read back and compared to the prediction: servers, kept definitions, Klefki's secrets and
 Claude's credentials; no project-scope entry or `.mcp.json`; the rest of the file and its key order kept; no secret
-in argv; refusals sanitised. A failure keeps every server in place or in a kept definition with its secret. Failing
+in argv; refusals sanitised. Klefki's own keyring can fail to set or delete. A failure keeps every server in place or in a kept definition with
+its secret, and Put back (with Claude Code working and the place free) and Forget must then succeed: a refusal
+fails the test. Failing
 seeds are kept in `crates/core/proptest-regressions/`.
 
 Why not as PLAN wrote it:

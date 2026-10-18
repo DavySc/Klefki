@@ -446,13 +446,12 @@ fn replace(
         entry::validate(&value)
     }
     .map_err(|why| format!("The definition is not usable: {why}."))?;
-    let op = Op::ReplaceServer {
-        project: file.project.clone(),
-        name: file.name.clone(),
-        entry: value.clone(),
-    };
     if !oauth {
-        out.claude.push(op);
+        out.claude.push(Op::ReplaceServer {
+            project: file.project.clone(),
+            name: file.name.clone(),
+            entry: value,
+        });
         return Ok(());
     }
     if swap::signs_in(&value) {
@@ -462,7 +461,6 @@ fn replace(
         project: file.project.clone(),
         name: file.name.clone(),
     };
-    out.preview.push(op);
     out.swaps.push(Swap {
         from: here.clone(),
         remove: true,
@@ -504,11 +502,29 @@ fn move_server(
     )?
     .pop()
     .expect("one place asked, one given");
-    if to.is_none() {
-        out.notes.push(format!(
+    match (&file.project, &to) {
+        (_, None) => out.notes.push(format!(
             "As a user server, {} is on in every project, except where it is switched off.",
             row.name
-        ));
+        )),
+        // The main consequence of narrowing it to one project.
+        (None, Some(there)) => {
+            let others: Vec<String> = snapshot
+                .projects
+                .iter()
+                .filter(|p| inventory::normalise_project(p) != inventory::normalise_project(there))
+                .map(|p| sanitize(&folder_name(p)))
+                .collect();
+            if !others.is_empty() {
+                out.warnings.push(format!(
+                    "{} will only be in {}: it is no longer there for you in {}.",
+                    row.name,
+                    sanitize(&folder_name(there)),
+                    some_of(&others)
+                ));
+            }
+        }
+        _ => {}
     }
     let copy = Op::CopyServer {
         from: file.project.clone(),
@@ -523,7 +539,6 @@ fn move_server(
     if row.oauth.is_none() {
         out.claude.extend([copy, remove]);
     } else {
-        out.preview.extend([copy, remove]);
         out.swaps.push(Swap {
             from: Spot {
                 project: file.project.clone(),
@@ -709,7 +724,6 @@ fn duplicate(
             out.claude.push(op);
             continue;
         }
-        out.preview.push(op);
         out.swaps.push(Swap {
             from: Spot {
                 project: from.clone(),
@@ -867,6 +881,20 @@ fn add(
     }
     if oauth {
         typed_secret_refused(&new, &value)?;
+        let lost: Vec<String> = value
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+            .filter(|k| swap::as_claude_writes(&value).get(k.as_str()).is_none())
+            .map(|k| sanitize(k))
+            .collect();
+        if !lost.is_empty() {
+            out.warnings.push(format!(
+                "Claude Code keeps only the settings it uses, so {new} loses {}.",
+                lost.join(", ")
+            ));
+        }
     }
     // Typed-in values are not shown (they may be secrets); which of the user's variables are read still is.
     let lines = describe(&shown_values(&value))
@@ -889,7 +917,12 @@ fn add(
                 sanitize(&folder_name(project))
             ));
         }
-        out.preview.push(op);
+        // Shown as Claude Code writes it.
+        out.preview.push(Op::AddServer {
+            project: to.clone(),
+            name: name.to_owned(),
+            entry: swap::as_claude_writes(&value),
+        });
         out.cli.push(CliAdd {
             name: name.to_owned(),
             json: value.to_string(),
