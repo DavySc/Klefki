@@ -1,7 +1,7 @@
 # Progress
 
 ## Current slice
-Owner's feedback on main (2026-10-18): the Failed tooltip is too slow, and the Duplicate dialog is not user friendly. Done, not committed; see below. Next: the edit form, then keyring secrets.
+Owner's feedback on main (2026-10-18): the Failed tooltip is too slow, and the Duplicate dialog is not user friendly. Done; committed as `673bdfb` on branch `status-tooltip-and-duplicate-dialog`, not yet pushed; see below. Next: the edit form, then keyring secrets.
 
 ## Status tooltip at once; Duplicate dialog reworked (2026-10-18)
 - **Tooltip.** egui shows a tooltip only after the pointer has been perfectly still for 0.5 s, and only over the words "● Failed". The status cell now shows its explanation when the pointer has been anywhere over the cell for 0.1 s, moving or not (`hovered_for`, `EXPLAIN_AFTER`); it goes when the pointer leaves, a button is down or the list scrolls. Other tooltips keep egui's behaviour. Tests (60 frames a second, so the delay is not skipped in quarter seconds): `a_failed_status_explains_itself_at_once_even_while_the_mouse_moves`, `the_whole_status_cell_explains_not_only_its_text` (also checks it goes away); both failed before.
