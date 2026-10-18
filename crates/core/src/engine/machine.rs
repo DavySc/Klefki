@@ -376,6 +376,11 @@ fn start() -> Rig {
 
 /// [`start`], with klefki's own check of each write `delay` after it.
 fn start_checking_after(delay: Duration) -> Rig {
+    start_spelled(delay, |key| key)
+}
+
+/// Like [`start_checking_after`], with each project's key in the file spelled by `spell`.
+fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("cfg");
     std::fs::create_dir_all(&cfg).unwrap();
@@ -388,7 +393,7 @@ fn start_checking_after(delay: Duration) -> Rig {
             // As Claude Code keys a project: the folder itself, not a link to it (macOS's temp folder is one).
             #[cfg(unix)]
             let path = std::fs::canonicalize(&path).unwrap();
-            path.to_str().unwrap().to_owned()
+            spell(path.to_str().unwrap().to_owned())
         })
         .collect();
     let (pa, pb) = (&projects[0], &projects[1]);
@@ -1054,6 +1059,58 @@ fn a_kept_definition_says_which_server_lost_its_shared_sign_in_and_putting_it_ba
     let world = rig.world();
     assert_eq!(world.creds.get(&shared).map(String::as_str), Some("sec-a"));
     assert!(world.kept.is_empty());
+}
+
+#[test]
+fn a_server_that_signs_in_lands_under_the_projects_own_spelling() {
+    // Found on Windows CI: Klefki ran Claude Code from the project's folder as Klefki spells it (`C:/…`), not as
+    // the file does (`C:\…`), and Claude Code, which keys a project by the folder it runs in, filed the server
+    // under a second entry for the same project. Here the variant every system has: a trailing separator.
+    let rig = start_spelled(Duration::from_millis(5), |key| {
+        format!("{key}{}", std::path::MAIN_SEPARATOR)
+    });
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let a = (None, "a".to_owned());
+    let pa = rig.projects[0].clone();
+    let projects = |rig: &Rig| -> Vec<String> {
+        rig.config()["projects"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let before = projects(&rig);
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(pa.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    assert_eq!(projects(&rig), before);
+    assert!(
+        rig.config()["projects"][&pa]["mcpServers"]
+            .get("a")
+            .is_some()
+    );
+    // The variant: a move there.
+    let b = (Some(pa.clone()), "b".to_owned());
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&b),
+        to: Target::User,
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&(None, "b".to_owned())),
+        to: Target::Local(pa.clone()),
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    assert_eq!(projects(&rig), before);
+    assert!(
+        rig.config()["projects"][&pa]["mcpServers"]
+            .get("b")
+            .is_some()
+    );
 }
 
 #[test]

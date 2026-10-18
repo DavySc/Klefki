@@ -782,6 +782,21 @@ fn read_root(claude_json: &Path) -> Result<Value, String> {
     })
 }
 
+/// `project` as the configuration's key for it is spelled; as given when the file has none (or cannot be read).
+fn spelled_in(claude_json: &Path, project: &str) -> String {
+    let wanted = inventory::normalise_project(project);
+    read_root(claude_json)
+        .ok()
+        .and_then(|root| {
+            root.get("projects")?
+                .as_object()?
+                .keys()
+                .find(|key| inventory::normalise_project(key) == wanted)
+                .cloned()
+        })
+        .unwrap_or_else(|| project.to_owned())
+}
+
 /// Where else in `root` a server shares the sign-in of `entry` at `spot` (same name, address and headers): Claude
 /// Code keeps one client secret and one sign-in for them, which removing one takes from both.
 fn sharing(root: &Value, spot: &Spot, entry: &Value) -> Vec<String> {
@@ -846,7 +861,13 @@ fn command(
     args.extend(flag);
     args.extend(["--", spot.name.as_str()]);
     args.extend(json);
-    let cwd = spot.project.as_deref().map(Path::new).or(ctx.home);
+    // From the folder as the file spells it: Claude Code keys a project by the folder it runs in, and wrote that key
+    // itself, so another spelling of the same folder (`C:/…` for `C:\…`) could file the server under a second entry.
+    let folder = spot
+        .project
+        .as_deref()
+        .map(|project| spelled_in(ctx.claude_json, project));
+    let cwd = folder.as_deref().map(Path::new).or(ctx.home);
     ctx.claude.run(&args, cwd, secret).map_err(|e| {
         format!(
             "Claude Code's command could not be started ({}).",

@@ -37,7 +37,7 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
   saved through Claude Code); the app test that OAuth servers are not edited in the form is split into one for
   project servers (unchanged) and one that an OAuth server is edited and says it signs in again.
 - Checks after cross-review round 1 and the main merge: `cargo fmt --check` 0, clippy workspace
-  and `-p klefki` 0, `cargo test --workspace` 481 core + 223 app + 32 cli passed (after the main merge), `cargo deny check` 0, no IO in
+  and `-p klefki` 0, `cargo test --workspace` 482 core + 223 app + 32 cli passed (after the main merge), `cargo deny check` 0, no IO in
   `crates/app/src`.
 - **Open / for human review:** OAuth servers are now removed through `claude mcp remove` (invariant area). A move or
   edit of an OAuth server signs it out (Claude deletes its credentials). Proposals in decision 007: letting the
@@ -78,6 +78,11 @@ between the user and local scope. Acceptance: PLAN's model-based test. Design an
     says so, and Put back restores it (`a_kept_definition_says_which_server_lost_its_shared_sign_in_…`). **For human
     review:** the model test's "every OAuth server with a Klefki secret has it in Claude Code" check now allows this
     one state (a kept definition sharing the sign-in), and requires the failure to have said it.
+  - Windows CI (first CI run of this branch; earlier pushes conflicted with main, so CI never ran): Claude Code was
+    run from the project folder as Klefki spells it (`C:/…`), not as the file does (`C:\…`), and the server landed
+    under a second entry. Claude Code now runs from the file's own spelling of the folder
+    (`a_server_that_signs_in_lands_under_the_projects_own_spelling`, reproduced on Linux with a trailing separator;
+    failed before). Real Claude Code on Windows not tried.
   - Soak after all fixes: 3 × 4000 cases passed (~110 s each), twice (before and after the main merge).
 - **Merged main** with the free-port check (#23) and the CLI (#25): one conflict in `api.rs` (`real_config` from
   main, plus `changer: None`). Decision renumbered to 007: main has its own 006 (CLI output).
