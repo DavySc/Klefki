@@ -92,6 +92,9 @@ impl DetailTab {
 struct Editor {
     id: ServerId,
     state: EditorState,
+    /// Asked for with Edit: brought into view when it arrives, for it is drawn below the summary, which can leave it
+    /// under the save bar.
+    reveal: bool,
 }
 
 enum EditorState {
@@ -449,6 +452,7 @@ impl ShellApp {
                         self.editor = Some(Editor {
                             id: id.clone(),
                             state: EditorState::Loading,
+                            reveal: false,
                         });
                         self.send(Command::Inspect(id));
                     }
@@ -524,6 +528,9 @@ impl ShellApp {
                 });
             }
             Event::Entry { id, json, editable } => {
+                // Brought into view for the server shown on a tab with the form; one looked at later opens as it is.
+                let shown = matches!(self.tab, DetailTab::General | DetailTab::HeadersEnv)
+                    && self.single_selected().is_some_and(|s| s.is(&id));
                 if let Some(editor) = &mut self.editor
                     && editor.id == id
                     && matches!(editor.state, EditorState::Loading)
@@ -532,6 +539,7 @@ impl ShellApp {
                         Ok(text) => EditorState::ready(text, editable),
                         Err(why) => EditorState::Failed(why),
                     };
+                    editor.reveal &= shown;
                 }
             }
             Event::CallbackPort { port, warning } => {
@@ -2486,6 +2494,13 @@ impl ShellApp {
             ui.ctx()
                 .request_discard("the detail panel's save bar changed height");
         }
+        // A definition asked for with Edit is brought into view until a pass laid out with its save bar is shown.
+        if !ui.ctx().will_discard()
+            && let Some(e) = self.editor.as_mut().filter(|e| s.is(&e.id))
+            && !matches!(e.state, EditorState::Loading)
+        {
+            e.reveal = false;
+        }
     }
 
     /// The detail panel's open tab for the row `i`, `s`, under the name and tabs.
@@ -2590,7 +2605,8 @@ impl ShellApp {
                 }
                 if self.core.is_some() {
                     ui.add_space(12.0);
-                    self.definition_form(ui, s);
+                    let form = ui.scope(|ui| self.definition_form(ui, s)).response;
+                    self.reveal_definition(s, &form);
                 }
             }
             DetailTab::Status => {
@@ -2729,7 +2745,8 @@ impl ShellApp {
             }
             DetailTab::HeadersEnv => {
                 if self.core.is_some() {
-                    self.values_form(ui, s);
+                    let form = ui.scope(|ui| self.values_form(ui, s)).response;
+                    self.reveal_definition(s, &form);
                 } else {
                     ui.label(RichText::new("Not available for sample data.").color(pal.text_muted));
                 }
@@ -2783,7 +2800,7 @@ impl ShellApp {
                 .desired_width(f32::INFINITY)
                 .desired_rows(14),
         );
-        self.save_bar_wanted = true;
+        self.form_end(ui, s);
     }
 
     /// The OAuth client secret of `s`: whether the system's secret store holds one, and setting, replacing or
@@ -2891,6 +2908,7 @@ impl ShellApp {
         self.editor = Some(Editor {
             id: s.id(),
             state: EditorState::Loading,
+            reveal: true,
         });
         self.send(Command::Inspect(s.id()));
     }
@@ -2901,6 +2919,19 @@ impl ShellApp {
             .as_mut()
             .filter(|e| s.is(&e.id))
             .map(|e| &mut e.state)
+    }
+
+    /// Brings the definition asked for with Edit, `shown`, into view once it has arrived. It scrolls no further than
+    /// that takes, so the summary above stays when there is room for both. `detail` says when it is done: the save
+    /// bar that comes with the form shortens the view only in the next pass.
+    fn reveal_definition(&self, s: &ServerRow, shown: &egui::Response) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.reveal && s.is(&e.id) && !matches!(e.state, EditorState::Loading))
+        {
+            shown.scroll_to_me(None);
+        }
     }
 
     /// Why the form is not shown for `s`, or `None` when it can be edited. Draws that reason.
@@ -3041,7 +3072,7 @@ impl ShellApp {
                 f.args.push(String::new());
             }
         }
-        self.save_bar_wanted = true;
+        self.form_end(ui, s);
     }
 
     /// The Env tab's form: environment variables for a command, headers for an address. Values that are there
@@ -3128,10 +3159,39 @@ impl ShellApp {
         if ui.small_button(format!("Add {noun}")).clicked() {
             pairs.push((String::new(), String::new()));
         }
-        self.save_bar_wanted = true;
+        self.form_end(ui, s);
     }
 
-    /// What stops saving, then Review and save… and Revert, and on the right the way to the JSON and back.
+    /// Under the last field of a form or of the JSON: the quiet way between the two, and the save bar asked for. The
+    /// fields are the way to edit, the JSON the way out when they fall short. Not in the save bar, which stays one
+    /// line and so puts no switch where the pointer was when the form came in.
+    fn form_end(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let pal = theme::palette(ui.ctx());
+        self.save_bar_wanted = true;
+        let Some(EditorState::Ready { form, as_json, .. }) = self.editor_for(s) else {
+            return;
+        };
+        let quiet =
+            |text: &str| egui::Button::new(RichText::new(text).color(pal.link)).frame(false);
+        ui.add_space(6.0);
+        if *as_json || form.is_err() {
+            if ui
+                .add_enabled(form.is_ok(), quiet("Back to the form"))
+                .on_disabled_hover_text("The form cannot show the JSON as it is now: see above")
+                .clicked()
+            {
+                *as_json = false;
+            }
+        } else if ui
+            .add(quiet("Edit as JSON"))
+            .on_hover_text("Every key of the definition, including those the form does not show")
+            .clicked()
+        {
+            *as_json = true;
+        }
+    }
+
+    /// What stops saving, then Review and save… and Revert.
     fn save_bar(&mut self, ui: &mut Ui, s: &ServerRow) {
         let pal = theme::palette(ui.ctx());
         let can_prepare = self.can_prepare();
@@ -3139,8 +3199,6 @@ impl ShellApp {
             original,
             text,
             problem,
-            form,
-            as_json,
             ..
         }) = self.editor_for(s)
         else {
@@ -3152,10 +3210,6 @@ impl ShellApp {
         let edited = text != original;
         let ready = edited && problem.is_none() && can_prepare;
         let mut review = None;
-        // The way to the JSON is quiet, after the buttons: the fields are the way to edit, the JSON the way out when
-        // they fall short. One line, which wraps in a narrow panel: the bar stays in view, so it is kept short.
-        let quiet =
-            |text: &str| egui::Button::new(RichText::new(text).color(pal.link)).frame(false);
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(ready, egui::Button::new("Review and save…"))
@@ -3168,23 +3222,6 @@ impl ShellApp {
                 .clicked()
             {
                 *text = original.clone();
-            }
-            if *as_json || form.is_err() {
-                if ui
-                    .add_enabled(form.is_ok(), quiet("Back to the form"))
-                    .on_disabled_hover_text("The form cannot show the JSON as it is now: see above")
-                    .clicked()
-                {
-                    *as_json = false;
-                }
-            } else if ui
-                .add(quiet("Edit as JSON"))
-                .on_hover_text(
-                    "Every key of the definition, including those the form does not show",
-                )
-                .clicked()
-            {
-                *as_json = true;
             }
         });
         if let Some(json) = review {
@@ -6257,14 +6294,18 @@ mod tests {
         assert!(!view.contains_rect(report), "Copy report at {report:?}");
     }
 
-    /// A definition with 14 arguments: the form is taller than the window.
-    fn long_form(size: egui::Vec2) -> Harness<'static, ShellApp> {
+    /// A definition with 14 arguments: its form is taller than the window.
+    fn long_definition() -> String {
         let args: Vec<String> = (0..14).map(|i| format!("\"--flag-{i}\"")).collect();
-        let json = format!(
+        format!(
             "{{\n  \"command\": \"node\",\n  \"args\": [{}]\n}}",
             args.join(", ")
-        );
-        let (mut h, _engine, _) = form_harness(&json, true);
+        )
+    }
+
+    /// The form of [`long_definition`], at `size`.
+    fn long_form(size: egui::Vec2) -> Harness<'static, ShellApp> {
+        let (mut h, _engine, _) = form_harness(&long_definition(), true);
         h.set_size(size);
         h.run();
         h
@@ -6332,15 +6373,17 @@ mod tests {
 
     #[test]
     fn tab_from_the_last_field_goes_on_to_the_save_bar() {
-        // The save bar sits below the form, so it comes next, not first.
+        // The save bar sits below the form, so it comes next, not first; the way to the JSON ends the form.
         let mut h = long_form(OPENING_SIZE);
         form(&mut h).args[13].push('x');
         h.run();
         h.get_by_label("Add argument").focus();
         h.run();
-        h.key_press(egui::Key::Tab);
-        h.run();
-        assert!(h.get_by_label("Review and save…").is_focused());
+        for next in ["Edit as JSON", "Review and save…"] {
+            h.key_press(egui::Key::Tab);
+            h.run();
+            assert!(h.get_by_label(next).is_focused(), "{next}");
+        }
     }
 
     #[test]
@@ -6387,24 +6430,178 @@ mod tests {
             }
             // The very edge of a button at the panel's right side, where the scroll bar shows.
             let rect = h.get_by_label("Remove argument 1").rect();
-            let edge = egui::pos2(rect.right() - 2.0, rect.center().y);
-            h.event(egui::Event::PointerMoved(edge));
-            h.run();
-            for pressed in [true, false] {
-                h.event(egui::Event::PointerButton {
-                    pos: edge,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: egui::Modifiers::NONE,
-                });
-                h.run();
-            }
+            click_at(&mut h, egui::pos2(rect.right() - 2.0, rect.center().y));
             assert_eq!(
                 form(&mut h).args.len(),
                 13,
                 "{bar_width:?}: the click reached the button"
             );
             assert_eq!(form(&mut h).args[0], "--flag-1");
+        }
+    }
+
+    /// A click of the mouse at `pos`, wherever that is.
+    fn click_at(h: &mut Harness<'static, ShellApp>, pos: egui::Pos2) {
+        h.event(egui::Event::PointerMoved(pos));
+        h.run();
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+            h.run();
+        }
+    }
+
+    /// A command with two arguments and a variable: three fields on General, two on Env.
+    const SHORT_DEFINITION: &str = "{\n  \"command\": \"node\",\n  \"args\": [\"server.js\", \"--port=3000\"],\n  \"env\": {\"LOG\": \"1\"}\n}";
+
+    /// A way to ask for the selected server's definition.
+    type Ask = fn(&mut Harness<'static, ShellApp>);
+
+    /// alpha's definition, `json`, asked for by `ask` at `size`, and arrived.
+    fn definition_asked_for(
+        size: egui::Vec2,
+        json: &str,
+        ask: impl FnOnce(&mut Harness<'static, ShellApp>),
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        h.set_size(size);
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        ask(&mut h);
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+        engine.events.send(entry_event(&a, json, true)).unwrap();
+        h.run();
+        (h, engine)
+    }
+
+    /// The detail panel's text fields, top to bottom: those under its tabs, right of the list.
+    fn detail_fields(h: &Harness<'static, ShellApp>) -> Vec<egui::Rect> {
+        use egui::accesskit::Role;
+        let tab = h.get_by_role_and_label(Role::Button, "General").rect();
+        let mut fields: Vec<egui::Rect> = h
+            .query_all_by_role(Role::TextInput)
+            .chain(h.query_all_by_role(Role::PasswordInput))
+            .map(|f| f.rect())
+            .filter(|f| f.left() >= tab.left() && f.top() >= tab.bottom())
+            .collect();
+        fields.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        fields
+    }
+
+    #[test]
+    fn the_definition_asked_for_is_brought_into_view() {
+        // Found in review: at the smallest size the form arrived below the summary, under the save bar, so Edit
+        // definition looked like it did nothing.
+        use egui::accesskit::Role;
+        let asks: [(&str, Ask); 3] = [
+            ("Edit definition on General", |h| {
+                h.get_by_label("Edit definition").click();
+            }),
+            ("Ctrl+E on Status", |h| {
+                h.get_by_role_and_label(Role::Button, "Status").click();
+                h.run();
+                h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+            }),
+            ("Edit definition on Env", |h| {
+                h.get_by_role_and_label(Role::Button, "Env").click();
+                h.run();
+                h.get_by_label("Edit definition").click();
+            }),
+        ];
+        for size in SIZES {
+            for (how, ask) in asks {
+                let (h, _engine) = definition_asked_for(size, SHORT_DEFINITION, ask);
+                let view = detail_view(&h, size);
+                let fields = detail_fields(&h);
+                assert!(fields.len() >= 2, "{size:?}, {how}: {fields:?}");
+                for field in fields {
+                    assert!(
+                        view.contains_rect(field),
+                        "{size:?}, {how}: a field at {field:?}, out of {view:?}"
+                    );
+                }
+                let end = h.get_by_label("Edit as JSON").rect();
+                assert!(
+                    view.contains_rect(end),
+                    "{size:?}, {how}: the form ends at {end:?}, out of {view:?}"
+                );
+            }
+            // Taller than the view, it comes in from its top.
+            let (h, _engine) = definition_asked_for(size, &long_definition(), asks[0].1);
+            let view = detail_view(&h, size);
+            let first = detail_fields(&h)[0];
+            assert!(
+                view.contains_rect(first),
+                "{size:?}, a long form: its first field at {first:?}, out of {view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_definition_that_arrives_while_another_server_is_shown_waits_where_it_is() {
+        // Brought into view only while its server is being looked at: going back to it later starts at its summary.
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        h.set_size(SMALLEST_SIZE);
+        let (a, b) = two_rows();
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        h.get_by_label("Edit definition").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+        h.get_by_label("beta").click();
+        h.run();
+        engine
+            .events
+            .send(entry_event(&a, SHORT_DEFINITION, true))
+            .unwrap();
+        h.run();
+        h.get_by_label("alpha").click();
+        h.run();
+        let tab = h.get_by_role_and_label(Role::Button, "General").rect();
+        let scope = h
+            .get_all_by_label("Scope")
+            .map(|l| l.rect())
+            .find(|r| r.left() >= tab.left())
+            .expect("the summary's first row");
+        let view = detail_view(&h, SMALLEST_SIZE);
+        assert!(
+            view.contains_rect(scope),
+            "Scope at {scope:?}, out of {view:?}"
+        );
+        h.get_by_label("Edit as JSON");
+    }
+
+    #[test]
+    fn a_second_click_where_edit_definition_was_leaves_the_form_a_form() {
+        // Found in review: the save bar came in under the pointer at the smallest size, with the way to the JSON on
+        // its second line, so a double click on Edit definition opened the raw JSON.
+        for size in SIZES {
+            let mut at = egui::Pos2::ZERO;
+            let (mut h, engine) = definition_asked_for(size, SHORT_DEFINITION, |h| {
+                at = h.get_by_label("Edit definition").rect().center();
+                click_at(h, at);
+            });
+            click_at(&mut h, at);
+            assert!(
+                h.query_by_label("Back to the form").is_none(),
+                "{size:?}: the second click at {at:?} opened the JSON"
+            );
+            h.get_by_label("Edit as JSON");
+            assert_eq!(drain(&engine), vec![], "{size:?}");
         }
     }
 

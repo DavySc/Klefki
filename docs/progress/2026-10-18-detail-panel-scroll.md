@@ -43,3 +43,21 @@ Guards that passed before and were checked by mutation:
   - At 800x480 the save bar stays in view under the fields.
   - At the default panel width "Edit as JSON" wraps under the buttons, so the bar is two lines; noted in the findings for Davy.
 - CI: GitHub Actions has not started jobs since about 23:55Z (no runner, no logs, on every PR), so CI on this round waits for that.
+
+## Review round 2 (PR comment 6257122294)
+Round 1 checked out; one new blocker, B3, from the pinned save bar at the smallest size.
+- **The definition asked for comes into view** (B3): at 800x480 "Edit definition" sat at the bottom, so its form arrived below the summary, under the save bar, with none of its fields in view. Edit (the button, Ctrl+E, the palette) now marks the editor `reveal`, and the form is scrolled into view when the definition arrives. It scrolls no further than that takes (`scroll_to_me(None)`): a form that fits leaves the summary above it where there is room, and a taller one comes in from its top. The save bar that comes with the form shortens the view only in the next pass, so the reveal is repeated until a pass that is shown (`will_discard`); done once in the first pass, it left the form's end under the bar. A definition that arrives while another server or tab is shown does not move anything later.
+- **No switch under the pointer** (B3): the save bar wrapped "Edit as JSON" onto a second line, which came in right under the pointer that had clicked "Edit definition", so a double click opened the JSON. The way to the JSON and back is now under the form's last field (`form_end`), as it was before round 1, and the save bar is one line: Review and save… and Revert, with what stops saving above them. This also gives the form one line more at 800x480 (the view runs to y=410, not 366), and needs no second "can this be edited" rule.
+- `tab_from_the_last_field_goes_on_to_the_save_bar` now walks Add argument, then Edit as JSON, then Review and save….
+
+### Tests
+Seen failing first against `b023c4b`:
+- `the_definition_asked_for_is_brought_into_view`, at both sizes, by Edit definition on General, Ctrl+E from Status, and Edit definition on Env: at 1200x720 the last argument at y=610..632 under a bar from y=606; at 800x480 the Command field at y=492, below a view ending at y=366. With a 14-argument definition, its first field must be in view (it was at y=492 in a view ending at 410 without the reveal). Finishing the reveal in the first pass instead of the shown one fails it too (the form's end at y=666..700 in a view ending at 650).
+- `a_second_click_where_edit_definition_was_leaves_the_form_a_form`: at 800x480 the second click at (534, 462) opened the JSON.
+
+Guard, passing before and checked by mutation: `a_definition_that_arrives_while_another_server_is_shown_waits_where_it_is` fails when every arriving definition is revealed (Scope at y=-81).
+
+### Checks
+- Full verify exit 0, 718 tests passed, deny "advisories ok, bans ok, licenses ok, sources ok". `cargo test -p klefki` 228 passed.
+- Trial merge into #26's head `349e33d`: no conflicts; `cargo clippy -p klefki --all-targets -- -D warnings` 0 and `cargo test -p klefki` 243 passed on the result.
+- Real app (release, Xvfb): at 800x480 Edit definition shows the Definition heading under the tabs, Type, Command and both arguments, over a one-line save bar; a second click at the same place lands on the disabled Review and save…. At 1200x720 the panel moves up 72 px, so the summary from Type down stays and the form ends with Edit as JSON above the bar. Ctrl+E at 800x480 with a long target in the summary brings the form in from its top.
