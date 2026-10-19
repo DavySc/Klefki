@@ -38,4 +38,17 @@ seed `19dc2de0…`). Find whether the model or the product is wrong, fix it, kee
   needs its own slice.
 - **Open:** a copy into the place a kept definition came from overwrites Klefki's copy of the kept secret (seen
   while probing; the model only checks it when the secrets differ, and they never do there). Not changed.
-- **Next:** cross-review by another thread, CI on three systems, merge.
+- **PR #7**, CI green on all three systems at 8e1a63c.
+- **Cross-review round 1** (Core review part 3 thread, review 5569333639). Blocker, in the model: after a step whose
+  store could not delete the copy left behind, a later listing drops the definition, also during a refused,
+  unchanged or failed step, where the model still expected it. The model now applies the same prediction
+  (`settled`) in every arm, allowing a step that changes nothing to have listed again (`unchanged`). Test
+  `a_kept_definition_whose_left_copy_could_not_be_deleted_goes_at_the_next_listing` (the reviewer's sequence with
+  four tails); it failed before. Folded in: the doc says why no store counts as nothing to lose; the listing reads
+  the configuration again just before deleting the copy left behind, so a server another Klefki put back there in
+  between keeps it (`a_copy_left_behind_is_not_deleted_when_a_server_is_put_back_there_meanwhile`, failed without
+  the re-read; the test store can now run something on a read). Left as noted: a copy into a kept definition's own
+  place (open item above), and differing secrets sharing a sign-in (decision 007's limit).
+- Checks after round 1: fmt 0, clippy workspace and `-p klefki` 0, `cargo test --workspace` 0 (530 core), deny 0,
+  model soak 4000 cases passed.
+- **Next:** reviewer confirms, merge.

@@ -1126,7 +1126,7 @@ impl Recovery {
             .into_iter()
             .filter(|r| {
                 let done = root.as_ref().is_some_and(|root| r.got_through(root))
-                    && r.secret_went_along(store);
+                    && r.secret_went_along(claude_json, store);
                 if done {
                     r.discard();
                 }
@@ -1185,8 +1185,9 @@ impl Recovery {
     }
 
     /// Whether Klefki's copy of the client secret, if it holds one where the server was, is also where the server
-    /// went (the one left behind is then deleted). Unsure counts as no.
-    fn secret_went_along(&self, store: Option<&dyn SecretStore>) -> bool {
+    /// went (the one left behind is then deleted). Unsure counts as no. Without a store Klefki holds no copy, so
+    /// there is none to lose.
+    fn secret_went_along(&self, claude_json: &Path, store: Option<&dyn SecretStore>) -> bool {
         let (Some((to, _)), Some(store)) = (&self.next, store) else {
             return true;
         };
@@ -1201,7 +1202,11 @@ impl Recovery {
         }
         match (store.get(&from), store.get(&to)) {
             (Ok(None), _) => true,
-            (Ok(Some(kept)), Ok(Some(there))) if kept == there => store.delete(&from).is_ok(),
+            // Read again just before: another Klefki may have put a server there since, with this secret.
+            (Ok(Some(kept)), Ok(Some(there))) if kept == there => {
+                read_root(claude_json).is_ok_and(|root| self.got_through(&root))
+                    && store.delete(&from).is_ok()
+            }
             _ => false,
         }
     }
