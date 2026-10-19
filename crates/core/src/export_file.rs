@@ -32,8 +32,9 @@ impl std::fmt::Display for SaveError {
 pub enum FileChoice {
     /// The file the user picked. The system's save dialog has already asked before replacing a file there.
     Chosen(PathBuf),
-    /// The user closed the dialog.
-    Cancelled,
+    /// The dialog closed without a file: the user cancelled, or a dialog that failed slowly (a desktop portal with no
+    /// file chooser) looked like it. A path can still be typed, starting from `suggested`.
+    Cancelled { suggested: PathBuf },
     /// No save dialog could be shown (on Linux: no desktop portal and no zenity). Ask for a path instead, starting
     /// from `suggested`.
     NoDialog { suggested: PathBuf },
@@ -51,7 +52,9 @@ pub(crate) fn choose(choose: &ChooseFile, name: &str, home: Option<&Path>) -> Fi
     let asked = Instant::now();
     match choose(name) {
         Some(path) => FileChoice::Chosen(path),
-        None if asked.elapsed() >= UNSEEN => FileChoice::Cancelled,
+        None if asked.elapsed() >= UNSEEN => FileChoice::Cancelled {
+            suggested: default_folder(home).join(name),
+        },
         None => FileChoice::NoDialog {
             suggested: default_folder(home).join(name),
         },
@@ -66,10 +69,18 @@ fn default_folder(home: Option<&Path>) -> PathBuf {
         .unwrap_or_default()
 }
 
-/// The file name to start from: the server's name for one, `mcp-servers.json` for more.
+/// The file name to start from: the server's name for one, `mcp-servers.json` for more. A project server's name comes
+/// from the repository's `.mcp.json`, so only the characters Claude Code allows in a name are kept (at most 64): a
+/// name can never pick a folder (`/etc/x`, `../x`, `C:\x`).
 pub fn file_name(servers: &[&str]) -> String {
+    let kept = |name: &str| -> String {
+        name.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            .take(64)
+            .collect()
+    };
     match servers {
-        [one] => format!("{one}-mcp.json"),
+        [one] if !kept(one).is_empty() => format!("{}-mcp.json", kept(one)),
         _ => "mcp-servers.json".to_owned(),
     }
 }
@@ -288,7 +299,10 @@ mod tests {
             std::thread::sleep(UNSEEN + Duration::from_millis(50));
             None
         });
-        assert_eq!(choose(&slow, "x.json", None), FileChoice::Cancelled);
+        match choose(&slow, "x.json", Some(home.path())) {
+            FileChoice::Cancelled { suggested } => assert!(suggested.ends_with("x.json")),
+            other => panic!("{other:?}"),
+        }
         let picked: ChooseFile = Arc::new(|name| Some(PathBuf::from("/picked").join(name)));
         assert_eq!(
             choose(&picked, "x.json", None),
@@ -301,5 +315,30 @@ mod tests {
         assert_eq!(file_name(&["github"]), "github-mcp.json");
         assert_eq!(file_name(&["a", "b"]), "mcp-servers.json");
         assert_eq!(file_name(&[]), "mcp-servers.json");
+    }
+
+    #[test]
+    fn a_server_name_from_a_repository_never_picks_the_folder() {
+        // Found in review: a project server's name is the repository's text.
+        for (name, expected) in [
+            ("/etc/cron.d/x", "etccrondx-mcp.json"),
+            ("../../x", "x-mcp.json"),
+            ("C:\\Users\\x", "CUsersx-mcp.json"),
+            ("../..", "mcp-servers.json"),
+            ("名前", "mcp-servers.json"),
+        ] {
+            let file = file_name(&[name]);
+            assert_eq!(file, expected, "{name:?}");
+            let suggested = Path::new("/home/me/Documents").join(&file);
+            assert_eq!(
+                suggested.parent(),
+                Some(Path::new("/home/me/Documents")),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            file_name(&[&"a".repeat(100)]),
+            format!("{}-mcp.json", "a".repeat(64))
+        );
     }
 }
