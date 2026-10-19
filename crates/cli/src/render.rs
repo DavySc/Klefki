@@ -86,21 +86,29 @@ pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
     }
 }
 
-/// Orders names as people count: `server-9` before `server-10`. Case is ignored first, then decides a tie.
+/// Orders names as people count: `server-9` before `server-10`. Case is ignored first, then decides a tie. This is
+/// the order [`ordered`] gives names within a group, where each name is split once.
+#[cfg(test)]
 fn natural(a: &str, b: &str) -> Ordering {
-    fn chunks(s: &str) -> Vec<(bool, String)> {
-        let mut out: Vec<(bool, String)> = Vec::new();
-        for c in s.chars() {
-            let digit = c.is_ascii_digit();
-            match out.last_mut() {
-                Some((d, text)) if *d == digit => text.push(c),
-                _ => out.push((digit, c.to_string())),
-            }
+    by_chunks(&chunks(a), &chunks(b)).then_with(|| a.cmp(b))
+}
+
+/// A name, lower-cased, as runs of digits and of other characters.
+fn chunks(name: &str) -> Vec<(bool, String)> {
+    let mut out: Vec<(bool, String)> = Vec::new();
+    for c in name.to_lowercase().chars() {
+        let digit = c.is_ascii_digit();
+        match out.last_mut() {
+            Some((d, text)) if *d == digit => text.push(c),
+            _ => out.push((digit, c.to_string())),
         }
-        out
     }
-    let (x, y) = (chunks(&a.to_lowercase()), chunks(&b.to_lowercase()));
-    for ((xd, xs), (yd, ys)) in x.iter().zip(&y) {
+    out
+}
+
+/// Compares runs of digits by their number and other runs as text.
+fn by_chunks(x: &[(bool, String)], y: &[(bool, String)]) -> Ordering {
+    for ((xd, xs), (yd, ys)) in x.iter().zip(y) {
         let order = if *xd && *yd {
             let (xt, yt) = (xs.trim_start_matches('0'), ys.trim_start_matches('0'));
             xt.len().cmp(&yt.len()).then_with(|| xt.cmp(yt))
@@ -111,20 +119,23 @@ fn natural(a: &str, b: &str) -> Ordering {
             return order;
         }
     }
-    x.len().cmp(&y.len()).then_with(|| a.cmp(b))
+    x.len().cmp(&y.len())
 }
 
 /// The rows to show, in the order they are shown: user servers, then per project its local and project servers;
 /// by name within a group.
 pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
-    let mut rows: Vec<&ServerRow> = rows.into_iter().collect();
-    rows.sort_by(|a, b| {
+    // Each name is split once, not at every comparison.
+    let mut keyed: Vec<(&ServerRow, Vec<(bool, String)>)> =
+        rows.into_iter().map(|r| (r, chunks(&r.name))).collect();
+    keyed.sort_by(|(a, x), (b, y)| {
         let group = |r: &'a ServerRow| (r.scope != Scope::User, &r.project, r.scope);
         group(a)
             .cmp(&group(b))
-            .then_with(|| natural(&a.name, &b.name))
+            .then_with(|| by_chunks(x, y))
+            .then_with(|| a.name.cmp(&b.name))
     });
-    rows
+    keyed.into_iter().map(|(r, _)| r).collect()
 }
 
 /// A path as shown in a heading: `~/…` under the home folder, which keeps lines short. JSON keeps the full path.
@@ -595,6 +606,32 @@ mod tests {
                 "server-10"
             ]
         );
+    }
+
+    #[test]
+    fn rows_in_a_group_sort_as_people_count() {
+        // `ordered` splits each name once instead of using `natural`, so it is checked on its own.
+        let s = fixture_snapshot();
+        let row = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let names = [
+            "server-10",
+            "Server-2",
+            "server-9",
+            "alpha",
+            "server-02b",
+            "Alpha",
+        ];
+        let rows: Vec<ServerRow> = names
+            .iter()
+            .map(|n| ServerRow {
+                name: (*n).to_owned(),
+                ..row.clone()
+            })
+            .collect();
+        let mut expected = names.to_vec();
+        expected.sort_by(|a, b| natural(a, b));
+        let got: Vec<&str> = ordered(&rows).iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

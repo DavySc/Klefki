@@ -12,17 +12,18 @@ Branch: made from main `5c27260`. It goes up on `claude/review-core-y2uzla` once
   - `runner.rs`: a timed-out run keeps no exit status to throw away later.
   - `fsx.rs`: a byte-order mark is removed in place instead of copying the file (up to 64 MB).
   - `report.rs`: the fallback keeps the last 25 lines without collecting every line first.
-  - `klefki-cli`: sorting borrows the project name instead of copying it twice per comparison; `transport_key` names its JSON values like its siblings do, so a changed table label cannot change the JSON; the duplicate `serde_json` dev-dependency is gone.
+  - `klefki-cli`: sorting splits each name once instead of at every comparison (the performance thread measured `ordered` on 3,950 rows at 5.5 ms before and 1.79 ms with names split once, release) and borrows the project name instead of copying it; `transport_key` names its JSON values like its siblings do, so a changed table label cannot change the JSON; the duplicate `serde_json` dev-dependency is gone.
   - Comments: `jsonspan.rs` said it never recurses (it recurses into the objects `descend` accepts), and `Secret::edit` promised that no plain copy is made.
 
 ## Pre-review (performance thread, by message, 02:33Z)
 Two should-fixes, both done:
 - The line for a name that can't be checked used "checked" in two senses and gave no way out (NN/g's error-message rubric, guidelines 6 and 7). It now says to rename the server in the repository's `.mcp.json` and words each rule itself; `NameError`'s own text is left alone, since the app's name field shows it.
+- Optional, done: the borrow alone did not speed up the sort; splitting each name once does. Test `rows_in_a_group_sort_as_people_count` checks `ordered` against `natural` (fails when the name order is reversed).
 - Taking the captured output instead of copying it let a reader thread still draining a pipe (a grandchild holds it) keep another full buffer. The copy stays; it was one copy of up to 64 KiB per run.
 
 ## Checks (Linux, 2026-10-19)
 - Each new test failed before its fix (quoted above).
-- Verify all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0, 703 tests passed, deny ok. Run before and after the pre-review fixes.
+- Verify all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0, deny ok; 703 tests before and after the pre-review fixes, 704 with the sort test.
 - End to end: `klefki-cli status` with fake-claude as `claude`, a temporary `CLAUDE_CONFIG_DIR` and a repository whose `.mcp.json` names `docs`, `x$(echo INJECTED)` and `-a;echo INJECTED`. `docs` gets "to check it: klefki-cli status docs"; the other two get the rename line naming `'$'` and `';'`. Exit 0.
 - Merges cleanly with #26, #28, #29 and #30 (`git merge-tree`).
 - Not run: Windows and macOS. The command is offered only for `[A-Za-z0-9_-]` names without a leading dash, which are inert in sh, cmd and PowerShell (reasoned, not run).
