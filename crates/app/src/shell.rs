@@ -49,12 +49,12 @@ impl Page {
 
     /// Pages that are not built yet say what they will do, so the menu is a map rather than a dead end.
     fn ready(self) -> bool {
-        matches!(self, Page::Connections | Page::Settings)
+        matches!(self, Page::Connections | Page::Settings | Page::ActivityLog)
     }
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections => "",
+            Page::Connections | Page::ActivityLog => "",
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
             }
@@ -64,7 +64,6 @@ impl Page {
             Page::Settings => {
                 "Coming soon: where to find the Claude CLI, and how often to check servers."
             }
-            Page::ActivityLog => "Coming soon: every change Klefki made, with its backup.",
         }
     }
 }
@@ -189,6 +188,8 @@ struct Outcome {
     warn: bool,
     /// What undoes it (a move back), offered on the card, which then stays until used or dismissed.
     undo: Option<Change>,
+    /// The change is in the Activity log, with its backup: the card offers to open it.
+    logged: bool,
 }
 
 /// How long a success message stays.
@@ -296,6 +297,8 @@ pub struct ShellApp {
     /// Exports asked for and not answered yet: only the answer to the last one fills the dialog.
     exports_pending: usize,
     pub page: Page,
+    /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
+    pub activity: Option<crate::activity::ActivityPage>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -348,6 +351,7 @@ impl ShellApp {
             exports_pending: 0,
             snapshot,
             page: Page::Connections,
+            activity: None,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -369,6 +373,19 @@ impl ShellApp {
         }
     }
 
+    /// Shows `page`. The Activity log is read each time it is opened and let go when it is left.
+    fn go(&mut self, page: Page) {
+        if page == Page::ActivityLog {
+            if self.activity.is_none() {
+                self.activity = Some(crate::activity::ActivityPage::default());
+                self.send(Command::Activity);
+            }
+        } else {
+            self.activity = None;
+        }
+        self.page = page;
+    }
+
     /// Re-reads the configuration and re-checks every server.
     fn refresh(&self) {
         self.send(Command::Refresh { live_all: true });
@@ -387,7 +404,22 @@ impl ShellApp {
     }
 
     fn apply_event(&mut self, event: Event) {
+        // A change saved while the Activity log is shown: read it again. What is shown stays until it arrives.
+        if self.activity.is_some()
+            && matches!(
+                event,
+                Event::Applied { changed: true, .. } | Event::ApplyFailed { .. }
+            )
+        {
+            self.send(Command::Activity);
+        }
         match event {
+            Event::Activity(log) => {
+                // Not kept once the page is left: it is read again when the page is opened.
+                if let Some(page) = &mut self.activity {
+                    page.log = Some(log);
+                }
+            }
             Event::Snapshot(snapshot) => {
                 // Rows are kept by position; carry selection, live results and diagnoses over by identity: the
                 // connection, as the file spells the server, since two servers can show the same name.
@@ -474,6 +506,7 @@ impl ShellApp {
                             warn: false,
                             undo: None,
                             sign_in: None,
+                            logged: false,
                         })
                     }
                 }
@@ -553,6 +586,7 @@ impl ShellApp {
                     warn,
                     undo: self.undo_move(changed),
                     sign_in,
+                    logged: changed,
                 });
             }
             Event::Applying { plan, step } => {
@@ -582,6 +616,7 @@ impl ShellApp {
                     warn: false,
                     undo: None,
                     sign_in: None,
+                    logged: false,
                 });
             }
             Event::Reapplied { .. } => {
@@ -593,6 +628,7 @@ impl ShellApp {
                     warn: false,
                     undo: None,
                     sign_in: None,
+                    logged: false,
                 });
             }
             Event::Entry { id, json, editable } => {
@@ -647,6 +683,7 @@ impl ShellApp {
                         warn: false,
                         undo: None,
                         sign_in: None,
+                        logged: false,
                     });
                 }
             }
@@ -868,6 +905,11 @@ impl ShellApp {
                     self.grid(ui);
                 }
                 Page::Settings => self.settings(ui),
+                Page::ActivityLog => {
+                    if let Some(page) = &mut self.activity {
+                        page.show(ui);
+                    }
+                }
                 other => {
                     ui.add_space(48.0);
                     ui.vertical_centered(|ui| {
@@ -885,7 +927,7 @@ impl ShellApp {
                         );
                         ui.add_space(12.0);
                         if ui.button("Back to connections").clicked() {
-                            self.page = Page::Connections;
+                            self.go(Page::Connections);
                         }
                     });
                 }
@@ -937,14 +979,23 @@ impl ShellApp {
                 {
                     self.command.open();
                 }
+                // On the Activity log it filters the changes, and says so: a box that filtered the hidden list of
+                // servers would find nothing there.
+                // The shortcut is left out there, so the longer words fit the box.
+                let (query, hint) = match &mut self.activity {
+                    Some(page) => (
+                        &mut page.filter,
+                        format!("{} Filter changes", icon::MAGNIFYING_GLASS),
+                    ),
+                    None => (
+                        &mut self.search,
+                        format!("{} Filter  {}", icon::MAGNIFYING_GLASS, shortcut("F")),
+                    ),
+                };
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
+                    egui::TextEdit::singleline(query)
                         .id(search_id())
-                        .hint_text(format!(
-                            "{} Filter  {}",
-                            icon::MAGNIFYING_GLASS,
-                            shortcut("F")
-                        ))
+                        .hint_text(hint)
                         .desired_width(220.0),
                 );
                 // Not while Claude Code cannot be found: the version would be of a program that is gone.
@@ -1024,7 +1075,7 @@ impl ShellApp {
                 );
             }
             if resp.clicked() {
-                self.page = page;
+                self.go(page);
             }
         }
     }
@@ -1277,7 +1328,7 @@ impl ShellApp {
     }
 
     /// Everything the command palette offers right now: actions on the selection first, then the rest.
-    fn commands(&self) -> Vec<Entry> {
+    pub(crate) fn commands(&self) -> Vec<Entry> {
         let mut out = Vec::new();
         let selected: Vec<&ServerRow> = self
             .selected
@@ -1466,6 +1517,14 @@ impl ShellApp {
                 command::Action::Select(i),
             );
         }
+        // After the servers, so they stay in view of an empty search; typing "act" finds it.
+        add(
+            icon::LIST_BULLETS,
+            "Activity log".into(),
+            "Changes Klefki saved, and their backups".into(),
+            None,
+            command::Action::ActivityLog,
+        );
         // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
         if live {
             add(
@@ -1489,13 +1548,13 @@ impl ShellApp {
         out
     }
 
-    fn run(&mut self, ctx: &egui::Context, action: command::Action) {
+    pub(crate) fn run(&mut self, ctx: &egui::Context, action: command::Action) {
         use command::Action as A;
         match action {
             A::Select(i) => {
                 self.selected.clear();
                 self.selected.insert(i);
-                self.page = Page::Connections;
+                self.go(Page::Connections);
             }
             A::TurnOn => self.prepare_toggle(true),
             A::TurnOff => self.prepare_toggle(false),
@@ -1527,7 +1586,8 @@ impl ShellApp {
                 self.tone = tone;
                 theme::set_tone(ctx, tone);
             }
-            A::Settings => self.page = Page::Settings,
+            A::Settings => self.go(Page::Settings),
+            A::ActivityLog => self.go(Page::ActivityLog),
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),
@@ -2698,6 +2758,7 @@ impl ShellApp {
         let mut dismiss = false;
         let mut sign_in = false;
         let mut undo = false;
+        let mut log = false;
         egui::Area::new(egui::Id::new("outcome"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .order(egui::Order::Foreground)
@@ -2726,6 +2787,13 @@ impl ShellApp {
                             if ui.small_button("Dismiss").clicked() {
                                 dismiss = true;
                             }
+                            // The backup's place stays on the Activity log after this card is gone.
+                            if outcome.logged
+                                && self.page != Page::ActivityLog
+                                && ui.small_button("Open activity log").clicked()
+                            {
+                                log = true;
+                            }
                             if outcome.undo.is_some() {
                                 undo = ui
                                     .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
@@ -2752,6 +2820,9 @@ impl ShellApp {
         } else if undo && let Some(change) = outcome.undo {
             self.outcome = None;
             self.prepare(vec![change]);
+        } else if log {
+            self.outcome = None;
+            self.go(Page::ActivityLog);
         } else if dismiss {
             self.outcome = None;
         }
