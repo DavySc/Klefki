@@ -5,6 +5,8 @@ pub(crate) mod entry;
 pub(crate) mod fsx;
 pub(crate) mod inventory;
 pub(crate) mod jsonspan;
+#[cfg(windows)]
+pub(crate) mod owner_only;
 pub(crate) mod secretlike;
 
 use std::path::PathBuf;

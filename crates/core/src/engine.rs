@@ -2341,6 +2341,14 @@ fn cli_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
         .collect()
 }
 
+/// The environment of a run that checks a server. A check ends whatever Claude leaves running
+/// (`RunSpec::end_leftovers`), so it must not start an update of Claude that would be ended with it.
+fn check_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
+    let mut env = cli_env(shared);
+    env.push(("DISABLE_AUTOUPDATER", OsStr::new("1")));
+    env
+}
+
 fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
     let stamp = ProgramStamp::of(program);
     if let (Some(stamp), Some((known, version))) = (&stamp, &*lock(&shared.version))
@@ -2364,6 +2372,7 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
         env: &cli_env(shared),
         timeout: VERSION_TIMEOUT,
         max_output: 1024,
+        end_leftovers: false,
     })
     .ok()?;
     let token = out.stdout.split_whitespace().next()?;
@@ -2391,9 +2400,10 @@ fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
         program: &program,
         args: &["mcp", "get", job.name.as_str()],
         cwd: Some(&job.cwd),
-        env: &cli_env(shared),
+        env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     interpret(result, timeout)
 }
@@ -2482,9 +2492,10 @@ fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
             job.name.as_str(),
         ],
         cwd: Some(&job.cwd),
-        env: &cli_env(shared),
+        env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     let stderr = result
         .as_ref()

@@ -20,6 +20,11 @@ pub(crate) struct RunSpec<'a> {
     pub timeout: Duration,
     /// Per stream. More output is read and discarded so the child never blocks on a full pipe.
     pub max_output: usize,
+    /// Also end what the program leaves running: when it ends by itself, and when Klefki itself ends while it runs
+    /// (it returns, is interrupted or its terminal closes; on Windows however it ends). For runs that start servers,
+    /// such as `mcp get`: Claude ends the server it started, not what that server started. Other runs leave what
+    /// they started alone, as Claude may start something on purpose that outlives it.
+    pub end_leftovers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,15 +66,19 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> io::Result<RunOutput> {
         cmd.current_dir(cwd);
     }
 
-    let (mut child, tree) = tree::spawn(&mut cmd)?;
+    let (mut child, tree) = tree::spawn(&mut cmd, spec.end_leftovers)?;
     let stdout = Capture::start(child.stdout.take(), spec.max_output);
     let stderr = Capture::start(child.stderr.take(), spec.max_output);
 
     let deadline = Instant::now() + spec.timeout;
     let mut timed_out = false;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+        if tree::has_ended(&mut child)? {
+            if spec.end_leftovers {
+                // Not waited for yet, so the tree still has its id.
+                tree.kill();
+            }
+            break Some(child.wait()?);
         }
         if Instant::now() >= deadline {
             timed_out = true;
@@ -152,7 +161,8 @@ impl Capture {
 mod tests {
     use super::*;
     use crate::cli::testutil::{
-        fake_claude, gone_soon, pid_alive, process_tree, tree_pids, write_scenario,
+        end_pid, fake_claude, gone_soon, pid_alive, process_tree, process_tree_left_behind,
+        tree_pids, write_scenario,
     };
     use sha2::{Digest, Sha256};
     use std::time::Instant;
@@ -192,6 +202,7 @@ mod tests {
                 env: &env,
                 timeout,
                 max_output: max,
+                end_leftovers: false,
             })
         }
 
@@ -301,6 +312,7 @@ mod tests {
                 env: &env,
                 timeout,
                 max_output: 1000,
+                end_leftovers: false,
             })
             .unwrap();
             assert!(out.timed_out);
@@ -314,6 +326,190 @@ mod tests {
                 assert!(gone_soon(pid), "process {pid} (depth {depth}) still runs");
             }
         }
+    }
+
+    /// Runs `program` as a check would (or, with `end_leftovers` false, as any other run).
+    fn run_tree(
+        program: &Path,
+        args: &[String],
+        env: &[(String, std::ffi::OsString)],
+        end_leftovers: bool,
+        timeout: Duration,
+    ) -> RunOutput {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let env: Vec<(&str, &OsStr)> = env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_os_str()))
+            .collect();
+        run(&RunSpec {
+            program,
+            args: &args,
+            cwd: None,
+            env: &env,
+            timeout,
+            max_output: 1000,
+            end_leftovers,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_check_ends_what_claude_left_running_when_it_ends_by_itself() {
+        // Regression: when Claude's own wait for a server ran out first, Claude ended the server but not what the
+        // server started (npx, then node), and those stayed after the check.
+        for depth in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let (program, args, env) = process_tree_left_behind(&pids, depth);
+            let out = run_tree(&program, &args, &env, true, SECS);
+            assert!(!out.timed_out, "{out:?}");
+            assert_eq!(out.exit_code, Some(0), "{out:?}");
+            for pid in tree_pids(&pids, depth as usize + 1) {
+                assert!(gone_soon(pid), "process {pid} (depth {depth}) still runs");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_check_that_is_stopped_for_a_while_is_not_taken_for_ended() {
+        // Found in review: on macOS `waitid(WEXITED)` also reports a stopped process, which ended the check's group
+        // while Claude still ran and then waited for it without a timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid.txt");
+        let json = format!(
+            r#"{{"rules":[{{"args":[],"delay_ms":1500,"stdout_file":"out.txt","write_pid_to":{}}}]}}"#,
+            serde_json::to_string(&pid_file.display().to_string()).unwrap()
+        );
+        let f = fixture(&json, &[("out.txt", b"answered\n")]);
+        let pauser = std::thread::spawn(move || {
+            let until = Instant::now() + SECS;
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < until, "the check never started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let signal = |name: &str| {
+                Command::new("kill")
+                    .args([name, &pid.to_string()])
+                    .status()
+                    .unwrap()
+            };
+            signal("-STOP");
+            std::thread::sleep(Duration::from_millis(500));
+            signal("-CONT");
+        });
+        let env: Vec<(&str, &OsStr)> = vec![
+            ("FAKE_CLAUDE_SCENARIO", f.scenario.as_os_str()),
+            ("FAKE_CLAUDE_LOG", f.log.as_os_str()),
+        ];
+        let out = run(&RunSpec {
+            program: fake_claude(),
+            args: &["mcp", "get", "x"],
+            cwd: None,
+            env: &env,
+            timeout: SECS,
+            max_output: 1000,
+            end_leftovers: true,
+        })
+        .unwrap();
+        pauser.join().unwrap();
+        assert_eq!(
+            (out.exit_code, out.stdout.as_str()),
+            (Some(0), "answered\n"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn other_runs_leave_what_claude_started_alone() {
+        // Claude may start something on purpose that outlives it, such as an update.
+        let dir = tempfile::tempdir().unwrap();
+        let pids = dir.path().join("pids");
+        let (program, args, env) = process_tree_left_behind(&pids, 1);
+        let out = run_tree(&program, &args, &env, false, SECS);
+        assert_eq!(out.exit_code, Some(0), "{out:?}");
+        std::thread::sleep(Duration::from_millis(300));
+        // The run's own process ended; the one it started is still there.
+        let alive: Vec<u32> = tree_pids(&pids, 2)
+            .into_iter()
+            .filter(|&p| pid_alive(p))
+            .collect();
+        for &pid in &alive {
+            end_pid(pid);
+        }
+        assert_eq!(alive.len(), 1, "{alive:?}");
+    }
+
+    const END_DURING_CHECK: &str = "KLEFKI_TEST_END_DURING_CHECK";
+
+    #[test]
+    fn klefki_ending_during_a_check_ends_the_check_and_what_it_started() {
+        // Regression: closing Klefki, or klefki-cli returning or being interrupted, while a check ran left `claude`
+        // and its server running: they lead a process group (or job) of their own, which nothing ended.
+        let mut ways = vec!["exit"];
+        if cfg!(unix) {
+            ways.extend(["SIGINT", "SIGTERM", "SIGHUP"]);
+        }
+        for way in ways {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::runner::tests::ends_during_a_check",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(END_DURING_CHECK, way)
+                .env("KLEFKI_TEST_END_PIDS", &pids)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            let found = tree_pids(&pids, 2);
+            let left: Vec<u32> = found.into_iter().filter(|&p| !gone_soon(p)).collect();
+            for &pid in &left {
+                end_pid(pid);
+            }
+            assert!(left.is_empty(), "{way} ({status}): {left:?} still ran");
+        }
+    }
+
+    /// Does nothing in a normal test run. Run by `klefki_ending_during_a_check_ends_the_check_and_what_it_started`,
+    /// it starts a check of a process tree and, once the tree runs, ends itself the way it is told to.
+    #[test]
+    fn ends_during_a_check() {
+        let Ok(way) = std::env::var(END_DURING_CHECK) else {
+            return;
+        };
+        let pids = std::path::PathBuf::from(std::env::var_os("KLEFKI_TEST_END_PIDS").unwrap());
+        let (program, args, env) = process_tree(&pids, 1);
+        std::thread::spawn(move || run_tree(&program, &args, &env, true, SECS * 3));
+        tree_pids(&pids, 2);
+        #[cfg(unix)]
+        {
+            let signal = match way.as_str() {
+                "SIGINT" => Some(libc::SIGINT),
+                "SIGTERM" => Some(libc::SIGTERM),
+                "SIGHUP" => Some(libc::SIGHUP),
+                _ => None,
+            };
+            if let Some(signal) = signal {
+                // SAFETY: a plain system call that sends a signal to this process.
+                unsafe {
+                    libc::raise(signal);
+                }
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        }
+        let _ = way;
+        std::process::exit(0);
     }
 
     #[test]
@@ -334,6 +530,7 @@ mod tests {
             env: &[(PIPE_HOLDER, OsStr::new("parent"))],
             timeout: SECS,
             max_output: 100_000,
+            end_leftovers: false,
         })
         .unwrap();
         assert!(!out.timed_out);
@@ -407,6 +604,7 @@ mod tests {
                 env: &[("FAKE_CLAUDE_LOG", f.log.as_os_str())],
                 timeout: SECS,
                 max_output: 1000,
+                end_leftovers: false,
             })
             .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}");
@@ -425,6 +623,7 @@ mod tests {
             env: &[],
             timeout: SECS,
             max_output: 10,
+            end_leftovers: false,
         })
         .unwrap_err();
         assert!(
@@ -491,6 +690,7 @@ mod tests {
             env: &env,
             timeout: SECS,
             max_output: 1000,
+            end_leftovers: false,
         })
         .unwrap();
         let start = f
