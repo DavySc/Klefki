@@ -2,7 +2,7 @@
 //! functions of the snapshot and the answers, so they are tested without running anything. All text in a snapshot
 //! and in the engine's answers is already sanitised by core.
 use klefki_core::api::{
-    Approval, Hint, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind,
+    Approval, Hint, NameError, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -346,6 +346,18 @@ pub fn command_word(name: &str) -> String {
     }
 }
 
+/// Why Klefki does not pass `name` to Claude Code, as the rule it breaks.
+fn name_rule(name: &str, why: NameError) -> String {
+    match why {
+        NameError::Empty => "a name cannot be empty".to_owned(),
+        NameError::TooLong => "a name can be at most 64 characters".to_owned(),
+        NameError::BadChar(' ') => "a name cannot hold a space".to_owned(),
+        NameError::BadChar(c) => format!("a name can hold only A-Z a-z 0-9 _ -, not {c:?}"),
+        NameError::LeadingDash => "a name cannot start with a dash".to_owned(),
+        NameError::Reserved => format!("{name} is a reserved word"),
+    }
+}
+
 /// The status column and the message after it.
 fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
     match outcome {
@@ -379,7 +391,10 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
                     "to check it: klefki-cli status {}",
                     command_word(name.as_str())
                 ),
-                Err(why) => format!("its name cannot be checked: {why}"),
+                Err(why) => format!(
+                    "to check it, rename it in the repository's .mcp.json ({})",
+                    name_rule(&row.name, why)
+                ),
             };
             (
                 label.to_owned(),
@@ -629,28 +644,40 @@ mod tests {
             .find(|r| r.scope == Scope::Project)
             .unwrap()
             .clone();
-        for (name, offered) in [
-            ("docs", true),
-            ("my_server-2", true),
-            ("x$(echo INJECTED)", false),
-            ("x`echo INJECTED`", false),
-            ("-a$HOME", false),
-            ("-a;echo INJECTED", false),
-            ("a\"b", false),
-            ("my server", false),
-            ("constructor", false),
+        let long = "a".repeat(65);
+        for (name, said) in [
+            ("docs", "; to check it: klefki-cli status docs\n"),
+            (
+                "my_server-2",
+                "; to check it: klefki-cli status my_server-2\n",
+            ),
+            (
+                "x$(echo INJECTED)",
+                "(a name can hold only A-Z a-z 0-9 _ -, not '$')\n",
+            ),
+            ("x`echo INJECTED`", "not '`')\n"),
+            ("-a$HOME", "not '$')\n"),
+            ("-a;echo INJECTED", "not ';')\n"),
+            ("a\"b", "not '\"')\n"),
+            ("my server", "(a name cannot hold a space)\n"),
+            ("-x", "(a name cannot start with a dash)\n"),
+            ("constructor", "(constructor is a reserved word)\n"),
+            (&long, "(a name can be at most 64 characters)\n"),
         ] {
             row.name = name.to_owned();
             let text = status_text(&[(&row, Outcome::ProjectServer)], None);
-            let suggested = text.contains("klefki-cli status");
-            assert_eq!(suggested, offered, "{name}: {text}");
-            if offered {
+            let offered = said.starts_with("; to check it:");
+            assert_eq!(
+                text.contains("klefki-cli status"),
+                offered,
+                "{name}: {text}"
+            );
+            assert!(text.contains(said), "{name}: {text}");
+            if !offered {
                 assert!(
-                    text.contains(&format!("to check it: klefki-cli status {name}\n")),
-                    "{text}"
+                    text.contains("; to check it, rename it in the repository's .mcp.json ("),
+                    "{name}: {text}"
                 );
-            } else {
-                assert!(text.contains("cannot be checked"), "{name}: {text}");
             }
         }
     }

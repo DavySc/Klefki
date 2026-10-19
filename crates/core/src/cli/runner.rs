@@ -143,8 +143,8 @@ impl Capture {
         let _ = self
             .done
             .recv_timeout(until.saturating_duration_since(Instant::now()));
-        let mut guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        (std::mem::take(&mut guard.0), guard.1)
+        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.0.clone(), guard.1)
     }
 }
 
