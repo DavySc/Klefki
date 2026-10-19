@@ -125,28 +125,46 @@ fn sounds_secret(name: &str) -> bool {
 /// path or a `${VAR}` reference, and any argument shaped like a known credential (`sk-…`, `ghp_…`) or a URL with a
 /// password. Only for showing: the definition itself is never changed.
 pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    const HIDDEN: &str = "…";
+    rewritten_args(args, false, &mut |_, _| "…".to_owned())
+}
+
+/// The arguments [`shown_args`] hides, each replaced by what `hide` gives for it instead of `…`. `hide` gets the name
+/// the secret goes by (the flag before it, the `NAME=` or header name, the query parameter; empty when there is none)
+/// and the secret itself. With `keep_address`, an address that signs in keeps everything but its user name and
+/// password, which become one replacement: what an export writes, so the definition still says where it connects.
+pub(crate) fn rewritten_args<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    keep_address: bool,
+    hide: &mut dyn FnMut(&str, &str) -> String,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut after_secret_flag = false;
+    // The flag just before, which names what follows it (`--db`). Only a bare flag: `--token=abc` holds a value.
+    let mut flag = "";
     for arg in args {
         let shown = if after_secret_flag && !arg.starts_with('-') && hideable(arg) {
-            HIDDEN.to_owned()
-        } else if let Some(header) = shown_header(arg) {
+            hide(flag, arg)
+        } else if let Some(header) = rewritten_header(arg, hide) {
             header
         } else if let Some((flag, header)) = arg.split_once('=')
             && flag.starts_with('-')
-            && let Some(header) = shown_header(header)
+            && let Some(header) = rewritten_header(header, hide)
         {
             format!("{flag}={header}")
+        } else if let Some(address) = keep_address
+            .then(|| rewritten_address(arg, &mut |_, secret| hide(flag, secret)))
+            .flatten()
+        {
+            address
         } else if let Some((name, value)) = arg.split_once('=')
             && !name.is_empty()
             && !value.is_empty()
             && ((sounds_secret(name) && hideable(value)) || looks_secret(name, value))
         {
-            format!("{name}={HIDDEN}")
+            format!("{name}={}", hide(name, value))
         } else if looks_secret("", arg) {
-            HIDDEN.to_owned()
-        } else if let Some(url) = shown_query(arg) {
+            hide(flag, arg)
+        } else if let Some(url) = rewritten_query(arg, hide) {
             url
         } else {
             arg.to_owned()
@@ -155,15 +173,60 @@ pub(crate) fn shown_args<'a>(args: impl IntoIterator<Item = &'a str>) -> Vec<Str
             && !arg.contains('=')
             && sounds_secret(arg)
             && !names_a_setting(arg);
+        // Letters only: a flag with digits in it may carry a value of its own, which must not become a name.
+        flag = if arg.starts_with('-')
+            && arg.len() <= 40
+            && arg
+                .chars()
+                .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+        {
+            arg
+        } else {
+            ""
+        };
         out.push(shown);
     }
     out
 }
 
+/// An address (`scheme://…`) that signs in, with its user name and password replaced by what `hide` gives, and each
+/// secret query parameter too: `postgres://${DB}@db.example.com/x`. `None` when the address does not sign in.
+pub(crate) fn rewritten_address(
+    address: &str,
+    hide: &mut dyn FnMut(&str, &str) -> String,
+) -> Option<String> {
+    let at = address.find("://")? + 3;
+    let authority_end = at
+        + address[at..]
+            .find(['/', '?', '#'])
+            .unwrap_or(address.len() - at);
+    let (userinfo, _) = address[at..authority_end].rsplit_once('@')?;
+    if !looks_secret("", &address[..authority_end]) || userinfo.contains("${") {
+        return None;
+    }
+    let signed_out = format!(
+        "{}{}{}",
+        &address[..at],
+        hide("", userinfo),
+        &address[at + userinfo.len()..]
+    );
+    Some(rewritten_query(&signed_out, hide).unwrap_or(signed_out))
+}
+
+/// An address with each secret query or fragment parameter replaced by what `hide` gives: [`rewritten_query`] for
+/// a definition's `url`, together with the user name and password of one that signs in. `None` when nothing in it
+/// is a secret.
+pub(crate) fn rewritten_url(
+    address: &str,
+    hide: &mut dyn FnMut(&str, &str) -> String,
+) -> Option<String> {
+    rewritten_address(address, hide).or_else(|| rewritten_query(address, hide))
+}
+
 /// An HTTP header passed as one argument, as mcp-remote takes them (`--header "Authorization: Bearer <token>"`):
 /// `Name: …` when the name sounds secret, keeping a `Bearer`/`Basic`/`Token` scheme. `None` for anything else,
 /// including a value that is a `${VAR}` reference.
-fn shown_header(arg: &str) -> Option<String> {
+fn rewritten_header(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Option<String> {
     let (name, value) = arg.split_once(':')?;
     let value = value.trim();
     let is_name = !name.is_empty()
@@ -184,14 +247,14 @@ fn shown_header(arg: &str) -> Option<String> {
         return None;
     }
     Some(match scheme {
-        Some(scheme) => format!("{name}: {scheme} …"),
-        None => format!("{name}: …"),
+        Some(scheme) => format!("{name}: {scheme} {}", hide(name, credential)),
+        None => format!("{name}: {}", hide(name, credential)),
     })
 }
 
 /// An address with each query or fragment parameter that looks secret shown as `name=…`; the others stay, as
 /// they say which workspace or region it is. `None` when nothing in it is hidden.
-fn shown_query(arg: &str) -> Option<String> {
+fn rewritten_query(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Option<String> {
     let at = arg.find("://")? + 3;
     let start = at + arg[at..].find(['?', '#'])?;
     let mut out = arg[..start].to_owned();
@@ -208,7 +271,8 @@ fn shown_query(arg: &str) -> Option<String> {
             {
                 hid = true;
                 out.push_str(name);
-                out.push_str("=…");
+                out.push('=');
+                out.push_str(&hide(name, value));
             }
             _ => out.push_str(pair),
         }
@@ -240,7 +304,7 @@ fn hideable(value: &str) -> bool {
 }
 
 /// `name` as an environment variable name: upper case letters, digits and `_`, not starting with a digit.
-fn variable(name: &str) -> String {
+pub(crate) fn variable(name: &str) -> String {
     if name.eq_ignore_ascii_case("authorization")
         || name.eq_ignore_ascii_case("proxy-authorization")
     {

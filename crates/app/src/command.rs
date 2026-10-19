@@ -29,6 +29,8 @@ pub enum Action {
     MigrateLegacy,
     /// Sign in to the selected server, or sign in again.
     SignIn,
+    /// Export the selected servers, or every server in the list.
+    Export,
 }
 
 pub struct Entry {
