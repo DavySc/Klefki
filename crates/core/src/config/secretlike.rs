@@ -3,11 +3,12 @@
 //! sit in `~/.claude.json`. Only a hint; nothing here changes a value or keeps one.
 
 /// The value to write instead of `value` for the variable or header called `name`, when `value` looks like a
-/// secret that was typed in. `None` for an empty value, one that already is a `${VAR}` reference, the hidden
-/// placeholder, and anything that does not look like a secret.
+/// secret that was typed in. `None` for an empty value, one that is only `${VAR}` references, the hidden
+/// placeholder, and anything that does not look like a secret. A value that mixes a reference with text of its own
+/// (`postgres://u:pw@${HOST}/db`) is judged by that text.
 pub(crate) fn suggestion(name: &str, value: &str) -> Option<String> {
     let value = value.trim();
-    if value.is_empty() || value == super::entry::MASK || value.contains("${") {
+    if value.is_empty() || value == super::entry::MASK {
         return None;
     }
     // "Bearer abc": the scheme stays, the credential goes.
@@ -17,7 +18,7 @@ pub(crate) fn suggestion(name: &str, value: &str) -> Option<String> {
         }
         _ => (None, value),
     };
-    if !looks_secret(name, credential) {
+    if only_references(name, credential) || !looks_secret(name, credential) {
         return None;
     }
     let reference = format!("${{{}}}", variable(name));
@@ -27,7 +28,87 @@ pub(crate) fn suggestion(name: &str, value: &str) -> Option<String> {
     })
 }
 
-const SCHEMES: [&str; 3] = ["Bearer", "Basic", "Token"];
+pub(crate) const SCHEMES: [&str; 3] = ["Bearer", "Basic", "Token"];
+
+/// Whether `value` is nothing but `${NAME}` references (each perhaps with a `:-default`), with no text of its own that
+/// could be a secret. A default is text too: one that would be a secret for `name` does not count.
+pub(crate) fn only_references(name: &str, value: &str) -> bool {
+    let mut rest = value.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(inner) = rest.strip_prefix("${") else {
+            return false;
+        };
+        let Some(end) = inner.find('}') else {
+            return false;
+        };
+        let (variable, default) = match inner[..end].split_once(":-") {
+            Some((variable, default)) => (variable, default),
+            None => (&inner[..end], ""),
+        };
+        let named = !variable.is_empty()
+            && variable
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let secret_default = !default.is_empty()
+            && (looks_secret(name, default) || (sounds_secret(name) && hideable(default)));
+        if !named || secret_default {
+            return false;
+        }
+        rest = inner[end + 1..].trim_start();
+    }
+    true
+}
+
+/// Whether `value`, set under `name`, is plainly a setting rather than a secret, so an export may keep it as the
+/// default of its reference (`${LOG_LEVEL:-debug}`): a name that does not sound secret, and a short value that is a
+/// number, a word of letters (`debug`, `true`), a path, or an address that neither signs in nor has a query.
+pub(crate) fn plain_setting(name: &str, value: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 64
+        || value.contains(['}', '$', '"', '\\'])
+        || value.contains(char::is_whitespace)
+        || sounds_secret(name)
+        // Short forms that `sounds_secret` leaves alone, as a flag or header could mean something else by them.
+        || ["pass", "pin", "pw", "sig", "salt", "private", "session", "jwt"]
+            .iter()
+            .any(|p| lower.contains(p))
+        || looks_secret(name, value)
+    {
+        return false;
+    }
+    // Short, as settings are: a long word or number is more likely a password or a PIN.
+    let number = value.len() <= 10
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+    let word = value.len() <= 16
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_');
+    let path = value.starts_with(['/', '~', '.']) || value.get(1..3) == Some(":/");
+    let address = value.contains("://") && !value.contains(['@', '?', '#']);
+    number || word || path || address
+}
+
+/// Whether some word of `text` (split at spaces, quotes, brackets and the like) has a known credential's shape
+/// (`sk-…`, `ghp_…`) or is an address that signs in: what a shell line or a JSON argument
+/// (`--config '{"apiKey":"sk-…"}'`) gives away. Only shapes, so a digest or an id stays readable.
+pub(crate) fn has_secret_word(text: &str) -> bool {
+    text.split(|c: char| c.is_whitespace() || "\"'`{}[](),;=<>".contains(c))
+        .any(|word| is_known_shape(word) || (word.contains("://") && looks_secret("", word)))
+}
+
+/// A long run of letters and digits with both in it, such as a key in an address's path: 24 characters or more.
+fn is_long_token(word: &str) -> bool {
+    word.len() >= 24
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && word.chars().any(|c| c.is_ascii_digit())
+        && word.chars().any(|c| c.is_ascii_alphabetic())
+}
 const PREFIXES: [&str; 16] = [
     "sk-",
     "sk_live_",
@@ -166,6 +247,9 @@ pub(crate) fn rewritten_args<'a>(
             hide(flag, arg)
         } else if let Some(url) = rewritten_query(arg, hide) {
             url
+        } else if has_secret_word(arg) && !only_references("", arg) {
+            // A credential inside a longer argument, such as JSON: the whole argument goes.
+            hide(flag, arg)
         } else {
             arg.to_owned()
         };
@@ -201,7 +285,9 @@ pub(crate) fn rewritten_address(
             .find(['/', '?', '#'])
             .unwrap_or(address.len() - at);
     let (userinfo, _) = address[at..authority_end].rsplit_once('@')?;
-    if !looks_secret("", &address[..authority_end]) || userinfo.contains("${") {
+    if !looks_secret("", &address[..authority_end])
+        || userinfo.split(':').all(|part| only_references("", part))
+    {
         return None;
     }
     let signed_out = format!(
@@ -233,7 +319,7 @@ fn rewritten_header(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Op
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !is_name || value.is_empty() || value.starts_with("//") || value.contains("${") {
+    if !is_name || value.is_empty() || value.starts_with("//") {
         return None;
     }
     let (scheme, credential) = match value.split_once(' ') {
@@ -242,6 +328,9 @@ fn rewritten_header(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Op
         }
         _ => (None, value),
     };
+    if only_references(name, credential) {
+        return None;
+    }
     // Any name, when the value has a scheme or a credential's shape.
     if !sounds_secret(name) && scheme.is_none() && !is_known_shape(credential) {
         return None;
@@ -252,13 +341,32 @@ fn rewritten_header(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Op
     })
 }
 
-/// An address with each query or fragment parameter that looks secret shown as `name=…`; the others stay, as
+/// An address with each part that looks secret replaced by what `hide` gives: a path segment shaped like a key
+/// (`/s/sk-live-…/mcp`, named `url token`), and a query or fragment parameter (`name=…`). The other parts stay, as
 /// they say which workspace or region it is. `None` when nothing in it is hidden.
 fn rewritten_query(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Option<String> {
     let at = arg.find("://")? + 3;
-    let start = at + arg[at..].find(['?', '#'])?;
-    let mut out = arg[..start].to_owned();
+    let path_at = at + arg[at..].find(['/', '?', '#']).unwrap_or(arg.len() - at);
+    let start = path_at
+        + arg[path_at..]
+            .find(['?', '#'])
+            .unwrap_or(arg.len() - path_at);
+    let mut out = arg[..path_at].to_owned();
     let mut hid = false;
+    for (i, segment) in arg[path_at..start].split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if !segment.is_empty()
+            && !only_references("", segment)
+            && (looks_secret("", segment) || is_long_token(segment))
+        {
+            hid = true;
+            out.push_str(&hide("url token", segment));
+        } else {
+            out.push_str(segment);
+        }
+    }
     for piece in arg[start..].split_inclusive(['?', '&', '#']) {
         let (pair, separator) = match piece.strip_suffix(['?', '&', '#']) {
             Some(pair) => (pair, &piece[pair.len()..]),
@@ -267,6 +375,7 @@ fn rewritten_query(arg: &str, hide: &mut dyn FnMut(&str, &str) -> String) -> Opt
         match pair.split_once('=') {
             Some((name, value))
                 if !value.is_empty()
+                    && !only_references(name, value)
                     && ((sounds_secret(name) && hideable(value)) || looks_secret(name, value)) =>
             {
                 hid = true;
@@ -294,7 +403,7 @@ fn names_a_setting(flag: &str) -> bool {
 /// A value after a secret-sounding name that is worth hiding: not a reference, not a path, not a plain word such
 /// as `true`.
 fn hideable(value: &str) -> bool {
-    !(value.contains("${")
+    !(only_references("", value)
         || value.starts_with(['/', '~', '.'])
         || value.contains('\\')
         || value.get(1..3) == Some(":/")
@@ -445,6 +554,29 @@ mod tests {
         assert_eq!(
             shown(&["--header", "X-Region: eu-west-1"]),
             "--header X-Region: eu-west-1"
+        );
+    }
+
+    #[test]
+    fn a_key_in_an_address_path_or_beside_a_reference_is_hidden_from_a_shown_command_line() {
+        // Review of #12.
+        let shown = |args: &[&str]| shown_args(args.iter().copied()).join(" ");
+        assert_eq!(
+            shown(&[
+                "mcp-remote",
+                "https://mcp.example.com/s/sk-live-abcdef1234567890/sse"
+            ]),
+            "mcp-remote https://mcp.example.com/s/…/sse"
+        );
+        assert_eq!(shown(&["--token", "${P}sk-abcdef1234567890"]), "--token …");
+        assert_eq!(shown(&["--token", "${P}"]), "--token ${P}");
+        assert_eq!(
+            shown(&["--config", "{\"apiKey\":\"sk-abcdef1234567890\"}"]),
+            "--config …"
+        );
+        assert_eq!(
+            shown(&["https://mcp.example.com/v1/workspaces/team-blue/mcp"]),
+            "https://mcp.example.com/v1/workspaces/team-blue/mcp"
         );
     }
 

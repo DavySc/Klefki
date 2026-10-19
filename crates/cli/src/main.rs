@@ -72,10 +72,23 @@ fn export(names: &[String]) -> u8 {
     for note in &exported.notes {
         eprintln!("note: {note}");
     }
-    if !exported.variables.is_empty() {
+    let (to_set, defaults): (Vec<_>, Vec<_>) =
+        exported.variables.iter().partition(|v| v.default.is_none());
+    if !to_set.is_empty() {
         eprintln!("Set these variables where the servers are added:");
-        for variable in &exported.variables {
+        for variable in to_set {
             eprintln!("  {}  ({})", variable.name, variable.replaces.join("; "));
+        }
+    }
+    if !defaults.is_empty() {
+        eprintln!("Plain settings kept as defaults (set the variable to change one):");
+        for variable in defaults {
+            let default = variable.default.as_deref().unwrap_or_default();
+            eprintln!(
+                "  {}={default}  ({})",
+                variable.name,
+                variable.replaces.join("; ")
+            );
         }
     }
     match out(&format!("{}\n", exported.text)) {

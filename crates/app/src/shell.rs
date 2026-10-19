@@ -1394,7 +1394,7 @@ impl ShellApp {
             add(
                 icon::EXPORT,
                 format!("Export {what}"),
-                "As one mcpServers block, secrets left out".into(),
+                "One mcpServers block; secrets and settings as ${VAR} references".into(),
                 None,
                 command::Action::Export,
             );
@@ -1480,7 +1480,7 @@ impl ShellApp {
                 add(
                     icon::EXPORT,
                     "Export the servers in the list".into(),
-                    "As one mcpServers block, secrets left out".into(),
+                    "One mcpServers block; secrets and settings as ${VAR} references".into(),
                     None,
                     command::Action::Export,
                 );
@@ -1664,10 +1664,29 @@ impl ShellApp {
             [one] => servers[*one].name.clone(),
             _ => format!("{} servers", rows.len()),
         };
+        let names: Vec<&str> = rows.iter().map(|&i| servers[i].name.as_str()).collect();
+        // Which rows the search decided, said plainly: the two cases work differently.
+        let search = self.search.trim();
+        let scope = if search.is_empty() {
+            None
+        } else if self.selected.is_empty() {
+            Some(format!(
+                "Only the servers that match \u{201c}{search}\u{201d}."
+            ))
+        } else {
+            let shown = self.visible();
+            match rows.iter().filter(|i| !shown.contains(i)).count() {
+                0 => None,
+                1 => Some("Includes 1 selected server the search hides.".to_owned()),
+                n => Some(format!("Includes {n} selected servers the search hides.")),
+            }
+        };
         self.exporting = Some(ExportView {
             what,
+            names: (rows.len() > 1).then(|| names_in_a_line(&names)),
+            scope,
             result: None,
-            copied: false,
+            copied_at: None,
         });
         self.exports_pending += 1;
         self.send(Command::Export(
@@ -1680,7 +1699,12 @@ impl ShellApp {
         let Some(view) = &mut self.exporting else {
             return;
         };
-        let mut copy = view.result.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let now = ctx.input(|i| i.time);
+        // Enter copies, unless a button has the keyboard: Enter is that button's then (Close closes).
+        let mut copy = view.result.is_some()
+            && ctx.memory(|m| m.focused().is_none())
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut copy_names = false;
         let mut close = false;
         let muted = |ui: &mut Ui, text: &str| {
             ui.add(egui::Label::new(RichText::new(text).color(pal.text_muted)).wrap());
@@ -1689,55 +1713,73 @@ impl ShellApp {
         let modal = egui::Modal::new(egui::Id::new("export_dialog")).show(ctx, |ui| {
             ui.set_width(640.0_f32.min(screen.width() - 48.0));
             ui.heading(format!("Export {}", view.what));
-            muted(
-                ui,
-                "One mcpServers block, as a .mcp.json has it. Paste it into Add on another computer, or into a project's .mcp.json.",
-            );
-            ui.add_space(8.0);
+            if let Some(names) = &view.names {
+                muted(ui, names);
+            }
+            if let Some(scope) = &view.scope {
+                ui.add(egui::Label::new(RichText::new(scope).color(pal.warn)).wrap());
+            }
+            ui.add_space(6.0);
             match &view.result {
                 // Text, not a spinner: an animation would repaint every frame, and reading takes milliseconds.
                 None => {
                     ui.label("Reading the definitions…");
                 }
                 Some(result) => {
+                    let (to_set, defaults): (Vec<_>, Vec<_>) =
+                        result.variables.iter().partition(|v| v.default.is_none());
                     if result.variables.is_empty() {
-                        ui.label("No values needed leaving out.");
+                        muted(ui, "Nothing was left out: no value needed a reference.");
                     } else {
-                        ui.label(RichText::new("Secrets stay behind").strong());
-                        muted(
-                            ui,
-                            "Every environment and header value, and anything else that looks like a secret, is written as a ${VAR} reference. Set these variables where you add the servers:",
-                        );
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical()
+                        let title = match (to_set.len(), defaults.len()) {
+                            (0, d) => format!("{d} settings as references, with their values as defaults"),
+                            (1, _) => "1 variable to set where you add them".to_owned(),
+                            (n, _) => format!("{n} variables to set where you add them"),
+                        };
+                        // Open when there is room; on a small window the block gets the room first.
+                        egui::CollapsingHeader::new(RichText::new(title).strong())
                             .id_salt("export_variables")
-                            .max_height((screen.height() * 0.2).min(132.0))
+                            .default_open(screen.height() >= 640.0)
                             .show(ui, |ui| {
-                                // Lines of text, not rows of controls: no control height between them.
-                                ui.spacing_mut().interact_size.y = 0.0;
-                                for variable in &result.variables {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new(&variable.name).strong().color(pal.key),
-                                        );
-                                        ui.label(
-                                            RichText::new(variable.replaces.join("; "))
-                                                .color(pal.text_muted),
-                                        );
+                                muted(
+                                    ui,
+                                    "Values that may be secrets are written as ${NAME}; plain settings keep their value as ${NAME:-value}.",
+                                );
+                                egui::ScrollArea::vertical()
+                                    .id_salt("export_variable_list")
+                                    .max_height((screen.height() * 0.2).min(132.0))
+                                    .show(ui, |ui| {
+                                        // Lines of text, not rows of controls: no control height between them.
+                                        ui.spacing_mut().interact_size.y = 0.0;
+                                        for variable in to_set.iter().chain(&defaults) {
+                                            ui.horizontal_wrapped(|ui| {
+                                                let name = RichText::new(&variable.name).strong();
+                                                ui.label(match &variable.default {
+                                                    None => name.color(pal.key),
+                                                    Some(_) => name,
+                                                });
+                                                if let Some(default) = &variable.default {
+                                                    ui.label(format!("= {default} (default)"));
+                                                }
+                                                ui.label(
+                                                    RichText::new(variable.replaces.join("; "))
+                                                        .color(pal.text_muted),
+                                                );
+                                            });
+                                        }
                                     });
-                                }
                             });
                     }
                     for note in &result.notes {
                         ui.add(egui::Label::new(RichText::new(note).color(pal.warn)).wrap());
                     }
-                    ui.add_space(8.0);
+                    ui.add_space(6.0);
                     // The block takes what is left of the window's height, so the buttons stay on screen.
                     let used = ui.cursor().top() - ui.min_rect().top();
-                    let room = screen.height() - 48.0 - used - 80.0;
+                    let room = screen.height() - 64.0 - used - 80.0;
                     egui::ScrollArea::vertical()
                         .id_salt("export_block")
-                        .max_height(room.clamp(64.0, 280.0))
+                        .max_height(room.clamp(96.0, 320.0))
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::multiline(&mut result.text.as_str())
@@ -1749,7 +1791,10 @@ impl ShellApp {
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let label = if view.copied { "Copied" } else { "Copy" };
+                let copied = view
+                    .copied_at
+                    .is_some_and(|at| now - at < COPIED_SECS);
+                let label = if copied { "Copied" } else { "Copy" };
                 let button = egui::Button::new(RichText::new(label).strong().color(pal.on_bright))
                     .fill(pal.primary)
                     .min_size(egui::vec2(96.0, 34.0));
@@ -1758,15 +1803,40 @@ impl ShellApp {
                     .on_hover_text("Copy the block (Enter)")
                     .on_disabled_hover_text("Reading the definitions…")
                     .clicked();
+                if view
+                    .result
+                    .as_ref()
+                    .is_some_and(|r| r.variables.iter().any(|v| v.default.is_none()))
+                {
+                    copy_names |= ui
+                        .add(egui::Button::new("Copy names").min_size(egui::vec2(80.0, 34.0)))
+                        .on_hover_text("Copy the variables to set, one NAME= a line")
+                        .clicked();
+                }
                 close |= ui
                     .add(egui::Button::new("Close").min_size(egui::vec2(80.0, 34.0)))
                     .on_hover_text("Esc")
                     .clicked();
             });
         });
-        if copy && let Some(result) = &view.result {
-            ctx.copy_text(result.text.clone());
-            view.copied = true;
+        if let Some(result) = &view.result {
+            if copy {
+                ctx.copy_text(result.text.clone());
+            }
+            if copy_names {
+                let lines: String = result
+                    .variables
+                    .iter()
+                    .filter(|v| v.default.is_none())
+                    .map(|v| format!("{}=\n", v.name))
+                    .collect();
+                ctx.copy_text(lines);
+            }
+            if copy || copy_names {
+                view.copied_at = Some(now);
+                // Back to "Copy" once the confirmation has been seen; no repaint every frame meanwhile.
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
+            }
         }
         if close || closed_on_purpose(&modal) {
             self.exporting = None;
@@ -5045,9 +5115,34 @@ fn matches_search(s: &ServerRow, q: &str) -> bool {
 struct ExportView {
     /// For the title: the one server's name, or `3 servers`.
     what: String,
+    /// The servers' names in one line, when there is more than one: what is exported, without recalling the list.
+    names: Option<String>,
+    /// How the search decided which servers these are, when it did.
+    scope: Option<String>,
     result: Option<Exported>,
-    /// The block was copied: the button says so.
-    copied: bool,
+    /// When something was last copied: the button says "Copied" for a few seconds.
+    copied_at: Option<f64>,
+}
+
+/// How long the Copy button says "Copied".
+const COPIED_SECS: f64 = 4.0;
+
+/// `a, b and c`; past eight names, `a, b, … and 12 more`.
+fn names_in_a_line(names: &[&str]) -> String {
+    const SHOWN: usize = 8;
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        _ if names.len() <= SHOWN => {
+            let (last, rest) = names.split_last().expect("not empty");
+            format!("{} and {last}", rest.join(", "))
+        }
+        _ => format!(
+            "{} and {} more",
+            names[..SHOWN].join(", "),
+            names.len() - SHOWN
+        ),
+    }
 }
 
 /// What the Duplicate dialog holds: the copy's name and where it goes.
@@ -5068,12 +5163,12 @@ const ACTIONS: [(&str, &str); 9] = [
     (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
     (icon::COPY, "Duplicate (Ctrl+D)"),
     (icon::ARROW_FAT_LINES_RIGHT, "Move (Ctrl+Shift+M)"),
-    // Its hover text says what it exports: the selection, or the whole list.
-    (icon::EXPORT, ""),
     (icon::SIGN_IN, "Sign in"),
     (icon::TOGGLE_RIGHT, "Turn on"),
     (icon::TOGGLE_LEFT, "Turn off"),
     (icon::TRASH, "Delete (Del)"),
+    // Last: it changes nothing. Its hover text says what it exports: the selection, or the whole list.
+    (icon::EXPORT, ""),
 ];
 
 /// What the Move dialog holds: the one place the server goes.
@@ -11282,6 +11377,7 @@ mod tests {
         h.get_by_label_contains("move through the list");
     }
 
+    /// An answer to Export. A variable's name ending in `=value` is a plain setting with that default.
     fn exported_block(text: &str, variables: &[(&str, &str)], notes: &[&str]) -> Event {
         Event::Exported(Exported {
             text: text.to_owned(),
@@ -11289,9 +11385,16 @@ mod tests {
             left_out: 0,
             variables: variables
                 .iter()
-                .map(|(name, replaces)| klefki_core::api::Variable {
-                    name: (*name).to_owned(),
-                    replaces: vec![(*replaces).to_owned()],
+                .map(|(name, replaces)| {
+                    let (name, default) = match name.split_once('=') {
+                        Some((name, default)) => (name, Some(default.to_owned())),
+                        None => (*name, None),
+                    };
+                    klefki_core::api::Variable {
+                        name: name.to_owned(),
+                        default,
+                        replaces: vec![(*replaces).to_owned()],
+                    }
                 })
                 .collect(),
             notes: notes.iter().map(|n| (*n).to_owned()).collect(),
@@ -11336,20 +11439,31 @@ mod tests {
             ])]
         );
         h.get_by_label("Export 3 servers");
+        // Which ones, without recalling the list.
+        h.get_by_label("alpha, beta and gamma");
         h.get_by_label("Reading the definitions…");
         let block = "{\n  \"mcpServers\": {}\n}";
         engine
             .events
             .send(exported_block(
                 block,
-                &[("GITHUB_TOKEN", "beta: env GITHUB_TOKEN")],
+                &[
+                    ("GITHUB_TOKEN", "beta: env GITHUB_TOKEN"),
+                    ("LOG_LEVEL=debug", "gamma: env LOG_LEVEL"),
+                ],
                 &["beta signs in with OAuth: its client secret is not in the block. Type it in when you add it."],
             ))
             .unwrap();
         h.run();
-        h.get_by_label("Secrets stay behind");
+        h.get_by_label("1 variable to set where you add them");
         h.get_by_label("GITHUB_TOKEN");
         h.get_by_label("beta: env GITHUB_TOKEN");
+        h.get_by_label("LOG_LEVEL");
+        h.get_by_label("= debug (default)");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy names")
+            .click();
+        h.step();
+        assert_eq!(copied(&h), ["GITHUB_TOKEN=\n"], "only the ones to set");
         h.get_by_label_contains("its client secret is not in the block");
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy")
             .click();
@@ -11386,13 +11500,26 @@ mod tests {
         // Nothing to copy yet: Enter does nothing.
         h.key_press(egui::Key::Enter);
         h.run();
-        assert!(!h.state().exporting.as_ref().unwrap().copied);
+        assert!(h.state().exporting.as_ref().unwrap().copied_at.is_none());
         engine.events.send(exported_block("{}", &[], &[])).unwrap();
         h.run();
-        h.get_by_label("No values needed leaving out.");
+        h.get_by_label("Nothing was left out: no value needed a reference.");
+        assert!(h.query_by_label("Copy names").is_none(), "no names to copy");
         h.key_press(egui::Key::Enter);
-        h.run();
+        h.step();
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Copied");
+        // The confirmation goes after a few seconds, so a second copy is confirmed again.
+        for _ in 0..20 {
+            h.step();
+        }
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy");
+        // Enter on a focused Close is Close's: it closes and copies nothing.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Close")
+            .focus();
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.step();
+        assert!(copied(&h).is_empty(), "{:?}", copied(&h));
         h.key_press(egui::Key::Escape);
         h.run();
         assert!(h.state().exporting.is_none());
@@ -11458,6 +11585,37 @@ mod tests {
         h.run();
         assert_eq!(drain(&engine), vec![Command::Export(vec![rows[1].id()])]);
         h.get_by_label("Export beta");
+        h.get_by_label("Includes 1 selected server the search hides.");
+    }
+
+    #[test]
+    fn export_says_when_the_search_narrowed_the_list() {
+        let (mut h, engine) = live_harness();
+        let rows = vec![
+            live_row("alpha", Scope::User, None),
+            live_row("alps", Scope::User, None),
+            live_row("beta", Scope::User, None),
+        ];
+        engine.events.send(snapshot_of(rows.clone())).unwrap();
+        h.run();
+        h.state_mut().search = "alp".into();
+        h.run();
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        h.get_by_label("Export 2 servers");
+        h.get_by_label("alpha and alps");
+        h.get_by_label("Only the servers that match \u{201c}alp\u{201d}.");
+    }
+
+    #[test]
+    fn names_in_a_line_counts_past_eight() {
+        assert_eq!(names_in_a_line(&["a", "b"]), "a and b");
+        let many: Vec<String> = (1..=10).map(|i| format!("s{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(
+            names_in_a_line(&many),
+            "s1, s2, s3, s4, s5, s6, s7, s8 and 2 more"
+        );
     }
 
     #[test]

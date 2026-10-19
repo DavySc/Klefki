@@ -6,7 +6,10 @@
 use crate::api::{Scope, ServerId, Snapshot};
 use crate::config::ConfigPaths;
 use crate::config::inventory::{self, FileKey, FileKeys};
-use crate::config::secretlike::{rewritten_args, rewritten_url, suggestion, variable};
+use crate::config::secretlike::{
+    SCHEMES, has_secret_word, only_references, plain_setting, rewritten_args, rewritten_url,
+    suggestion, variable,
+};
 use crate::sanitize::{is_bad, shown};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -28,10 +31,14 @@ pub struct Exported {
     pub notes: Vec<String>,
 }
 
-/// A `${NAME}` reference the export wrote instead of a value: set `NAME` where the block is used.
+/// A `${NAME}` reference the export wrote instead of a value: set `NAME` where the block is used, or, for a plain
+/// setting, leave it to its default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Variable {
     pub name: String,
+    /// The value it stands for when it is plainly a setting, kept as the reference's default (`${LOG_LEVEL:-debug}`)
+    /// so the server works as before without it being set. `None` for anything that may be a secret: it must be set.
+    pub default: Option<String>,
     /// What it stands for: `github: env GITHUB_TOKEN`, `docs: argument after --api-key`.
     pub replaces: Vec<String>,
 }
@@ -136,6 +143,7 @@ pub(crate) fn export(sources: Vec<Source>) -> Exported {
         }
         servers.insert(name, Value::Object(exported));
     }
+    notes.append(&mut refs.notes);
     let count = servers.len();
     let block = Value::Object(Map::from_iter([(
         "mcpServers".to_owned(),
@@ -198,6 +206,8 @@ struct References {
     /// definition.
     taken: HashMap<String, Option<u64>>,
     variables: Vec<Variable>,
+    /// Values that mixed a reference with text of their own, which were replaced whole.
+    notes: Vec<String>,
 }
 
 impl References {
@@ -221,6 +231,23 @@ impl References {
 
     /// `${NAME}` for `value`, named after `hint` (a variable, header or flag name), and noted as replacing `what`.
     fn reference(&mut self, hint: &str, value: &str, what: String) -> String {
+        self.reference_with(hint, value, what, false)
+    }
+
+    /// [`reference`](Self::reference), or `${NAME:-value}` when `keep_plain` and the value is plainly a setting.
+    fn reference_with(
+        &mut self,
+        hint: &str,
+        value: &str,
+        what: String,
+        keep_plain: bool,
+    ) -> String {
+        let default = (keep_plain && plain_setting(hint, value)).then(|| value.to_owned());
+        if value.contains("${") {
+            self.notes.push(format!(
+                "{what} mixed a reference with text of its own, which may be a secret: all of it is now one variable."
+            ));
+        }
         let mut hasher = DefaultHasher::new();
         value.hash(&mut hasher);
         let fingerprint = hasher.finish();
@@ -238,10 +265,14 @@ impl References {
             Some(_) => {}
             None => self.variables.push(Variable {
                 name: name.clone(),
+                default: default.clone(),
                 replaces: vec![what],
             }),
         }
-        format!("${{{name}}}")
+        match default {
+            Some(default) => format!("${{{name}:-{default}}}"),
+            None => format!("${{{name}}}"),
+        }
     }
 
     /// The definition of `server` with every value that may be a secret replaced by a reference.
@@ -262,21 +293,20 @@ impl References {
                         let Value::String(text) = value else {
                             continue;
                         };
-                        if text.contains("${") {
-                            continue;
-                        }
                         let what = format!("{server}: header {}", shown(name));
                         // "Bearer abc": the scheme stays, the credential goes.
                         *value = Value::String(match text.trim().split_once(' ') {
                             Some((scheme, credential))
-                                if ["Bearer", "Basic", "Token"]
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(scheme)) =>
+                                if SCHEMES.iter().any(|s| s.eq_ignore_ascii_case(scheme)) =>
                             {
+                                if only_references(name, credential) {
+                                    continue;
+                                }
                                 let reference = self.reference(name, credential.trim(), what);
                                 format!("{scheme} {reference}")
                             }
-                            _ => self.reference(name, text, what),
+                            _ if only_references(name, text) => continue,
+                            _ => self.reference_with(name, text, what, true),
                         });
                     }
                 }
@@ -321,8 +351,15 @@ impl References {
                         *url = written;
                     }
                 }
-                // What it runs, and how it is reached: settings, not secrets.
-                ("type" | "command" | "headersHelper", _) => {}
+                ("type", _) => {}
+                // What it runs: a program, or for headersHelper a whole shell line, which can hold a token. One with a
+                // credential in it is replaced whole, as a partly rewritten shell line is hard to trust.
+                (key @ ("command" | "headersHelper"), Value::String(line)) => {
+                    if has_secret_word(line) && !only_references("", line) {
+                        let what = format!("{server}: {key}");
+                        *line = self.reference(key, line, what);
+                    }
+                }
                 (key, value) => self.settings(server, key, value),
             }
         }
@@ -356,11 +393,16 @@ impl References {
     /// An environment value as a reference, unless it already is one: `None` to leave it.
     fn whole(&mut self, value: &Value, name: &str, what: impl FnOnce() -> String) -> Option<Value> {
         let text = match value {
-            Value::String(s) if s.contains("${") => return None,
+            Value::String(s) if only_references(name, s) => return None,
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        Some(Value::String(self.reference(name, &text, what())))
+        Some(Value::String(self.reference_with(
+            name,
+            &text,
+            what(),
+            true,
+        )))
     }
 }
 
@@ -386,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn every_environment_and_header_value_becomes_a_reference() {
+    fn every_environment_and_header_value_becomes_a_reference_with_plain_settings_as_defaults() {
         let out = export(vec![
             source(
                 "github",
@@ -403,9 +445,9 @@ mod tests {
             block(&out),
             json!({"mcpServers": {
                 "github": {"command": "npx", "args": ["-y", "gh-mcp"],
-                           "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}", "LOG_LEVEL": "${LOG_LEVEL}", "PORT": "${PORT}"}},
+                           "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}", "LOG_LEVEL": "${LOG_LEVEL:-debug}", "PORT": "${PORT:-8080}"}},
                 "gateway": {"type": "http", "url": "https://mcp.example.com/mcp",
-                            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}", "X-Team": "${X_TEAM}"}}
+                            "headers": {"Authorization": "Bearer ${AUTH_TOKEN}", "X-Team": "${X_TEAM:-blue}"}}
             }})
         );
         assert_eq!(out.servers, 2);
@@ -414,13 +456,14 @@ mod tests {
             ["GITHUB_TOKEN", "LOG_LEVEL", "PORT", "AUTH_TOKEN", "X_TEAM"]
         );
         assert_eq!(out.variables[3].replaces, ["gateway: header Authorization"]);
-        for secret in [
-            "ghp_abcdefghijklmnop1234",
-            "sk-abcdef1234567890",
-            "debug",
-            "blue",
-            "8080",
-        ] {
+        // Plain settings keep their value as the default, so the server works as before; secrets must be set.
+        let defaults: Vec<Option<&str>> =
+            out.variables.iter().map(|v| v.default.as_deref()).collect();
+        assert_eq!(
+            defaults,
+            [None, Some("debug"), Some("8080"), None, Some("blue")]
+        );
+        for secret in ["ghp_abcdefghijklmnop1234", "sk-abcdef1234567890"] {
             assert!(!out.text.contains(secret), "{secret} left in {}", out.text);
         }
     }
@@ -445,9 +488,130 @@ mod tests {
         // `TOKEN` and `HOME` may hold something else where the block is used: b's values get names of their own.
         assert_eq!(
             block["mcpServers"]["b"]["env"],
-            json!({"TOKEN": "${TOKEN_2}", "HOME": "${HOME_2}"})
+            json!({"TOKEN": "${TOKEN_2}", "HOME": "${HOME_2:-/home/other}"})
         );
         assert_eq!(names(&out), ["TOKEN_2", "HOME_2"]);
+    }
+
+    #[test]
+    fn a_value_that_mixes_a_reference_with_text_is_replaced_whole() {
+        // Review of #12: any `${` made the whole value count as a reference, so the text beside it went out.
+        let out = export(vec![source(
+            "mixed",
+            json!({"type": "http", "url": "https://${USER}:hunter2pw@a.example.com/sse",
+                   "env": {"DATABASE_URL": "postgres://u:pw999secret@${HOST}/db",
+                           "API_KEY": "${API_KEY:-sk-live-abcdef1234567890}",
+                           "ONLY": "${A}${B:-plain}"},
+                   "headers": {"X-Api-Key": "${PREFIX}sk-abcdef1234567890",
+                               "Authorization": "Bearer ${ORG}.sk-abcdef1234567890",
+                               "X-Ref": "Bearer ${TOKEN}"},
+                   "args": ["--token", "${P}sk-abcdef1234567890", "--key=${K}abcdef123456"]}),
+        )]);
+        for secret in [
+            "hunter2pw",
+            "pw999secret",
+            "sk-live-abcdef",
+            "sk-abcdef1234567890",
+            "abcdef123456",
+        ] {
+            assert!(!out.text.contains(secret), "{secret} left in {}", out.text);
+        }
+        let block = block(&out);
+        let server = &block["mcpServers"]["mixed"];
+        // Nothing but references, a plain default included, stays as written.
+        assert_eq!(server["env"]["ONLY"], "${A}${B:-plain}");
+        assert_eq!(server["headers"]["X-Ref"], "Bearer ${TOKEN}");
+        assert_eq!(server["env"]["DATABASE_URL"], "${DATABASE_URL}");
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("mixed: env DATABASE_URL mixed a reference")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn a_key_in_an_address_path_a_shell_line_or_a_json_argument_becomes_a_reference() {
+        // Review of #12: these went out in clear.
+        let out = export(vec![
+            source(
+                "path",
+                json!({"type": "http", "url": "https://mcp.example.com/api/mcp/s/sk-live-abcdef1234567890/mcp"}),
+            ),
+            source(
+                "b64",
+                json!({"type": "sse", "url": "https://mcp.example.com/s/ZmFrZXNlY3JldHRva2VuMTIzNDU2Nzg5MA/sse"}),
+            ),
+            source(
+                "remote",
+                json!({"command": "npx", "args": ["mcp-remote", "https://mcp.example.com/s/sk-live-abcdef1234567890/sse"]}),
+            ),
+            source(
+                "helper",
+                json!({"type": "http", "url": "https://h.example.com/mcp",
+                "headersHelper": "echo '{\"Authorization\":\"Bearer sk-abcdef1234567890\"}'"}),
+            ),
+            source(
+                "json",
+                json!({"command": "x", "args": ["--config", "{\"apiKey\":\"sk-abcdef1234567890\"}"]}),
+            ),
+            source(
+                "plain",
+                json!({"type": "http", "url": "https://mcp.example.com/v1/workspaces/team-blue/mcp",
+                "headersHelper": "/usr/local/bin/get-headers --profile work"}),
+            ),
+        ]);
+        for secret in ["sk-live-abcdef", "ZmFrZXNl", "sk-abcdef1234567890"] {
+            assert!(!out.text.contains(secret), "{secret} left in {}", out.text);
+        }
+        let block = block(&out);
+        let servers = &block["mcpServers"];
+        assert_eq!(
+            servers["path"]["url"],
+            "https://mcp.example.com/api/mcp/s/${URL_TOKEN}/mcp"
+        );
+        assert_eq!(
+            servers["remote"]["args"][1],
+            "https://mcp.example.com/s/${URL_TOKEN}/sse"
+        );
+        assert_eq!(servers["helper"]["headersHelper"], "${HEADERSHELPER}");
+        assert_eq!(servers["json"]["args"], json!(["--config", "${CONFIG}"]));
+        // Ordinary paths and helpers stay readable.
+        assert_eq!(
+            servers["plain"]["url"],
+            "https://mcp.example.com/v1/workspaces/team-blue/mcp"
+        );
+        assert_eq!(
+            servers["plain"]["headersHelper"],
+            "/usr/local/bin/get-headers --profile work"
+        );
+    }
+
+    #[test]
+    fn only_plain_settings_keep_a_default() {
+        let out = export(vec![source(
+            "s",
+            json!({"command": "x", "env": {
+                "MODE": "production", "DEBUG": "true", "TIMEOUT": "30", "DIR": "/srv/data",
+                "BASE": "https://api.example.com/v1", "DB_PASS": "hunter", "SESSION": "abc",
+                "CODE": "12345678901", "WORDY": "correcthorsebatterystaple", "MIXED": "abc123",
+                "AUTH_URL": "https://u:p@x.example.com", "QUERY": "https://x.example.com/?k=v"
+            }}),
+        )]);
+        let env = &block(&out)["mcpServers"]["s"]["env"];
+        for name in ["MODE", "DEBUG", "TIMEOUT", "DIR", "BASE"] {
+            assert!(
+                env[name].as_str().unwrap().contains(":-"),
+                "{name}: {}",
+                env[name]
+            );
+        }
+        for name in [
+            "DB_PASS", "SESSION", "CODE", "WORDY", "MIXED", "AUTH_URL", "QUERY",
+        ] {
+            assert_eq!(env[name], format!("${{{name}}}"), "{name}");
+        }
     }
 
     #[test]
