@@ -1926,6 +1926,18 @@ impl ShellApp {
             // Behind the review, as it was, to come Back to.
             return;
         }
+        let focused = form.focus_was;
+        if form.asking_to_discard
+            && ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_)))
+            })
+        {
+            // Back to typing: the question no longer fits what is there.
+            form.asking_to_discard = false;
+            form.focus_back = None;
+        }
         form.reread();
         form.refill();
         let checked = form.check(&self.snapshot.servers);
@@ -2094,8 +2106,16 @@ impl ShellApp {
                     let keep = ui
                         .add(egui::Button::new("Keep editing").min_size(egui::vec2(80.0, 34.0)))
                         .on_hover_text("Esc");
+                    // The least destructive answer has the keyboard, so Enter keeps editing and Shift+Tab
+                    // reaches Discard.
+                    if std::mem::take(&mut form.focus_answer) {
+                        keep.request_focus();
+                    }
                     if keep.clicked() {
                         form.asking_to_discard = false;
+                        if let Some(id) = form.focus_back.take() {
+                            ui.memory_mut(|m| m.request_focus(id));
+                        }
                     }
                 });
                 return (ui.min_rect().height() - body_height, body_height);
@@ -2116,6 +2136,7 @@ impl ShellApp {
             (ui.min_rect().height() - body_height, body_height)
         });
         settle(ctx, &modal.response);
+        form.focus_was = ctx.memory(|m| m.focused());
         let (taken, body_height) = modal.inner;
         if (taken - overhead).abs() > 0.5 {
             ctx.data_mut(|d| d.insert_temp(overhead_id, taken));
@@ -2141,6 +2162,12 @@ impl ShellApp {
             && (cancel || discard_now || escaped && !form.asking_to_discard && !form.has_typing());
         if escaped && !close {
             form.asking_to_discard = !form.asking_to_discard;
+            if form.asking_to_discard {
+                form.focus_back = focused;
+                form.focus_answer = true;
+            } else if let Some(id) = form.focus_back.take() {
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
         }
         if let Some(port) = form.port_wanted.take() {
             form.port_pending = Some(port);
@@ -3938,6 +3965,12 @@ struct AddForm {
     reviewing: bool,
     /// Esc was pressed with something pasted or typed: the dialog asks before throwing it away.
     asking_to_discard: bool,
+    /// The field that had the keyboard before the question, to give it back once the question is put away.
+    focus_back: Option<egui::Id>,
+    /// What had the keyboard at the end of the last frame: Esc takes it away before the dialog sees the key.
+    focus_was: Option<egui::Id>,
+    /// Give Keep editing the keyboard on the next frame.
+    focus_answer: bool,
     /// Why the last review or add failed, said in the dialog.
     failed: Option<String>,
     /// Bring the OAuth settings into view on the next frame.
@@ -3993,6 +4026,9 @@ impl AddForm {
             tried: false,
             reviewing: false,
             asking_to_discard: false,
+            focus_back: None,
+            focus_was: None,
+            focus_answer: false,
             failed: None,
             reveal_oauth: false,
             port_wanted: None,
@@ -4004,9 +4040,27 @@ impl AddForm {
     /// Something was pasted or typed that closing would throw away. How the server connects and where it goes are
     /// choices, quickly made again, not typing.
     fn has_typing(&self) -> bool {
+        let empty = |rows: &[(String, String)]| {
+            rows.iter()
+                .all(|(k, v)| k.trim().is_empty() && v.trim().is_empty())
+        };
         let fields = ServerFields {
             transport: ServerFields::default().transport,
+            oauth: ServerFields::default().oauth,
             ..self.fields.clone()
+        };
+        let fields = ServerFields {
+            env: if empty(&fields.env) {
+                Vec::new()
+            } else {
+                fields.env
+            },
+            headers: if empty(&fields.headers) {
+                Vec::new()
+            } else {
+                fields.headers
+            },
+            ..fields
         };
         !self.text.trim().is_empty()
             || (self.name_edited && !self.name.trim().is_empty())
@@ -9707,8 +9761,13 @@ mod tests {
             h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
             h.run();
             add_form(&mut h).mode = mode;
-            // Choosing how a server connects, or where it goes, is not typing: there is nothing to lose.
-            add_form(&mut h).fields.transport = TransportKind::Http;
+            // Choosing how a server connects, or where it goes, is not typing: there is nothing to lose. Nor is
+            // ticking OAuth, or adding a row and leaving it empty.
+            let f = add_form(&mut h);
+            f.fields.transport = TransportKind::Http;
+            f.fields.oauth = true;
+            f.fields.headers.push((String::new(), " ".into()));
+            f.fields.env.push((String::new(), String::new()));
             h.run();
             h.key_press(egui::Key::Escape);
             h.run();
@@ -9769,6 +9828,61 @@ mod tests {
             assert!(h.state().add.is_none(), "{what}");
             assert!(duplicate_requested(&engine).is_empty(), "{what}");
         }
+    }
+
+    #[test]
+    fn the_discard_question_works_from_the_keyboard() {
+        // From the review of #13: after Esc nothing had the keyboard, and Tab went into the paste box, which kept
+        // it, so Discard and Keep editing could not be reached without a mouse.
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text = "claude mcp add x node";
+        paste(&mut h, text);
+        h.run();
+        let typing_in = h.ctx.memory(|m| m.focused());
+        assert!(typing_in.is_some(), "the paste box has the keyboard");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.run();
+        // The least destructive answer has the keyboard: Enter keeps editing.
+        assert!(h.get_by_label("Keep editing").is_focused());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.run();
+        assert!(h.query_by_label(DISCARD_QUESTION).is_none());
+        assert_eq!(
+            h.ctx.memory(|m| m.focused()),
+            typing_in,
+            "back where it was"
+        );
+        // One Tab back from Keep editing reaches Discard; Enter on it closes.
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+        h.run();
+        assert!(h.get_by_label("Discard").is_focused());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.state().add.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn going_back_to_typing_puts_the_discard_question_away() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add x node");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.get_by_label(DISCARD_QUESTION);
+        h.event(egui::Event::Text("y".into()));
+        h.run();
+        assert!(h.query_by_label(DISCARD_QUESTION).is_none());
+        h.get_by_label("Review");
+        assert!(h.state().add.is_some());
     }
 
     #[test]
