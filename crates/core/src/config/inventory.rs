@@ -1552,7 +1552,7 @@ mod tests {
         let s = e.load();
         assert_eq!(
             find(&s, Scope::User, "rel").relative_paths,
-            ["build/index.js", "CFG=./c.json"]
+            ["build/index.js", "./c.json (in CFG)"]
         );
         assert!(find(&s, Scope::User, "abs").relative_paths.is_empty());
         assert!(find(&s, Scope::User, "web").relative_paths.is_empty());

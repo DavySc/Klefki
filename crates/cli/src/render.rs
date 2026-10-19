@@ -646,7 +646,7 @@ mod tests {
             .iter()
             .find(|r| r.scope == Scope::Project)
             .unwrap();
-        let paths = vec!["build/index.js".to_owned(), "CFG=./c.json".to_owned()];
+        let paths = vec!["build/index.js".to_owned(), "./c.json (in CFG)".to_owned()];
         let rel = ServerRow {
             relative_paths: paths.clone(),
             ..user.clone()
@@ -657,7 +657,7 @@ mod tests {
         };
         assert!(
             notes(&rel, 2).contains(
-                &"relative to each session's folder: build/index.js, CFG=./c.json".to_owned()
+                &"relative to each session's folder: build/index.js, ./c.json (in CFG)".to_owned()
             ),
             "{:?}",
             notes(&rel, 2)
@@ -665,7 +665,7 @@ mod tests {
         assert!(!notes(&in_repo, 2).iter().any(|n| n.contains("relative")));
         assert_eq!(
             row_json(&rel, 2)["relative_paths"],
-            json!(["build/index.js", "CFG=./c.json"])
+            json!(["build/index.js", "./c.json (in CFG)"])
         );
         assert_eq!(row_json(user, 2)["relative_paths"], json!([]));
         assert!(!row_json(&in_repo, 2).contains_key("relative_paths"));

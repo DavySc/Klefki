@@ -12,4 +12,12 @@ Goal: PLAN "Nice to have" 6. A user-scope stdio server whose command names a pat
 - Real app (debug, Xvfb 1200x720, the real config above): badges, hover and details as described; screenshots in the project files under `reviews/2026-10-19-relative-path/`. `klefki-cli list` and `--json` as above.
 - Not done: a hint on the Status tab's failure explanation; flagging bare program names (on Windows a bare `server.exe` is also looked for in the current folder first); a live hint in the Add form before Review (the review warns).
 - Main `4b8fb5a` (#34 Secrets page) merged in; its new test row in `secret_uses.rs` gets the field. Full verify after: no failures (app 325, core 691, cli 19 + 25), deny ok.
-- Next: cross-review (Secrets page author), then merge.
+- Cross-review round 1 (at `ffe2aa3`), folded in:
+  - B1: `.`, `./`, `..`, `../..` and `PYTHONPATH=.` were flagged, but every folder has them; on a user server they mean "the project the session is in" (filesystem `.`, `git --repository .`). They are no longer flagged; `./x` and `../y/z.js` still are. Test `the_session_folder_itself_is_not_flagged_as_every_folder_has_it` (seen failing first).
+  - N1: advice first and shorter: "Use full paths: sessions in other folders can't find `srv/s.js` or `./c.json (in CFG)`." (warn colour, paths in the code font), then the why in muted text. A variable reads `./c.json (in CFG)`, not `CFG=./c.json`. Review warning and badge hover shortened the same way.
+  - N2: the package a runner downloads (`npx`, `bunx`, `pnpx`, `uvx`, `pnpm/yarn dlx`, `bun x`) is not a path (`npx -y chart.js`). Test `the_package_a_runner_downloads_is_not_a_path`.
+  - N3: patterns with `*` or `?` are not files. Test `patterns_are_not_files`.
+  - N4: doc comment on `anchored` says a `./data:/data` volume is decided by its `./` first.
+  - N5 (merge order with #29): whichever merges second re-checks "Klefki checks them from your home folder" against `where_to_run`.
+  - Full verify: no failures (app 325, core 694, cli 19 + 25), deny ok. Real app: `reviews/2026-10-19-relative-path/round2/` in the project files; the filesystem server with `.` has no badge.
+- Next: re-review, then merge.

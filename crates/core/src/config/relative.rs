@@ -11,7 +11,7 @@ pub(crate) const MAX_SHOWN: usize = 5;
 const MAX_CHARS: usize = 80;
 
 /// The parts of a stdio definition that name a path relative to the folder the server is started in, as they are
-/// shown: the command, arguments, and `NAME=value` for environment variables, cleaned and cut, at most
+/// shown: the command, arguments, and `value (in NAME)` for environment variables, cleaned and cut, at most
 /// [`MAX_SHOWN`], each once. Arguments and variables that look like secrets are never named. Empty for anything
 /// that is not a stdio definition.
 pub(crate) fn relative_paths(entry: &Value) -> Vec<String> {
@@ -47,10 +47,11 @@ pub(crate) fn relative_paths(entry: &Value) -> Vec<String> {
         .collect();
     // `uv --directory /srv/weather run weather.py`: the rest is found from that folder, not from where it starts.
     if !folder_option(&args).is_some_and(anchored) {
+        let package = downloaded_package(command, &args);
         let shown = secretlike::shown_args(args.iter().copied());
-        for (arg, shown) in args.iter().zip(&shown) {
+        for (i, (arg, shown)) in args.iter().zip(&shown).enumerate() {
             // What is hidden as a secret is never named.
-            if *arg == shown && relative_arg(arg) {
+            if Some(i) != package && *arg == shown && relative_arg(arg) {
                 add(arg);
             }
         }
@@ -64,11 +65,35 @@ pub(crate) fn relative_paths(entry: &Value) -> Vec<String> {
                 continue;
             }
             if relative_word(value) {
-                add(&format!("{name}={value}"));
+                add(&format!("{value} (in {name})"));
             }
         }
     }
     out
+}
+
+/// Programs that download and run a package named by their first word that is not an option (`npx -y chart.js`).
+const RUNNERS: [&str; 4] = ["npx", "bunx", "pnpx", "uvx"];
+/// Package managers that do the same after one of these words (`pnpm dlx x`, `bun x x`).
+const MANAGERS: [&str; 3] = ["pnpm", "yarn", "bun"];
+
+/// Where in `args` the package a runner downloads is named, if `command` is one: a package name, not a path.
+fn downloaded_package(command: &str, args: &[&str]) -> Option<usize> {
+    let program = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let program = program
+        .split_once('.')
+        .map_or(program, |(stem, _)| stem)
+        .to_ascii_lowercase();
+    let mut words = args.iter().enumerate().filter(|(_, a)| !a.starts_with('-'));
+    if RUNNERS.contains(&program.as_str()) {
+        return words.next().map(|(i, _)| i);
+    }
+    if MANAGERS.contains(&program.as_str())
+        && words.next().is_some_and(|(_, w)| matches!(*w, "dlx" | "x"))
+    {
+        return words.next().map(|(i, _)| i);
+    }
+    None
 }
 
 /// Options that set the folder a program works from, so that what follows is found from there.
@@ -102,7 +127,8 @@ fn folder_option<'a>(args: &[&'a str]) -> Option<&'a str> {
 
 /// Whether `word` does not depend on the folder it is read from: a full path (`/x`, `C:\\x`, `\\\\nas\\x`), one a
 /// shell or Claude Code fills in (`~`, `$HOME`), an npm scope (`@x/y`), or anything with a colon in it (an address
-/// `https://`, `github:o/r`, a drive, a port, an image tag), which is not a plain relative path.
+/// `https://`, `github:o/r`, a drive, a port, an image tag), which is not a plain relative path. A word starting
+/// with `./` or `../` is decided before this: a Docker volume `./data:/data` is read from the current folder.
 fn anchored(word: &str) -> bool {
     word.starts_with(['/', '\\', '~', '@']) || word.contains(['$', ':'])
 }
@@ -126,13 +152,21 @@ const FILE_TYPES: [&str; 37] = [
     "json5", "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "db", "sqlite", "sqlite3",
 ];
 
-/// Whether `word` is a path relative to the folder it is read from: `.`, `..`, `./x`, `..\\x`, or a file of a known
-/// type, alone or in a folder (`server.py`, `build/index.js`).
+/// Whether `word` is a path relative to the folder it is read from: `./x`, `..\\x`, or a file of a known type, alone
+/// or in a folder (`server.py`, `build/index.js`). Not the folder itself or one above it (`.`, `./`, `../..`):
+/// every folder has those, so on a user server they mean "the project the session is in". Not a pattern
+/// (`**/*.ts`), which names no one file.
 fn relative_word(word: &str) -> bool {
-    if matches!(word, "." | "..")
-        || ["./", "../", ".\\", "..\\"]
-            .iter()
-            .any(|prefix| word.starts_with(prefix))
+    if word.contains(['*', '?'])
+        || word
+            .split(['/', '\\'])
+            .all(|part| matches!(part, "." | ".." | ""))
+    {
+        return false;
+    }
+    if ["./", "../", ".\\", "..\\"]
+        .iter()
+        .any(|prefix| word.starts_with(prefix))
     {
         return true;
     }
@@ -166,7 +200,6 @@ mod tests {
         assert_eq!(args(&["./server.py"]), ["./server.py"]);
         assert_eq!(args(&["..\\tools\\mcp.js"]), ["..\\tools\\mcp.js"]);
         assert_eq!(args(&["server.py"]), ["server.py"], "a bare file name too");
-        assert_eq!(args(&["--root", "."]), ["."]);
         assert_eq!(args(&["--config=./mcp.json"]), ["--config=./mcp.json"]);
         assert_eq!(
             args(&["dist/index.mjs", "data/db.sqlite"]),
@@ -230,16 +263,63 @@ mod tests {
         // A folder option that is relative itself is the problem.
         assert_eq!(
             args(&["--directory", ".", "run", "weather.py"]),
-            [".", "weather.py"]
+            ["weather.py"]
         );
         assert_eq!(args(&["--directory", "./srv", "run", "x"]), ["./srv"]);
+    }
+
+    #[test]
+    fn the_session_folder_itself_is_not_flagged_as_every_folder_has_it() {
+        // Review B1: on a user server `.` is usually the point, "whatever project I am in".
+        for words in [
+            &["-y", "@modelcontextprotocol/server-filesystem", "."][..],
+            &["-y", "@modelcontextprotocol/server-filesystem", "./"],
+            &["mcp-server-git", "--repository", "."],
+            &["--root", ".."],
+            &["--root", "..\\"],
+            &["--root=../.."],
+            &[".\\"],
+        ] {
+            assert!(args(words).is_empty(), "{words:?}: {:?}", args(words));
+        }
+        let e =
+            found(json!({"command": "python", "args": ["-m", "srv"], "env": {"PYTHONPATH": "."}}));
+        assert!(e.is_empty(), "{e:?}");
+        // What is in it, or next to it, is another matter.
+        assert_eq!(args(&["./x", "../y/z.js"]), ["./x", "../y/z.js"]);
+    }
+
+    #[test]
+    fn the_package_a_runner_downloads_is_not_a_path() {
+        // Review N2: the first word after npx and the like names a package, even one called like a file.
+        let ran = |command: &str, args: &[&str]| found(json!({"command": command, "args": args}));
+        assert!(ran("npx", &["-y", "chart.js"]).is_empty());
+        assert!(ran("npx.cmd", &["-y", "mcp-server.sh", "--stdio"]).is_empty());
+        assert!(ran("bunx", &["tool.js"]).is_empty());
+        assert!(ran("uvx", &["mcp.py"]).is_empty());
+        assert!(ran("pnpm", &["dlx", "x.js"]).is_empty());
+        assert!(ran("yarn", &["dlx", "x.js"]).is_empty());
+        // Only that word: a file given to the package is still found from where it starts.
+        assert_eq!(ran("npx", &["-y", "pkg", "./cfg.json"]), ["./cfg.json"]);
+        assert_eq!(
+            ran("node", &["index.js"]),
+            ["index.js"],
+            "node runs a file, not a package"
+        );
+        assert_eq!(ran("pnpm", &["run", "x.js"]), ["x.js"]);
+    }
+
+    #[test]
+    fn patterns_are_not_files() {
+        // Review N3.
+        assert!(args(&["--glob", "**/*.ts", "--exclude", "*.json", "file?.py"]).is_empty());
     }
 
     #[test]
     fn environment_variables_holding_a_relative_path_are_found() {
         let e = found(json!({"command": "npx", "args": ["-y", "pkg"],
             "env": {"CONFIG": "./mcp.json", "DB": "data/app.db", "LEVEL": "debug", "ROOT": "/srv", "HOME_DIR": "~/x"}}));
-        assert_eq!(e, ["CONFIG=./mcp.json", "DB=data/app.db"]);
+        assert_eq!(e, ["./mcp.json (in CONFIG)", "data/app.db (in DB)"]);
     }
 
     #[test]
@@ -248,7 +328,7 @@ mod tests {
             json!({"command": "node", "args": ["--token", "ghp_abcdefghijklmnopqrstuvwxyz0123456789.json", "a.js"],
             "env": {"API_KEY": "./sk-abcdefghijklmnopqrstuvwxyz012345", "X": "./x.json"}}),
         );
-        assert_eq!(e, ["a.js", "X=./x.json"], "{e:?}");
+        assert_eq!(e, ["a.js", "./x.json (in X)"], "{e:?}");
     }
 
     #[test]

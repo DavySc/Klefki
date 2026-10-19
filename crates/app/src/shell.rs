@@ -3996,9 +3996,15 @@ impl ShellApp {
                 }
                 if s.scope == Scope::User && !s.relative_paths.is_empty() {
                     ui.add_space(8.0);
+                    // What to do first, with the paths as values; why under it, quieter.
+                    ui.add(egui::Label::new(relative_job(ui, &s.relative_paths, pal.warn)).wrap());
                     ui.add(
                         egui::Label::new(
-                            RichText::new(relative_text(&s.relative_paths)).color(pal.warn),
+                            RichText::new(
+                                "Claude Code starts user servers in each session's folder. Klefki checks them \
+                                 from your home folder, so the check can pass here.",
+                            )
+                            .color(pal.text_muted),
                         )
                         .wrap(),
                     );
@@ -6718,8 +6724,8 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
             "relative path",
             pal.warn,
             Some(
-                "Claude Code starts this server in the folder the session started in, so in a project without \
-                 the file its command names, it fails. The details say which.",
+                "Claude Code starts user servers in each session's folder, so sessions in other folders can't \
+                 find a file its command names. The details say which.",
             ),
         ));
     }
@@ -6918,18 +6924,29 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32, color: Color32) -> egui::Respon
         .response
 }
 
-/// Why a user server whose command names `paths` relative to where it starts can fail, for the detail panel.
-fn relative_text(paths: &[String]) -> String {
-    let (named, it) = match paths {
-        [one] => (one.clone(), "it"),
-        [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "them"),
-        [] => (String::new(), "it"),
+/// "Use full paths: sessions in other folders can't find `a` or `b`.", the paths in the code font, for the detail
+/// panel of a user server whose command names `paths` relative to where it starts.
+fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::text::LayoutJob {
+    let text = |style: egui::TextStyle| egui::TextFormat {
+        font_id: style.resolve(ui.style()),
+        color,
+        ..Default::default()
     };
-    format!(
-        "This server is used in every project, and Claude Code starts it in the folder the session started in, so \
-         it looks for {named} there and fails in projects without {it}. Klefki checks it from your home folder, \
-         so a check can pass where a session fails. Write full paths in the command."
-    )
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        "Use full paths: sessions in other folders can't find ",
+        0.0,
+        text(egui::TextStyle::Body),
+    );
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            let between = if i + 1 == paths.len() { " or " } else { ", " };
+            job.append(between, 0.0, text(egui::TextStyle::Body));
+        }
+        job.append(path, 0.0, text(egui::TextStyle::Monospace));
+    }
+    job.append(".", 0.0, text(egui::TextStyle::Body));
+    job
 }
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
@@ -8211,7 +8228,7 @@ mod tests {
     fn a_user_server_with_a_relative_path_is_marked_and_its_details_name_the_paths() {
         let (mut h, engine) = live_harness();
         let mut user = live_row("docs", Scope::User, None);
-        user.relative_paths = vec!["build/index.js".into(), "CFG=./c.json".into()];
+        user.relative_paths = vec!["build/index.js".into(), "./c.json (in CFG)".into()];
         // In its own project's folder a relative path is what it should be.
         let mut local = live_row("tools", Scope::Local, Some("C:/Repos/WebApp"));
         local.relative_paths = vec!["server.py".into()];
@@ -8224,14 +8241,19 @@ mod tests {
         assert_eq!(badges.len(), 1, "only the user server");
         h.get_by_label("relative path").hover();
         h.run();
-        h.get_by_label_contains("in a project without the file its command names, it fails");
+        h.get_by_label_contains(
+            "sessions in other folders can't \
+             find a file its command names",
+        );
         h.get_by_label("docs").click();
         h.run();
-        h.get_by_label_contains("it looks for build/index.js and CFG=./c.json there");
-        h.get_by_label_contains("a check can pass where a session fails");
+        h.get_by_label(
+            "Use full paths: sessions in other folders can't find build/index.js or ./c.json (in CFG).",
+        );
+        h.get_by_label_contains("so the check can pass here");
         h.get_by_label("tools").click();
         h.run();
-        assert!(h.query_by_label_contains("it looks for").is_none());
+        assert!(h.query_by_label_contains("Use full paths").is_none());
     }
 
     #[test]

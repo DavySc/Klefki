@@ -254,15 +254,13 @@ fn relative_in_user_servers(out: &Resolved, snapshot: &Snapshot) -> Vec<String> 
         .into_iter()
         .filter(|(_, paths)| !paths.is_empty())
         .map(|(name, paths)| {
-            let (them, it) = if paths.len() == 1 {
-                ("is", "it")
-            } else {
-                ("are", "them")
+            let named = match paths.as_slice() {
+                [rest @ .., last] if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+                _ => paths.concat(),
             };
             format!(
-                "{} is a user server, used in every project, and Claude Code starts it in the folder the session started in. {} {them} looked for there, so it fails in projects without {it}. Write full paths.",
+                "{}: use full paths. Claude Code starts user servers in each session's folder, so sessions in other folders can't find {named}.",
                 sanitize(name),
-                and_list(&paths)
             )
         })
         .collect()

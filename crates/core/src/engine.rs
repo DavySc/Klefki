@@ -6681,7 +6681,7 @@ mod tests {
     fn relative_warnings(plan: &PlanView) -> Vec<&String> {
         plan.warnings
             .iter()
-            .filter(|w| w.contains("folder the session started in"))
+            .filter(|w| w.contains("each session's folder"))
             .collect()
     }
 
@@ -6695,7 +6695,8 @@ mod tests {
             panic!("{:?}", plan.warnings)
         };
         assert!(
-            warning.starts_with("rel ") && warning.contains("build/index.js and CFG=./c.json"),
+            warning.starts_with("rel: use full paths.")
+                && warning.contains("can't find build/index.js or ./c.json (in CFG)."),
             "{warning}"
         );
         let plan = plan_for(
