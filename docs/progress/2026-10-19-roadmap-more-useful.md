@@ -12,4 +12,4 @@ Add the five additions the owner chose from an evaluation of other MCP managers 
 - Docs only. `cargo fmt --check`: exit 0.
 
 ## Next
-None of these starts until the owner says so. Rank 1 is packaging and release. Rank 2 starts with a spike on how Claude Code names and turns off plugin servers and claude.ai connectors.
+None of these starts until the owner says so. Rank 1 is packaging and release; owner swapped sets (now 4) and approvals (now 5). Rank 2 starts with a spike on how Claude Code names and turns off plugin servers and claude.ai connectors.
