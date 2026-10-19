@@ -52,6 +52,9 @@ pub enum Command {
     Discard(u64),
     /// Send the server's definition, for viewing and editing (see [`Event::Entry`]).
     Inspect(ServerId),
+    /// The definitions of these servers as one `{"mcpServers": {…}}` block, values that may be secrets replaced by
+    /// `${VAR}` references (see [`Event::Exported`]). Writes nothing.
+    Export(Vec<ServerId>),
     /// Whether a client secret is stored for this OAuth server (see [`Event::SecretStatus`]).
     SecretStatus(ServerId),
     /// Keep this client secret for the OAuth server, in the system's secret store.
@@ -344,6 +347,8 @@ pub enum Event {
         id: ServerId,
         step: SignInStep,
     },
+    /// The block [`Command::Export`] asked for.
+    Exported(crate::export::Exported),
     /// Why a sign-in could not come back to `port` now, or `None` when it could ([`Command::CheckCallbackPort`]).
     CallbackPort {
         port: u16,
@@ -758,6 +763,17 @@ fn engine_main(
             Command::Check(id) => enqueue_now(&shared, &state, &id, JobKind::Check),
             Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose),
             Command::Inspect(id) => inspect(&shared, &state, id),
+            Command::Export(ids) => {
+                let sources = crate::export::sources(
+                    shared.config.paths.as_ref(),
+                    &state.snapshot,
+                    &state.keys,
+                    &ids,
+                );
+                shared
+                    .emitter
+                    .emit(Event::Exported(crate::export::export(sources)));
+            }
             Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
             Command::StoreSecret { id, secret: value } => {
                 secret(&shared, &state.snapshot, id, SecretOp::Store(value));
@@ -5261,6 +5277,54 @@ mod tests {
         assert!(json.contains("\"command\": \"node\""), "{json}");
         let (gone, _) = entry_of(&core, user_id("ghost"));
         assert!(gone.is_err());
+    }
+
+    fn exported(core: &Core, ids: Vec<ServerId>) -> crate::export::Exported {
+        core.send(Command::Export(ids));
+        collect(core, |e| e.iter().any(|x| matches!(x, Event::Exported(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Exported(out) => Some(out),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn an_export_reads_each_server_from_its_own_file_in_the_order_asked() {
+        let (env, key, _repo) = repo_env(serde_json::json!({
+            "mcpServers": {"loc": {"type": "stdio", "command": "x", "env": {"K": "v-12345678"}}}
+        }));
+        let claude_json_before =
+            std::fs::read(env.dir.path().join("cfg").join(".claude.json")).unwrap();
+        let core = env.start();
+        let out = exported(
+            &core,
+            vec![
+                project_id(&key, "ps"),
+                local_id("loc", &key),
+                user_id("gone"),
+            ],
+        );
+        let block: serde_json::Value = serde_json::from_str(&out.text).unwrap();
+        let servers = block["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.keys().collect::<Vec<_>>(), ["ps", "loc"]);
+        assert_eq!(servers["ps"]["command"], "node");
+        assert_eq!(
+            servers["ps"]["env"],
+            serde_json::json!({"NODE_OPTIONS": "${NODE_OPTIONS}"})
+        );
+        assert_eq!(servers["loc"]["env"], serde_json::json!({"K": "${K}"}));
+        assert!(!out.text.contains("v-12345678"), "{}", out.text);
+        assert_eq!(
+            out.notes,
+            ["Left out gone: it is no longer in the configuration."]
+        );
+        // Reading is all it does.
+        assert_eq!(
+            std::fs::read(env.dir.path().join("cfg").join(".claude.json")).unwrap(),
+            claude_json_before
+        );
     }
 
     #[test]

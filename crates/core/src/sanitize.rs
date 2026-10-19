@@ -102,7 +102,9 @@ fn skip_escape(chars: &mut std::str::Chars<'_>) {
     }
 }
 
-fn is_bad(c: char) -> bool {
+/// A character [`sanitize`] removes (besides escape sequences): control characters other than line breaks and tabs, and
+/// bidi controls.
+pub(crate) fn is_bad(c: char) -> bool {
     let control = c.is_control() && c != '\n' && c != '\t';
     let bidi = matches!(
         c,

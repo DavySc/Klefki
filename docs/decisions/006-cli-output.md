@@ -1,11 +1,12 @@
-# 006: `klefki-cli list` and `klefki-cli status`
+# 006: `klefki-cli list`, `status` and `export`
 
-Date: 2026-10-18. Decided without the owner (overnight, safe defaults); open to change. PLAN.md lists an optional headless `klefki-cli` (list/status/export). This covers `list` and `status`. `export` waits for its own open question (format).
+Date: 2026-10-18. Decided without the owner (overnight, safe defaults); open to change. PLAN.md lists an optional headless `klefki-cli` (list/status/export). This covers `list` and `status`; `export` was added on 2026-10-19 (below).
 
 ## Commands
 ```
 klefki-cli list   [NAME...] [--json]
 klefki-cli status [NAME...] [--json] [--claude PATH]
+klefki-cli export [NAME...]
 klefki-cli help | --help | -h
 klefki-cli --version | -V
 ```
@@ -36,5 +37,12 @@ Written for people first, with `--json` for scripts (clig.dev: "Human-readable o
 | 2 | Usage error: unknown command or option, a name that matches no server, no command at all. |
 | 3 | Claude Code could not be used: not found, refused (a script shim), or no check got an answer (all timed out or gave output Klefki does not understand). A broken tool, not a broken server, so monitoring can tell them apart (clig.dev: map exit codes to the main failure modes). |
 
+## `export` (2026-10-19)
+- Prints the servers (all, or those named) as one `{"mcpServers": {…}}` block on stdout: the shape a `.mcp.json` has, and what the app's Add reads back when pasted. It is the same block the app's Export dialog shows, made by core (`export.rs`). It reads the configuration only: no process, no write.
+- Redaction (PLAN.md, Export): every environment and header value becomes a `${VAR}` reference (a header keeps its `Bearer`/`Basic`/`Token` scheme); so does each argument, address part (user name and password, secret query parameters) or other setting that looks like a secret, by the same rules that hide them from a shown command line. Values already written as references stay. One value gets one variable; a different value under a name in use gets `NAME_2`; names the definitions already refer to are never reused. A variable is named after a variable, header, parameter or bare flag (`--db` gives `DB`), never after anything that could hold a value. OAuth client secrets are never in a definition, and the block says so for each OAuth server.
+- A value made entirely of references stays; one that mixes a reference with text is replaced, with a note. Secret-looking URL path segments, and a `command` or `headersHelper` holding a known key shape, are replaced too (the latter two whole). An environment value that is a plain setting (short number, word, path, or URL without credentials, under a name that does not sound secret) becomes `${NAME:-value}`, so the block works with nothing set; stderr lists those apart from the variables that must be set.
+- The variables to set, and notes (a server left out, two servers with one name: the second is `NAME_2`; the same definition in two places is in the block once), go to stderr, so `> servers.json` holds only the block. No `--json`: the output is JSON already.
+- Exit 0 when every server is in the block, 1 when one could not be read (the note says why), 2 for a name that matches no server.
+
 ## Not done here
-`export` (format and redaction rules are PLAN.md's, still open), filtering by project or scope, colour. Ctrl+C does not yet stop running checks and the servers they started (follow-up, with #24's process-tree kill).
+Filtering by project or scope, colour. Ctrl+C does not yet stop running checks and the servers they started (follow-up, with #24's process-tree kill).

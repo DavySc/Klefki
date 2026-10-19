@@ -132,7 +132,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
   - Ctrl/Cmd+F search, Ctrl+N add, Ctrl+E edit, Ctrl+D duplicate
   - Del delete, Space toggle, F5 refresh status
   - Ctrl+S apply, Esc cancel
-- **Export**: header, env and secret values are replaced with `${VAR}` or redacted; project entries are exported only as user/local candidates.
+- **Export**: header, env and secret values are replaced with `${VAR}` or redacted. A plain, non-secret-looking env setting keeps its value as a default (`${LOG_LEVEL:-debug}`); anything secret-looking never does. Project entries are exported only as user/local candidates.
 - **Import**: parsed as untrusted and previewed (target, conflict handling, full stdio commands, a secret prompt per OAuth row), then applied as one plan.
 
 ## Milestones

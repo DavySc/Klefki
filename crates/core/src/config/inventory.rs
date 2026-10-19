@@ -534,7 +534,62 @@ pub(crate) fn server_entry(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{} does not exist", display_path(&paths.claude_json)))?;
     let root = parse_claude_json(&text)?;
-    let found = match project {
+    entry_in(&root, project, name)
+        .ok_or_else(|| "the server is no longer in the configuration".to_owned())
+}
+
+/// The definitions of several servers, as [`server_entry`] reads each one, with every file read once: `.claude.json`
+/// for user and local servers, and each project's `.mcp.json` for its project servers (`in_repository`).
+pub(crate) fn server_entries(
+    paths: &ConfigPaths,
+    wanted: &[(&FileKey, bool)],
+) -> Vec<Result<Value, String>> {
+    let root = wanted
+        .iter()
+        .any(|(_, in_repository)| !in_repository)
+        .then(|| {
+            fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("{} does not exist", display_path(&paths.claude_json)))
+                .and_then(|text| parse_claude_json(&text))
+        });
+    // Each project's servers, read once.
+    let mut repositories: HashMap<&str, Result<ProjectServerList, String>> = HashMap::new();
+    wanted
+        .iter()
+        .map(|(key, in_repository)| {
+            let gone = || "the server is no longer in the configuration".to_owned();
+            if *in_repository {
+                let project = key
+                    .project
+                    .as_deref()
+                    .ok_or("a project server needs its project")?;
+                let servers = repositories.entry(project).or_insert_with(|| {
+                    if !is_safe_project_path(project) {
+                        return Err("the project is not a local absolute path".to_owned());
+                    }
+                    let path = Path::new(project).join(".mcp.json");
+                    read_project_servers(&path)?
+                        .map(|(servers, _)| servers)
+                        .ok_or_else(|| format!("{} does not exist", display_path(&path)))
+                });
+                let servers = servers.as_ref().map_err(String::clone)?;
+                return servers
+                    .iter()
+                    .find(|(n, _)| *n == key.name)
+                    .map(|(_, v)| v.clone())
+                    .ok_or_else(gone);
+            }
+            let root = root.as_ref().expect("read for every user and local server");
+            let root = root.as_ref().map_err(String::clone)?;
+            entry_in(root, key.project.as_deref(), &key.name).ok_or_else(gone)
+        })
+        .collect()
+}
+
+/// A user server (`project` is `None`) or local server's definition in the parsed `.claude.json`.
+fn entry_in(root: &Value, project: Option<&str>, name: &str) -> Option<Value> {
+    match project {
         None => root.get("mcpServers").and_then(|s| s.get(name)).cloned(),
         Some(project) => {
             let wanted = normalise_project(project);
@@ -545,8 +600,7 @@ pub(crate) fn server_entry(
                 .filter(|(key, _)| normalise_project(key) == wanted)
                 .find_map(|(_, entry)| entry.get("mcpServers").and_then(|s| s.get(name)).cloned())
         }
-    };
-    found.ok_or_else(|| "the server is no longer in the configuration".to_owned())
+    }
 }
 
 /// The definition of one server in a project's `.mcp.json`, as Claude Code would read it (a later duplicate wins).
@@ -563,6 +617,9 @@ pub(crate) fn project_server(project: &str, name: &str) -> Result<Value, String>
         .map(|(_, v)| v)
         .ok_or_else(|| format!("{} no longer defines that server", display_path(&path)))
 }
+
+/// The servers in a project's `.mcp.json`, by name, in file order.
+type ProjectServerList = Vec<(String, Value)>;
 
 /// Names of servers in a project's `.mcp.json`, plus each name defined more than once.
 type ProjectServers = (Vec<(String, Value)>, Vec<String>);
