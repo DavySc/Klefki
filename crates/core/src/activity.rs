@@ -48,6 +48,8 @@ pub struct ActivityEntry {
     pub failed: Option<String>,
     /// The copies kept before the change, one per file it changed.
     pub backups: Vec<Backup>,
+    /// Backups of the change past those listed: a change of many servers can keep more than are shown.
+    pub more_backups: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +72,13 @@ struct Record {
     error: Option<String>,
     #[serde(default)]
     backups: Vec<String>,
+    /// Backups past those in `backups`, counted but not listed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    more_backups: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// The log, next to the backup folder (like the recovery folder): `.../klefki/activity.jsonl`.
@@ -87,20 +96,34 @@ pub(crate) fn record(
     // Capped here too, so one large change (a bulk delete of a hundred servers) cannot crowd out the rest.
     let record = Record {
         at: now_ms(),
-        summary: capped(summary.iter().map(String::as_str), MAX_TEXT),
+        summary: capped(summary.iter().map(|s| clip(s, MAX_TEXT))),
         error: error.map(|e| clip(e, MAX_ERROR)),
-        backups: capped(backups.iter().map(|b| b.to_string_lossy()), MAX_PATH),
+        backups: backups
+            .iter()
+            .take(listed(backups.len()))
+            .map(|b| clip(&b.to_string_lossy(), MAX_PATH))
+            .collect(),
+        more_backups: backups.len() - listed(backups.len()),
     };
     let mut line = serde_json::to_string(&record).map_err(io::Error::other)?;
     line.push('\n');
     append(&log_path(backup_dir), line.as_bytes())
 }
 
-fn capped<S: AsRef<str>>(lines: impl Iterator<Item = S>, max: usize) -> Vec<String> {
-    lines
-        .take(MAX_LINES)
-        .map(|l| clip(l.as_ref(), max))
-        .collect()
+/// How many of `n` lines are listed: all of them up to [`MAX_LINES`], or one fewer, to leave room to say how many
+/// more there are. A log that looks complete when it is not is worse than a short one.
+fn listed(n: usize) -> usize {
+    if n > MAX_LINES { MAX_LINES - 1 } else { n }
+}
+
+/// The sentences of a change, ending with "…and N more" past [`MAX_LINES`].
+fn capped(lines: impl ExactSizeIterator<Item = String>) -> Vec<String> {
+    let n = lines.len();
+    let mut out: Vec<String> = lines.take(listed(n)).collect();
+    if n > out.len() {
+        out.push(format!("…and {} more", n - out.len()));
+    }
+    out
 }
 
 fn append(path: &Path, line: &[u8]) -> io::Result<()> {
@@ -176,10 +199,14 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
             unreadable += 1;
             continue;
         };
+        let shown_backups = listed(record.backups.len());
+        let more_backups = record
+            .more_backups
+            .saturating_add(record.backups.len() - shown_backups);
         let backups = record
             .backups
             .iter()
-            .take(MAX_LINES)
+            .take(shown_backups)
             .map(|path| {
                 let name = file_name(path);
                 mentioned.insert(name.to_owned());
@@ -196,17 +223,13 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
             ActivityEntry {
                 when: String::new(),
                 exact: String::new(),
-                summary: record
-                    .summary
-                    .iter()
-                    .take(MAX_LINES)
-                    .map(|s| shown(s))
-                    .collect(),
+                summary: capped(record.summary.iter().map(|s| shown(s))),
                 failed: record
                     .error
                     .as_deref()
                     .map(|e| clip(&sanitize_line(e), MAX_ERROR)),
                 backups,
+                more_backups,
             },
         ));
     }
@@ -229,6 +252,7 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
                     ),
                     kept: true,
                 }],
+                more_backups: 0,
             },
         ));
     }
@@ -641,7 +665,8 @@ mod tests {
         let entry = &activity.entries[0];
         assert_eq!(entry.summary, ["Turn off redevil next"]);
         assert!(entry.failed.as_ref().unwrap().chars().count() <= MAX_ERROR + 1);
-        assert_eq!(entry.backups.len(), MAX_LINES);
+        assert_eq!(entry.backups.len(), MAX_LINES - 1);
+        assert_eq!(entry.more_backups, 50 - (MAX_LINES - 1));
         assert_eq!(entry.backups[0].of, ".claude.json");
         assert_eq!(
             activity.problem.as_deref(),
@@ -713,11 +738,30 @@ mod tests {
             longest < 30_000,
             "a record is capped when written: {longest}"
         );
-        assert!(
-            text.len() as u64 <= MAX_BYTES / 2 + 30_000,
-            "{}",
-            text.len()
-        );
+        // Never more than the size that starts a cut, plus the one change that went past it: far below the read
+        // limit.
+        assert!(text.len() as u64 <= MAX_BYTES + 30_000, "{}", text.len());
+    }
+
+    #[test]
+    fn a_change_too_large_to_log_in_full_says_how_much_is_left_out() {
+        // Cross-review R1: a bulk delete of 120 servers was logged as 20 deletes, and nothing said there were more.
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let sentences: Vec<String> = (0..30).map(|i| format!("Delete s{i}")).collect();
+        let paths: Vec<PathBuf> = (0..25).map(|i| backups.join(format!("b{i}.bak"))).collect();
+        record(&backups, &sentences, None, &paths).unwrap();
+        let entry = &load(&backups).entries[0];
+        assert_eq!(entry.summary.len(), MAX_LINES);
+        assert_eq!(entry.summary[..MAX_LINES - 1], sentences[..MAX_LINES - 1]);
+        assert_eq!(entry.summary[MAX_LINES - 1], "…and 11 more");
+        assert_eq!(entry.backups.len(), MAX_LINES - 1);
+        assert_eq!(entry.more_backups, 6);
+        // Exactly as many as fit: all listed, nothing said to be left out.
+        record(&backups, &sentences[..MAX_LINES], None, &paths[..MAX_LINES]).unwrap();
+        let entry = &load(&backups).entries[0];
+        assert_eq!(entry.summary, sentences[..MAX_LINES]);
+        assert_eq!((entry.backups.len(), entry.more_backups), (MAX_LINES, 0));
     }
 
     #[test]

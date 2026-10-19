@@ -18,6 +18,12 @@ Roadmap slice (M3): the Activity log page lists every change Klefki saved, newes
 - UX folded in: the top bar's box filters the changes on this page, with the hint "Filter changes" (U1, test `the_filter_box_filters_the_changes_on_this_page`); the backup path shows on the Copy path button's hover, not as a line (U2); backups no change mentions are folded into "Other backups (n)" after the changes (U3); the time's hover gives the exact time with seconds and UTC offset (U4); the success message has an "Open activity log" button (U6). U5: the error text is the engine's own, which already says the next step (a kept definition: "put it back from the Connections page"); no separate wording was added.
 - Checks: full verify exit 0 (272 app + 564 core + 35 cli tests, deny ok); Windows clippy exit 0. Real app 1200x720 and 800x480 in the project folder `reviews/2026-10-19-activity-log/round2/`.
 
+## Cross-review round 2 (re-review at `67a3b12`: ready once R1 is in)
+- R1 folded in: a change with more than 20 sentences is logged as 19 and "…and N more"; backups past 19 are counted (`more_backups`) and the page says "…and N more backups, under Other backups". Same on read, for a log written by hand. Test `a_change_too_large_to_log_in_full_says_how_much_is_left_out` (30 sentences read back as 19 plus "…and 11 more"; exactly 20 are all listed).
+- R3 folded in: after Copy path the page shows "Copied <path>", not only the hover.
+- R2 (move an unreadable log aside and start a new one) left for a follow-up, as the reviewer suggested.
+
 ## Open / next
+- Follow-up R2: a log that cannot be read is appended to and reported as unreadable forever; move it to `activity.jsonl.unreadable` and start a new one.
 - No restore from a backup yet. Restoring a whole `.claude.json` would also undo Claude Code's own writes since; a safe restore needs its own design (per change, through Prepare → diff → Apply).
 - Main (#12 Export, #14 engine check fixes) merged in without conflicts. Full verify on the merge: exit 0 (279 app + 593 core + 38 cli tests, deny ok); Windows clippy exit 0.

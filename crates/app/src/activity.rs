@@ -185,6 +185,16 @@ fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<Strin
             for backup in &entry.backups {
                 copy = backup_line(ui, backup, copied).or(copy.take());
             }
+            if entry.more_backups > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "…and {} more backups, under Other backups",
+                        entry.more_backups
+                    ))
+                    .small()
+                    .color(pal.text_muted),
+                );
+            }
         });
     });
     ui.add_space(6.0);
@@ -223,10 +233,18 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<Str
         {
             copy = Some(backup.path.clone());
         }
-        if copied == Some(backup.path.as_str()) {
-            ui.label(RichText::new("Copied").small().color(pal.success));
-        }
     });
+    // What was copied, in the open: hover text is out of reach of the keyboard.
+    if copied == Some(backup.path.as_str()) {
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Copied {}", backup.path))
+                    .small()
+                    .color(pal.success),
+            )
+            .wrap(),
+        );
+    }
     copy
 }
 
@@ -284,6 +302,7 @@ mod tests {
                     summary: vec!["Turn off alpha in 2 projects".to_owned()],
                     failed: None,
                     backups: vec![backup("/data/backups/claude.json.1-0.bak", true)],
+                    more_backups: 0,
                 },
                 ActivityEntry {
                     when: "Yesterday 18:02".to_owned(),
@@ -291,6 +310,7 @@ mod tests {
                     summary: vec!["Move beta to user".to_owned()],
                     failed: Some("Claude Code already added beta to user.".to_owned()),
                     backups: vec![backup("/data/backups/claude.json.0-0.bak", false)],
+                    more_backups: 0,
                 },
                 ActivityEntry {
                     when: "13 Oct 09:12".to_owned(),
@@ -298,6 +318,7 @@ mod tests {
                     summary: Vec::new(),
                     failed: None,
                     backups: vec![backup("/data/backups/claude.json.9-0.bak", true)],
+                    more_backups: 0,
                 },
             ],
             problem: None,
@@ -333,6 +354,12 @@ mod tests {
         assert!(h.query_by_label_contains("/data/backups/").is_none());
         assert_eq!(h.get_all_by_label_contains("Copy path").count(), 1);
         assert!(h.query_by_label("Loading…").is_none());
+        assert!(h.query_by_label_contains("more backups").is_none());
+        let mut log = sample();
+        log.entries[0].more_backups = 6;
+        engine.events.send(Event::Activity(log)).unwrap();
+        h.run();
+        h.get_by_label("…and 6 more backups, under Other backups");
     }
 
     #[test]
@@ -357,12 +384,16 @@ mod tests {
             .collect();
         assert_eq!(copied, ["/data/backups/claude.json.1-0.bak"]);
         h.run();
-        h.get_by_label("Copied");
+        // What was copied shows in the open, not only on hover (cross-review R3).
+        h.get_by_label("Copied /data/backups/claude.json.1-0.bak");
         for _ in 0..30 {
             h.step();
         }
         h.run();
-        assert!(h.query_by_label("Copied").is_none(), "the note goes away");
+        assert!(
+            h.query_by_label_contains("Copied").is_none(),
+            "the note goes away"
+        );
     }
 
     #[test]
