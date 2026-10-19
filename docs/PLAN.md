@@ -176,6 +176,35 @@ Ideas from an outside brainstorm, compared with this plan and checked on a real 
 
 Not planned, with the reasons recorded in decision 003: `cmd /c` validation (a plain `npx` entry works with the current native Claude Code), and cleanup of old MCP logs (a current install shows 14 MB in 659 files, so the reported runaway growth did not reproduce, and deleting files needs its own safety design).
 
+## Roadmap (ranked 2026-10-19)
+Everything not yet built, ranked by impact and by how much it sets Klefki apart from other MCP managers (mcpick, mcpm, MCPMate, Docker MCP Toolkit, add-mcp, mcp-scan; evaluation in the project's assessment of 2026-10-19). None starts until the owner says so; one slice per branch. Items that add a write target, a network call or a spawn need an invariant review first. Build order may differ where a cheap item unblocks others.
+
+| # | Item | Size | Impact | Sets Klefki apart | Described in |
+|---|---|---|---|---|---|
+| 1 | Packaging and release (M4) | L | Very high: nobody can install Klefki without it, and the repo is going public | No, but every other item depends on it to reach users | Milestones, M4 |
+| 2 | Every server Claude Code loads, and why one doesn't | M | High | Yes: no other tool shows plugin and organisation servers or explains a policy block, and Claude Code hides the block | Below |
+| 3 | Tools view: tools, context cost, changed descriptions | L | High: tool definitions cost context every turn | Yes: no manager combines per-server cost with change detection (mcp-scan pins hashes as a CLI only) | Below |
+| 4 | Server sets | S–M | High | No: mcpm, MCPMate and Docker have profiles, mcpick plans them. High impact for little work | Below |
+| 5 | Approvals per server | S–M | Medium-high | Yes: others leave Claude Code permission rules to hand-edited settings | Below |
+| 6 | Network probe for HTTP servers | M | Medium: explains bare `ECONNREFUSED` and TLS-proxy failures | Yes: no manager diagnoses why a remote server fails. Builds `net/` together with 3 | Nice to have 5 |
+| 7 | VS Code servers | M read-only, L to write | Medium-high: the other client the owner uses | No: add-mcp, mcpm, MCPMate and Docker cover it | Below |
+| 8 | Bounded log tail | M | Medium | Partly: MCP Router has logs; redaction and flat memory are Klefki's own | Nice to have 2 |
+| 9 | Scope drift watcher and Refresh scopes | M | Low-medium: OAuth gateway users only | Yes, but niche | Milestones, M3 |
+| 10 | Copy MCP Inspector command | S | Low | No | Nice to have 7 |
+| 11 | Import: `${VAR}` value entry and leftovers | S–M | Low-medium | No | Progress file of Import |
+| 12 | Per-configuration record of stored client secrets | S–M | Low: safety of Secrets page clean-up | No | Secrets page progress file |
+| 13 | Legacy v1 secret and settings import | S | Low: v1 users only | No | Core, `legacy.rs` |
+| 14 | VS Code extension scope hint | S | Low | No; blocked on an experiment | Nice to have 4 |
+
+The model-based test of change operations is not ranked: it is quality work, best done alongside 2, 4 and 5, which add change operations.
+
+### Details of the items added on 2026-10-19
+- **Every server Claude Code loads, and why one doesn't (M).** Read-only rows for plugin servers (a plugin's `.mcp.json`, `mcpServers` in `plugin.json`, `.mcpb` bundles), organisation servers (`managed-mcp.json`, `managedMcpServers`) and claude.ai connectors (from the cached status, never a new `mcp list`). Mark a server "Blocked by policy" when `deniedMcpServers` matches it, or `allowedMcpServers` applies and does not, naming the rule and its settings file (matching: `serverUrl` with `*`, exact `serverCommand`, `serverName`). Plugin and managed files are untrusted input. Spike first: whether plugin servers and connectors can be turned off through `disabledMcpServers`, and under which names. Sets apart: no other tool shows plugin and organisation servers or explains a policy block, and Claude Code itself hides the block.
+- **Tools view (L).** On an explicit click only, connect to a server and call `tools/list`: show each tool, an estimated token cost, and flag a tool whose description changed since it was last seen (stored hash). Feeds tool names into approvals and helps choose sets. A stdio server runs its command, so the "explicit click, full command shown first" rule of project checks applies; HTTP servers need `net/` (shared with the network probe and Copy MCP Inspector command). Sets apart: no other manager shows a server's context cost together with tool changes since approval (mcp-scan pins hashes, but only as a CLI scanner; MCPMate's inspector has no cost or change view). Biggest user pain: tool definitions cost context every turn.
+- **Server sets (S–M).** Named groups of servers, kept in app data, switched on for a project, for every project, or alone (everything else off). Each switch is one Prepare → diff → Apply plan over `disabledMcpServers`, so backups, the Activity log and restore apply. Available from the palette and `klefki-cli`. Expected: mcpick (planned), mcpm, MCPMate and Docker all have profiles. Cheap and high impact.
+- **Approvals per server (S–M).** On the detail panel, show the permission rules that apply to a server (`mcp__<server>`, `mcp__<server>__*`, `mcp__<server>__<tool>`) and the file each comes from; write auto-approve, ask or block through a plan to `~/.claude/settings.json` (user) or `.claude/settings.local.json` (one project). `~/.claude/settings.json` is a new write target: invariant review first. Sets apart: other managers leave Claude Code's per-server permission rules to hand-edited settings files.
+- **VS Code servers (M read-only; L to write).** A page like the Claude Desktop page for VS Code's own MCP servers (`.vscode/mcp.json` per workspace and the profile's `mcp.json`; key `servers`, `inputs` for secrets), with the Desktop page's rules (read on open, values never read, sanitised). "Copy to Claude Code" through the Import plan, and Export in VS Code's format. Writing to VS Code is a separate decision; a direct file writer changes the invariants. Other clients (Cursor, Windsurf, Codex, Gemini CLI and the like) are deferred indefinitely (owner, 2026-10-19). Expected: add-mcp, mcpm, MCPMate and Docker cover VS Code, so it does not set Klefki apart.
+
 ## Verification
 - **Unit tests**:
   - name validation and reserved names, ProjectKey normalisation
