@@ -22,6 +22,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
@@ -104,6 +105,16 @@ pub enum Command {
     /// What Klefki changed, and the backups it kept (see [`Event::Activity`]). Read only when asked: the Activity log
     /// page asks each time it is opened.
     Activity,
+    /// Which servers use secrets and where each lives, and the client secrets nothing uses (see [`Event::Secrets`]).
+    /// Read only when asked: the Secrets page asks each time it is opened. No secret is read.
+    Secrets,
+    /// [`Command::Secrets`] again after the files changed: the definitions are read again, and the system's store is
+    /// not asked again (asking can prompt to unlock it, and Claude Code saves often); its last listing is used.
+    SecretsAfterFileChange,
+    /// Delete a client secret from the system's store that no server uses ([`crate::api::UnusedSecret`]). Refused
+    /// when a server, or a definition Klefki keeps to put back, uses it by now. Answers with
+    /// [`Event::UnusedSecretForgotten`], then [`Event::Secrets`].
+    ForgetUnusedSecret(crate::model::ConnectionId),
 }
 
 /// Where a sign-in is ([`Event::SignIn`]). Text is sanitised.
@@ -397,6 +408,13 @@ pub enum Event {
     },
     /// The activity log, after [`Command::Activity`].
     Activity(crate::activity::Activity),
+    /// What the Secrets page shows, after [`Command::Secrets`].
+    Secrets(crate::secret_uses::Secrets),
+    /// Whether [`Command::ForgetUnusedSecret`] deleted the secret, or why not (sanitised).
+    UnusedSecretForgotten {
+        connection: crate::model::ConnectionId,
+        result: Result<(), String>,
+    },
 }
 
 /// The UI's handle to the engine.
@@ -614,6 +632,7 @@ enum JobKind {
     Diagnose,
 }
 
+#[derive(Clone)]
 struct Job {
     id: ServerId,
     /// Already validated; it is passed to the CLI as its own argument.
@@ -626,6 +645,8 @@ struct Job {
     background: bool,
     /// Asked for on its own ([`Queue::push_now`]): ahead of every other job, after earlier such asks.
     now: bool,
+    /// A `claude mcp list` had no clear answer for it: it is checked on its own, not through another list.
+    alone: bool,
 }
 
 #[derive(Default)]
@@ -670,6 +691,21 @@ impl Queue {
             .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
         let at = self.jobs.iter().take_while(|q| q.now).count();
         self.jobs.insert(at, Job { now: true, ..job });
+    }
+
+    /// Takes the other background checks waiting to run in `cwd`, to be answered by one `claude mcp list`. None when
+    /// there are too few for a list to pay off: it starts every server of the folder, those not asked about too.
+    fn take_mates(&mut self, cwd: &Path) -> Vec<Job> {
+        let is_mate =
+            |j: &Job| j.background && j.kind == JobKind::Check && !j.alone && j.cwd == cwd;
+        if self.jobs.iter().filter(|j| is_mate(j)).count() + 1 < MIN_LIST_BATCH {
+            return Vec::new();
+        }
+        let (mates, rest): (Vec<Job>, Vec<Job>) = std::mem::take(&mut self.jobs)
+            .into_iter()
+            .partition(|j| is_mate(j));
+        self.jobs = rest.into();
+        mates
     }
 
     fn take(&mut self) -> Option<Job> {
@@ -760,6 +796,33 @@ impl Drop for Announced<'_> {
 /// klefki from 123 MB to about 700 MB at startup. One keeps it near 300 MB.
 const BACKGROUND_CHECKS: usize = 1;
 
+/// Background checks of one folder that are answered by one `claude mcp list` instead of one `mcp get` each: the
+/// list costs one Claude start and checks all servers at once (30 servers: 2.6 s against 28.5 s), but it starts
+/// every server of the folder, so for a few separate checks are as quick and touch only those.
+const MIN_LIST_BATCH: usize = 4;
+
+/// A list holds a line for every server of the folder, with its command.
+const MAX_LIST_OUTPUT: usize = 4 * 1024 * 1024;
+
+/// What a list is run with, besides the usual environment.
+/// - No claude.ai connectors: a list also checks those over the network (21 of them took 19-32 s where the servers in
+///   the files took 7 s), and they are not servers of these files.
+/// - A connection timeout of 3 s (Claude's own is 30 s) and 10 servers connected at once (Claude's is 3): a list
+///   prints only when the last server is done, so one that hangs would hold back the answers of all the others for
+///   30 s. Now that is about 8 s (the 3 s probe Claude starts with, the timeout and its own start); 6 hanging servers
+///   took 13.5 s with 3 at once, 8.4 s with 10. A server that needs longer than 3 s is not given a failure for it:
+///   see `parse::parse_list`, and it is checked with `get`.
+const LIST_ENV: [(&str, &str); 3] = [
+    ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+    ("MCP_TIMEOUT", "3000"),
+    ("MCP_SERVER_CONNECTION_BATCH_SIZE", "10"),
+];
+
+fn list_env<'a>(mut base: Vec<(&'a str, &'a OsStr)>) -> Vec<(&'a str, &'a OsStr)> {
+    base.extend(LIST_ENV.iter().map(|&(k, v)| (k, OsStr::new(v))));
+    base
+}
+
 struct Shared {
     config: EngineConfig,
     queue: Mutex<Queue>,
@@ -773,6 +836,11 @@ struct Shared {
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     /// The secret store once opened. Not kept when opening failed, so a store unlocked later is found.
     secret_store: Mutex<Option<Arc<dyn SecretStore>>>,
+    /// Cleared when a `claude mcp list` gave no answer at all (it failed, or its output is not what is read): every
+    /// check is then a `get`, as before, until klefki is started again.
+    list_works: AtomicBool,
+    /// What the system's store last listed for the Secrets page, or why it could not.
+    secrets_listed: Mutex<Option<Result<Vec<crate::model::ConnectionId>, String>>>,
     /// Per file, the redo log of klefki's changes whose check is still due.
     journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
@@ -835,6 +903,8 @@ fn engine_main(
         version: Mutex::new(None),
         journals: Arc::default(),
         secret_store: Mutex::new(None),
+        list_works: AtomicBool::new(true),
+        secrets_listed: Mutex::new(None),
         emitter,
         input: input_tx.clone(),
     });
@@ -977,6 +1047,11 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
+            Command::Secrets => secrets(&shared, &state, SecretsAsk::List),
+            Command::SecretsAfterFileChange => secrets(&shared, &state, SecretsAsk::Reuse),
+            Command::ForgetUnusedSecret(connection) => {
+                secrets(&shared, &state, SecretsAsk::Forget(connection));
+            }
         }
     }
     // The UI is gone: a sign-in still running is stopped, so no `claude` keeps listening after Klefki closes.
@@ -1033,6 +1108,98 @@ fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
             stored: stored.map_err(|e| e.to_string()),
         });
     });
+}
+
+/// How the Secrets page asks about the system's store.
+enum SecretsAsk {
+    /// List it again.
+    List,
+    /// Use its last listing, if there is one.
+    Reuse,
+    /// Delete this unused client secret, if nothing uses it, then list the store again.
+    Forget(crate::model::ConnectionId),
+}
+
+/// The Secrets page: the definitions are read here, the system's store is listed on a thread of its own (it may be
+/// slow, or ask the user to unlock it).
+fn secrets(shared: &Arc<Shared>, state: &State, ask: SecretsAsk) {
+    let report = crate::secret_uses::read(
+        shared.config.paths.as_ref(),
+        shared.config.home.as_deref(),
+        &state.snapshot,
+        &state.keys,
+    );
+    let snapshot = Arc::clone(&state.snapshot);
+    let shared = Arc::clone(shared);
+    std::thread::spawn(move || {
+        // Definitions Klefki keeps to put back still use their client secret.
+        let kept: Vec<crate::model::ConnectionId> = shared
+            .config
+            .backup_dir
+            .as_deref()
+            .map(swap::Recovery::files)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(swap::Recovery::connections)
+            .collect();
+        let reused = match ask {
+            SecretsAsk::Reuse => lock(&shared.secrets_listed).clone(),
+            _ => None,
+        };
+        let listed = match reused {
+            Some(listed) => listed,
+            None => list_secrets(&shared, &snapshot, &kept, ask),
+        };
+        shared
+            .emitter
+            .emit(Event::Secrets(crate::secret_uses::with_store(
+                report, &snapshot, listed, &kept,
+            )));
+    });
+}
+
+/// The connections the system's store keeps a client secret for, or why it could not say; after deleting `ask`'s
+/// unused secret. Remembered for [`SecretsAsk::Reuse`].
+fn list_secrets(
+    shared: &Shared,
+    snapshot: &Snapshot,
+    kept: &[crate::model::ConnectionId],
+    ask: SecretsAsk,
+) -> Result<Vec<crate::model::ConnectionId>, String> {
+    let store = secret_store(shared);
+    if let SecretsAsk::Forget(connection) = ask {
+        let used = snapshot
+            .servers
+            .iter()
+            .any(|r| r.connection == connection && r.oauth.is_some())
+            || kept.contains(&connection);
+        let result = if used {
+            Err("A server uses this client secret now, so it was kept.".to_owned())
+        } else {
+            match &store {
+                Ok(store) => store
+                    .delete(&connection)
+                    .map(|_| ())
+                    .map_err(|e| sanitize(&e.to_string())),
+                Err(e) => Err(sanitize(&e.to_string())),
+            }
+        };
+        shared
+            .emitter
+            .emit(Event::UnusedSecretForgotten { connection, result });
+    }
+    let listed = match &store {
+        Ok(store) => store.list().map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    // A store that cannot be opened matters only when a server signs in with OAuth.
+    let signs_in = snapshot.servers.iter().any(|r| r.oauth.is_some());
+    let listed = match listed {
+        Err(_) if !signs_in => Ok(Vec::new()),
+        listed => listed,
+    };
+    *lock(&shared.secrets_listed) = Some(listed.clone());
+    listed
 }
 
 /// The store client secrets are kept in: the one tests give, else the system's own, opened the first time it is
@@ -2269,6 +2436,7 @@ fn build_job(
         announce,
         background: false,
         now: false,
+        alone: false,
     })
 }
 
@@ -2342,7 +2510,9 @@ fn worker(shared: &Shared) {
     }
 }
 
-fn run(shared: &Shared, job: &Job) {
+/// Says a job is checking, when it should, and notes the change count its answer is compared with. Taken after the
+/// announcement: an edit noted before this is one the check will see.
+fn begin<'a>(shared: &'a Shared, job: &Job) -> (Option<Announced<'a>>, u64) {
     let announced = job
         .announce
         .then(|| Announced::new(&shared.queue, &job.id.connection));
@@ -2351,16 +2521,30 @@ fn run(shared: &Shared, job: &Job) {
             .emitter
             .status(job.id.clone(), Status::Checking, None);
     }
-    // Taken after the announcement: an edit noted before this is one the check will see.
     let started = lock(&shared.changes).count;
     if let Some(a) = &announced {
         a.started(started);
     }
+    (announced, started)
+}
+
+fn run(shared: &Shared, job: &Job) {
+    let (_announced, started) = begin(shared, job);
     // An answer about a server edited or removed while this ran is about a definition that is gone.
     let current = || !lock(&shared.changes).since(&job.id.connection, started);
     match job.kind {
         JobKind::Check => {
-            let (status, detail) = execute(shared, job);
+            let listed = if job.background {
+                check_listed(shared, job)
+            } else {
+                ListedCheck::Not
+            };
+            let (status, detail) = match listed {
+                ListedCheck::Answer(answer) => answer,
+                ListedCheck::Not => execute(shared, job),
+                // Its `get` goes in the queue behind those of the servers that were only slow.
+                ListedCheck::Later => return,
+            };
             if current() {
                 shared.emitter.status(job.id.clone(), status, detail);
             }
@@ -2450,6 +2634,127 @@ fn claude_program(shared: &Shared) -> Option<PathBuf> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// What `check_listed` made of the job it was given.
+enum ListedCheck {
+    /// The list answered for it.
+    Answer((Status, Option<String>)),
+    /// No list was run for it: check it with `get` now.
+    Not,
+    /// The list had no answer for it, and it is queued again, to be checked with `get` in its turn.
+    Later,
+}
+
+/// Answers the other background checks waiting in the job's folder from one `claude mcp list`, and returns the answer
+/// for the job itself when the list had a clear one. A server the list did not answer clearly goes back to the queue
+/// to be checked on its own, so what is shown is always what `claude mcp get` says. A list that answered nothing
+/// ends listing for the rest of the run, and the job is checked as usual.
+fn check_listed(shared: &Shared, job: &Job) -> ListedCheck {
+    if job.alone || !shared.list_works.load(Ordering::Relaxed) {
+        return ListedCheck::Not;
+    }
+    let Some(program) = claude_program(shared) else {
+        return ListedCheck::Not;
+    };
+    let mates = lock(&shared.queue).take_mates(&job.cwd);
+    if mates.is_empty() {
+        return ListedCheck::Not;
+    }
+    let begun: Vec<_> = mates
+        .into_iter()
+        .map(|mate| {
+            let started = begin(shared, &mate);
+            (mate, started)
+        })
+        .collect();
+    let names: Vec<&str> = std::iter::once(job.name.as_str())
+        .chain(begun.iter().map(|(mate, _)| mate.name.as_str()))
+        .collect();
+    let env = list_env(cli_env(shared));
+    let result = runner::run(&RunSpec {
+        program: &program,
+        args: &["mcp", "list"],
+        cwd: Some(&job.cwd),
+        env: &env,
+        timeout: shared.config.check_timeout,
+        max_output: MAX_LIST_OUTPUT,
+        // It starts the servers, as `mcp get` does: none may outlive it.
+        end_leftovers: true,
+    });
+    let answers = match result {
+        Ok(out) if !out.timed_out && out.exit_code == Some(0) => {
+            // Cut off in the middle of a line: that line is not read.
+            let text = match (out.truncated, out.stdout.rfind('\n')) {
+                (true, Some(end)) => &out.stdout[..end],
+                (true, None) => "",
+                (false, _) => out.stdout.as_str(),
+            };
+            parse::parse_list(text, &names)
+        }
+        _ => HashMap::new(),
+    };
+    if answers.is_empty() {
+        shared.list_works.store(false, Ordering::Relaxed);
+    }
+    // The servers the list did not answer, with whether each never answered the connection.
+    let mut again: Vec<(Job, bool)> = Vec::new();
+    for (mate, (_announced, started)) in begun {
+        match answers.get(mate.name.as_str()) {
+            Some(parse::Listed::Settled(checked)) => {
+                // Edited or removed while the list ran: the answer is about a definition that is gone.
+                if !lock(&shared.changes).since(&mate.id.connection, started) {
+                    shared
+                        .emitter
+                        .status(mate.id.clone(), checked.status, checked.detail.clone());
+                }
+            }
+            other => again.push((
+                Job {
+                    alone: true,
+                    ..mate
+                },
+                never_connected(other),
+            )),
+        }
+    }
+    let own = answers.get(job.name.as_str());
+    if let Some(parse::Listed::Settled(checked)) = own {
+        let answer = (checked.status, checked.detail.clone());
+        return queue_again(shared, again, ListedCheck::Answer(answer));
+    }
+    // The job has no answer either: it waits for its turn like the others, so that a server that hangs does not
+    // hold the rest back with its 30 s. It was taken before them, so it stays ahead of them.
+    again.insert(
+        0,
+        (
+            Job {
+                alone: true,
+                ..job.clone()
+            },
+            never_connected(own),
+        ),
+    );
+    queue_again(shared, again, ListedCheck::Later)
+}
+
+fn never_connected(listed: Option<&parse::Listed>) -> bool {
+    matches!(
+        listed,
+        Some(parse::Listed::Open {
+            never_connected: true
+        })
+    )
+}
+
+/// Queues the servers a list did not answer, those that answered the connection too slowly first and those that never
+/// did last (the order within each stays), and returns `then`.
+fn queue_again(shared: &Shared, mut again: Vec<(Job, bool)>, then: ListedCheck) -> ListedCheck {
+    again.sort_by_key(|(_, never_connected)| *never_connected);
+    if !again.is_empty() {
+        lock(&shared.queue).add(again.into_iter().map(|(job, _)| job).collect());
+    }
+    then
 }
 
 fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
@@ -2619,7 +2924,8 @@ mod tests {
     use crate::model::Target;
     use std::time::Instant;
 
-    const WAIT: Duration = Duration::from_secs(15);
+    /// Long enough for a slow machine: starting a process took 1-3 s while a whole run of these tests started them at once.
+    const WAIT: Duration = Duration::from_secs(60);
 
     struct Env {
         dir: tempfile::TempDir,
@@ -2722,6 +3028,19 @@ mod tests {
                 }
             }
             out
+        }
+
+        /// The folder of every `mcp list` the fake CLI was asked to run, in order.
+        fn lists(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|l| {
+                    l["event"] == "start" && l["argv"] == serde_json::json!(["mcp", "list"])
+                })
+                .map(|l| l["cwd"].as_str().unwrap_or_default().to_owned())
+                .collect()
         }
     }
 
@@ -3019,6 +3338,374 @@ mod tests {
         let gets = env.gets();
         assert_eq!(gets.len(), 4);
         assert_eq!(max_overlap(&gets), 1, "{gets:?}");
+    }
+
+    /// What `claude mcp list` prints for `lines` (name, command, status as Claude words it).
+    fn list_output(lines: &[(&str, &str)]) -> Vec<u8> {
+        let mut text = String::from("Checking MCP server health…\n\n");
+        for (name, status) in lines {
+            text.push_str(&format!("{name}: x - {status}\n"));
+        }
+        text.into_bytes()
+    }
+
+    fn servers(n: usize) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> = (0..n)
+            .map(|i| (format!("s{i}"), serde_json::json!({"command": "x"})))
+            .collect();
+        serde_json::json!({ "mcpServers": map })
+    }
+
+    const LIST_AND_GET: &str = r#"{"rules":[{"args":["--version"]},
+        {"args":["mcp","list"],"stdout_file":"list.txt"},
+        {"args":["mcp","get","s2"],"stdout_file":"failed.txt"},
+        {"args":["mcp","get","s5"],"stdout_file":"failed.txt"},
+        {"args":["mcp","get"],"stdout_file":"c.txt"}]}"#;
+
+    fn all_checked(core: &Core, n: usize) -> Vec<Event> {
+        collect(core, |e| {
+            (0..n).all(|i| final_status(e, &format!("s{i}")).is_some())
+        })
+    }
+
+    #[test]
+    fn background_checks_in_one_folder_share_one_claude_list() {
+        let list = list_output(&[
+            ("s0", "✔ Connected"),
+            (
+                "s1",
+                "✘ Failed to connect — CONNECTION_CLOSED: Connection closed",
+            ),
+            ("s2", "! Connected · tools fetch failed — no tools"),
+            ("s3", "! Needs authentication"),
+            ("s4", "✔ Connected"),
+            ("s5", "✔ Connected"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        let said = |n: &str| status_of(&events, n);
+        assert_eq!(said("s0"), Some((Status::Connected, None)));
+        assert_eq!(
+            said("s1"),
+            Some((
+                Status::Failed,
+                Some("CONNECTION_CLOSED: Connection closed".to_owned())
+            ))
+        );
+        assert_eq!(
+            said("s2"),
+            Some((Status::Degraded, Some("no tools".to_owned())))
+        );
+        assert_eq!(said("s3").map(|s| s.0), Some(Status::NeedsAuth));
+        assert_eq!(said("s5"), Some((Status::Connected, None)));
+        assert_eq!(env.lists().len(), 1, "one list for the folder");
+        assert!(env.gets().is_empty(), "no get: {:?}", env.gets());
+    }
+
+    #[test]
+    fn a_server_the_list_does_not_answer_clearly_is_checked_on_its_own() {
+        // s2 is on two lines and s5 on none: Claude is asked about each of them, and the list is not asked again.
+        let list = list_output(&[
+            ("s0", "✔ Connected"),
+            ("s1", "✔ Connected"),
+            ("s2", "✔ Connected"),
+            ("s2", "✔ Connected"),
+            ("s3", "✔ Connected"),
+            ("s4", "✔ Connected"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        assert_eq!(final_status(&events, "s0"), Some(Status::Connected));
+        assert_eq!(
+            final_status(&events, "s2"),
+            Some(Status::Failed),
+            "its own get"
+        );
+        assert_eq!(
+            final_status(&events, "s5"),
+            Some(Status::Failed),
+            "its own get"
+        );
+        let mut asked: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        asked.sort();
+        assert_eq!(asked, ["s2", "s5"]);
+        assert_eq!(env.lists().len(), 1);
+    }
+
+    #[test]
+    fn when_the_list_fails_every_server_is_checked_with_get() {
+        // Variant: a list that exits 1, and one that exits 0 with nothing usable, both leave the servers to `get`.
+        for scenario in [
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"exit_code":1},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"stdout_file":"nonsense.txt"},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+        ] {
+            let env = Env::new(
+                &servers(6),
+                scenario,
+                &[("c.txt", CONNECTED), ("nonsense.txt", b"something else\n")],
+            );
+            let core = env.start();
+            let events = all_checked(&core, 6);
+            assert_eq!(final_status(&events, "s3"), Some(Status::Connected));
+            assert_eq!(env.gets().len(), 6, "{scenario}");
+            assert_eq!(env.lists().len(), 1, "not asked again: {scenario}");
+        }
+    }
+
+    #[test]
+    fn a_list_answer_a_timeout_may_have_caused_is_checked_with_get() {
+        // The list runs with a short timeout so a hanging server cannot hold the others back; what it says
+        // about a server that ran out of time is not Claude's answer, which `get` gives with the full time.
+        let list = list_output(&[
+            ("s0", "✔ Connected"),
+            ("s1", "✘ Failed to connect — Request timed out"),
+            (
+                "s2",
+                "✘ Failed to connect — MCP server \"[redacted]\" connection timed out after 3000ms",
+            ),
+            ("s3", "! Connected · tools fetch failed — Request timed out"),
+            ("s4", "✔ Connected"),
+            ("s5", "✘ Failed to connect"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        assert_eq!(
+            final_status(&events, "s1"),
+            Some(Status::Connected),
+            "its get"
+        );
+        assert_eq!(final_status(&events, "s2"), Some(Status::Failed), "its get");
+        assert_eq!(
+            final_status(&events, "s3"),
+            Some(Status::Connected),
+            "its get"
+        );
+        assert_eq!(final_status(&events, "s5"), Some(Status::Failed), "its get");
+        let mut asked: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        asked.sort();
+        assert_eq!(asked, ["s1", "s2", "s3", "s5"]);
+        assert_eq!(env.lists().len(), 1);
+    }
+
+    #[test]
+    fn a_server_that_never_connected_in_the_list_is_checked_after_one_that_was_only_slow() {
+        // A hanging server's own `get` takes 30 s, so the others come first, though it is first in the queue and
+        // is the job that ran the list.
+        let list = list_output(&[
+            (
+                "s0",
+                "✘ Failed to connect — MCP server \"s0\" connection timed out after 3000ms",
+            ),
+            ("s1", "✘ Failed to connect — Request timed out"),
+            ("s2", "✔ Connected"),
+            ("s3", "✔ Connected"),
+            ("s4", "✔ Connected"),
+            ("s5", "✔ Connected"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        assert_eq!(
+            final_status(&events, "s2"),
+            Some(Status::Connected),
+            "from the list"
+        );
+        assert_eq!(
+            final_status(&events, "s0"),
+            Some(Status::Connected),
+            "its own get"
+        );
+        let asked: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(asked, ["s1", "s0"], "the slow one first");
+        assert_eq!(env.lists().len(), 1);
+    }
+
+    #[test]
+    fn the_list_is_asked_for_a_short_timeout_and_a_wide_batch_without_the_connectors() {
+        let base = [("FAKE", OsStr::new("1"))];
+        let env = list_env(base.to_vec());
+        assert!(
+            env.contains(&("FAKE", OsStr::new("1"))),
+            "the usual environment stays"
+        );
+        for (key, value) in [
+            ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+            ("MCP_TIMEOUT", "3000"),
+            ("MCP_SERVER_CONNECTION_BATCH_SIZE", "10"),
+        ] {
+            assert!(env.contains(&(key, OsStr::new(value))), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_hangs_is_ended_and_the_servers_are_checked_with_get() {
+        let env = Env::new(
+            &servers(6),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"hang":true},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let mut config = env.config();
+        config.check_timeout = Duration::from_millis(400);
+        let core = start_with(config, || {});
+        let events = all_checked(&core, 6);
+        assert_eq!(final_status(&events, "s4"), Some(Status::Connected));
+        assert_eq!(env.gets().len(), 6);
+        assert_eq!(env.lists().len(), 1, "not asked again");
+    }
+
+    #[test]
+    fn servers_a_list_could_not_answer_keep_their_order_and_the_one_that_ran_it_its_place() {
+        // Regression (Windows CI): the job that ran the list went to the back, behind servers that were after it, so
+        // a server on screen could be checked before an earlier one. The list fails slowly; the servers on screen
+        // are named while it runs.
+        let env = Env::new(
+            &servers(5),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"delay_ms":600,"exit_code":1},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = env.start();
+        std::thread::sleep(Duration::from_millis(250));
+        core.send(Command::Visible(vec![
+            crate::model::ConnectionId::new(Scope::User, None, "s4"),
+            crate::model::ConnectionId::new(Scope::User, None, "s3"),
+        ]));
+        all_checked(&core, 5);
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(order, ["s3", "s4", "s0", "s1", "s2"], "{order:?}");
+    }
+
+    #[test]
+    fn a_few_servers_are_checked_one_by_one() {
+        // A list starts every server of the folder; for a few, separate gets are not slower and start only those.
+        let env = Env::new(
+            &servers(3),
+            LIST_AND_GET,
+            &[
+                ("list.txt", b""),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        all_checked(&core, 3);
+        assert_eq!(env.gets().len(), 3);
+        assert!(env.lists().is_empty());
+    }
+
+    #[test]
+    fn a_check_the_user_asks_for_is_always_a_get() {
+        let list = list_output(
+            &(0..6)
+                .map(|i| (["s0", "s1", "s2", "s3", "s4", "s5"][i], "✔ Connected"))
+                .collect::<Vec<_>>(),
+        );
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        all_checked(&core, 6);
+        core.send(Command::Check(user_id("s5")));
+        let events = collect(&core, |e| final_status(e, "s5").is_some());
+        assert_eq!(
+            final_status(&events, "s5"),
+            Some(Status::Failed),
+            "its get answered"
+        );
+        assert_eq!(env.lists().len(), 1);
+        assert_eq!(env.gets().len(), 1);
+    }
+
+    #[test]
+    fn each_folder_gets_its_own_list() {
+        let env = Env::new(
+            &serde_json::json!({}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"stdout_file":"list.txt"},{"args":["mcp","get"],"stdout_file":"failed.txt"}]}"#,
+            &[
+                (
+                    "list.txt",
+                    &list_output(&[
+                        ("a0", "✔ Connected"),
+                        ("a1", "✔ Connected"),
+                        ("a2", "✔ Connected"),
+                        ("a3", "✔ Connected"),
+                    ]),
+                ),
+                ("failed.txt", FAILED),
+            ],
+        );
+        // Two projects, four local servers each, named alike so the one list text answers both.
+        let (p1, p2) = (env.dir.path().join("p1"), env.dir.path().join("p2"));
+        std::fs::create_dir_all(&p1).unwrap();
+        std::fs::create_dir_all(&p2).unwrap();
+        let local: serde_json::Map<String, serde_json::Value> = (0..4)
+            .map(|i| (format!("a{i}"), serde_json::json!({"command": "x"})))
+            .collect();
+        std::fs::write(
+            env.dir.path().join("cfg").join(".claude.json"),
+            serde_json::json!({"projects": {
+                p1.to_str().unwrap(): {"mcpServers": local},
+                p2.to_str().unwrap(): {"mcpServers": local}}})
+            .to_string(),
+        )
+        .unwrap();
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter()
+                .filter(
+                    |x| matches!(x, Event::Status { status, .. } if *status != Status::Checking),
+                )
+                .count()
+                >= 8
+        });
+        let mut folders = env.lists();
+        folders.sort();
+        assert_eq!(folders.len(), 2, "{folders:?}");
+        assert!(
+            folders[0].ends_with("p1") && folders[1].ends_with("p2"),
+            "{folders:?}"
+        );
+        assert!(env.gets().is_empty(), "{:?}", env.gets());
     }
 
     #[test]
@@ -5023,6 +5710,232 @@ mod tests {
         // Not written next to the configuration either.
         let dump = walk(env.dir.path());
         assert!(!dump.contains("s3cret"), "{dump}");
+    }
+
+    // ---- the Secrets page
+
+    fn secrets_report(core: &Core) -> crate::secret_uses::Secrets {
+        core.send(Command::Secrets);
+        collect(core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Secrets(s) => Some(s),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn secrets_env() -> Env {
+        quiet_env(&serde_json::json!({
+            "mcpServers": {
+                "sso": {"type": "http", "url": "https://sso.example.com/mcp", "oauth": {"clientId": "klefki-1"}},
+                "gh": {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_0123456789abcdefghijABCDEFGHIJ012345", "LOG_LEVEL": "debug"}},
+                "ref": {"type": "http", "url": "https://ref.example.com/", "headers": {"Authorization": "Bearer ${REF_TOKEN}"}},
+                "plain": {"command": "node", "args": ["server.js"]}
+            },
+            "projects": {"/work/a": {"mcpServers": {"sso2": {"type": "http", "url": "https://sso2.example.com/", "oauth": {"clientId": "c2"}}}}}
+        }))
+    }
+
+    #[test]
+    fn the_secrets_page_says_where_each_secret_lives_without_any_value() {
+        use crate::secret_uses::{Place, SecretKind};
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let gone = crate::model::ConnectionId::new(Scope::User, None, "gone");
+        for (id, value) in [
+            (user_id("sso").connection, "s3cret-one"),
+            (gone.clone(), "s3cret-two"),
+        ] {
+            store
+                .set(&id, &crate::secrets::Secret::new(value.into()))
+                .unwrap();
+        }
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        let places: Vec<(String, SecretKind, String, Place)> = report
+            .servers
+            .iter()
+            .flat_map(|s| {
+                s.uses
+                    .iter()
+                    .map(|u| (s.id.name.clone(), u.kind, u.name.clone(), u.place.clone()))
+            })
+            .collect();
+        assert_eq!(
+            places,
+            [
+                // Typed in first.
+                (
+                    "gh".into(),
+                    SecretKind::Env,
+                    "GITHUB_TOKEN".into(),
+                    Place::Written {
+                        instead: Some("${GITHUB_TOKEN}".into())
+                    }
+                ),
+                (
+                    "sso".into(),
+                    SecretKind::ClientSecret,
+                    "".into(),
+                    Place::Store(Some(true))
+                ),
+                (
+                    "ref".into(),
+                    SecretKind::Header,
+                    "Authorization".into(),
+                    Place::Environment(vec!["REF_TOKEN".into()])
+                ),
+            ]
+        );
+        assert!(
+            report.servers[0].file.ends_with(".claude.json"),
+            "{:?}",
+            report.servers[0]
+        );
+        assert_eq!(report.written(), 1);
+        let unused: Vec<&str> = report.unused.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(unused, ["gone"]);
+        assert_eq!(report.store_problem, None);
+        let everything = format!("{report:?}");
+        for value in ["s3cret", "ghp_0123"] {
+            assert!(!everything.contains(value), "{everything}");
+        }
+    }
+
+    #[test]
+    fn unused_means_unused_in_this_configuration_and_the_report_names_it() {
+        // Cross-review B1: one store, two Claude Code configurations (CLAUDE_CONFIG_DIR). The second one cannot
+        // see the first's servers, so the page must say which configuration it looked at.
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let sso = user_id("sso").connection;
+        store
+            .set(&sso, &crate::secrets::Secret::new("s3cret".into()))
+            .unwrap();
+        let second = quiet_env(&serde_json::json!({"mcpServers": {"plain": {"command": "node"}}}));
+        let core = with_store(&second, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        let unused: Vec<&str> = report.unused.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(unused, ["sso"]);
+        let config = second.dir.path().join("cfg").join(".claude.json");
+        assert_eq!(
+            report.config,
+            crate::sanitize::shown(&config.display().to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_change_reads_the_definitions_again_but_not_the_store() {
+        // Cross-review N1/N2: listing the store can ask to unlock it, and Claude Code saves often.
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        assert_eq!(secrets_report(&core).store_problem, None);
+        *store.fail.lock().unwrap() =
+            Some(crate::secrets::SecretError::Unavailable("locked".into()));
+        let mut config = config_json(&env);
+        config["mcpServers"]["new"] =
+            serde_json::json!({"command": "x", "env": {"API_TOKEN": "${API_TOKEN}"}});
+        write_config(&env, &config);
+        core.send(Command::Refresh { live_all: false });
+        collect(&core, |e| !snapshots(e).is_empty());
+        core.send(Command::SecretsAfterFileChange);
+        let again = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Secrets(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(again.store_problem, None, "the store was not asked again");
+        assert!(
+            again.servers.iter().any(|s| s.id.name == "new"),
+            "{again:?}"
+        );
+        // Asked on purpose (opening the page, Try again), it is.
+        assert!(secrets_report(&core).store_problem.is_some());
+    }
+
+    #[test]
+    fn an_unused_client_secret_is_forgotten_only_while_nothing_uses_it() {
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let gone = crate::model::ConnectionId::new(Scope::User, None, "gone");
+        let sso = user_id("sso").connection;
+        for id in [&gone, &sso] {
+            store
+                .set(id, &crate::secrets::Secret::new("s3cret".into()))
+                .unwrap();
+        }
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let forgotten = |core: &Core, id: &crate::model::ConnectionId| {
+            core.send(Command::ForgetUnusedSecret(id.clone()));
+            let events = collect(core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))));
+            let result = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::UnusedSecretForgotten { connection, result } if connection == id => {
+                        Some(result.clone())
+                    }
+                    _ => None,
+                })
+                .expect("an answer before the new list");
+            let report = events
+                .into_iter()
+                .find_map(|e| match e {
+                    Event::Secrets(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap();
+            (result, report)
+        };
+        let (result, report) = forgotten(&core, &gone);
+        assert_eq!(result, Ok(()));
+        assert!(report.unused.is_empty(), "{report:?}");
+        assert!(store.get(&gone).unwrap().is_none());
+        // A server's own client secret is not Forget's to take, whatever the page showed.
+        let (result, _) = forgotten(&core, &sso);
+        assert!(result.unwrap_err().contains("uses"));
+        assert!(store.get(&sso).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_used_is_said_only_when_a_server_needs_it() {
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        *store.fail.lock().unwrap() = Some(crate::secrets::SecretError::Unavailable(
+            "no Secret Service".into(),
+        ));
+        let env = secrets_env();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        assert!(
+            report
+                .store_problem
+                .as_deref()
+                .is_some_and(|p| p.contains("no Secret Service")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .servers
+                .iter()
+                .flat_map(|s| &s.uses)
+                .any(|u| u.place == crate::secret_uses::Place::Store(None))
+        );
+        // Variant: nothing signs in with OAuth, so the store does not matter here.
+        let env = quiet_env(&serde_json::json!({
+            "mcpServers": {"gh": {"command": "npx", "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}
+        }));
+        let core = with_store(&env, store);
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        assert_eq!(report.store_problem, None);
+        assert_eq!(report.servers.len(), 1);
     }
 
     /// Every file's text under `dir`, to look for a value that must not be there.
@@ -7470,6 +8383,30 @@ mod tests {
             ["mcp", "add-json", "-s", "user", "--client-secret"]
         );
         assert_eq!(last.2.as_deref(), Some(sha256(CLIENT_SECRET).as_str()));
+    }
+
+    #[test]
+    fn a_kept_definitions_client_secret_is_not_offered_to_forget() {
+        // Put back hands the kept secret to Claude Code again, so it is in use although sso is in no file now.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        keep_sso(&env, &core, &key);
+        let sso = user_id("sso").connection;
+        assert!(store.get(&sso).unwrap().is_some());
+        let report = secrets_report(&core);
+        assert!(report.unused.is_empty(), "{report:?}");
+        core.send(Command::ForgetUnusedSecret(sso.clone()));
+        let refused = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::UnusedSecretForgotten { result, .. } => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert!(refused.is_err());
+        assert!(store.get(&sso).unwrap().is_some());
     }
 
     #[test]

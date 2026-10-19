@@ -64,6 +64,14 @@ impl ConnectionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// An id read back from where it was stored, such as the secret store's list: `None` unless it is one
+    /// [`ConnectionId::new`] makes.
+    pub(crate) fn from_stored(id: &str) -> Option<Self> {
+        let (scope, project, name) = Self::parse(id)?;
+        let id = Self(id.to_owned());
+        (Self::new(scope, project.as_deref(), &name) == id).then_some(id)
+    }
 }
 
 fn scope_word(scope: crate::api::Scope) -> &'static str {
