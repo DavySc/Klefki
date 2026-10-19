@@ -23,7 +23,8 @@ impl Secret {
         self.0.is_empty()
     }
 
-    /// The value, to be typed into: a password field edits it in place, so no plain copy is made.
+    /// The value, to be typed into by a password field. Klefki makes no copy of its own, but a growing `String` may
+    /// move, and the field may keep copies (such as for undo); those are not wiped.
     pub fn edit(&mut self) -> &mut String {
         &mut self.0
     }

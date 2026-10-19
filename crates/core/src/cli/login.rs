@@ -159,21 +159,28 @@ pub(crate) fn check_paste(page: &Page, pasted: &str) -> Result<String, String> {
 
 /// Claude's own words for why it stopped: its last line that is not the link, a prompt or a notice.
 pub(crate) fn last_message(text: &str) -> Option<String> {
-    const NOT_A_REASON: [&str; 4] = [
+    said(text).next_back().map(|l| clip(l, MAX_MESSAGE_CHARS))
+}
+
+/// The lines of `text` that are Claude's own words: not the link, a prompt or a notice.
+fn said(text: &str) -> impl DoubleEndedIterator<Item = &str> {
+    const NOT_SAID: [&str; 4] = [
         "[mcp-sdk]",
         "Waiting for authorization",
         "Starting authentication",
         "Visit this URL",
     ];
-    text.lines()
-        .map(str::trim)
-        .rfind(|l| {
-            !l.is_empty()
-                && !l.contains(PROMPT)
-                && !l.contains("://")
-                && !NOT_A_REASON.iter().any(|p| l.starts_with(p))
-        })
-        .map(|l| clip(l, MAX_MESSAGE_CHARS))
+    text.lines().map(str::trim).filter(|l| {
+        !l.is_empty()
+            && !l.contains(PROMPT)
+            && !l.contains("://")
+            && !NOT_SAID.iter().any(|p| l.starts_with(p))
+    })
+}
+
+/// `output` as text, cleaned of escapes and control characters.
+fn text_of(output: &[u8]) -> String {
+    sanitize(&String::from_utf8_lossy(output))
 }
 
 /// What the session reports as it goes.
@@ -384,7 +391,7 @@ pub(crate) fn drive(
             break if code == 0 {
                 Outcome::SignedIn
             } else {
-                Outcome::Failed(last_message(&read.text).unwrap_or_else(|| {
+                Outcome::Failed(last_message(&text_of(&read.output)).unwrap_or_else(|| {
                     format!("Claude Code stopped without signing in (exit code {code}).")
                 }))
             };
@@ -401,8 +408,6 @@ pub(crate) fn drive(
 #[derive(Default)]
 struct Reading {
     output: Vec<u8>,
-    /// `output`, cleaned of escapes and control characters.
-    text: String,
     page: Option<Page>,
     /// What Claude printed since an address was typed in: its answer.
     after_paste: Option<Vec<u8>>,
@@ -412,7 +417,6 @@ impl Reading {
     /// Takes in more output and reports what it shows. `Err` when Claude printed a link Klefki will not open.
     fn absorb(&mut self, bytes: &[u8], progress: &mut dyn FnMut(Progress)) -> Result<(), String> {
         keep(&mut self.output, bytes);
-        self.text = sanitize(&String::from_utf8_lossy(&self.output));
         if self.page.is_none() {
             match find_page(&words(&self.output)) {
                 Some(Ok(found)) => {
@@ -425,7 +429,7 @@ impl Reading {
         }
         if let Some(after) = &mut self.after_paste {
             keep(after, bytes);
-            if let Some(answer) = refusal(&sanitize(&String::from_utf8_lossy(after))) {
+            if let Some(answer) = refusal(&text_of(after)) {
                 self.after_paste = None;
                 progress(Progress::PasteRefused(answer));
             }
@@ -469,10 +473,7 @@ fn keep(output: &mut Vec<u8>, bytes: &[u8]) {
 /// nor its success message.
 fn refusal(after: &str) -> Option<String> {
     let complete = &after[..after.rfind('\n')? + 1];
-    complete
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.contains(PROMPT) && !l.contains("://"))
+    said(complete)
         .find(|l| !l.starts_with("Authenticated"))
         .map(|l| clip(l, MAX_MESSAGE_CHARS))
 }
@@ -490,10 +491,6 @@ mod tests {
             .join("../../fixtures/mcp-login")
             .join(name);
         std::fs::read(path).unwrap()
-    }
-
-    fn text_of(bytes: &[u8]) -> String {
-        sanitize(&String::from_utf8_lossy(bytes))
     }
 
     fn https_page() -> Page {
@@ -848,6 +845,34 @@ mod tests {
         );
         assert_eq!(seen.last(), Some(&Progress::Finished(Outcome::Cancelled)));
         assert!(term.killed);
+    }
+
+    #[test]
+    fn a_notice_after_a_paste_is_not_taken_for_claudes_refusal() {
+        // Core review 3: the refusal skipped fewer lines than `last_message`, so a notice Claude printed after the
+        // paste was reported as Claude not taking it.
+        let echo = "http://localhost:61983/callback?code=c0de&state=s\r\r\n";
+        for notice in [
+            "[mcp-sdk] SEP-2352 notice",
+            "Waiting for authorization...",
+            "Starting authentication for \"spike\"...",
+            "Visit this URL to sign in:",
+        ] {
+            let after = text_of(format!("{echo}{notice}\r\n").as_bytes());
+            assert_eq!(refusal(&after), None, "{notice}");
+        }
+        // Claude's own refusal is still read, also after a notice.
+        let refused = fixture("real-paste-refused-tail.txt");
+        for after in [
+            refused.clone(),
+            [b"[mcp-sdk] notice\r\n".as_slice(), &refused].concat(),
+        ] {
+            let why = refusal(&text_of(&after)).unwrap();
+            assert!(
+                why.starts_with("That doesn't look like a redirect URL"),
+                "{why}"
+            );
+        }
     }
 
     /// The output buffer drops its oldest half when it grows too large; a refusal after that must still be seen

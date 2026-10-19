@@ -1,6 +1,7 @@
 //! Finds where members and values sit in JSON text, so a change can replace a few bytes instead of rewriting a
 //! large file. Callers check that the whole text is valid JSON first; the scanner still returns errors rather than
-//! panicking on anything else, and never recurses, so deep nesting cannot overflow the stack.
+//! panicking on anything else. It recurses only into the objects `descend` accepts, one level each, and scans every
+//! other value without recursion, so deep nesting cannot overflow the stack.
 use std::ops::Range;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
