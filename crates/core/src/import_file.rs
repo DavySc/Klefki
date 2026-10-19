@@ -87,7 +87,11 @@ pub(crate) fn read(path: &Path) -> ImportFile {
                 "{shown} is not text that Klefki can read (UTF-8 or UTF-16). Choose an export, or a file of server definitions."
             )),
         },
-        Ok(None) => failed(format!("{shown} is no longer there.")),
+        // The whole path: a typo in a folder's name shows there.
+        Ok(None) => failed(format!(
+            "There is no file at {}.",
+            crate::sanitize::shown(&path.to_string_lossy())
+        )),
         Err(e) => failed(format!(
             "Could not read {shown}: {}.",
             crate::sanitize::shown(&e.to_string())
@@ -187,8 +191,9 @@ mod tests {
         assert!(read_text(&big).is_ok());
         let why = read_text(dir.path()).unwrap_err();
         assert!(why.ends_with("is a folder. Choose a file."), "{why}");
-        let why = read_text(&dir.path().join("gone.json")).unwrap_err();
-        assert_eq!(why, "gone.json is no longer there.");
+        let gone = dir.path().join("gone.json");
+        let why = read_text(&gone).unwrap_err();
+        assert_eq!(why, format!("There is no file at {}.", gone.display()));
     }
 
     #[test]

@@ -1019,10 +1019,13 @@ fn engine_main(
                     });
                 }
             },
+            // Read on a thread of its own too: a path on a network share that stopped answering would hold up
+            // every other command.
             Command::ReadImportFile(path) => {
-                shared
-                    .emitter
-                    .emit(Event::ImportFile(crate::import_file::read(&path)));
+                let emitter = shared.emitter.clone();
+                std::thread::spawn(move || {
+                    emitter.emit(Event::ImportFile(crate::import_file::read(&path)));
+                });
             }
             Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
             Command::StoreSecret { id, secret: value } => {
@@ -6877,6 +6880,22 @@ mod tests {
             file_of(&core),
             crate::import_file::ImportFile::Read { .. }
         ));
+
+        // Nearby: a pipe typed as the path (it would wait for a writer) is refused, not waited on.
+        #[cfg(unix)]
+        {
+            let pipe = env.dir.path().join("pipe.json");
+            let made = std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            core.send(Command::ReadImportFile(pipe));
+            assert!(matches!(
+                file_of(&core),
+                crate::import_file::ImportFile::Failed { .. }
+            ));
+        }
     }
 
     #[test]
