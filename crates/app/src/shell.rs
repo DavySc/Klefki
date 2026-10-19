@@ -8,9 +8,10 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Exported, Hint,
-    LegacyDisabled, Part, Pasted, PastedServer, PlanView, Scope, Secret, ServerFields, ServerId,
-    ServerName, ServerRow, Snapshot, Status, Target, TransportKind, same_project, secret_reference,
+    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Exported,
+    FileChoice, Hint, LegacyDisabled, Part, Pasted, PastedServer, PlanView, SaveError, Scope,
+    Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
+    same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -328,6 +329,8 @@ pub struct ShellApp {
     exporting: Option<ExportView>,
     /// Exports asked for and not answered yet: only the answer to the last one fills the dialog.
     exports_pending: usize,
+    /// Save dialogs asked for and not answered yet: an answer counts only when it is the last one asked for.
+    export_choices_pending: usize,
     pub page: Page,
     /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
     pub activity: Option<crate::activity::ActivityPage>,
@@ -387,6 +390,7 @@ impl ShellApp {
             outcome: None,
             exporting: None,
             exports_pending: 0,
+            export_choices_pending: 0,
             snapshot,
             page: Page::Connections,
             activity: None,
@@ -733,6 +737,79 @@ impl ShellApp {
                     view.result = Some(exported);
                 }
             }
+            Event::ExportFileChosen(choice) => {
+                self.export_choices_pending = self.export_choices_pending.saturating_sub(1);
+                if let Some(view) = &mut self.exporting
+                    && self.export_choices_pending == 0
+                    && view.save == Saving::Choosing
+                {
+                    view.save = Saving::Idle;
+                    match choice {
+                        FileChoice::Chosen(path) => {
+                            if let Some(result) = &view.result {
+                                // The system's dialog asked before replacing a file there.
+                                let text = result.text.clone();
+                                view.save = Saving::Writing {
+                                    path: path.clone(),
+                                    typed: None,
+                                };
+                                self.send(Command::SaveExport {
+                                    path,
+                                    text,
+                                    replace: true,
+                                });
+                            }
+                        }
+                        // A dialog that failed slowly looks like a cancel: the way to type a path stays in reach.
+                        FileChoice::Cancelled { suggested } => {
+                            view.save = Saving::Offered {
+                                path: suggested.to_string_lossy().into_owned(),
+                            };
+                        }
+                        FileChoice::NoDialog { suggested } => {
+                            view.save = Saving::Typing {
+                                path: suggested.to_string_lossy().into_owned(),
+                                focus: true,
+                                no_dialog: true,
+                            };
+                        }
+                    }
+                }
+            }
+            Event::ExportSaved {
+                path,
+                shown,
+                result,
+            } => {
+                if let Some(view) = &mut self.exporting
+                    && let Saving::Writing { path: asked, typed } = &view.save
+                    && *asked == path
+                {
+                    let typed = typed.clone();
+                    view.save = Saving::Idle;
+                    match result {
+                        Ok(()) => view.status = Some(Ok(format!("Saved to {shown}"))),
+                        Err(SaveError::Exists) => {
+                            view.status = None;
+                            view.save = Saving::Exists {
+                                path,
+                                typed: typed.unwrap_or_default(),
+                            };
+                        }
+                        Err(why) => {
+                            view.status = Some(Err(format!("Not saved: {why}")));
+                            // A typed path stays, to be put right.
+                            if let Some(path) = typed {
+                                view.save = Saving::Typing {
+                                    path,
+                                    focus: false,
+                                    no_dialog: false,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
             Event::CallbackPort { port, warning } => {
                 if let Some(form) = &mut self.add {
                     if form.port_pending == Some(port) {
@@ -1011,8 +1088,9 @@ impl ShellApp {
                         });
                 }
                 Page::ActivityLog => {
-                    if let Some(page) = &mut self.activity {
-                        page.show(ui);
+                    let restore = self.activity.as_mut().and_then(|page| page.show(ui));
+                    if let Some(backup) = restore {
+                        self.prepare(vec![Change::Restore { backup }]);
                     }
                 }
                 other => {
@@ -1851,6 +1929,12 @@ impl ShellApp {
             }
         };
         self.exporting = Some(ExportView {
+            file_name: klefki_core::api::export_file_name(&names),
+            save: Saving::Idle,
+            status: None,
+            size: egui::Vec2::ZERO,
+            status_height: 26.0,
+            folded: false,
             what,
             names: (rows.len() > 1).then(|| names_in_a_line(&names)),
             scope,
@@ -1875,10 +1959,16 @@ impl ShellApp {
             && ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut copy_names = false;
         let mut close = false;
+        let mut choose = false;
+        let mut save_typed = false;
+        let mut replace = false;
+        let mut keep = false;
+        let mut type_instead = false;
         let muted = |ui: &mut Ui, text: &str| {
             ui.add(egui::Label::new(RichText::new(text).color(pal.text_muted)).wrap());
         };
         let screen = ctx.content_rect();
+        let short = screen.height() < 640.0;
         let modal = egui::Modal::new(egui::Id::new("export_dialog")).show(ctx, |ui| {
             ui.set_width(640.0_f32.min(screen.width() - 48.0));
             ui.heading(format!("Export {}", view.what));
@@ -1906,9 +1996,16 @@ impl ShellApp {
                             (n, _) => format!("{n} variables to set where you add them"),
                         };
                         // Open when there is room; on a small window the block gets the room first.
+                        // Saving's rows take room the block needs on a short window: the list folds, once.
+                        let fold = short
+                            && !view.folded
+                            && (view.status.is_some()
+                                || !matches!(view.save, Saving::Idle | Saving::Choosing));
+                        view.folded |= fold;
                         egui::CollapsingHeader::new(RichText::new(title).strong())
                             .id_salt("export_variables")
-                            .default_open(screen.height() >= 640.0)
+                            .default_open(!short)
+                            .open(fold.then_some(false))
                             .show(ui, |ui| {
                                 muted(
                                     ui,
@@ -1943,12 +2040,23 @@ impl ShellApp {
                         ui.add(egui::Label::new(RichText::new(note).color(pal.warn)).wrap());
                     }
                     ui.add_space(6.0);
-                    // The block takes what is left of the window's height, so the buttons stay on screen.
+                    // The block takes what is left of the window's height, so the buttons (and what saving says
+                    // under them) stay on screen.
                     let used = ui.cursor().top() - ui.min_rect().top();
-                    let room = screen.height() - 64.0 - used - 80.0;
+                    let below = match view.save {
+                        Saving::Typing { .. } | Saving::Exists { .. } => 64.0,
+                        Saving::Offered { .. } => 32.0,
+                        Saving::Writing { typed: Some(_), .. } => 40.0,
+                        _ => 0.0,
+                    } + if view.status.is_some() {
+                        view.status_height
+                    } else {
+                        0.0
+                    };
+                    let room = screen.height() - 64.0 - used - 80.0 - below;
                     egui::ScrollArea::vertical()
                         .id_salt("export_block")
-                        .max_height(room.clamp(96.0, 320.0))
+                        .max_height(room.clamp(if below > 0.0 { 64.0 } else { 96.0 }, 320.0))
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::multiline(&mut result.text.as_str())
@@ -1968,10 +2076,24 @@ impl ShellApp {
                 let button = egui::Button::new(RichText::new(label).strong().color(pal.on_bright))
                     .fill(pal.primary)
                     .min_size(egui::vec2(96.0, 34.0));
-                copy |= ui
+                let copy_button = ui
                     .add_enabled(view.result.is_some(), button)
                     .on_hover_text("Copy the block (Enter)")
-                    .on_disabled_hover_text("Reading the definitions…")
+                    .on_disabled_hover_text("Reading the definitions…");
+                announce(ui.ctx(), copy_button.id);
+                copy |= copy_button.clicked();
+                let busy = matches!(view.save, Saving::Choosing | Saving::Writing { .. });
+                choose |= ui
+                    .add_enabled(
+                        view.result.is_some() && !busy,
+                        egui::Button::new("Save to file…").min_size(egui::vec2(96.0, 34.0)),
+                    )
+                    .on_hover_text("Save the block as a JSON file")
+                    .on_disabled_hover_text(if busy {
+                        "Waiting for the save dialog"
+                    } else {
+                        "Reading the definitions…"
+                    })
                     .clicked();
                 if view
                     .result
@@ -1979,17 +2101,166 @@ impl ShellApp {
                     .is_some_and(|r| r.variables.iter().any(|v| v.default.is_none()))
                 {
                     let label = if copied(Copied::Names) { "Copied" } else { "Copy names" };
-                    copy_names |= ui
+                    let names_button = ui
                         .add(egui::Button::new(label).min_size(egui::vec2(80.0, 34.0)))
-                        .on_hover_text("Copy the variables to set, one NAME= a line")
-                        .clicked();
+                        .on_hover_text("Copy the variables to set, one NAME= a line");
+                    announce(ui.ctx(), names_button.id);
+                    copy_names |= names_button.clicked();
                 }
                 close |= ui
                     .add(egui::Button::new("Close").min_size(egui::vec2(80.0, 34.0)))
                     .on_hover_text("Esc")
                     .clicked();
             });
+            // A typed path keeps its row while it is written and while replacing is asked, so nothing jumps.
+            let typed_row = match &mut view.save {
+                Saving::Typing { path, focus, .. } => Some((path, std::mem::take(focus), true)),
+                Saving::Writing {
+                    typed: Some(path), ..
+                }
+                | Saving::Exists { typed: path, .. } => Some((path, false, false)),
+                _ => None,
+            };
+            if let Some((path, focus, editable)) = typed_row {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let label = ui.label("Save to");
+                    let field = ui
+                        .add_enabled(
+                            editable,
+                            egui::TextEdit::singleline(path)
+                                .id(egui::Id::new("export_save_path"))
+                                .desired_width((ui.available_width() - 96.0).max(120.0))
+                                .font(egui::TextStyle::Monospace),
+                        )
+                        .labelled_by(label.id);
+                    if focus {
+                        field.request_focus();
+                        select_file_stem(ui.ctx(), field.id, path);
+                    }
+                    let entered =
+                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    save_typed |= ui
+                        .add_enabled(
+                            editable && !path.trim().is_empty(),
+                            egui::Button::new("Save here").min_size(egui::vec2(88.0, 28.0)),
+                        )
+                        .clicked()
+                        || (editable && entered);
+                });
+            }
+            match &view.save {
+                Saving::Typing {
+                    no_dialog: true, ..
+                } => muted(
+                    ui,
+                    "No save dialog could be opened here, so type where the file goes.",
+                ),
+                Saving::Offered { .. } => {
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let said = ui.label(RichText::new("Not saved.").color(pal.text_muted));
+                        announce(ui.ctx(), said.id);
+                        type_instead |= ui.link("Type a path instead").clicked();
+                    });
+                }
+                Saving::Exists { path, .. } => {
+                    ui.horizontal_wrapped(|ui| {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let question = ui.label(
+                            RichText::new(format!("{name} is there already. Replace it?"))
+                                .color(pal.warn),
+                        );
+                        announce(ui.ctx(), question.id);
+                        replace |= ui.button("Replace").clicked();
+                        keep |= ui.button("Keep it").clicked();
+                    });
+                }
+                _ => {}
+            }
+            if let Some(status) = &view.status {
+                ui.add_space(6.0);
+                let said = match status {
+                    // One line, however long the path: its start gives way, so the file's name stays in view.
+                    Ok(text) => {
+                        let shown = keep_the_end(ui, text, ui.available_width());
+                        let said = ui.add(egui::Label::new(
+                            RichText::new(&shown).color(pal.success),
+                        ));
+                        if shown != *text {
+                            ui.ctx()
+                                .accesskit_node_builder(said.id, |node| node.set_value(text.clone()));
+                            said.on_hover_text(text)
+                        } else {
+                            said
+                        }
+                    }
+                    Err(text) => {
+                        ui.add(egui::Label::new(RichText::new(text).color(pal.warn)).wrap())
+                    }
+                };
+                announce(ui.ctx(), said.id);
+                // A long path wraps; the block gives up that much room in the next frame.
+                view.status_height = said.rect.height() + 6.0;
+            }
         });
+        if choose {
+            view.save = Saving::Choosing;
+            view.status = None;
+            self.export_choices_pending += 1;
+            let name = view.file_name.clone();
+            if let Some(core) = &self.core {
+                core.send(Command::ChooseExportFile { name });
+            }
+        }
+        if (save_typed || replace)
+            && let Some(result) = &view.result
+        {
+            let typed = match &view.save {
+                Saving::Typing { path, .. } => Some(path.clone()),
+                Saving::Exists { typed, .. } if replace => Some(typed.clone()),
+                _ => None,
+            };
+            if let Some(typed) = typed {
+                // Quotes from a copied path ("Copy as path" on Windows) are not part of it.
+                let path = std::path::PathBuf::from(typed.trim().trim_matches('"'));
+                if path.is_absolute() {
+                    view.status = None;
+                    view.save = Saving::Writing {
+                        path: path.clone(),
+                        typed: Some(typed),
+                    };
+                    if let Some(core) = &self.core {
+                        core.send(Command::SaveExport {
+                            path,
+                            text: result.text.clone(),
+                            replace,
+                        });
+                    }
+                } else {
+                    view.status = Some(Err(
+                        "Not saved: give the whole path, starting from the drive or /.".to_owned(),
+                    ));
+                }
+            }
+        }
+        if keep && let Saving::Exists { typed, .. } = &view.save {
+            view.save = Saving::Typing {
+                path: typed.clone(),
+                focus: true,
+                no_dialog: false,
+            };
+        }
+        if type_instead && let Saving::Offered { path } = &view.save {
+            view.save = Saving::Typing {
+                path: path.clone(),
+                focus: true,
+                no_dialog: false,
+            };
+        }
         if let Some(result) = &view.result {
             if copy {
                 ctx.copy_text(result.text.clone());
@@ -2009,6 +2280,13 @@ impl ShellApp {
                 // Back to "Copy" once the confirmation has been seen; no repaint every frame meanwhile.
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
             }
+        }
+        // The dialog is centred by its size in the frame before; when what it holds changes its size, one more frame
+        // puts it in place (or a click aimed at a button lands where the button was).
+        let size = modal.response.rect.size();
+        if view.size != size {
+            view.size = size;
+            ctx.request_repaint();
         }
         if close || closed_on_purpose(&modal) {
             self.exporting = None;
@@ -3116,6 +3394,17 @@ impl ShellApp {
                             "The configuration already looks like this. Nothing would be written.",
                         );
                     }
+                    // Warnings first: what a change costs is read before the details (cross-review of the restore).
+                    for warning in &plan.warnings {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {warning}", icon::WARNING))
+                                    .color(pal.warn),
+                            )
+                            .wrap(),
+                        );
+                    }
                     for review in &plan.reviews {
                         ui.add_space(4.0);
                         Frame::new()
@@ -3131,16 +3420,6 @@ impl ShellApp {
                                     );
                                 }
                             });
-                    }
-                    for warning in &plan.warnings {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{} {warning}", icon::WARNING))
-                                    .color(pal.warn),
-                            )
-                            .wrap(),
-                        );
                     }
                     for (at, file) in plan.files.iter().enumerate() {
                         if file.lines.is_empty() {
@@ -5658,6 +5937,45 @@ struct ExportView {
     result: Option<Exported>,
     /// What was last copied, and when: that button says "Copied" for a few seconds.
     copied: Option<(Copied, f64)>,
+    /// The file name the save dialog starts with.
+    file_name: String,
+    save: Saving,
+    /// What the last save did, said as a sentence: `Ok` when it saved.
+    status: Option<Result<String, String>>,
+    /// The dialog's size in the last frame.
+    size: egui::Vec2,
+    /// How tall the save status was in the last frame (it wraps a long path).
+    status_height: f32,
+    /// The variables list was folded to make room for saving on a short window (once: it can be opened again).
+    folded: bool,
+}
+
+/// Where saving the export to a file is.
+#[derive(Clone, PartialEq)]
+enum Saving {
+    Idle,
+    /// The system's save dialog is open.
+    Choosing,
+    /// The save dialog closed without a file; typing a path is offered, starting from `path`.
+    Offered {
+        path: String,
+    },
+    /// The path is typed in: no save dialog could be shown (`no_dialog`), or the user asked to type it.
+    Typing {
+        path: String,
+        focus: bool,
+        no_dialog: bool,
+    },
+    /// Written by the engine; `typed` is the text of a typed path, to come back to if the save fails.
+    Writing {
+        path: std::path::PathBuf,
+        typed: Option<String>,
+    },
+    /// A typed path names a file that is there already: replace it?
+    Exists {
+        path: std::path::PathBuf,
+        typed: String,
+    },
 }
 
 /// Which of the Export dialog's buttons copied.
@@ -5665,6 +5983,30 @@ struct ExportView {
 enum Copied {
     Block,
     Names,
+}
+
+/// Selects the file's name without its extension in the text field `id` holding `path`, as a system save dialog does,
+/// so the part people change is in view and typed over.
+fn select_file_stem(ctx: &egui::Context, id: egui::Id, path: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let name_at = path.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let stem_end = path[name_at..]
+        .rfind('.')
+        .filter(|&i| i > 0)
+        .map_or(path.len(), |i| name_at + i);
+    let chars = |byte: usize| path[..byte].chars().count();
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(
+        CCursor::new(chars(name_at)),
+        CCursor::new(chars(stem_end)),
+    )));
+    state.store(ctx, id);
+}
+
+/// Makes the widget `id` a polite live region: a screen reader reads out a change to it ("Copied", "Saved to …")
+/// when it is next idle, without moving the keyboard focus (WCAG 2.2, 4.1.3 Status Messages).
+fn announce(ctx: &egui::Context, id: egui::Id) {
+    ctx.accesskit_node_builder(id, |node| node.set_live(egui::accesskit::Live::Polite));
 }
 
 /// How long the Copy button says "Copied".
@@ -6315,6 +6657,42 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         if let Some(hover) = &b.hover {
             response.on_hover_text(hover);
         }
+    }
+}
+
+/// `text` in one line of `width`: as it is when it fits, or else its `Saved to ` (when it has one), `…` and as much of
+/// its end as fits.
+fn keep_the_end(ui: &Ui, text: &str, width: f32) -> String {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let fits = |t: &str| {
+        ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE))
+            .size()
+            .x
+            <= width
+    };
+    if fits(text) {
+        return text.to_owned();
+    }
+    let head = if text.starts_with("Saved to ") {
+        "Saved to "
+    } else {
+        ""
+    };
+    let tail = &text[head.len()..];
+    // The shortest cut that fits, found by halving: layout is the cost, not the length.
+    let starts: Vec<usize> = tail.char_indices().map(|(i, _)| i).collect();
+    let (mut lo, mut hi) = (0, starts.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits(&format!("{head}…{}", &tail[starts[mid]..])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    match starts.get(lo) {
+        Some(&at) => format!("{head}…{}", &tail[at..]),
+        None => format!("{head}…"),
     }
 }
 
@@ -8990,6 +9368,26 @@ mod tests {
             .unwrap();
         h.run();
         (h, engine)
+    }
+
+    #[test]
+    fn warnings_come_before_what_each_server_would_run() {
+        // Cross-review of the restore, U1: a reverted token was only said after every "would run" card.
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        let mut plan = plan_view(7, &["+ alpha"], &["alpha: the token goes back"], false);
+        plan.reviews = (0..4)
+            .map(|i| klefki_core::api::Review {
+                title: format!("server{i} would run:"),
+                lines: vec!["Command: x".to_owned()],
+            })
+            .collect();
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        let warning = h.get_by_label_contains("alpha: the token goes back").rect();
+        let card = h.get_by_label("server0 would run:").rect();
+        assert!(warning.bottom() <= card.top(), "{warning:?} {card:?}");
     }
 
     #[test]
@@ -13199,6 +13597,478 @@ mod tests {
         assert_eq!(
             names_in_a_line(&many),
             "s1, s2, s3, s4, s5, s6, s7, s8 and 2 more"
+        );
+    }
+
+    /// Opens Export on `rows` (nothing selected) and fills it with `block`; the commands sent so far are drained.
+    fn export_open(
+        rows: Vec<ServerRow>,
+        block: &str,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        engine.events.send(exported_block(block, &[], &[])).unwrap();
+        h.run();
+        drain(&engine);
+        (h, engine)
+    }
+
+    #[test]
+    fn save_to_file_asks_where_in_the_systems_dialog_and_says_where_it_was_saved() {
+        let block = "{\n  \"mcpServers\": {}\n}";
+        let (mut h, engine) = export_open(vec![live_row("github", Scope::User, None)], block);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        // One server: its name is the file's.
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseExportFile {
+                name: "github-mcp.json".into()
+            }]
+        );
+        // While the system's dialog is open, a second one is not asked for.
+        assert!(
+            h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+                .accesskit_node()
+                .is_disabled()
+        );
+        let file = std::path::PathBuf::from("/home/me/github-mcp.json");
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Chosen(file.clone())))
+            .unwrap();
+        h.run();
+        // The system's dialog asked before replacing a file, so this does not ask again.
+        assert_eq!(
+            drain(&engine),
+            vec![Command::SaveExport {
+                path: file.clone(),
+                text: block.into(),
+                replace: true
+            }]
+        );
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: file.clone(),
+                shown: "/home/me/github-mcp.json".into(),
+                result: Ok(()),
+            })
+            .unwrap();
+        h.run();
+        // Said where a screen reader announces it too.
+        let status = h.get_by_label("Saved to /home/me/github-mcp.json");
+        assert_eq!(
+            status.accesskit_node().live(),
+            egui::accesskit::Live::Polite
+        );
+        assert!(
+            !h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+                .accesskit_node()
+                .is_disabled()
+        );
+        // Closing the system's dialog changes nothing.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Cancelled {
+                suggested: "/home/me/github-mcp.json".into(),
+            }))
+            .unwrap();
+        h.run();
+        assert!(drain(&engine).is_empty());
+        assert!(h.state().exporting.is_some());
+    }
+
+    #[test]
+    fn a_long_saved_path_keeps_to_one_line_and_its_file_name_in_view() {
+        let (mut h, engine) = export_open(vec![live_row("a", Scope::User, None)], "{}");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        let long = format!("/{}/a-mcp.json", "a-very-long-folder-name/".repeat(12));
+        let file = std::path::PathBuf::from(&long);
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Chosen(file.clone())))
+            .unwrap();
+        h.run();
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: file,
+                shown: long.clone(),
+                result: Ok(()),
+            })
+            .unwrap();
+        h.run();
+        // Read out whole; drawn as one line ending in the file's name, inside the dialog.
+        let said = format!("Saved to {long}");
+        let rect = h.get_by_label(&said).rect();
+        let copy = h
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Copy")
+            .rect();
+        assert!(rect.height() < copy.height(), "{rect:?}");
+        // The dialog's content is 640 wide, starting where Copy does.
+        assert!(
+            rect.left() >= copy.left() && rect.right() <= copy.left() + 640.0,
+            "{rect:?}"
+        );
+    }
+
+    /// A whole path on this system: `/home/me/x` here, `C:\home\me\x` on Windows, where a path from `/` is not.
+    fn whole(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_owned()
+        }
+    }
+
+    #[test]
+    fn after_the_dialog_closes_without_a_file_a_path_can_still_be_typed() {
+        // Found in review: a desktop portal without a file chooser fails slowly, which looks like a cancel; without
+        // this the user clicked Save to file… and nothing happened.
+        let (mut h, engine) = export_open(vec![live_row("a", Scope::User, None)], "{}");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Cancelled {
+                suggested: whole("/home/me/Documents/a-mcp.json").into(),
+            }))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label("Save to").is_none(),
+            "a cancel opens nothing"
+        );
+        let said = h.get_by_label("Not saved.");
+        assert_eq!(said.accesskit_node().live(), egui::accesskit::Live::Polite);
+        h.get_by_label("Type a path instead").click();
+        h.run();
+        let field = h.get_by_label("Save to");
+        assert_eq!(
+            field.accesskit_node().value().as_deref(),
+            Some(whole("/home/me/Documents/a-mcp.json").as_str())
+        );
+        assert!(
+            h.query_by_label_contains("No save dialog could be opened")
+                .is_none()
+        );
+        // The file's name is selected, as a save dialog does: typing replaces it and keeps the folder and `.json`.
+        h.get_by_label("Save to").type_text("servers");
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save here")
+            .click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::SaveExport {
+                path: whole("/home/me/Documents/servers.json").into(),
+                text: "{}".into(),
+                replace: false
+            }]
+        );
+    }
+
+    #[test]
+    fn on_a_short_window_the_variables_fold_when_saving_needs_the_room() {
+        let (mut h, engine) = live_harness();
+        h.set_size(egui::vec2(800.0, 480.0));
+        engine
+            .events
+            .send(snapshot_of(vec![
+                live_row("a", Scope::User, None),
+                live_row("b", Scope::User, None),
+            ]))
+            .unwrap();
+        h.run();
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        engine
+            .events
+            .send(exported_block("{}", &[("TOKEN", "a: env TOKEN")], &[]))
+            .unwrap();
+        h.run();
+        // Opened by hand (as one left open at a larger size stays open).
+        h.get_by_label("1 variable to set where you add them")
+            .click();
+        h.run();
+        h.get_by_label("a: env TOKEN");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::NoDialog {
+                suggested: "/home/me/mcp-servers.json".into(),
+            }))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label("a: env TOKEN").is_none(),
+            "folded for the path row"
+        );
+        // Once: opened again, it stays open.
+        h.get_by_label("1 variable to set where you add them")
+            .click();
+        h.run();
+        h.get_by_label("a: env TOKEN");
+        let close = h
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Close")
+            .rect();
+        assert!(close.bottom() <= 480.0, "{close:?}");
+    }
+
+    #[test]
+    fn copied_is_announced_to_screen_readers() {
+        let (mut h, _engine) = export_open(vec![live_row("a", Scope::User, None)], "{}");
+        for label in ["Copy", "Copied"] {
+            let button = h.get_by_role_and_label(egui::accesskit::Role::Button, label);
+            // A polite live region: the change of label is read out, without moving the focus.
+            assert_eq!(
+                button.accesskit_node().live(),
+                egui::accesskit::Live::Polite,
+                "{label}"
+            );
+            if label == "Copy" {
+                button.click();
+                h.run();
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_save_says_why_and_the_block_stays() {
+        let (mut h, engine) = export_open(
+            vec![
+                live_row("a", Scope::User, None),
+                live_row("b", Scope::User, None),
+            ],
+            "{}",
+        );
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseExportFile {
+                name: "mcp-servers.json".into()
+            }]
+        );
+        let file = std::path::PathBuf::from("/home/me/.claude.json");
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Chosen(file.clone())))
+            .unwrap();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: file,
+                shown: "/home/me/.claude.json".into(),
+                result: Err(SaveError::Refused(
+                    "That is Claude Code's own configuration.".into(),
+                )),
+            })
+            .unwrap();
+        h.run();
+        let status = h.get_by_label("Not saved: That is Claude Code's own configuration.");
+        assert_eq!(
+            status.accesskit_node().live(),
+            egui::accesskit::Live::Polite
+        );
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy");
+    }
+
+    #[test]
+    fn without_a_save_dialog_a_path_is_typed_and_an_existing_file_is_replaced_only_when_confirmed()
+    {
+        let (mut h, engine) = export_open(
+            vec![
+                live_row("a", Scope::User, None),
+                live_row("b", Scope::User, None),
+            ],
+            "{}",
+        );
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        drain(&engine);
+        let suggested = std::path::PathBuf::from(whole("/home/me/Documents/mcp-servers.json"));
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::NoDialog {
+                suggested: suggested.clone(),
+            }))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("No save dialog could be opened");
+        let field = h.get_by_label("Save to");
+        assert_eq!(
+            field.accesskit_node().value().as_deref(),
+            Some(whole("/home/me/Documents/mcp-servers.json").as_str())
+        );
+        // The field has the keyboard, so Enter saves (and does not copy).
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(copied(&h).is_empty());
+        assert_eq!(
+            drain(&engine),
+            vec![Command::SaveExport {
+                path: suggested.clone(),
+                text: "{}".into(),
+                replace: false
+            }]
+        );
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: suggested.clone(),
+                shown: whole("/home/me/Documents/mcp-servers.json"),
+                result: Err(SaveError::Exists),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("mcp-servers.json is there already. Replace it?");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Keep it")
+            .click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+        assert!(h.query_by_label_contains("is there already").is_none());
+        h.get_by_label("Save to");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save here")
+            .click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: suggested.clone(),
+                shown: whole("/home/me/Documents/mcp-servers.json"),
+                result: Err(SaveError::Exists),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Replace")
+            .click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::SaveExport {
+                path: suggested.clone(),
+                text: "{}".into(),
+                replace: true
+            }]
+        );
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: suggested,
+                shown: whole("/home/me/Documents/mcp-servers.json"),
+                result: Ok(()),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label(&format!(
+            "Saved to {}",
+            whole("/home/me/Documents/mcp-servers.json")
+        ));
+        assert!(
+            h.query_by_label("Save to").is_none(),
+            "the path field is done"
+        );
+    }
+
+    #[test]
+    fn a_typed_path_must_be_a_whole_path_and_quotes_around_it_are_dropped() {
+        let (mut h, engine) = export_open(vec![live_row("a", Scope::User, None)], "{}");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::NoDialog {
+                suggested: std::path::PathBuf::from("/home/me/a-mcp.json"),
+            }))
+            .unwrap();
+        h.run();
+        drain(&engine);
+        h.get_by_label("Save to").focus();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.get_by_label("Save to").type_text("servers.json");
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save here")
+            .click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+        h.get_by_label_contains("the whole path");
+        let whole = if cfg!(windows) {
+            r"C:\me\servers.json"
+        } else {
+            "/me/servers.json"
+        };
+        h.get_by_label("Save to").focus();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.get_by_label("Save to").type_text(&format!("\"{whole}\""));
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save here")
+            .click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::SaveExport {
+                path: std::path::PathBuf::from(whole),
+                text: "{}".into(),
+                replace: false
+            }]
+        );
+    }
+
+    #[test]
+    fn a_dialog_answer_after_export_was_closed_saves_nothing() {
+        let (mut h, engine) = export_open(vec![live_row("a", Scope::User, None)], "{}");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Close")
+            .click();
+        h.run();
+        // Open again, with another block.
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        engine
+            .events
+            .send(exported_block("second", &[], &[]))
+            .unwrap();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Chosen(
+                "/x/a.json".into(),
+            )))
+            .unwrap();
+        h.run();
+        assert!(
+            drain(&engine).is_empty(),
+            "the file was picked for the export that was closed"
+        );
+        assert!(
+            !h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+                .accesskit_node()
+                .is_disabled()
         );
     }
 

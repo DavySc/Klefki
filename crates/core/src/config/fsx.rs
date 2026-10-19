@@ -84,6 +84,62 @@ pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option
     Ok(Some((text, bom)))
 }
 
+/// Why [`write_whole`] wrote nothing.
+#[derive(Debug)]
+pub(crate) enum WriteError {
+    /// A file is there already, and replacing it was not asked for.
+    Exists,
+    /// The path is a link, a folder or a secret store, which are never written.
+    Refused(&'static str),
+    Io(io::Error),
+}
+
+/// Writes `text` as the whole file at `path`, all at once: a temporary file beside it, flushed to disk, then moved
+/// into place, so a reader never sees half of it. Without `replace`, an existing file stays as it was (checked by
+/// the move itself, not by an earlier look). A link is never followed or replaced, and secret stores are not written.
+pub(crate) fn write_whole(path: &Path, text: &str, replace: bool) -> Result<(), WriteError> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .ok_or(WriteError::Refused("no file name"))?;
+    if is_denied(&name.to_string_lossy()) {
+        return Err(WriteError::Refused("credential files are never written"));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(WriteError::Refused("it is a link to another file"));
+        }
+        Ok(meta) if !meta.is_file() => return Err(WriteError::Refused("it is a folder")),
+        Ok(_) if !replace => return Err(WriteError::Exists),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(WriteError::Io(e)),
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".klefki.tmp.")
+        .tempfile_in(dir)
+        .map_err(WriteError::Io)?;
+    tmp.write_all(text.as_bytes()).map_err(WriteError::Io)?;
+    tmp.as_file().sync_all().map_err(WriteError::Io)?;
+    let placed = if replace {
+        tmp.persist(path)
+    } else {
+        tmp.persist_noclobber(path)
+    };
+    // The temporary file goes with the error, which removes it.
+    placed.map(drop).map_err(|e| {
+        if !replace && e.error.kind() == io::ErrorKind::AlreadyExists {
+            WriteError::Exists
+        } else {
+            WriteError::Io(e.error)
+        }
+    })
+}
+
 /// Is the opened file (`opened`, from its handle) the regular file the path named when it was checked
 /// (`checked`)? On Unix by device and inode; elsewhere by size and times, which a different file all but never
 /// shares.

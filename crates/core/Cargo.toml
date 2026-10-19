@@ -20,6 +20,9 @@ zeroize = "1"
 portable-pty = "0.9"
 # Opens a checked https sign-in page: ShellExecute on Windows, never `cmd /c start` (no shell).
 open = { version = "5", features = ["shellexecute-on-windows"] }
+# The system's own save dialog for Export: the common dialog on Windows, NSSavePanel on macOS, the desktop portal
+# (libdbus, loaded when used) or zenity on Linux. No GTK.
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 
 # Ending a process together with what it started: a process group on Unix, a job object on Windows.
 [target.'cfg(unix)'.dependencies]
@@ -30,6 +33,7 @@ version = "0.61"
 features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

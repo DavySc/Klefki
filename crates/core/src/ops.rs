@@ -85,6 +85,9 @@ pub(crate) struct CliAdd {
     pub project: Option<String>,
     /// Handed to the command only in `MCP_CLIENT_SECRET`.
     pub secret: Option<Secret>,
+    /// The client secret is the one Klefki keeps under this server's own place and name, looked up when the plan is
+    /// made: a server a restore puts back.
+    pub stored: bool,
 }
 
 /// An approval is by name. If the repository edits the definition after the user looked at it, the approval
@@ -129,6 +132,9 @@ pub(crate) fn resolve(
             Change::Move { .. } => "Move",
             Change::PutBack { .. } => "Put back",
             Change::ForgetKept { .. } => "Forget",
+            Change::Restore { .. } => {
+                return Err("A restore is reviewed on its own.".to_owned());
+            }
         };
         if !verbs.contains(&verb) {
             verbs.push(verb);
@@ -162,6 +168,7 @@ pub(crate) fn resolve(
                         .to_owned(),
                 );
             }
+            Change::Restore { .. } => unreachable!("refused above"),
             Change::Add {
                 name,
                 json,
@@ -247,6 +254,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         Change::Add { name, targets, .. } => {
             return format!("Add {}{}", sanitize(name), places(targets));
         }
+        Change::Restore { .. } => return "Restore a backup".to_owned(),
         Change::Move { id, to } => {
             let to = match to {
                 Target::User => "the user".to_owned(),
@@ -298,7 +306,7 @@ fn places(targets: &[Target]) -> String {
 }
 
 /// `a`, `a and b`, `a, b and c`.
-fn and_list(items: &[String]) -> String {
+pub(crate) fn and_list(items: &[String]) -> String {
     match items {
         [] => String::new(),
         [one] => one.clone(),
@@ -308,7 +316,7 @@ fn and_list(items: &[String]) -> String {
 
 /// Like [`and_list`], naming the first few and counting the rest, so a long list keeps the summary one line.
 /// The app's notice cuts names the same way (`shell::some_names`, which cannot call this); keep the two alike.
-fn some_of(items: &[String]) -> String {
+pub(crate) fn some_of(items: &[String]) -> String {
     const NAMED: usize = 5;
     if items.len() <= NAMED + 1 {
         return and_list(items);
@@ -954,6 +962,7 @@ fn add(
             json: value.to_string(),
             project: to,
             secret: secret.cloned(),
+            stored: false,
         });
     }
     let remote = value
@@ -984,7 +993,7 @@ fn add(
 /// Refuses a secret typed into the environment or headers of a server Claude Code's command adds: the command takes
 /// the definition in its arguments, which other programs on the computer can read while it runs. The value is
 /// never named, only its variable or header and what to write instead.
-fn typed_secret_refused(new: &str, entry: &Value) -> Result<(), String> {
+pub(crate) fn typed_secret_refused(new: &str, entry: &Value) -> Result<(), String> {
     for (key, what) in [("env", "variable"), ("headers", "header")] {
         let Some(Value::Object(values)) = entry.get(key) else {
             continue;
@@ -1005,7 +1014,7 @@ fn typed_secret_refused(new: &str, entry: &Value) -> Result<(), String> {
 /// `entry` with every environment and header value hidden. A value that reads the user's variables shows only
 /// those (`<hidden> ${SUFFIX}`), so the review still says which are read; one made of nothing but references, after
 /// an auth scheme (`Bearer ${TOKEN}`), is shown as it is.
-fn shown_values(entry: &Value) -> Value {
+pub(crate) fn shown_values(entry: &Value) -> Value {
     let mut out = entry::masked(entry);
     for key in ["env", "headers"] {
         if let (Some(Value::Object(values)), Some(Value::Object(was))) =
@@ -1126,7 +1135,7 @@ fn approve(
 
 /// Everything the server would run or connect to, one fact per line. Refuses what cannot be shown whole and
 /// exactly: unknown shapes, hidden characters, very long values.
-fn describe(entry: &Value) -> Result<Vec<String>, String> {
+pub(crate) fn describe(entry: &Value) -> Result<Vec<String>, String> {
     let object = entry.as_object().ok_or("the definition is not an object")?;
     let text = |key: &str| -> Result<Option<&str>, String> {
         match object.get(key) {
