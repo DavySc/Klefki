@@ -20,4 +20,11 @@ disallowed-methods = [
   { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "UI does no network IO (a DNS lookup); use klefki_core::api" },
   { path = "std::os::unix::net::UnixListener::bind", reason = "UI does no IO; use klefki_core::api" },
   { path = "std::os::unix::net::UnixStream::connect", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixListener::bind_addr", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixStream::connect_addr", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixDatagram::bind", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixDatagram::bind_addr", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixDatagram::unbound", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixDatagram::connect", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixDatagram::connect_addr", reason = "UI does no IO; use klefki_core::api" },
 ]
