@@ -30,6 +30,7 @@ Verdict: sound, tests real (all 8 fail on main, 96 parallel runs passed). Folded
 
 ## Cross-review round 2
 - Found by the reviewer in round 1's re-announce, reproduced with a probe: a check that started before its server was edited stayed in `Queue::announced`, so the next unrelated reload said "Checking…" for it again, and its answer never came. Each entry now records the change count its check started at (`Running::started`), and a reload re-announces only checks whose server has not changed since. Test `a_check_of_a_server_since_edited_is_not_announced_again`, seen failing first.
+- Merged main `b9ebb0f` (#12, export): clean. Full verify exit 0, 878 passed, 0 failed, deny ok.
 
 ## Open
 - The app still drops "Checking…" on every snapshot; the engine now says it again after each one, so a check still waiting in the queue (not yet started) shows its last status until it starts, as before F5.
