@@ -18,6 +18,16 @@ Three engine bugs from the core review's list of open items (engine items 1-3), 
 - Full verify (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`) on this branch from main `9b2be4e`: exit 0, 847 passed, 0 failed, deny "advisories ok, bans ok, licenses ok, sources ok".
 - Real app (debug build, Xvfb 1200x720, temp `HOME` and `CLAUDE_CONFIG_DIR`, fake-claude as `claude` on `PATH`): `demo` (`old-server`) shows Connected. With `.claude.json` edited from outside to `new-server` and the fake now answering failed, the row shows `new-server` and Failed a few seconds later; the log shows exactly two `mcp get demo` runs.
 
+## Cross-review round 1 (another thread, review on #14)
+Verdict: sound, tests real (all 8 fail on main, 96 parallel runs passed). Folded in:
+- **"Checking…" after F5 or any reload.** The app drops `Checking` on every snapshot, so a check kept across F5 looked done until its answer came. The engine now keeps the servers whose check announced itself and has not answered (`Queue::announced`, an `Announced` guard in `run`), and every `reload` says `Checking` again for them right after the snapshot (not for edited ones). This also covers watcher reloads, the app item noted below. Test `a_check_still_running_is_announced_again_after_a_refresh`, seen failing first.
+- **After-save failures** name their files and say each reason once: "After saving, the check of <files> failed: <reason>". A lock or a change during that check no longer says "Nothing was changed" (the change was saved). Test `after_save_check_failures_name_their_files_once_each`, seen failing first.
+- (Optional 3) the change count is taken after the announcement in `run`.
+- (Optional 5) an edited server whose check is refused keeps the reason ("not checked: the project folder was not found"). Test `an_edited_server_that_cannot_be_checked_says_why`, seen failing first.
+- (Optional 6) every reload drops waiting checks of servers it no longer lists. Test `a_check_the_user_asked_for_of_a_server_since_removed_is_not_run`, seen failing first.
+- Full verify after round 1: exit 0, 851 passed, 0 failed, deny ok.
+- Not taken: (4) re-running a stale diagnosis on its own: it would start a second process the user did not see coming, and the note says what to do. (7) reordered keys re-check once, harmless. (8) the replay test's fixed wait stays; on a slow runner it passes without proving much, never fails wrongly.
+
 ## Open
-- The app still drops "Checking…" on every snapshot (the separate app item in the findings); an edited server's "Checking…" can be hidden by a later unrelated reload until its answer comes.
+- The app still drops "Checking…" on every snapshot; the engine now says it again after each one, so a check still waiting in the queue (not yet started) shows its last status until it starts, as before F5.
 - Next: cross-review, CI on three systems, merge.

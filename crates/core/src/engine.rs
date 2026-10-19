@@ -5,7 +5,7 @@ use crate::cli::locate;
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::ConfigPaths;
-use crate::config::docstore::{Docstore, Plan};
+use crate::config::docstore::{Docstore, Plan, StoreError};
 use crate::config::entry;
 use crate::config::fsx;
 use crate::config::inventory::{self, FileKey, FileKeys};
@@ -516,6 +516,9 @@ struct Queue {
     background_running: usize,
     /// The servers on screen, from [`Command::Visible`]: their background jobs go first.
     visible: std::collections::HashSet<crate::model::ConnectionId>,
+    /// Servers whose check said it was running and has not answered yet, with how many such checks run: the app
+    /// forgets "Checking…" on every snapshot, so each reload says it again.
+    announced: HashMap<crate::model::ConnectionId, usize>,
     shutdown: bool,
 }
 
@@ -583,6 +586,31 @@ impl Drop for BackgroundSlot<'_> {
         lock(self.queue).background_running -= 1;
         // A worker may be waiting for room to run the next one.
         self.wake.notify_all();
+    }
+}
+
+/// A running check's entry in [`Queue::announced`], taken out when dropped, also when the job panics.
+struct Announced<'a> {
+    queue: &'a Mutex<Queue>,
+    connection: &'a crate::model::ConnectionId,
+}
+
+impl<'a> Announced<'a> {
+    fn new(queue: &'a Mutex<Queue>, connection: &'a crate::model::ConnectionId) -> Self {
+        *lock(queue).announced.entry(connection.clone()).or_default() += 1;
+        Self { queue, connection }
+    }
+}
+
+impl Drop for Announced<'_> {
+    fn drop(&mut self) {
+        let mut queue = lock(self.queue);
+        if let Some(n) = queue.announced.get_mut(self.connection) {
+            *n -= 1;
+            if *n == 0 {
+                queue.announced.remove(self.connection);
+            }
+        }
     }
 }
 
@@ -1545,7 +1573,7 @@ fn check_later(shared: &Shared, id: u64, started: Vec<(Docstore, u64)>) {
             match result {
                 Ok(again) => reapplied |= again,
                 // The other files are still checked: each has its own log to retire.
-                Err(e) => failed.push(e.to_string()),
+                Err(e) => failed.push((store.path.clone(), e)),
             }
         }
         if reapplied {
@@ -1555,12 +1583,42 @@ fn check_later(shared: &Shared, id: u64, started: Vec<(Docstore, u64)>) {
         if !failed.is_empty() {
             emitter.emit(Event::ApplyFailed {
                 plan: id,
-                error: failed.join(" "),
+                error: after_save_failures(&failed),
             });
         } else if reapplied {
             emitter.emit(Event::Reapplied { plan: id });
         }
     });
+}
+
+/// Why the check after a save failed, once per reason, naming the files. The change itself was saved.
+fn after_save_failures(failed: &[(PathBuf, StoreError)]) -> String {
+    let mut reasons: Vec<(String, Vec<String>)> = Vec::new();
+    for (path, e) in failed {
+        let reason = match e {
+            StoreError::Locked | StoreError::Changed => {
+                "Claude Code was busy writing its configuration. Look \
+                again in a moment, and make the change again if it is gone."
+                    .to_owned()
+            }
+            other => other.to_string(),
+        };
+        let file = sanitize(&path.display().to_string());
+        match reasons.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, files)) => files.push(file),
+            None => reasons.push((reason, vec![file])),
+        }
+    }
+    reasons
+        .iter()
+        .map(|(reason, files)| {
+            format!(
+                "After saving, the check of {} failed: {reason}",
+                files.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1626,6 +1684,28 @@ impl State {
         shared
             .emitter
             .emit(Event::Snapshot(Arc::clone(&self.snapshot)));
+        let running: HashSet<_> = {
+            let mut queue = lock(&shared.queue);
+            // A waiting check of a server that is gone would start a process for nothing.
+            queue
+                .jobs
+                .retain(|j| self.keys.contains_key(&j.id.connection));
+            queue
+                .announced
+                .keys()
+                .filter(|c| !edited.contains(*c))
+                .cloned()
+                .collect()
+        };
+        // The snapshot made the app forget which checks are running.
+        for row in self
+            .snapshot
+            .servers
+            .iter()
+            .filter(|r| running.contains(&r.connection))
+        {
+            shared.emitter.status(row.id(), Status::Checking, None);
+        }
         (before, edited)
     }
 }
@@ -1649,9 +1729,9 @@ fn kept_list(shared: &Shared) -> Vec<crate::api::Kept> {
 }
 
 fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
+    let (_, edited) = state.reload(shared);
     // Checks the user asked for stay: a server that is off, or a project's, would not be queued again.
     lock(&shared.queue).jobs.retain(|j| !j.background);
-    let (_, edited) = state.reload(shared);
     let snapshot = &state.snapshot;
 
     let cli = locate::locate(&locate::Search {
@@ -1666,7 +1746,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
             shared.emitter.emit(Event::CliProblem(format!(
                 "Live status is unavailable: {e}."
             )));
-            show_edited(shared, snapshot, &edited, &HashSet::new());
+            show_edited(shared, snapshot, &edited, &HashSet::new(), &HashSet::new());
             return;
         }
     };
@@ -1676,6 +1756,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
         .emit(Event::CliVersion(cached_cli_version(shared, &program)));
 
     let mut jobs = Vec::new();
+    let mut tried = HashSet::new();
     let keys = &state.keys;
     for row in &snapshot.servers {
         let edit = edited.contains(&row.connection);
@@ -1683,6 +1764,9 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
         let wanted = row.scope != Scope::Project
             && row.enabled
             && (live_all || (shared.config.background_checks && (edit || needs_check(row))));
+        if wanted && edit {
+            tried.insert(row.connection.clone());
+        }
         if wanted
             && let Some(mut job) = build_job(
                 shared,
@@ -1697,7 +1781,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
         }
     }
     let checking = queue_checks(shared, jobs, &edited);
-    show_edited(shared, snapshot, &edited, &checking);
+    show_edited(shared, snapshot, &edited, &tried, &checking);
 }
 
 /// After the configuration changed (by klefki, or on disk from outside): show the new state, and check only servers
@@ -1709,37 +1793,40 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
     }
     let (before, edited) = state.reload(shared);
     let snapshot = &state.snapshot;
-    let jobs: Vec<Job> = snapshot
-        .servers
-        .iter()
-        .filter(|row| {
-            let edit = edited.contains(&row.connection);
-            shared.config.background_checks
-                && row.scope != Scope::Project
-                && row.enabled
-                && (edit
-                    || (needs_check(row)
-                        && !before
-                            .servers
-                            .iter()
-                            .any(|old| old.enabled && same_row(old, row))))
-        })
-        .filter_map(|row| {
-            build_job(
-                shared,
-                row,
-                state.keys.get(&row.connection),
-                JobKind::Check,
-                edited.contains(&row.connection) || row.status == Status::Unknown,
-            )
-            .map(|job| Job {
+    let mut jobs = Vec::new();
+    let mut tried = HashSet::new();
+    for row in &snapshot.servers {
+        let edit = edited.contains(&row.connection);
+        let wanted = shared.config.background_checks
+            && row.scope != Scope::Project
+            && row.enabled
+            && (edit
+                || (needs_check(row)
+                    && !before
+                        .servers
+                        .iter()
+                        .any(|old| old.enabled && same_row(old, row))));
+        if !wanted {
+            continue;
+        }
+        if edit {
+            tried.insert(row.connection.clone());
+        }
+        if let Some(job) = build_job(
+            shared,
+            row,
+            state.keys.get(&row.connection),
+            JobKind::Check,
+            edit || row.status == Status::Unknown,
+        ) {
+            jobs.push(Job {
                 background: true,
                 ..job
-            })
-        })
-        .collect();
+            });
+        }
+    }
     let checking = queue_checks(shared, jobs, &edited);
-    show_edited(shared, snapshot, &edited, &checking);
+    show_edited(shared, snapshot, &edited, &tried, &checking);
 }
 
 /// Queues background checks and returns the edited servers among them. A background check of an edited server
@@ -1767,18 +1854,18 @@ fn queue_checks(
 }
 
 /// The status the app shows for an edited server is about its old definition. Each says it is being checked again
-/// (`checking`), or no longer claims a verdict.
+/// (`checking`), or no longer claims a verdict. Those `tried` but not checking already said why they cannot be.
 fn show_edited(
     shared: &Shared,
     snapshot: &Snapshot,
     edited: &HashSet<crate::model::ConnectionId>,
+    tried: &HashSet<crate::model::ConnectionId>,
     checking: &HashSet<crate::model::ConnectionId>,
 ) {
-    for row in snapshot
-        .servers
-        .iter()
-        .filter(|r| edited.contains(&r.connection))
-    {
+    for row in snapshot.servers.iter().filter(|r| {
+        edited.contains(&r.connection)
+            && (checking.contains(&r.connection) || !tried.contains(&r.connection))
+    }) {
         if checking.contains(&row.connection) {
             shared.emitter.status(row.id(), Status::Checking, None);
         } else if row.status_cached || row.status == Status::Unknown {
@@ -1918,14 +2005,18 @@ fn worker(shared: &Shared) {
 }
 
 fn run(shared: &Shared, job: &Job) {
-    let started = lock(&shared.changes).count;
-    // An answer about a server edited or removed while this ran is about a definition that is gone.
-    let current = || !lock(&shared.changes).since(&job.id.connection, started);
+    let _announced = job
+        .announce
+        .then(|| Announced::new(&shared.queue, &job.id.connection));
     if job.announce {
         shared
             .emitter
             .status(job.id.clone(), Status::Checking, None);
     }
+    // Taken after the announcement: an edit noted before this is one the check will see.
+    let started = lock(&shared.changes).count;
+    // An answer about a server edited or removed while this ran is about a definition that is gone.
+    let current = || !lock(&shared.changes).since(&job.id.connection, started);
     match job.kind {
         JobKind::Check => {
             let (status, detail) = execute(shared, job);
@@ -2721,6 +2812,100 @@ mod tests {
             final_status(e, "mine") == Some(Status::Connected)
         });
         assert_eq!(env.gets().len(), 1, "{:?}", env.gets());
+    }
+
+    #[test]
+    fn a_check_still_running_is_announced_again_after_a_refresh() {
+        // Cross-review of #14: the app drops "Checking…" on every snapshot, so a check that goes on would look done.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {"mine": {"command": "x"}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":1500}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["mine".to_owned()]);
+        let core = env.start();
+        core.send(Command::Check(user_id("mine")));
+        collect(&core, |e| {
+            status_of(e, "mine").is_some_and(|s| s.0 == Status::Checking)
+        });
+        core.send(Command::Refresh { live_all: false });
+        let events = collect(&core, |e| final_status(e, "mine").is_some());
+        let snapshot = events
+            .iter()
+            .rposition(|e| matches!(e, Event::Snapshot(_)))
+            .expect("the refresh's snapshot");
+        assert_eq!(
+            status_of(&events[snapshot..], "mine").map(|s| s.0),
+            Some(Status::Connected)
+        );
+        assert!(
+            events[snapshot..].iter().any(|e| matches!(e,
+                Event::Status { id, status: Status::Checking, .. } if id.name == "mine")),
+            "{:#?}",
+            &events[snapshot..]
+        );
+    }
+
+    #[test]
+    fn a_check_the_user_asked_for_of_a_server_since_removed_is_not_run() {
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {"busy": {"command": "x"}, "gone": {"command": "y"}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":800}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["gone".to_owned()]);
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                watch_interval: None,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| {
+            status_of(e, "busy").is_some_and(|s| s.0 == Status::Checking)
+        });
+        core.send(Command::Check(user_id("gone")));
+        write_config(
+            &env,
+            &serde_json::json!({"mcpServers": {"busy": {"command": "x"}}}),
+        );
+        core.send(Command::Refresh { live_all: false });
+        collect(&core, |e| final_status(e, "busy").is_some());
+        std::thread::sleep(Duration::from_millis(500));
+        let gets: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert!(!gets.iter().any(|n| n == "gone"), "{gets:?}");
+    }
+
+    #[test]
+    fn an_edited_server_that_cannot_be_checked_says_why() {
+        // Cross-review of #14: the reason it was not checked stays, not a vaguer "changed since its last check".
+        let env = quiet_env(&serde_json::json!({
+            "projects": {"/work/missing": {"mcpServers": {"loc": {"command": "old"}}}}
+        }));
+        let core = env.start();
+        collect(&core, |e| status_of(e, "loc").is_some());
+        write_config(
+            &env,
+            &serde_json::json!({"projects": {"/work/missing": {"mcpServers": {"loc": {"command": "new"}}}}}),
+        );
+        let mut events = collect(&core, |e| {
+            after_target(e, "loc", "new").is_some_and(|a| status_of(a, "loc").is_some())
+        });
+        // Anything said after it would be among these.
+        std::thread::sleep(Duration::from_millis(300));
+        while let Some(e) = core.try_recv() {
+            events.push(e);
+        }
+        let after = after_target(&events, "loc", "new").unwrap();
+        assert_eq!(
+            status_of(after, "loc"),
+            Some((
+                Status::Unknown,
+                Some("not checked: the project folder was not found".to_owned())
+            )),
+            "{after:#?}"
+        );
     }
 
     #[test]
@@ -4660,6 +4845,37 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn after_save_check_failures_name_their_files_once_each() {
+        // Cross-review of #14: two files failing the same way read as one sentence twice, naming neither.
+        let (env, core, key, _repo) = approve_then_fail_the_settings_check(
+            serde_json::json!({"disabledMcpjsonServers": ["ps", "other"]}),
+        );
+        let mut config = config_json(&env);
+        config["projects"][&key]["disabledMcpjsonServers"] = serde_json::json!(["ps", "other"]);
+        write_config(&env, &config);
+        std::fs::create_dir(env.dir.path().join("cfg").join(".claude.json.lock")).unwrap();
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::ApplyFailed { .. }))
+        });
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ApplyFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            error.contains("settings.local.json") && error.contains(".claude.json"),
+            "{error}"
+        );
+        assert_eq!(error.matches("writing").count(), 1, "{error}");
+        assert!(
+            !error.contains("Nothing was changed"),
+            "the change was saved; only the check after it failed: {error}"
+        );
     }
 
     #[test]
