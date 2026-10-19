@@ -3567,6 +3567,14 @@ impl ShellApp {
             {
                 *text = original.clone();
             }
+            // A draft outlives other changes, so it does not pass for what the file holds.
+            if text != original {
+                ui.add(
+                    egui::Label::new(RichText::new("Unsaved").small().color(pal.text_muted))
+                        .extend(),
+                )
+                .on_hover_text("This edit is not saved yet: Review and save… writes it");
+            }
         });
         if let Some(json) = review
             && self.can_prepare()
@@ -8681,6 +8689,25 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
+    }
+
+    #[test]
+    fn the_save_bar_says_while_a_draft_is_not_saved() {
+        // A draft is kept through other changes, so it says it is not saved yet rather than passing for what the
+        // file holds.
+        let (mut h, engine, _) = form_harness(FORM_ORIGINAL, true);
+        assert!(h.query_by_label("Unsaved").is_none());
+        form(&mut h).command = "node22".into();
+        h.run();
+        apply_another_change(&mut h, &engine, 3);
+        h.get_by_label("Unsaved");
+        // Once the message about the other change has faded: it sits over the save bar until then.
+        h.state_mut().outcome.as_mut().unwrap().shown_at = Some(-1000.0);
+        h.run();
+        h.get_by_label("Revert").click();
+        h.run();
+        assert_eq!(form(&mut h).command, "node");
+        assert!(h.query_by_label("Unsaved").is_none());
     }
 
     #[test]
