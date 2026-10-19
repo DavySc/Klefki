@@ -347,6 +347,7 @@ fn row(
         shadowed: false,
         shadowed_in: Vec::new(),
         casing_collision: false,
+        relative_paths: super::relative::relative_paths(entry),
         status_cached: false,
         oauth: oauth_info(entry),
     }
@@ -1526,6 +1527,41 @@ mod tests {
         assert_eq!(gh.shadowed_in.len(), 2);
         // A project server is still hidden only by a local one, never by the user server it hides.
         assert!(!find(&s, Scope::Project, "gh").shadowed);
+    }
+
+    #[test]
+    fn rows_name_the_relative_paths_of_their_command() {
+        let e = Env::new();
+        let p = e.project("rel");
+        std::fs::write(
+            p.join(".mcp.json"),
+            r#"{"mcpServers":{"repo":{"command":"node","args":["tools/mcp.js"]}}}"#,
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {
+                    "rel": {"command": "node", "args": ["build/index.js"], "env": {"CFG": "./c.json"}},
+                    "abs": {"command": "node", "args": ["/opt/x/index.js"]},
+                    "web": {"type": "http", "url": "https://x.example.com/a.js"}
+                },
+                "projects": {p.to_string_lossy(): {"mcpServers": {"mine": {"command": "./run.sh"}}}}
+            }),
+        );
+        let s = e.load();
+        assert_eq!(
+            find(&s, Scope::User, "rel").relative_paths,
+            ["build/index.js", "./c.json (in CFG)"]
+        );
+        assert!(find(&s, Scope::User, "abs").relative_paths.is_empty());
+        assert!(find(&s, Scope::User, "web").relative_paths.is_empty());
+        // Found for every stdio row; whether it matters depends on the scope, which is for the reader to say.
+        assert_eq!(find(&s, Scope::Local, "mine").relative_paths, ["./run.sh"]);
+        assert_eq!(
+            find(&s, Scope::Project, "repo").relative_paths,
+            ["tools/mcp.js"]
+        );
     }
 
     #[test]

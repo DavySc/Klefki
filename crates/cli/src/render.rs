@@ -238,6 +238,12 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if row.casing_collision {
         notes.push("another server's name differs only in case".to_owned());
     }
+    if row.scope == Scope::User && !row.relative_paths.is_empty() {
+        notes.push(format!(
+            "relative to each session's folder: {}",
+            row.relative_paths.join(", ")
+        ));
+    }
     if row.oauth.is_some() {
         notes.push("OAuth".to_owned());
     }
@@ -325,6 +331,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     o.insert("shadowed".into(), json!(row.shadowed));
     if row.scope == Scope::User {
         o.insert("shadowed_in".into(), json!(row.shadowed_in));
+        o.insert("relative_paths".into(), json!(row.relative_paths));
     }
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
@@ -628,6 +635,40 @@ mod tests {
         assert_eq!(json["shadowed"], json!(false));
         assert_eq!(json["shadowed_in"], json!(["/a", "/b"]));
         assert!(!row_json(&by_local, 2).contains_key("shadowed_in"));
+    }
+
+    #[test]
+    fn a_user_server_with_a_relative_path_says_which() {
+        let s = fixture_snapshot();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let project = s
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Project)
+            .unwrap();
+        let paths = vec!["build/index.js".to_owned(), "./c.json (in CFG)".to_owned()];
+        let rel = ServerRow {
+            relative_paths: paths.clone(),
+            ..user.clone()
+        };
+        let in_repo = ServerRow {
+            relative_paths: paths,
+            ..project.clone()
+        };
+        assert!(
+            notes(&rel, 2).contains(
+                &"relative to each session's folder: build/index.js, ./c.json (in CFG)".to_owned()
+            ),
+            "{:?}",
+            notes(&rel, 2)
+        );
+        assert!(!notes(&in_repo, 2).iter().any(|n| n.contains("relative")));
+        assert_eq!(
+            row_json(&rel, 2)["relative_paths"],
+            json!(["build/index.js", "./c.json (in CFG)"])
+        );
+        assert_eq!(row_json(user, 2)["relative_paths"], json!([]));
+        assert!(!row_json(&in_repo, 2).contains_key("relative_paths"));
     }
 
     #[test]

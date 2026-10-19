@@ -7297,6 +7297,114 @@ mod tests {
         );
     }
 
+    /// Two projects, with a local server in /work/a and a user server that both start a script by a relative path.
+    fn relative_projects() -> serde_json::Value {
+        let mut config = two_projects("end");
+        config["mcpServers"]["rel"] =
+            serde_json::json!({"command": "node", "args": ["build/index.js"]});
+        config["projects"]["/work/a"]["mcpServers"]["here"] =
+            serde_json::json!({"command": "python", "args": ["server.py"]});
+        config
+    }
+
+    fn relative_warnings(plan: &PlanView) -> Vec<&String> {
+        plan.warnings
+            .iter()
+            .filter(|w| w.contains("each session's folder"))
+            .collect()
+    }
+
+    #[test]
+    fn a_server_added_for_the_user_with_a_relative_path_is_warned_about_and_a_local_one_is_not() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let json = r#"{"command": "node", "args": ["build/index.js"], "env": {"CFG": "./c.json"}}"#;
+        let plan = plan_for(&core, vec![add("rel", json, vec![Target::User])]);
+        let [warning] = relative_warnings(&plan)[..] else {
+            panic!("{:?}", plan.warnings)
+        };
+        assert!(
+            warning.starts_with("rel: use full paths.")
+                && warning.contains("can't find build/index.js or ./c.json (in CFG)."),
+            "{warning}"
+        );
+        let plan = plan_for(
+            &core,
+            vec![add("rel", json, vec![Target::Local("/work/b".into())])],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+        let plan = plan_for(
+            &core,
+            vec![add(
+                "abs",
+                r#"{"command": "node", "args": ["/opt/x/index.js"]}"#,
+                vec![Target::User],
+            )],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_local_server_moved_or_duplicated_to_the_user_with_a_relative_path_is_warned_about() {
+        let env = quiet_env(&relative_projects());
+        let core = env.start();
+        for change in [
+            Change::Move {
+                id: local_id("here", "/work/a"),
+                to: Target::User,
+            },
+            duplicate(local_id("here", "/work/a"), "here2", vec![Target::User]),
+        ] {
+            let plan = plan_for(&core, vec![change]);
+            let [warning] = relative_warnings(&plan)[..] else {
+                panic!("{:?}", plan.warnings)
+            };
+            assert!(warning.contains("server.py"), "{warning}");
+        }
+        // Into another project it is as it was: the session starts in that project's folder.
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: local_id("here", "/work/a"),
+                to: Target::Local("/work/b".into()),
+            }],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn saving_a_user_server_says_so_while_it_still_has_a_relative_path_and_not_once_fixed() {
+        let env = quiet_env(&relative_projects());
+        let core = env.start();
+        let save = |json: &str| Change::Replace {
+            id: user_id("rel"),
+            json: json.to_owned(),
+        };
+        let plan = plan_for(
+            &core,
+            vec![save(
+                r#"{"command": "node", "args": ["build/index.js", "--verbose"]}"#,
+            )],
+        );
+        assert_eq!(relative_warnings(&plan).len(), 1, "{:?}", plan.warnings);
+        let plan = plan_for(
+            &core,
+            vec![save(
+                r#"{"command": "node", "args": ["/srv/rel/build/index.js"]}"#,
+            )],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+        // Turning it off writes no definition, so it is no moment to bring this up.
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("rel"),
+                enabled: false,
+            }],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
     #[test]
     fn a_point_raised_by_two_changes_apart_is_said_once() {
         // Variant of the migration's repeated note: two deletes with another change between them.
