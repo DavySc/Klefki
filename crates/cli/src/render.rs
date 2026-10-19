@@ -1,7 +1,9 @@
 //! What `list` and `status` print: a table for people, JSON for scripts (docs/decisions/006-cli-output.md). Pure
 //! functions of the snapshot and the answers, so they are tested without running anything. All text in a snapshot
 //! and in the engine's answers is already sanitised by core.
-use klefki_core::api::{Approval, Hint, Scope, ServerRow, Snapshot, Status, TransportKind};
+use klefki_core::api::{
+    Approval, Hint, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind,
+};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -117,7 +119,7 @@ fn natural(a: &str, b: &str) -> Ordering {
 pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
     let mut rows: Vec<&ServerRow> = rows.into_iter().collect();
     rows.sort_by(|a, b| {
-        let group = |r: &ServerRow| (r.scope != Scope::User, r.project.clone(), r.scope);
+        let group = |r: &'a ServerRow| (r.scope != Scope::User, &r.project, r.scope);
         group(a)
             .cmp(&group(b))
             .then_with(|| natural(&a.name, &b.name))
@@ -257,7 +259,13 @@ fn scope_key(scope: Scope) -> &'static str {
 }
 
 fn transport_key(kind: TransportKind) -> &'static str {
-    kind.label()
+    match kind {
+        TransportKind::Stdio => "stdio",
+        TransportKind::Http => "http",
+        TransportKind::Sse => "sse",
+        TransportKind::Ws => "ws",
+        TransportKind::Invalid => "invalid",
+    }
 }
 
 fn approval_key(approval: Approval) -> &'static str {
@@ -364,12 +372,20 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
                 Status::Unknown | Status::Checking => NOT_CHECKED,
                 status => status.label(),
             };
+            // The name comes from the repository's `.mcp.json`. Only a name Klefki passes to Claude Code can be
+            // checked, and such a name is the same word in any shell.
+            let how = match ServerName::parse(&row.name) {
+                Ok(name) => format!(
+                    "to check it: klefki-cli status {}",
+                    command_word(name.as_str())
+                ),
+                Err(why) => format!("its name cannot be checked: {why}"),
+            };
             (
                 label.to_owned(),
                 format!(
-                    "not checked: it may run the repository's own command ({}); to check it: klefki-cli status {}",
-                    row.target,
-                    command_word(&row.name)
+                    "not checked: it may run the repository's own command ({}); {how}",
+                    row.target
                 ),
             )
         }
@@ -599,6 +615,44 @@ mod tests {
         assert_eq!(command_word("-x"), "-- -x");
         assert_eq!(command_word("a\"b"), "\"a\\\"b\"");
         assert_eq!(command_word(""), "\"\"");
+    }
+
+    #[test]
+    fn a_project_server_gets_a_check_command_only_when_its_name_can_be_checked() {
+        // Core review 3: a name from the repository's `.mcp.json` was quoted in a way a shell still expands, so
+        // copying the suggestion could run what the name held. Only a name Klefki passes to Claude Code can be
+        // checked, and such a name needs no quoting.
+        let s = fixture_snapshot();
+        let mut row = s
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Project)
+            .unwrap()
+            .clone();
+        for (name, offered) in [
+            ("docs", true),
+            ("my_server-2", true),
+            ("x$(echo INJECTED)", false),
+            ("x`echo INJECTED`", false),
+            ("-a$HOME", false),
+            ("-a;echo INJECTED", false),
+            ("a\"b", false),
+            ("my server", false),
+            ("constructor", false),
+        ] {
+            row.name = name.to_owned();
+            let text = status_text(&[(&row, Outcome::ProjectServer)], None);
+            let suggested = text.contains("klefki-cli status");
+            assert_eq!(suggested, offered, "{name}: {text}");
+            if offered {
+                assert!(
+                    text.contains(&format!("to check it: klefki-cli status {name}\n")),
+                    "{text}"
+                );
+            } else {
+                assert!(text.contains("cannot be checked"), "{name}: {text}");
+            }
+        }
     }
 
     fn checked(status: Status, detail: &str) -> Outcome {
