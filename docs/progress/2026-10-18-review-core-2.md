@@ -26,6 +26,7 @@ No blockers. Done (6f702c7, 0a999fc):
 - Found re-reading: since fb13a9b, `cd app && claude mcp add …` lost the command, which main read (checked on main). The command after `&&` or `;` is read again.
 ## Review round 2 (performance thread, comment 6257426105)
 Items 1-6 and 9 verified. One should-fix, done: since fb13a9b the lexer copied the rest of the line at each command start, so one 256 KiB line of `$ ` took 43 s in release (`> `, `- `, `1. `, `;` and `&&` chains similar). It now reads through a slice cursor, finds a line's end once, checks markers and fences only before a line's first command, and stops first words at a space, `;` or `&`. Release: `$ ` 1.7 ms, slowest shape 34 ms; debug: all under 0.3 s. Test: `a_full_paste_of_one_long_line_is_read_quickly` (failed first: `"$ ": 43.1s`).
+For whoever next edits paste.rs (optional, from round 2): `false || claude mcp add …` and `echo x | claude mcp add …` are refused as "does not start with claude mcp add", where "uses the shell (||)" would be more exact; a raw-Markdown inline-code line (`` `claude mcp add …` ``) and `npx @anthropic-ai/claude-code mcp add …` get the generic "Nothing here adds a server".
 
 Not done: auto-correcting typography (item 3's bigger option: changing pasted text silently is a product call; the problem now names the word); one mask for hidden values (item 8, a finding for Davy); folding prose notes into one (item 7, the performance thread's follow-up after #29 and #30 merge).
 
