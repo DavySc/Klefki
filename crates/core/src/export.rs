@@ -596,7 +596,13 @@ mod tests {
                 "MODE": "production", "DEBUG": "true", "TIMEOUT": "30", "DIR": "/srv/data",
                 "BASE": "https://api.example.com/v1", "DB_PASS": "hunter", "SESSION": "abc",
                 "CODE": "12345678901", "WORDY": "correcthorsebatterystaple", "MIXED": "abc123",
-                "AUTH_URL": "https://u:p@x.example.com", "QUERY": "https://x.example.com/?k=v"
+                "AUTH_URL": "https://u:p@x.example.com", "QUERY": "https://x.example.com/?k=v",
+                // A key in an address's or a file's path, as `url` and arguments already hide it, at any length.
+                "ENDPOINT": "https://mcp.example.com/s/ZmFrZXNlY3JldHRva2VuMTIzNDU2Nzg5MA/sse",
+                "HOOK": "https://h.io/s/sk-live-abcdef1234567890",
+                "SHORT": "https://h.io/ZmFrZXNlY3JldHRva2VuMTIz",
+                "FRAGMENT": "https://h.io/#ZmFrZXNlY3JldHRva2VuMTIz",
+                "KEYFILE": "/srv/ZmFrZXNlY3JldHRva2VuMTIzNDU2/key"
             }}),
         )]);
         let env = &block(&out)["mcpServers"]["s"]["env"];
@@ -608,7 +614,8 @@ mod tests {
             );
         }
         for name in [
-            "DB_PASS", "SESSION", "CODE", "WORDY", "MIXED", "AUTH_URL", "QUERY",
+            "DB_PASS", "SESSION", "CODE", "WORDY", "MIXED", "AUTH_URL", "QUERY", "ENDPOINT",
+            "HOOK", "SHORT", "FRAGMENT", "KEYFILE",
         ] {
             assert_eq!(env[name], format!("${{{name}}}"), "{name}");
         }

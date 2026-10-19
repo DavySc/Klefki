@@ -1686,7 +1686,7 @@ impl ShellApp {
             names: (rows.len() > 1).then(|| names_in_a_line(&names)),
             scope,
             result: None,
-            copied_at: None,
+            copied: None,
         });
         self.exports_pending += 1;
         self.send(Command::Export(
@@ -1791,10 +1791,11 @@ impl ShellApp {
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let copied = view
-                    .copied_at
-                    .is_some_and(|at| now - at < COPIED_SECS);
-                let label = if copied { "Copied" } else { "Copy" };
+                let copied = |what| {
+                    view.copied
+                        .is_some_and(|(it, at)| it == what && now - at < COPIED_SECS)
+                };
+                let label = if copied(Copied::Block) { "Copied" } else { "Copy" };
                 let button = egui::Button::new(RichText::new(label).strong().color(pal.on_bright))
                     .fill(pal.primary)
                     .min_size(egui::vec2(96.0, 34.0));
@@ -1808,8 +1809,9 @@ impl ShellApp {
                     .as_ref()
                     .is_some_and(|r| r.variables.iter().any(|v| v.default.is_none()))
                 {
+                    let label = if copied(Copied::Names) { "Copied" } else { "Copy names" };
                     copy_names |= ui
-                        .add(egui::Button::new("Copy names").min_size(egui::vec2(80.0, 34.0)))
+                        .add(egui::Button::new(label).min_size(egui::vec2(80.0, 34.0)))
                         .on_hover_text("Copy the variables to set, one NAME= a line")
                         .clicked();
                 }
@@ -1833,7 +1835,8 @@ impl ShellApp {
                 ctx.copy_text(lines);
             }
             if copy || copy_names {
-                view.copied_at = Some(now);
+                let what = if copy { Copied::Block } else { Copied::Names };
+                view.copied = Some((what, now));
                 // Back to "Copy" once the confirmation has been seen; no repaint every frame meanwhile.
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
             }
@@ -5120,8 +5123,15 @@ struct ExportView {
     /// How the search decided which servers these are, when it did.
     scope: Option<String>,
     result: Option<Exported>,
-    /// When something was last copied: the button says "Copied" for a few seconds.
-    copied_at: Option<f64>,
+    /// What was last copied, and when: that button says "Copied" for a few seconds.
+    copied: Option<(Copied, f64)>,
+}
+
+/// Which of the Export dialog's buttons copied.
+#[derive(Clone, Copy, PartialEq)]
+enum Copied {
+    Block,
+    Names,
 }
 
 /// How long the Copy button says "Copied".
@@ -11464,6 +11474,11 @@ mod tests {
             .click();
         h.step();
         assert_eq!(copied(&h), ["GITHUB_TOKEN=\n"], "only the ones to set");
+        h.run();
+        // The button that copied says so; the block's Copy does not claim the names.
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Copied");
+        assert!(h.query_by_label("Copy names").is_none());
         h.get_by_label_contains("its client secret is not in the block");
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy")
             .click();
@@ -11471,6 +11486,7 @@ mod tests {
         assert_eq!(copied(&h), [block]);
         h.run();
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Copied");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Copy names");
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Close")
             .click();
         h.run();
@@ -11500,7 +11516,7 @@ mod tests {
         // Nothing to copy yet: Enter does nothing.
         h.key_press(egui::Key::Enter);
         h.run();
-        assert!(h.state().exporting.as_ref().unwrap().copied_at.is_none());
+        assert!(h.state().exporting.as_ref().unwrap().copied.is_none());
         engine.events.send(exported_block("{}", &[], &[])).unwrap();
         h.run();
         h.get_by_label("Nothing was left out: no value needed a reference.");

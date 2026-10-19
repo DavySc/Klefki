@@ -89,9 +89,15 @@ pub(crate) fn plain_setting(name: &str, value: &str) -> bool {
         && value
             .chars()
             .all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_');
+    // No key among the path's parts, by the rule `rewritten_query` hides one with from `url` and arguments.
+    let no_token = || {
+        value
+            .split('/')
+            .all(|part| !(looks_secret("", part) || is_long_token(part)))
+    };
     let path = value.starts_with(['/', '~', '.']) || value.get(1..3) == Some(":/");
     let address = value.contains("://") && !value.contains(['@', '?', '#']);
-    number || word || path || address
+    number || word || ((path || address) && no_token())
 }
 
 /// Whether some word of `text` (split at spaces, quotes, brackets and the like) has a known credential's shape
