@@ -516,9 +516,11 @@ struct Queue {
     background_running: usize,
     /// The servers on screen, from [`Command::Visible`]: their background jobs go first.
     visible: std::collections::HashSet<crate::model::ConnectionId>,
-    /// Servers whose check said it was running and has not answered yet, with how many such checks run: the app
-    /// forgets "Checking…" on every snapshot, so each reload says it again.
-    announced: HashMap<crate::model::ConnectionId, usize>,
+    /// Checks that said they are running and have not answered yet: the app forgets "Checking…" on every
+    /// snapshot, so each reload says it again for those that will still answer.
+    announced: Vec<Running>,
+    /// Tells the entries of [`Queue::announced`] apart.
+    tokens: u64,
     shutdown: bool,
 }
 
@@ -589,28 +591,46 @@ impl Drop for BackgroundSlot<'_> {
     }
 }
 
+struct Running {
+    token: u64,
+    connection: crate::model::ConnectionId,
+    /// The change count its answer is compared with ([`Changes::since`]); `None` until it is taken.
+    started: Option<u64>,
+}
+
 /// A running check's entry in [`Queue::announced`], taken out when dropped, also when the job panics.
 struct Announced<'a> {
     queue: &'a Mutex<Queue>,
-    connection: &'a crate::model::ConnectionId,
+    token: u64,
 }
 
 impl<'a> Announced<'a> {
-    fn new(queue: &'a Mutex<Queue>, connection: &'a crate::model::ConnectionId) -> Self {
-        *lock(queue).announced.entry(connection.clone()).or_default() += 1;
-        Self { queue, connection }
+    fn new(queue: &'a Mutex<Queue>, connection: &crate::model::ConnectionId) -> Self {
+        let mut q = lock(queue);
+        q.tokens += 1;
+        let token = q.tokens;
+        q.announced.push(Running {
+            token,
+            connection: connection.clone(),
+            started: None,
+        });
+        Self { queue, token }
+    }
+
+    fn started(&self, count: u64) {
+        if let Some(r) = lock(self.queue)
+            .announced
+            .iter_mut()
+            .find(|r| r.token == self.token)
+        {
+            r.started = Some(count);
+        }
     }
 }
 
 impl Drop for Announced<'_> {
     fn drop(&mut self) {
-        let mut queue = lock(self.queue);
-        if let Some(n) = queue.announced.get_mut(self.connection) {
-            *n -= 1;
-            if *n == 0 {
-                queue.announced.remove(self.connection);
-            }
-        }
+        lock(self.queue).announced.retain(|r| r.token != self.token);
     }
 }
 
@@ -1690,11 +1710,16 @@ impl State {
             queue
                 .jobs
                 .retain(|j| self.keys.contains_key(&j.id.connection));
+            let changes = lock(&shared.changes);
+            // Not those whose server changed since they started: their answer will not come.
             queue
                 .announced
-                .keys()
-                .filter(|c| !edited.contains(*c))
-                .cloned()
+                .iter()
+                .filter(|r| {
+                    !edited.contains(&r.connection)
+                        && r.started.is_none_or(|n| !changes.since(&r.connection, n))
+                })
+                .map(|r| r.connection.clone())
                 .collect()
         };
         // The snapshot made the app forget which checks are running.
@@ -2005,7 +2030,7 @@ fn worker(shared: &Shared) {
 }
 
 fn run(shared: &Shared, job: &Job) {
-    let _announced = job
+    let announced = job
         .announce
         .then(|| Announced::new(&shared.queue, &job.id.connection));
     if job.announce {
@@ -2015,6 +2040,9 @@ fn run(shared: &Shared, job: &Job) {
     }
     // Taken after the announcement: an edit noted before this is one the check will see.
     let started = lock(&shared.changes).count;
+    if let Some(a) = &announced {
+        a.started(started);
+    }
     // An answer about a server edited or removed while this ran is about a definition that is gone.
     let current = || !lock(&shared.changes).since(&job.id.connection, started);
     match job.kind {
@@ -2843,6 +2871,56 @@ mod tests {
                 Event::Status { id, status: Status::Checking, .. } if id.name == "mine")),
             "{:#?}",
             &events[snapshot..]
+        );
+    }
+
+    #[test]
+    fn a_check_of_a_server_since_edited_is_not_announced_again() {
+        // Cross-review of #14, round 2: its answer will not come, so "Checking…" said again would stay for good.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {"mine": {"command": "old"}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt","delay_ms":1500}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = start_with(
+            EngineConfig {
+                background_checks: false,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        core.send(Command::Check(user_id("mine")));
+        collect(&core, |e| {
+            status_of(e, "mine").is_some_and(|s| s.0 == Status::Checking)
+        });
+        write_config(
+            &env,
+            &serde_json::json!({"mcpServers": {"mine": {"command": "new"}}}),
+        );
+        collect(&core, |e| {
+            after_target(e, "mine", "new").is_some_and(|a| status_of(a, "mine").is_some())
+        });
+        // An unrelated reload while the stale check still runs.
+        core.send(Command::Refresh { live_all: false });
+        let deadline = Instant::now() + WAIT;
+        while env.gets().iter().any(|g| g.2 == u64::MAX) {
+            assert!(Instant::now() < deadline, "{:?}", env.gets());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let mut events = Vec::new();
+        while let Some(e) = core.try_recv() {
+            events.push(e);
+        }
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Snapshot(_))),
+            "the refresh came after the edit: {events:#?}"
+        );
+        assert_ne!(
+            status_of(&events, "mine").map(|s| s.0),
+            Some(Status::Checking),
+            "{events:#?}"
         );
     }
 
