@@ -1,5 +1,6 @@
 mod activity;
 mod command;
+mod desktop;
 mod explain;
 mod secrets;
 mod shell;
