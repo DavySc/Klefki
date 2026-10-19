@@ -41,3 +41,4 @@ Roadmap slice (follow-up of the Activity log, #15): restore Claude Code's server
 - Non-blocking taken: putting back a server that is now somewhere else warns that both stay. Test `a_server_put_back_that_is_now_somewhere_else_says_both_stay`.
 - Each new test was seen failing with its fix reverted.
 - Checks: full verify exit 0 (305 app + 625 core + 17 + 22 cli tests, deny ok); Windows clippy exit 0. Real app screenshots in `reviews/2026-10-19-restore/round2/`.
+- Main (#23, #24) merged in without conflicts; full verify on the merge exit 0 (305 app + 633 core + 17 + 22 cli tests, deny ok), Windows clippy exit 0.
