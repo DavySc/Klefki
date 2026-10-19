@@ -31,6 +31,8 @@ struct RawServer {
     shadowed_in: Vec<String>,
     #[serde(default)]
     casing_collision: bool,
+    #[serde(default)]
+    relative_paths: Vec<String>,
 }
 
 pub(crate) fn load() -> Snapshot {
@@ -81,6 +83,7 @@ pub(crate) fn load() -> Snapshot {
                 shadowed: s.shadowed,
                 shadowed_in: s.shadowed_in.iter().map(|p| sanitize(p)).collect(),
                 casing_collision: s.casing_collision,
+                relative_paths: s.relative_paths.iter().map(|p| sanitize(p)).collect(),
                 status_cached: false,
                 oauth: None,
             })

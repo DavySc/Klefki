@@ -19,6 +19,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Connections,
+    Desktop,
     ScopeDrift,
     Secrets,
     Settings,
@@ -26,8 +27,9 @@ pub enum Page {
 }
 
 impl Page {
-    const ALL: [(Page, &'static str, &'static str); 5] = [
+    const ALL: [(Page, &'static str, &'static str); 6] = [
         (Page::Connections, icon::PLUGS_CONNECTED, "Connections"),
+        (Page::Desktop, icon::DESKTOP, "Claude Desktop"),
         (Page::ScopeDrift, icon::GIT_DIFF, "Scope drift"),
         (Page::Secrets, icon::KEY, "Secrets"),
         (Page::Settings, icon::GEAR, "Settings"),
@@ -52,13 +54,13 @@ impl Page {
     fn ready(self) -> bool {
         matches!(
             self,
-            Page::Connections | Page::Secrets | Page::Settings | Page::ActivityLog
+            Page::Connections | Page::Desktop | Page::Secrets | Page::Settings | Page::ActivityLog
         )
     }
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections | Page::Secrets | Page::ActivityLog => "",
+            Page::Connections | Page::Desktop | Page::Secrets | Page::ActivityLog => "",
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
             }
@@ -344,6 +346,8 @@ pub struct ShellApp {
     pub page: Page,
     /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
     pub activity: Option<crate::activity::ActivityPage>,
+    /// The Claude Desktop page while it is shown; like the Activity log, read when opened and let go when left.
+    pub desktop: Option<crate::desktop::DesktopPage>,
     /// The Secrets page while it is shown; `None` on every other page, like the Activity log.
     pub secrets: Option<crate::secrets::SecretsPage>,
     pub search: String,
@@ -409,6 +413,7 @@ impl ShellApp {
             snapshot,
             page: Page::Connections,
             activity: None,
+            desktop: None,
             secrets: None,
             search: String::new(),
             selected: BTreeSet::new(),
@@ -431,8 +436,8 @@ impl ShellApp {
         }
     }
 
-    /// Shows `page`. The Activity log and the Secrets page are read each time they are opened and let go when they
-    /// are left.
+    /// Shows `page`. The Activity log, Claude Desktop's servers and the Secrets page are read each time they are
+    /// opened and let go when they are left.
     fn go(&mut self, page: Page) {
         if page == Page::ActivityLog {
             if self.activity.is_none() {
@@ -441,6 +446,14 @@ impl ShellApp {
             }
         } else {
             self.activity = None;
+        }
+        if page == Page::Desktop {
+            if self.desktop.is_none() {
+                self.desktop = Some(crate::desktop::DesktopPage::default());
+                self.send(Command::Desktop);
+            }
+        } else {
+            self.desktop = None;
         }
         if page == Page::Secrets {
             if self.secrets.is_none() {
@@ -472,9 +485,12 @@ impl ShellApp {
         };
     }
 
-    /// Re-reads the configuration and re-checks every server.
+    /// Re-reads the configuration and re-checks every server; on the Claude Desktop page, its file too.
     fn refresh(&self) {
         self.send(Command::Refresh { live_all: true });
+        if self.desktop.is_some() {
+            self.send(Command::Desktop);
+        }
     }
 
     fn poll_core(&mut self) {
@@ -512,6 +528,12 @@ impl ShellApp {
             }
         }
         match event {
+            Event::Desktop(desktop) => {
+                // Not kept once the page is left: it is read again when the page is opened.
+                if let Some(page) = &mut self.desktop {
+                    page.set(desktop);
+                }
+            }
             Event::Secrets(report) => {
                 if let Some(page) = &mut self.secrets {
                     page.report = Some(report);
@@ -1074,8 +1096,9 @@ impl ShellApp {
                 self.move_selection(step);
             }
         }
-        // Del and Ctrl+E act on the selection, unless a text field has the keyboard (Del edits text there).
-        if idle && self.core.is_some() {
+        // Del and Ctrl+E act on the selection, unless a text field has the keyboard (Del edits text there). Only where
+        // the selection is in view: on another page they would act on a server the user cannot see.
+        if idle && self.core.is_some() && self.page == Page::Connections {
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.prepare_delete();
             }
@@ -1092,12 +1115,16 @@ impl ShellApp {
             {
                 self.open_move();
             }
-            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
-                self.open_add();
-            }
-            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
-                self.ask_import();
-            }
+        }
+        // Adding and importing need no selection, so they work from any page.
+        if idle
+            && self.core.is_some()
+            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N))
+        {
+            self.open_add();
+        }
+        if idle && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.ask_import();
         }
         let pal = theme::palette(ui.ctx());
         self.save_bar_shown = false;
@@ -1181,6 +1208,11 @@ impl ShellApp {
                             self.settings(ui);
                             bring_focus_into_view(ui);
                         });
+                }
+                Page::Desktop => {
+                    if let Some(page) = &mut self.desktop {
+                        page.show(ui, &self.snapshot);
+                    }
                 }
                 Page::Secrets => {
                     let live = self.core.is_some();
@@ -1277,19 +1309,26 @@ impl ShellApp {
                 // On the Activity log it filters the changes, and says so: a box that filtered the hidden list of
                 // servers would find nothing there.
                 // The shortcut is left out there, so the longer words fit the box.
-                let (query, hint) = match (&mut self.activity, &mut self.secrets) {
-                    (Some(page), _) => (
+                let (query, hint) = if let Some(page) = &mut self.activity {
+                    (
                         &mut page.filter,
                         format!("{} Filter changes", icon::MAGNIFYING_GLASS),
-                    ),
-                    (None, Some(page)) => (
+                    )
+                } else if let Some(page) = &mut self.secrets {
+                    (
                         &mut page.filter,
                         format!("{} Filter secrets", icon::MAGNIFYING_GLASS),
-                    ),
-                    (None, None) => (
+                    )
+                } else if let Some(page) = &mut self.desktop {
+                    (
+                        &mut page.filter,
+                        format!("{} Filter servers", icon::MAGNIFYING_GLASS),
+                    )
+                } else {
+                    (
                         &mut self.search,
                         format!("{} Filter  {}", icon::MAGNIFYING_GLASS, shortcut("F")),
-                    ),
+                    )
                 };
                 ui.add(
                     egui::TextEdit::singleline(query)
@@ -1843,6 +1882,13 @@ impl ShellApp {
             None,
             command::Action::ActivityLog,
         );
+        add(
+            icon::DESKTOP,
+            "Claude Desktop".into(),
+            "The servers in Claude Desktop's configuration, read-only".into(),
+            None,
+            command::Action::Desktop,
+        );
         // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
         if live {
             add(
@@ -1913,6 +1959,7 @@ impl ShellApp {
             }
             A::Settings => self.go(Page::Settings),
             A::ActivityLog => self.go(Page::ActivityLog),
+            A::Desktop => self.go(Page::Desktop),
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),
@@ -4235,6 +4282,21 @@ impl ShellApp {
                         self.open_casing();
                     }
                 }
+                if s.scope == Scope::User && !s.relative_paths.is_empty() {
+                    ui.add_space(8.0);
+                    // What to do first, with the paths as values; why under it, quieter.
+                    ui.add(egui::Label::new(relative_job(ui, &s.relative_paths, pal.warn)).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Claude Code starts user servers in each session's folder. Klefki checks them \
+                                 from your home folder, so the check can pass here.",
+                            )
+                            .color(pal.text_muted),
+                        )
+                        .wrap(),
+                    );
+                }
                 if s.scope == Scope::Project
                     && s.approval.is_some_and(|a| a != Approval::Approved)
                     && self.core.is_some()
@@ -5982,14 +6044,15 @@ impl AddForm {
             .filter(|&i| checked[i] == Check::Ready && conflicts[i].is_some())
             .collect();
         if conflicting.len() > 1 {
+            // The question on a line of its own, so the two answers stay together on the next.
+            ui.label(
+                RichText::new(format!(
+                    "{} already exist. For all of them:",
+                    conflicting.len()
+                ))
+                .color(pal.text_muted),
+            );
             ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} already exist. For all of them:",
-                        conflicting.len()
-                    ))
-                    .color(pal.text_muted),
-                );
                 let all_replaced = conflicting.iter().all(|&i| self.replace[i]);
                 let none_replaced = conflicting.iter().all(|&i| !self.replace[i]);
                 // Neither is chosen while the servers differ.
@@ -7528,6 +7591,16 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     if s.casing_collision {
         badges.push(loud("casing", pal.warn, None));
     }
+    if s.scope == Scope::User && !s.relative_paths.is_empty() {
+        badges.push(loud(
+            "relative path",
+            pal.warn,
+            Some(
+                "Claude Code starts user servers in each session's folder, so sessions in other folders can't \
+                 find a file its command names. The details say which.",
+            ),
+        ));
+    }
     // The toggle is per project: a user server can be off in some and on in others.
     if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
         badges.push(loud(
@@ -7721,6 +7794,31 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32, color: Color32) -> egui::Respon
             ui.label(RichText::new(text).small().color(color));
         })
         .response
+}
+
+/// "Use full paths: sessions in other folders can't find `a` or `b`.", the paths in the code font, for the detail
+/// panel of a user server whose command names `paths` relative to where it starts.
+fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::text::LayoutJob {
+    let text = |style: egui::TextStyle| egui::TextFormat {
+        font_id: style.resolve(ui.style()),
+        color,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        "Use full paths: sessions in other folders can't find ",
+        0.0,
+        text(egui::TextStyle::Body),
+    );
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            let between = if i + 1 == paths.len() { " or " } else { ", " };
+            job.append(between, 0.0, text(egui::TextStyle::Body));
+        }
+        job.append(path, 0.0, text(egui::TextStyle::Monospace));
+    }
+    job.append(".", 0.0, text(egui::TextStyle::Body));
+    job
 }
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
@@ -8031,6 +8129,7 @@ mod tests {
             shadowed: false,
             shadowed_in: Vec::new(),
             casing_collision: false,
+            relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
         };
@@ -8157,6 +8256,7 @@ mod tests {
             shadowed: false,
             shadowed_in: Vec::new(),
             casing_collision: false,
+            relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
         }
@@ -8994,6 +9094,38 @@ mod tests {
         h.get_by_label("in 2 of 17 projects: WebApp, Api").hover();
         h.run();
         h.get_by_label_contains("C:/Repos/WebApp\nC:/Repos/Api");
+    }
+
+    #[test]
+    fn a_user_server_with_a_relative_path_is_marked_and_its_details_name_the_paths() {
+        let (mut h, engine) = live_harness();
+        let mut user = live_row("docs", Scope::User, None);
+        user.relative_paths = vec!["build/index.js".into(), "./c.json (in CFG)".into()];
+        // In its own project's folder a relative path is what it should be.
+        let mut local = live_row("tools", Scope::Local, Some("C:/Repos/WebApp"));
+        local.relative_paths = vec!["server.py".into()];
+        engine
+            .events
+            .send(snapshot_with_projects(3, vec![user, local]))
+            .unwrap();
+        h.run();
+        let badges: Vec<_> = h.query_all_by_label("relative path").collect();
+        assert_eq!(badges.len(), 1, "only the user server");
+        h.get_by_label("relative path").hover();
+        h.run();
+        h.get_by_label_contains(
+            "sessions in other folders can't \
+             find a file its command names",
+        );
+        h.get_by_label("docs").click();
+        h.run();
+        h.get_by_label(
+            "Use full paths: sessions in other folders can't find build/index.js or ./c.json (in CFG).",
+        );
+        h.get_by_label_contains("so the check can pass here");
+        h.get_by_label("tools").click();
+        h.run();
+        assert!(h.query_by_label_contains("Use full paths").is_none());
     }
 
     #[test]

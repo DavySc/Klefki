@@ -4,6 +4,7 @@ use std::sync::Arc;
 pub use crate::activity::{Activity, ActivityEntry, Backup};
 pub use crate::config::ConfigPaths;
 pub use crate::config::definition::Definition;
+pub use crate::desktop::{Desktop, DesktopServer};
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
     SignInFailure, SignInStep,
@@ -192,6 +193,11 @@ pub struct ServerRow {
     /// loaded instead, in the inventory's order. Empty for other rows.
     pub shadowed_in: Vec<String>,
     pub casing_collision: bool,
+    /// Stdio servers: the parts of the command (the program, arguments, `NAME=value` variables) that name a path
+    /// relative to the folder the server is started in, as shown, at most a few. Claude Code starts a server in the
+    /// folder the session started in, so on a user server, which every project loads, these work only in a folder
+    /// that has them, while klefki's own check runs in the home folder. Empty for other rows.
+    pub relative_paths: Vec<String>,
     /// `status` is what Claude's own cache last said, which can be old, not an answer klefki got itself. Such rows
     /// are checked again in the background; until then the app shows the status as last known.
     pub status_cached: bool,
@@ -313,6 +319,7 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         pick_dialog: std::sync::Arc::new(open_pick_dialog),
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
+        desktop: crate::desktop::DesktopRoots::discover(),
     }
 }
 

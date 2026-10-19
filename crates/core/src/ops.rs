@@ -4,7 +4,7 @@ use crate::api::{
 };
 use crate::config::docstore::Op;
 use crate::config::inventory::{FileKey, FileKeys};
-use crate::config::{entry, fsx, inventory, secretlike};
+use crate::config::{entry, fsx, inventory, relative, secretlike};
 use crate::sanitize::sanitize;
 use crate::secrets::Secret;
 use crate::swap::{self, Spot, Swap};
@@ -198,12 +198,72 @@ pub(crate) fn resolve(
             "A running Claude Code session may need a restart before it notices this.".to_owned(),
         );
     }
+    out.warnings
+        .extend(relative_in_user_servers(&out, snapshot));
     // Several changes can raise the same point; it is said once, where it first came up.
     for said in [&mut out.warnings, &mut out.notes] {
         let mut seen = std::collections::HashSet::new();
         said.retain(|s| seen.insert(s.clone()));
     }
     Ok(out)
+}
+
+/// A warning for each server this plan writes for the user whose command names a path relative to the folder it
+/// starts in. A user server runs in every project, and Claude Code starts it in the folder the session started in.
+/// Only `.claude.json` edits: what Claude Code's own commands add or move signs in with OAuth, which only an address
+/// does.
+fn relative_in_user_servers(out: &Resolved, snapshot: &Snapshot) -> Vec<String> {
+    // Copied or moved as it is: what its row found.
+    let found_in = |project: &Option<String>, name: &str| {
+        let scope = if project.is_some() {
+            Scope::Local
+        } else {
+            Scope::User
+        };
+        let id = crate::model::ConnectionId::new(scope, project.as_deref(), name);
+        snapshot
+            .servers
+            .iter()
+            .find(|r| r.connection == id)
+            .map(|r| r.relative_paths.clone())
+            .unwrap_or_default()
+    };
+    let mut found: Vec<(&str, Vec<String>)> = Vec::new();
+    for op in &out.claude {
+        match op {
+            Op::AddServer {
+                project: None,
+                name,
+                entry,
+            }
+            | Op::ReplaceServer {
+                project: None,
+                name,
+                entry,
+            } => found.push((name, relative::relative_paths(entry))),
+            Op::CopyServer {
+                from,
+                name,
+                to: None,
+                new_name,
+            } => found.push((new_name, found_in(from, name))),
+            _ => {}
+        }
+    }
+    found
+        .into_iter()
+        .filter(|(_, paths)| !paths.is_empty())
+        .map(|(name, paths)| {
+            let named = match paths.as_slice() {
+                [rest @ .., last] if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+                _ => paths.concat(),
+            };
+            format!(
+                "{}: use full paths. Claude Code starts user servers in each session's folder, so sessions in other folders can't find {named}.",
+                sanitize(name),
+            )
+        })
+        .collect()
 }
 
 /// One plain sentence for a change, naming the server and where it applies, as the row shows them (the caller's

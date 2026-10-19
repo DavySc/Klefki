@@ -105,6 +105,9 @@ pub enum Command {
     /// What Klefki changed, and the backups it kept (see [`Event::Activity`]). Read only when asked: the Activity log
     /// page asks each time it is opened.
     Activity,
+    /// Claude Desktop's servers (see [`Event::Desktop`]). Read only when asked: the Claude Desktop page asks each time
+    /// it is opened. Klefki never writes Claude Desktop's configuration.
+    Desktop,
     /// Which servers use secrets and where each lives, and the client secrets nothing uses (see [`Event::Secrets`]).
     /// Read only when asked: the Secrets page asks each time it is opened. No secret is read.
     Secrets,
@@ -408,6 +411,8 @@ pub enum Event {
     },
     /// The activity log, after [`Command::Activity`].
     Activity(crate::activity::Activity),
+    /// Claude Desktop's servers, after [`Command::Desktop`].
+    Desktop(crate::desktop::Desktop),
     /// What the Secrets page shows, after [`Command::Secrets`].
     Secrets(crate::secret_uses::Secrets),
     /// Whether [`Command::ForgetUnusedSecret`] deleted the secret, or why not (sanitised).
@@ -545,6 +550,8 @@ pub(crate) struct EngineConfig {
     /// Runs Claude Code's own commands that change servers (`mcp add-json`, `mcp remove`) instead of the CLI found
     /// on disk. Tests give a stand-in that changes the configuration as Claude Code would.
     pub changer: Option<Arc<dyn swap::Claude>>,
+    /// Where Claude Desktop's configuration can be. Tests give folders of their own, or none.
+    pub desktop: crate::desktop::DesktopRoots,
 }
 
 /// Opens an https link in the user's browser.
@@ -1050,6 +1057,9 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
+            Command::Desktop => shared
+                .emitter
+                .emit(Event::Desktop(crate::desktop::load(&shared.config.desktop))),
             Command::Secrets => secrets(&shared, &state, SecretsAsk::List),
             Command::SecretsAfterFileChange => secrets(&shared, &state, SecretsAsk::Reuse),
             Command::ForgetUnusedSecret(connection) => {
@@ -2998,6 +3008,7 @@ mod tests {
                 },
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
+                desktop: crate::desktop::DesktopRoots::default(),
             }
         }
 
@@ -5256,6 +5267,54 @@ mod tests {
     }
 
     #[test]
+    fn claude_desktop_is_read_only_when_asked_and_never_written() {
+        let env = quiet_env(&two_projects("end"));
+        let roaming = env.dir.path().join("Roaming");
+        let file = roaming.join("Claude").join(crate::desktop::FILE_NAME);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let text = r#"{"mcpServers": {"files": {"command": "npx", "args": ["-y", "fs"]}}}"#;
+        std::fs::write(&file, text).unwrap();
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let core = start_with(
+            EngineConfig {
+                desktop: crate::desktop::DesktopRoots {
+                    roaming: Some(roaming),
+                    packages: None,
+                },
+                ..env.config()
+            },
+            || {},
+        );
+        // Starting up reads Claude Code's configuration, not Claude Desktop's.
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert!(!events.iter().any(|e| matches!(e, Event::Desktop(_))));
+        for _ in 0..2 {
+            core.send(Command::Desktop);
+            let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Desktop(_))));
+            let desktop = events
+                .into_iter()
+                .find_map(|e| match e {
+                    Event::Desktop(d) => Some(d),
+                    _ => None,
+                })
+                .unwrap();
+            let names: Vec<&str> = desktop.servers.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["files"]);
+            assert_eq!(desktop.servers[0].target, "npx -y fs");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
+        // Nothing else was put next to it either.
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
     fn a_saved_change_is_in_the_activity_log_with_its_backup() {
         let env = quiet_env(&two_projects("end"));
         let core = env.start();
@@ -7378,6 +7437,114 @@ mod tests {
             "{:?}",
             plan.warnings
         );
+    }
+
+    /// Two projects, with a local server in /work/a and a user server that both start a script by a relative path.
+    fn relative_projects() -> serde_json::Value {
+        let mut config = two_projects("end");
+        config["mcpServers"]["rel"] =
+            serde_json::json!({"command": "node", "args": ["build/index.js"]});
+        config["projects"]["/work/a"]["mcpServers"]["here"] =
+            serde_json::json!({"command": "python", "args": ["server.py"]});
+        config
+    }
+
+    fn relative_warnings(plan: &PlanView) -> Vec<&String> {
+        plan.warnings
+            .iter()
+            .filter(|w| w.contains("each session's folder"))
+            .collect()
+    }
+
+    #[test]
+    fn a_server_added_for_the_user_with_a_relative_path_is_warned_about_and_a_local_one_is_not() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let json = r#"{"command": "node", "args": ["build/index.js"], "env": {"CFG": "./c.json"}}"#;
+        let plan = plan_for(&core, vec![add("rel", json, vec![Target::User])]);
+        let [warning] = relative_warnings(&plan)[..] else {
+            panic!("{:?}", plan.warnings)
+        };
+        assert!(
+            warning.starts_with("rel: use full paths.")
+                && warning.contains("can't find build/index.js or ./c.json (in CFG)."),
+            "{warning}"
+        );
+        let plan = plan_for(
+            &core,
+            vec![add("rel", json, vec![Target::Local("/work/b".into())])],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+        let plan = plan_for(
+            &core,
+            vec![add(
+                "abs",
+                r#"{"command": "node", "args": ["/opt/x/index.js"]}"#,
+                vec![Target::User],
+            )],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn a_local_server_moved_or_duplicated_to_the_user_with_a_relative_path_is_warned_about() {
+        let env = quiet_env(&relative_projects());
+        let core = env.start();
+        for change in [
+            Change::Move {
+                id: local_id("here", "/work/a"),
+                to: Target::User,
+            },
+            duplicate(local_id("here", "/work/a"), "here2", vec![Target::User]),
+        ] {
+            let plan = plan_for(&core, vec![change]);
+            let [warning] = relative_warnings(&plan)[..] else {
+                panic!("{:?}", plan.warnings)
+            };
+            assert!(warning.contains("server.py"), "{warning}");
+        }
+        // Into another project it is as it was: the session starts in that project's folder.
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: local_id("here", "/work/a"),
+                to: Target::Local("/work/b".into()),
+            }],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+    }
+
+    #[test]
+    fn saving_a_user_server_says_so_while_it_still_has_a_relative_path_and_not_once_fixed() {
+        let env = quiet_env(&relative_projects());
+        let core = env.start();
+        let save = |json: &str| Change::Replace {
+            id: user_id("rel"),
+            json: json.to_owned(),
+        };
+        let plan = plan_for(
+            &core,
+            vec![save(
+                r#"{"command": "node", "args": ["build/index.js", "--verbose"]}"#,
+            )],
+        );
+        assert_eq!(relative_warnings(&plan).len(), 1, "{:?}", plan.warnings);
+        let plan = plan_for(
+            &core,
+            vec![save(
+                r#"{"command": "node", "args": ["/srv/rel/build/index.js"]}"#,
+            )],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
+        // Turning it off writes no definition, so it is no moment to bring this up.
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("rel"),
+                enabled: false,
+            }],
+        );
+        assert!(relative_warnings(&plan).is_empty(), "{:?}", plan.warnings);
     }
 
     #[test]
