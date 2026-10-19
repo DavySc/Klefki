@@ -81,7 +81,7 @@ impl Pasted {
         };
         if pasted.servers.len() > MAX_SERVERS {
             return Err(format!(
-                "That holds more than {MAX_SERVERS} servers; Klefki adds at most {MAX_SERVERS} at a time."
+                "That holds more than {MAX_SERVERS} servers. Paste up to {MAX_SERVERS} at a time."
             ));
         }
         let mut seen = HashSet::new();
@@ -283,8 +283,8 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
             _ => None,
         };
         match (adds, command.shell) {
-            (Some(_), Some(what)) => servers.push(PastedServer::refused(
-                "",
+            (Some((verb, rest)), Some(what)) => servers.push(PastedServer::refused(
+                &shell_named(verb, rest),
                 format!(
                     "This command uses the shell ({what}), and Klefki never runs pasted text. Paste the claude mcp add command on its own."
                 ),
@@ -354,6 +354,18 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
         ));
     }
     Ok(Pasted { servers, notes })
+}
+
+/// The name a command refused for using the shell gives, so the list says which command it is. Read as any other
+/// command is, so a word that may be a secret is left out of it too.
+fn shell_named(verb: &str, rest: &[&str]) -> String {
+    let mut notes = Vec::new();
+    let server = if verb == "add" {
+        add(rest, &mut notes)
+    } else {
+        add_json(rest, &mut notes)
+    };
+    server.name
 }
 
 /// `names`, each written by `show`, for a note: a long list names the first few and counts the rest.
@@ -1006,8 +1018,9 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
     // no command has started on it yet.
     let mut line_end = 0;
     let mut fresh = true;
-    // Where the Markdown inline code holding the command being read ends (`` `claude mcp add …` ``).
-    let mut code_end: Option<usize> = None;
+    // Where the Markdown inline code or table cell holding the command being read ends (`` `claude mcp add …` ``,
+    // `| claude mcp add … |`), and whether it is in a table.
+    let mut code_end: Option<(usize, bool)> = None;
     let end_word = |current: &mut Words, word: &mut String, in_word: &mut bool| {
         if *in_word {
             current.words.push(std::mem::take(word));
@@ -1020,12 +1033,22 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
         }
     };
     while let Some(c) = chars.next() {
-        if code_end.is_some_and(|end| end == text.len() - chars.rest.len() - c.len_utf8()) {
-            // The command ends with its code; the prose after it on the line is not read.
+        if let Some((end, table)) = code_end
+            && end == text.len() - chars.rest.len() - c.len_utf8()
+        {
+            // The command ends with its code or cell. The rest of the line is read for another one (a table's next
+            // cell starts at this pipe); the prose around them is not.
             code_end = None;
             end_word(&mut current, &mut word, &mut in_word);
             end_command(&mut commands, &mut current);
-            chars.rest = &text[line_end..];
+            let from = if table { end } else { end + c.len_utf8() };
+            chars.rest = match chained_claude(&text[from..line_end], table) {
+                Some((_, start, Chained::Enclosed(end))) => {
+                    code_end = Some((from + end, table));
+                    &text[from + start..]
+                }
+                _ => &text[line_end..],
+            };
             continue;
         }
         if pasted && !in_word && current.words.is_empty() && !c.is_whitespace() {
@@ -1050,7 +1073,7 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
             if c == '`'
                 && let Some(end) = inline_claude(&line[1..])
             {
-                code_end = Some(at + 1 + end);
+                code_end = Some((at + 1 + end, false));
                 continue;
             }
             if !"$#'\"\\`^".contains(c) && !is_claude(first_word(line)) {
@@ -1061,7 +1084,8 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
                     continue;
                 }
                 // Up to a claude command chained after it (`cd app && claude mcp add …`), which is read.
-                let (skipped, next) = match chained_claude(line) {
+                let table = c == '|';
+                let (skipped, next) = match chained_claude(line, table) {
                     Some((end, start, Chained::Then)) => (&line[..end], at + start),
                     Some((_, start, Chained::Shell(what))) => {
                         // Read, so that it is refused saying why.
@@ -1069,9 +1093,9 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
                         chars.rest = &text[at + start..];
                         continue;
                     }
-                    Some((_, start, Chained::Code(end))) => {
+                    Some((_, start, Chained::Enclosed(end))) => {
                         // The text around it explains it: not a line of its own.
-                        code_end = Some(at + end);
+                        code_end = Some((at + end, table));
                         chars.rest = &text[at + start..];
                         continue;
                     }
@@ -1239,16 +1263,21 @@ enum Chained {
     Then,
     /// After `||`, a pipe or `&`: what it does depends on the shell.
     Shell(&'static str),
-    /// In Markdown inline code, which ends at this byte of the line.
-    Code(usize),
+    /// In Markdown inline code or a table cell, which ends at this byte of the line.
+    Enclosed(usize),
 }
 
 /// Where a claude command after other text starts (`cd app && claude mcp add …`, ``Run `claude mcp add …` ``): the
-/// end of the text before it, the start of the command, in bytes, and how it follows.
-fn chained_claude(line: &str) -> Option<(usize, usize, Chained)> {
+/// end of the text before it, the start of the command, in bytes, and how it follows. In a Markdown `table` row a
+/// pipe is the edge of a cell, which can hold a command.
+fn chained_claude(line: &str, table: bool) -> Option<(usize, usize, Chained)> {
     line.char_indices().find_map(|(i, _)| {
         let rest = &line[i..];
-        let (after, how) = if let Some(after) = rest.strip_prefix("&&") {
+        let enclosed = |after: &str, end: usize| Chained::Enclosed(line.len() - after.len() + end);
+        let (after, how) = if let Some(after) = rest.strip_prefix('|').filter(|_| table) {
+            let end = after.find('|').unwrap_or(after.len());
+            (after, enclosed(after, end))
+        } else if let Some(after) = rest.strip_prefix("&&") {
             (after, Chained::Then)
         } else if let Some(after) = rest.strip_prefix("||") {
             (after, Chained::Shell("||"))
@@ -1261,12 +1290,8 @@ fn chained_claude(line: &str) -> Option<(usize, usize, Chained)> {
         } else {
             let after = rest.strip_prefix('`')?;
             let end = inline_claude(after)?;
-            (after, Chained::Code(line.len() - after.len() + end))
+            (after, enclosed(after, end))
         };
-        // A Markdown table row starts with a pipe, and pipes into nothing.
-        if matches!(how, Chained::Shell(_)) && line[..i].trim().is_empty() {
-            return None;
-        }
         is_claude(first_word(after)).then(|| (i, line.len() - after.len(), how))
     })
 }
@@ -1299,7 +1324,7 @@ fn run_by_package(line: &str) -> Option<usize> {
             continue;
         }
         let version = word.strip_prefix(PACKAGE)?;
-        if !version.is_empty() && !version.starts_with('@') {
+        if !version.is_empty() && (!version.starts_with('@') || version.len() == 1) {
             return None;
         }
         return Some(line.len() - after.len());
@@ -2287,9 +2312,32 @@ mod tests {
                 "{text}: {problem}"
             );
         }
-        // Nearby: a Markdown table row that starts with a pipe is not a pipe into claude.
-        let error = Pasted::parse("| claude mcp add a -- npx a | adds a |").unwrap_err();
-        assert!(!error.contains("shell"), "{error}");
+        // The refused server is named, so it is clear which command is meant.
+        let pasted =
+            Pasted::parse("claude mcp add a -- npx a\nfalse || claude mcp add web -- npx web")
+                .unwrap();
+        assert_eq!(pasted.servers[1].name, "web", "{pasted:?}");
+        assert!(pasted.servers[1].problem.is_some(), "{pasted:?}");
+        // Nearby: the name never shows a word that may be a secret.
+        let s = one("false || claude mcp add --client-secret sk_live_ABCDEFGH1234 x -- npx x");
+        assert!(!format!("{s:?}").contains("ABCDEFGH"), "{s:?}");
+    }
+
+    #[test]
+    fn a_command_in_a_markdown_table_is_read_from_its_cell() {
+        // Review of #32: the pipes between a table's cells were taken for a pipe into claude.
+        let pasted = Pasted::parse(
+            "| Server | Command |\n|---|---|\n| github | claude mcp add github -- npx gh |\n| claude mcp add a -- npx a | first cell |\n| docs | `claude mcp add docs -- npx docs` | more |\n| two | claude mcp add b -- npx b | claude mcp add c -- npx c |\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["github", "a", "docs", "b", "c"], "{pasted:?}");
+        assert!(
+            pasted.servers.iter().all(|s| s.problem.is_none()),
+            "{pasted:?}"
+        );
+        assert_eq!(json_of(&pasted.servers[0])["args"], json!(["gh"]));
+        assert_eq!(pasted.notes, ["Skipped 2 lines of other text."]);
     }
 
     #[test]
@@ -2308,6 +2356,17 @@ mod tests {
         );
         assert_eq!(json_of(&pasted.servers[2])["args"], json!(["c d"]));
         assert_eq!(pasted.servers[1].scope, Some(Scope::User));
+        // Every command on a line is read, and a mistyped one is named.
+        let pasted = Pasted::parse(
+            "Run `claude mcp add a -- npx a` then `claude mcp add b -- npx b`, or `claude mcp ad c -- npx c`.",
+        )
+        .unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "{pasted:?}");
+        assert_eq!(
+            pasted.notes,
+            ["Skipped a line that is not a claude mcp add command: claude mcp ad c -- npx c"]
+        );
         // Shell inside the code is still the shell, and other code is other text.
         let s = one("`claude mcp add x -- node a.js | tee log`");
         assert!(s.problem.is_some_and(|p| p.contains("|")) && s.json.is_empty());
@@ -2336,6 +2395,7 @@ mod tests {
             "npx @anthropic-ai/claude-code-router mcp add a -- npx a",
             "npx @someone/claude-code mcp add a -- npx a",
             "npxx @anthropic-ai/claude-code mcp add a -- npx a",
+            "npx @anthropic-ai/claude-code@ mcp add a -- npx a",
         ] {
             assert!(Pasted::parse(text).is_err(), "{text}");
         }
@@ -2372,7 +2432,7 @@ mod tests {
         let error = Pasted::parse(&many).unwrap_err();
         assert_eq!(
             error,
-            "That holds more than 100 servers; Klefki adds at most 100 at a time."
+            "That holds more than 100 servers. Paste up to 100 at a time."
         );
     }
 
@@ -2394,6 +2454,10 @@ mod tests {
             ";",
             "claude;",
             "\u{1b}[0m && claude mcp add s -- x; ",
+            "| claude mcp add s -- x ",
+            "| a ",
+            "`claude mcp add s -- x` ",
+            "`claude ",
         ] {
             let text = unit.repeat((MAX_PASTE_BYTES - tail.len()) / unit.len()) + tail;
             let started = std::time::Instant::now();
