@@ -41,10 +41,13 @@ pub struct PastedServer {
     /// The word after `--client-secret` was left out, as it may be the secret, and the name with it: the dialog says
     /// so where it offers the form.
     pub word_left_out: bool,
+    /// The `${NAME}` references in its settings that have no default, each once, in order: Claude Code fills them
+    /// in from its own environment when it starts the server, so they must be set there.
+    pub needs: Vec<String>,
 }
 
 /// Pasted text larger than this is refused: a few servers are a few KiB.
-const MAX_PASTE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_PASTE_BYTES: usize = 256 * 1024;
 const MAX_SERVERS: usize = 100;
 /// A summary longer than this is cut; the review shows everything in full.
 const MAX_SUMMARY_CHARS: usize = 300;
@@ -102,6 +105,7 @@ impl PastedServer {
             oauth: false,
             asks_secret: false,
             word_left_out: false,
+            needs: Vec::new(),
         }
     }
 
@@ -122,6 +126,7 @@ impl PastedServer {
         server.oauth = entry.get("oauth").is_some();
         server.summary = summary(&entry);
         server.hints = hints(&entry);
+        server.needs = needs(&entry);
         server.json = serde_json::to_string_pretty(&entry).unwrap_or_default();
         if server.json.len() > MAX_ENTRY_BYTES {
             server.problem.get_or_insert(format!(
@@ -930,6 +935,38 @@ fn hints(entry: &Value) -> Vec<String> {
     out
 }
 
+/// The `${NAME}` references without a default in the string values of `entry` (never its keys), each once.
+fn needs(entry: &Value) -> Vec<String> {
+    fn walk<'a>(value: &'a Value, seen: &mut HashSet<&'a str>, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => {
+                let mut rest = s.as_str();
+                while let Some(at) = rest.find("${") {
+                    rest = &rest[at + 2..];
+                    let Some(end) = rest.find('}') else { break };
+                    let inner = &rest[..end];
+                    let mut chars = inner.chars();
+                    let named = chars
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    // A set, not a search of the list: a paste can hold thousands.
+                    if named && seen.insert(inner) {
+                        out.push(inner.to_owned());
+                    }
+                    rest = &rest[end + 1..];
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|v| walk(v, seen, out)),
+            Value::Object(map) => map.values().for_each(|v| walk(v, seen, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(entry, &mut HashSet::new(), &mut out);
+    out
+}
+
 /// One line per `~` path in the command or its arguments.
 pub(crate) fn path_hints(entry: &Value) -> Vec<String> {
     let mut out = Vec::new();
@@ -1438,6 +1475,21 @@ mod tests {
         let pasted = Pasted::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
         assert_eq!(pasted.servers.len(), 1, "{pasted:?}");
         pasted.servers.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn the_variables_an_export_left_to_set_are_listed() {
+        let server = one(
+            r#"{"mcpServers": {"gh": {"type": "http", "url": "https://${HOST:-api.example.com}/${TENANT}/mcp",
+                "headers": {"Authorization": "Bearer ${AUTH_TOKEN}", "${KEY_NOT_VALUE}": "x"},
+                "env": {"A": "${AUTH_TOKEN}${TENANT}", "B": "${not a name}", "C": "${}", "D": "${OPEN"}}}}"#,
+        );
+        // Each once, in order; a default makes it optional, and only values count.
+        assert_eq!(server.needs, ["TENANT", "AUTH_TOKEN"]);
+        // Nearby: a command's arguments count too, and a server without references needs nothing.
+        let server = one("claude mcp add x -- node ${HOME_DIR}/server.js --port ${PORT:-80}");
+        assert_eq!(server.needs, ["HOME_DIR"]);
+        assert!(one("claude mcp add x -- node s.js").needs.is_empty());
     }
 
     fn json_of(server: &PastedServer) -> Value {

@@ -13,6 +13,7 @@ pub use crate::export_file::{
     FileChoice, Owner as DialogOwner, SaveError, ShownDialog, file_name as export_file_name,
 };
 pub use crate::form::{Part, ServerFields, secret_reference};
+pub use crate::import_file::ImportFile;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::secrets::{Secret, SecretError};
@@ -308,6 +309,7 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         secrets: None,
         open_url: std::sync::Arc::new(open_https),
         open_dialog: std::sync::Arc::new(open_save_dialog),
+        pick_dialog: std::sync::Arc::new(open_pick_dialog),
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
     }
@@ -329,6 +331,23 @@ fn open_save_dialog(
         dialog = dialog.set_parent(owner);
     }
     let answer = dialog.save_file();
+    Box::pin(async move { answer.await.map(|file| file.path().to_path_buf()) })
+}
+
+/// Opens the system's own open dialog, to choose a file to import, over `owner` as [`open_save_dialog`] does.
+fn open_pick_dialog(owner: Option<&dyn crate::export_file::Owner>) -> crate::export_file::Answer {
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("Import servers");
+    // An export can be saved under any name. The macOS panel has no filter menu, so a filter there would only hide
+    // such a file.
+    if !cfg!(target_os = "macos") {
+        dialog = dialog
+            .add_filter("JSON", &["json"])
+            .add_filter("All files", &["*"]);
+    }
+    if let Some(owner) = owner {
+        dialog = dialog.set_parent(owner);
+    }
+    let answer = dialog.pick_file();
     Box::pin(async move { answer.await.map(|file| file.path().to_path_buf()) })
 }
 

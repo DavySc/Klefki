@@ -133,7 +133,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
   - Del delete, Space toggle, F5 refresh status
   - Ctrl+S apply, Esc cancel
 - **Export**: header, env and secret values are replaced with `${VAR}` or redacted. A plain, non-secret-looking env setting keeps its value as a default (`${LOG_LEVEL:-debug}`); anything secret-looking never does. Project entries are exported only as user/local candidates. The block can be copied or saved to a file (the system's save dialog; `klefki-cli export --output`); a file is never replaced without asking, and Claude Code's own files and `.mcp.json` files are never written.
-- **Import**: parsed as untrusted and previewed (target, conflict handling, full stdio commands, a secret prompt per OAuth row), then applied as one plan.
+- **Import**: parsed as untrusted and previewed (target, conflict handling, full stdio commands, a secret prompt per OAuth row), then applied as one plan. The file comes from the system's open dialog (Import button, Ctrl+O, the palette), a typed path where there is no dialog, or a file dropped on the window; it is read like a paste (at most 256 KiB, UTF-8 or UTF-16, never a link or `.credentials.json`). A server whose name is taken in a ticked place is kept there by default; it can be replaced or imported under a free name instead. Each row says which `${VAR}` references must be set where Claude Code runs.
 
 ## Milestones
 1. **M0**: rustup, workspace, CI on 3 operating systems. Themed shell (nav, top bar, toolbar, grid) fed by fixtures, to confirm the look early.

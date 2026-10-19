@@ -6,7 +6,7 @@ use std::path::Path;
 const DENIED_FILE_NAMES: &[&str] = &[".credentials.json"];
 
 /// Compared the way Windows and macOS open files: any case, without a `:stream` suffix or trailing dots and spaces.
-fn is_denied(name: &str) -> bool {
+pub(crate) fn is_denied(name: &str) -> bool {
     let name = name.split(':').next().unwrap_or(name);
     let name = name.trim_end_matches(['.', ' ']).to_lowercase();
     DENIED_FILE_NAMES.contains(&name.as_str())
@@ -19,6 +19,22 @@ pub(crate) fn read_limited(path: &Path, max_bytes: u64) -> io::Result<Option<Str
 
 /// Like [`read_limited`], and also says whether the file started with a byte-order mark, so a writer can keep it.
 pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option<(String, bool)>> {
+    let Some(buf) = read_limited_bytes(path, max_bytes)? else {
+        return Ok(None);
+    };
+    let mut text =
+        String::from_utf8(buf).map_err(|_| io::Error::other("file is not valid UTF-8"))?;
+    // Removed in place: the file can be large.
+    let bom = text.starts_with('\u{feff}');
+    if bom {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(Some((text, bom)))
+}
+
+/// The bytes of a file of at most `max_bytes`, read with the same care as [`read_limited`]: never a link or a
+/// credential file. `Ok(None)` when the file does not exist.
+pub(crate) fn read_limited_bytes(path: &Path, max_bytes: u64) -> io::Result<Option<Vec<u8>>> {
     if path
         .file_name()
         .is_some_and(|n| is_denied(&n.to_string_lossy()))
@@ -74,14 +90,7 @@ pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option
             "file grew past the size limit while reading",
         ));
     }
-    let mut text =
-        String::from_utf8(buf).map_err(|_| io::Error::other("file is not valid UTF-8"))?;
-    // Removed in place: the file can be large.
-    let bom = text.starts_with('\u{feff}');
-    if bom {
-        text.drain(..'\u{feff}'.len_utf8());
-    }
-    Ok(Some((text, bom)))
+    Ok(Some(buf))
 }
 
 /// Why [`write_whole`] wrote nothing.

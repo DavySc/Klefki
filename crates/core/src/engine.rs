@@ -69,6 +69,15 @@ pub enum Command {
         text: String,
         replace: bool,
     },
+    /// Ask the user, in the system's open dialog, for a file to import, and read it (see [`Event::ImportFile`]).
+    /// `shown` is the dialog when the UI already opened it over its window ([`Core::choose_import_file`]); without
+    /// it no dialog is opened, and a path is asked for instead.
+    ChooseImportFile {
+        shown: Option<crate::export_file::ShownDialog>,
+    },
+    /// Read the file at `path` for an import: typed, or dropped on the window (see [`Event::ImportFile`]). Writes
+    /// nothing.
+    ReadImportFile(PathBuf),
     /// Whether a client secret is stored for this OAuth server (see [`Event::SecretStatus`]).
     SecretStatus(ServerId),
     /// Keep this client secret for the OAuth server, in the system's secret store.
@@ -379,6 +388,8 @@ pub enum Event {
         shown: String,
         result: Result<(), crate::export_file::SaveError>,
     },
+    /// The file to import, read, or why there is none ([`Command::ChooseImportFile`], [`Command::ReadImportFile`]).
+    ImportFile(crate::import_file::ImportFile),
     /// Why a sign-in could not come back to `port` now, or `None` when it could ([`Command::CheckCallbackPort`]).
     CallbackPort {
         port: u16,
@@ -394,6 +405,8 @@ pub struct Core {
     rx: Receiver<Event>,
     /// Opens the system's save dialog; `None` for a detached `Core` that opens none.
     open_dialog: Option<crate::export_file::OpenDialog>,
+    /// Opens the system's open dialog; `None` for a detached `Core` that opens none.
+    pick_dialog: Option<crate::import_file::PickDialog>,
 }
 
 impl Core {
@@ -413,6 +426,16 @@ impl Core {
         self.send(Command::ChooseExportFile { name, shown });
     }
 
+    /// [`Command::ChooseImportFile`] with the system's open dialog opened here, over `owner` (Klefki's window), as
+    /// [`Core::choose_export_file`] does. Call it on the thread that owns the window.
+    pub fn choose_import_file(&self, owner: Option<&dyn crate::export_file::Owner>) {
+        let shown = self
+            .pick_dialog
+            .as_ref()
+            .map(|pick| crate::export_file::ShownDialog::pick(pick, owner));
+        self.send(Command::ChooseImportFile { shown });
+    }
+
     /// The next event, if one is ready. Never blocks.
     pub fn try_recv(&self) -> Option<Event> {
         self.rx.try_recv().ok()
@@ -428,6 +451,7 @@ impl Core {
             tx,
             rx,
             open_dialog: None,
+            pick_dialog: None,
         };
         (core, Detached { commands, events })
     }
@@ -441,6 +465,19 @@ impl Core {
         let (mut core, engine) = Core::detached();
         core.open_dialog = Some(Arc::new(move |name, owner| {
             Box::pin(std::future::ready(open(name, owner.is_some())))
+        }));
+        (core, engine)
+    }
+
+    /// [`Core::detached`], with `pick` showing the open dialog instead of the system: it is told whether the dialog
+    /// has an owner window.
+    #[doc(hidden)]
+    pub fn detached_with_pick_dialog(
+        pick: impl Fn(bool) -> Option<PathBuf> + Send + Sync + 'static,
+    ) -> (Core, Detached) {
+        let (mut core, engine) = Core::detached();
+        core.pick_dialog = Some(Arc::new(move |owner| {
+            Box::pin(std::future::ready(pick(owner.is_some())))
         }));
         (core, engine)
     }
@@ -483,6 +520,8 @@ pub(crate) struct EngineConfig {
     pub open_url: OpenUrl,
     /// Opens the system's save dialog. Tests answer for the user instead.
     pub open_dialog: crate::export_file::OpenDialog,
+    /// Opens the system's open dialog. Tests answer for the user instead.
+    pub pick_dialog: crate::import_file::PickDialog,
     /// How long a sign-in may wait for the user before it is stopped.
     pub sign_in_timeout: Duration,
     /// Runs Claude Code's own commands that change servers (`mcp add-json`, `mcp remove`) instead of the CLI found
@@ -522,11 +561,13 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
         })
         .expect("start the command relay");
     let open_dialog = Some(Arc::clone(&config.open_dialog));
+    let pick_dialog = Some(Arc::clone(&config.pick_dialog));
     std::thread::spawn(move || engine_main(config, input_rx, input_tx, emitter));
     Core {
         tx,
         rx,
         open_dialog,
+        pick_dialog,
     }
 }
 
@@ -889,6 +930,29 @@ fn engine_main(
                     shown,
                     result,
                 });
+            }
+            Command::ChooseImportFile { shown } => match shown.and_then(|s| s.take()) {
+                // Only the UI's thread may open a dialog, so without one opened there, a path is asked for.
+                None => shared
+                    .emitter
+                    .emit(Event::ImportFile(crate::import_file::ImportFile::NoDialog)),
+                // Waited for, and the file read, on a thread of its own: the engine keeps going.
+                Some((opened, answer)) => {
+                    let emitter = shared.emitter.clone();
+                    std::thread::spawn(move || {
+                        let picked = pollster::block_on(answer);
+                        let file = match crate::import_file::answered(opened, picked) {
+                            Ok(path) => crate::import_file::read(&path),
+                            Err(none) => none,
+                        };
+                        emitter.emit(Event::ImportFile(file));
+                    });
+                }
+            },
+            Command::ReadImportFile(path) => {
+                shared
+                    .emitter
+                    .emit(Event::ImportFile(crate::import_file::read(&path)));
             }
             Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
             Command::StoreSecret { id, secret: value } => {
@@ -2618,6 +2682,10 @@ mod tests {
                 open_dialog: {
                     let chosen = Arc::clone(&self.chosen);
                     Arc::new(move |_, _| Box::pin(std::future::ready(lock(&chosen).clone())))
+                },
+                pick_dialog: {
+                    let chosen = Arc::clone(&self.chosen);
+                    Arc::new(move |_| Box::pin(std::future::ready(lock(&chosen).clone())))
                 },
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
@@ -5841,6 +5909,61 @@ mod tests {
             "{chosen:?}"
         );
         assert_eq!(lock(&opened).len(), before);
+    }
+
+    #[test]
+    fn the_open_dialog_opens_over_the_window_and_the_file_picked_is_read_elsewhere() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let opened: Arc<Mutex<Vec<(bool, std::thread::ThreadId)>>> = Arc::default();
+        let (answer, user) = mpsc::channel::<Option<PathBuf>>();
+        let user = Arc::new(Mutex::new(user));
+        let mut config = env.config();
+        config.pick_dialog = {
+            let opened = Arc::clone(&opened);
+            Arc::new(move |owner| {
+                lock(&opened).push((owner.is_some(), std::thread::current().id()));
+                let user = Arc::clone(&user);
+                Box::pin(async move { lock(&user).recv().ok().flatten() })
+            })
+        };
+        let core = start_with(config, || {});
+        let file_of = |core: &Core| {
+            first_event(core, |e| match e {
+                Event::ImportFile(file) => Some(file.clone()),
+                _ => None,
+            })
+        };
+        core.choose_import_file(Some(&Window));
+        // Opened here, over the window, and this thread did not wait for the user.
+        assert_eq!(*lock(&opened), vec![(true, std::thread::current().id())]);
+        let file = env.dir.path().join("servers.json");
+        std::fs::write(&file, "{\"mcpServers\": {}}").unwrap();
+        answer.send(Some(file.clone())).unwrap();
+        assert_eq!(
+            file_of(&core),
+            crate::import_file::ImportFile::Read {
+                shown: "servers.json".into(),
+                text: "{\"mcpServers\": {}}".into()
+            }
+        );
+
+        // Nearby: closing the dialog reads nothing; without a dialog from the UI, none is opened here.
+        core.choose_import_file(None);
+        answer.send(None).unwrap();
+        assert!(matches!(
+            file_of(&core),
+            crate::import_file::ImportFile::Cancelled | crate::import_file::ImportFile::NoDialog
+        ));
+        let before = lock(&opened).len();
+        core.send(Command::ChooseImportFile { shown: None });
+        assert_eq!(file_of(&core), crate::import_file::ImportFile::NoDialog);
+        assert_eq!(lock(&opened).len(), before);
+        // A path typed or dropped is read the same way.
+        core.send(Command::ReadImportFile(file));
+        assert!(matches!(
+            file_of(&core),
+            crate::import_file::ImportFile::Read { .. }
+        ));
     }
 
     #[test]
