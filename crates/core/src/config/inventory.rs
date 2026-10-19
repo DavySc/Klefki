@@ -575,12 +575,15 @@ impl<'de> Deserialize<'de> for Pairs {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Pairs, A::Error> {
                 let mut entries: Vec<(String, Value)> = Vec::new();
+                // Where each name is in `entries`, and whether it was repeated: a file from a repository may repeat
+                // names many thousands of times.
+                let mut index: HashMap<String, (usize, bool)> = HashMap::new();
                 let mut duplicates = Vec::new();
                 while let Some((k, v)) = map.next_entry::<String, Value>()? {
-                    if let Some(slot) = entries.iter_mut().find(|(e, _)| *e == k) {
-                        slot.1 = v;
+                    if let Some((i, repeated)) = index.get_mut(&k) {
+                        entries[*i].1 = v;
                         // Once per name: at most one per entry, however often it repeats.
-                        if !duplicates.contains(&k) {
+                        if !std::mem::replace(repeated, true) {
                             duplicates.push(k);
                         }
                     } else if entries.len() >= MAX_MCP_SERVERS {
@@ -588,6 +591,7 @@ impl<'de> Deserialize<'de> for Pairs {
                             "more than {MAX_MCP_SERVERS} servers"
                         )));
                     } else {
+                        index.insert(k.clone(), (entries.len(), false));
                         entries.push((k, v));
                     }
                 }
