@@ -46,7 +46,7 @@ impl Env {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let project = root.join("repo");
+        let project = root.join("Repo");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("cfg")).unwrap();
@@ -126,9 +126,47 @@ impl Env {
 
     fn project(&self) -> String {
         self.root()
-            .join("repo")
+            .join("Repo")
             .to_string_lossy()
             .replace('\\', "/")
+    }
+
+    /// The project as a group heading names it for a `klefki-cli` whose home folder is `home`: `~/…` under it, the
+    /// full path otherwise. On Windows `HOME` is not redirected (see `command`), so the home there is the real
+    /// profile, which often holds the temporary folder.
+    fn shown_project(&self, home: Option<&Path>) -> String {
+        let project = self.project();
+        let Some(home) = home else {
+            return project;
+        };
+        let home = home.to_string_lossy().replace('\\', "/");
+        let home = home.trim_end_matches('/');
+        let fold = |s: &str| {
+            if cfg!(windows) || cfg!(target_os = "macos") {
+                s.to_ascii_lowercase()
+            } else {
+                s.to_owned()
+            }
+        };
+        // Compared folded, but the rest keeps its case, as the CLI prints it.
+        match project.get(..home.len()) {
+            Some(head) if !home.is_empty() && fold(head) == fold(home) => {
+                match &project[home.len()..] {
+                    rest if rest.starts_with('/') => format!("~{rest}"),
+                    _ => project,
+                }
+            }
+            _ => project,
+        }
+    }
+
+    /// The home folder the commands from `command` see.
+    fn home(&self) -> Option<PathBuf> {
+        if cfg!(windows) {
+            std::env::home_dir()
+        } else {
+            Some(self.root().join("home"))
+        }
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -194,14 +232,7 @@ fn list_shows_every_server_grouped_by_scope_and_project_without_running_anything
     let out = env.run(&["list"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
-    let user = stdout.find("User").expect("a User group");
-    let local = stdout
-        .find(&format!("Local in {}", env.project()))
-        .expect("a Local group naming the project");
-    let project = stdout
-        .find(&format!("Project in {}", env.project()))
-        .expect("a Project group naming the project");
-    assert!(user < local && local < project, "{stdout}");
+    assert_groups_in_order(&stdout, &env.shown_project(env.home().as_deref()));
     let alpha = line_of(&stdout, "alpha");
     assert!(alpha.contains(" on "), "{alpha}");
     assert!(
@@ -225,6 +256,42 @@ fn list_shows_every_server_grouped_by_scope_and_project_without_running_anything
     assert_eq!(at("alpha"), at("beta"), "{stdout}");
     assert_eq!(at("alpha"), at("gamma"), "{stdout}");
     assert!(!env.any_run(), "list started the Claude CLI");
+}
+
+/// `out` has a User group, then the Local and Project groups headed by `project`.
+fn assert_groups_in_order(out: &str, project: &str) {
+    let user = out.find("User").expect("a User group");
+    let local = out
+        .find(&format!("Local in {project}"))
+        .unwrap_or_else(|| panic!("a Local group naming {project} in:\n{out}"));
+    let project = out
+        .find(&format!("Project in {project}"))
+        .unwrap_or_else(|| panic!("a Project group naming {project} in:\n{out}"));
+    assert!(user < local && local < project, "{out}");
+}
+
+/// The project under the home folder, as the temporary folder often is on Windows: headings shorten it to `~/…`.
+/// Not on Windows, where a test cannot move the home folder (see `Env::command`).
+#[cfg(not(windows))]
+#[test]
+fn list_shortens_a_project_under_the_home_folder() {
+    let env = Env::new();
+    let out = env
+        .command(&["list"])
+        .env("HOME", env.root())
+        .output()
+        .expect("run klefki-cli");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let shown = env.shown_project(Some(env.root()));
+    assert_eq!(shown, "~/Repo");
+    assert_groups_in_order(&text(&out.stdout), &shown);
+    let json = env
+        .command(&["list", "--json"])
+        .env("HOME", env.root())
+        .output()
+        .expect("run klefki-cli");
+    let json = text(&json.stdout);
+    assert!(json.contains(&format!("\"{}\"", env.project())), "{json}");
 }
 
 #[test]
@@ -574,7 +641,7 @@ fn a_named_server_that_is_off_is_not_checked() {
 #[test]
 fn a_rejected_project_server_is_not_checked_even_when_named() {
     let env = Env::new();
-    let settings = env.root().join("repo").join(".claude");
+    let settings = env.root().join("Repo").join(".claude");
     std::fs::create_dir_all(&settings).unwrap();
     std::fs::write(
         settings.join("settings.local.json"),
