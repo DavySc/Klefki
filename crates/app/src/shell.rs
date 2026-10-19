@@ -271,8 +271,10 @@ pub struct ShellApp {
     outcome_chosen: Option<OutcomeChoice>,
     cli_version: Option<String>,
     cli_problem: Option<String>,
-    /// A change the engine has prepared and the user has not yet confirmed.
-    plan: Option<PlanView>,
+    /// A change the engine has prepared and the user has not yet confirmed. Shared, so drawing it needs no copy.
+    plan: Option<Arc<PlanView>>,
+    /// Where each line of the plan's diffs goes, so only the lines in view are laid out on each frame.
+    diff_tops: DiffTops,
     /// Apply was pressed and the engine has not answered yet.
     applying: bool,
     /// A plan was asked for and the engine has not answered yet.
@@ -358,6 +360,7 @@ impl ShellApp {
             cli_version: None,
             cli_problem: None,
             plan: None,
+            diff_tops: DiffTops::default(),
             applying: false,
             preparing: false,
             editor: None,
@@ -535,7 +538,7 @@ impl ShellApp {
                     self.send(Command::Discard(plan.id));
                 } else {
                     self.draft_plan = saves_draft.then_some(plan.id);
-                    self.plan = Some(plan);
+                    self.plan = Some(Arc::new(plan));
                 }
             }
             Event::PlanFailed(why) => {
@@ -2721,7 +2724,15 @@ impl ShellApp {
 
     /// Moves the selection `step` rows through the list as shown, starting at the top when nothing is selected.
     fn move_selection(&mut self, step: i32) {
-        let order = self.visible();
+        // The rows as the list shows them, already sorted: an arrow key does not sort them again.
+        let order: Vec<usize> = self
+            .cached_grid_rows()
+            .iter()
+            .filter_map(|row| match row {
+                GridRow::Server(i) => Some(*i),
+                GridRow::Group(_) => None,
+            })
+            .collect();
         if order.is_empty() {
             return;
         }
@@ -3070,10 +3081,13 @@ impl ShellApp {
     fn plan_dialog(&mut self, ctx: &egui::Context) {
         let pal = theme::palette(ctx);
         let Some(plan) = self.plan.clone() else {
+            // What the last plan's diffs needed goes with it.
+            self.diff_tops = DiffTops::default();
             return;
         };
         let applying = self.applying;
         let from_add = self.add.as_ref().is_some_and(|f| f.reviewing);
+        let diff_tops = &mut self.diff_tops;
         let mut apply = false;
         let mut back = false;
         let mut cancel = false;
@@ -3128,15 +3142,22 @@ impl ShellApp {
                             .wrap(),
                         );
                     }
-                    for file in &plan.files {
+                    for (at, file) in plan.files.iter().enumerate() {
                         if file.lines.is_empty() {
                             continue;
                         }
                         ui.add_space(8.0);
+                        // The size is in the heading: only the lines in view are laid out, so a screen reader would
+                        // otherwise not know there are more, and the box below shows few at a time.
+                        let count = file.lines.len();
                         ui.label(
-                            RichText::new(format!("Changes in {}", file.path))
-                                .small()
-                                .color(pal.text_muted),
+                            RichText::new(format!(
+                                "Changes in {} · {count} {}",
+                                file.path,
+                                if count == 1 { "line" } else { "lines" }
+                            ))
+                            .small()
+                            .color(pal.text_muted),
                         );
                         Frame::new()
                             .fill(pal.field)
@@ -3145,11 +3166,25 @@ impl ShellApp {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 // Its own scroll position per plan and file: each review opens at the top.
+                                // Only the lines in view are laid out: a diff can have thousands.
+                                // A bar that is always drawn, beside the lines: the default one is invisible until
+                                // pointed at, so a long diff would look no longer than the box.
+                                ui.spacing_mut().scroll = egui::style::ScrollStyle {
+                                    // In the text's colour, on a track that stands out from the box.
+                                    foreground_color: true,
+                                    ..egui::style::ScrollStyle::solid()
+                                };
+                                ui.visuals_mut().extreme_bg_color = pal.border;
                                 egui::ScrollArea::vertical()
                                     .id_salt(("plan_diff", plan.id, &file.path))
                                     .max_height(220.0)
-                                    .show(ui, |ui| {
-                                        for line in &file.lines {
+                                    // As wide as the box, so the bar is at its edge, not after the widest line in view.
+                                    .auto_shrink([false, true])
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                    )
+                                    .show_viewport(ui, |ui, viewport| {
+                                        let line = |ui: &Ui, line: &str| {
                                             let color = if line.starts_with("+ ") {
                                                 pal.success
                                             } else if line.starts_with("- ") {
@@ -3157,13 +3192,32 @@ impl ShellApp {
                                             } else {
                                                 pal.text_muted
                                             };
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(line).monospace().color(color),
-                                                )
-                                                .wrap(),
-                                            );
+                                            egui::WidgetText::from(
+                                                RichText::new(line).monospace().color(color),
+                                            )
+                                            .into_galley(
+                                                ui,
+                                                Some(egui::TextWrapMode::Wrap),
+                                                ui.available_width(),
+                                                egui::FontSelection::Default,
+                                            )
+                                        };
+                                        let tops =
+                                            diff_tops.of(ui, plan.id, at, &file.lines, |ui, l| {
+                                                line(ui, l).size().y
+                                            });
+                                        let first = tops
+                                            .partition_point(|&top| top <= viewport.min.y)
+                                            .saturating_sub(1);
+                                        let end = tops
+                                            .partition_point(|&top| top < viewport.max.y)
+                                            .min(file.lines.len());
+                                        let total = tops.last().copied().unwrap_or(0.0);
+                                        ui.add_space(tops[first]);
+                                        for text in &file.lines[first..end.max(first)] {
+                                            ui.add(egui::Label::new(line(ui, text)));
                                         }
+                                        ui.add_space(total - tops[end.max(first)]);
                                     });
                             });
                     }
@@ -4797,6 +4851,8 @@ impl AddForm {
 
     /// Each server, in order: ready, left out, or waiting for a better name. The form has one.
     fn check(&self, servers: &[ServerRow]) -> Vec<Check> {
+        // Runs on every frame: the rows are gone through once for all the names.
+        let taken = Taken::new(&self.places, servers.iter());
         match self.mode {
             AddMode::Paste => {
                 let Ok(read) = &self.read else {
@@ -4829,7 +4885,7 @@ impl AddForm {
                                 read.servers[j].problem.is_none() && !read.servers[j].asks_secret
                             })
                             .map(|j| self.names[j].as_str());
-                        self.name_check(&self.names[i], earlier, servers)
+                        Self::name_check(&self.names[i], earlier, &taken)
                     })
                     .collect()
             }
@@ -4838,7 +4894,7 @@ impl AddForm {
                     return Vec::new();
                 };
                 vec![match (
-                    self.name_check(&self.name, std::iter::empty(), servers),
+                    Self::name_check(&self.name, std::iter::empty(), &taken),
                     &filled.read.problem,
                 ) {
                     (Check::Ready, Some(problem)) => Check::Skipped(problem.clone()),
@@ -4850,10 +4906,9 @@ impl AddForm {
 
     /// Whether `name` can be added, after the names `earlier` in the same paste, to the places ticked.
     fn name_check<'a>(
-        &self,
         name: &str,
         mut earlier: impl Iterator<Item = &'a str>,
-        servers: &[ServerRow],
+        taken: &Taken,
     ) -> Check {
         if name.is_empty() {
             return Check::Name("Give it a name.".to_owned());
@@ -4864,7 +4919,7 @@ impl AddForm {
         if earlier.any(|e| e == name) {
             return Check::Name(format!("{name} is named twice in what you pasted."));
         }
-        if let Some(taken) = self.places.taken(name, servers) {
+        if let Some(taken) = taken.of(name) {
             return Check::Name(format!(
                 "{name} already exists {taken}. Choose another name, or untick it there."
             ));
@@ -5767,23 +5822,7 @@ impl Places {
     /// to count: the engine refuses those, while a name in a project's `.mcp.json` is only hidden by it, which the
     /// review warns about.
     fn taken(&self, name: &str, servers: &[ServerRow]) -> Option<String> {
-        let has = |scope: Scope, project: Option<&str>| {
-            servers.iter().any(|s| {
-                s.name == name
-                    && s.scope == scope
-                    && match (s.project.as_deref(), project) {
-                        (Some(a), Some(b)) => same_project(a, b),
-                        (a, b) => a == b,
-                    }
-            })
-        };
-        let user = self.user && has(Scope::User, None);
-        let folders: Vec<&str> = self
-            .ticked()
-            .filter(|p| has(Scope::Local, Some(p)))
-            .map(folder_name)
-            .collect();
-        places_in_words(user, &folders)
+        Taken::new(self, servers.iter().filter(|s| s.name == name)).of(name)
     }
 
     /// The tick boxes: the user, then the projects in a list of at most `list_height`, searchable when long. `tag`
@@ -6475,6 +6514,92 @@ struct Live {
     status: Status,
     detail: Option<String>,
     hint: Option<Hint>,
+}
+
+/// Which ticked places already have a server of a given name, for many names at once.
+struct Taken<'a> {
+    user: bool,
+    /// The ticked projects, in order.
+    ticked: Vec<&'a str>,
+    /// By name: whether the user has one, and the ticked projects (in `ticked`) that have one of their own.
+    names: HashMap<&'a str, (bool, Vec<usize>)>,
+}
+
+impl<'a> Taken<'a> {
+    fn new(places: &'a Places, servers: impl Iterator<Item = &'a ServerRow>) -> Self {
+        let ticked: Vec<&str> = places.ticked().collect();
+        let mut at: HashMap<_, Vec<usize>> = HashMap::new();
+        for (i, project) in ticked.iter().enumerate() {
+            at.entry(klefki_core::api::project_key(project))
+                .or_default()
+                .push(i);
+        }
+        let mut names: HashMap<&str, (bool, Vec<usize>)> = HashMap::new();
+        for s in servers {
+            match (s.scope, s.project.as_deref()) {
+                (Scope::User, None) => names.entry(s.name.as_str()).or_default().0 = true,
+                (Scope::Local, Some(project)) => {
+                    if let Some(found) = at.get(&klefki_core::api::project_key(project)) {
+                        names.entry(s.name.as_str()).or_default().1.extend(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            user: places.user,
+            ticked,
+            names,
+        }
+    }
+
+    /// The ticked places that already have a server called `name`, in words.
+    fn of(&self, name: &str) -> Option<String> {
+        let (user, found) = self.names.get(name)?;
+        let mut found = found.clone();
+        found.sort_unstable();
+        found.dedup();
+        let folders: Vec<&str> = found.iter().map(|&i| folder_name(self.ticked[i])).collect();
+        places_in_words(self.user && *user, &folders)
+    }
+}
+
+/// Where each line of a plan's diffs starts, laid out once per plan, file and width.
+#[derive(Default)]
+struct DiffTops {
+    plan: u64,
+    /// Per file: the width laid out at, and the top of each line, with the end of the last one after them.
+    files: HashMap<usize, (f32, Vec<f32>)>,
+}
+
+impl DiffTops {
+    fn of(
+        &mut self,
+        ui: &Ui,
+        plan: u64,
+        file: usize,
+        lines: &[String],
+        height: impl Fn(&Ui, &str) -> f32,
+    ) -> &[f32] {
+        if self.plan != plan {
+            self.plan = plan;
+            self.files.clear();
+        }
+        let width = ui.available_width();
+        let gap = ui.spacing().item_spacing.y;
+        let (laid_at, tops) = self.files.entry(file).or_insert((f32::NAN, Vec::new()));
+        if *laid_at != width || tops.len() != lines.len() + 1 {
+            *laid_at = width;
+            tops.clear();
+            tops.push(0.0);
+            let mut y = 0.0;
+            for line in lines {
+                y += height(ui, line) + gap;
+                tops.push(y);
+            }
+        }
+        tops
+    }
 }
 
 #[cfg(test)]
@@ -8704,6 +8829,40 @@ mod tests {
         assert_eq!(short, long, "a long target made the detail panel wider");
     }
 
+    #[test]
+    fn a_name_is_taken_in_the_ticked_places_that_have_it_however_the_project_is_spelled() {
+        // Performance review: the check now goes through the rows once for all names. It must find the same places.
+        let projects: Vec<String> = ["C:/Repos/WebApp", "/home/u/b", "/home/u/a", "/home/u/c"]
+            .map(str::to_owned)
+            .to_vec();
+        let rows = vec![
+            live_row("alpha", Scope::User, None),
+            live_row("alpha", Scope::Local, Some("c:\\Repos\\WebApp\\")),
+            live_row("alpha", Scope::Local, Some("/home/u/a")),
+            live_row("alpha", Scope::Local, Some("/home/u/c")),
+            // Only hidden by a new one, not refused: the review says so.
+            live_row("alpha", Scope::Project, Some("/home/u/b")),
+            live_row("beta", Scope::Local, Some("/home/u/b")),
+        ];
+        let mut places = Places::new(&projects, None);
+        places.user = true;
+        for at in [0, 1, 2] {
+            places.projects[at].1 = true;
+        }
+        assert_eq!(
+            places.taken("alpha", &rows).as_deref(),
+            Some("for the user and in WebApp and a")
+        );
+        assert_eq!(places.taken("beta", &rows).as_deref(), Some("in b"));
+        assert_eq!(places.taken("gamma", &rows), None);
+        // Variant: the user not ticked, and a project ticked that has none.
+        places.user = false;
+        places.projects[0].1 = false;
+        assert_eq!(places.taken("alpha", &rows).as_deref(), Some("in a"));
+        places.projects[2].1 = false;
+        assert_eq!(places.taken("alpha", &rows), None);
+    }
+
     // ---- switching servers on and off
 
     fn plan_view(id: u64, lines: &[&str], warnings: &[&str], nothing_to_do: bool) -> PlanView {
@@ -8834,6 +8993,70 @@ mod tests {
     }
 
     #[test]
+    fn a_long_diff_lays_out_only_the_lines_in_view_and_scrolls_to_its_end() {
+        // Performance review: every line of a diff was laid out on every frame (22 ms a frame at 16,000 lines).
+        let lines: Vec<String> = (0..500)
+            .map(|i| {
+                if i == 250 {
+                    // Wraps over several lines: the lines after it must still land where they are drawn.
+                    format!("+ line {i} {}", "wide ".repeat(60))
+                } else {
+                    format!("+ line {i}")
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let (mut h, _engine) = with_plan(&refs, &[], false);
+        // Cross-review: with only the lines in view laid out, the heading says how many there are.
+        h.get_by_label("Changes in .claude.json · 500 lines");
+        let first = h.get_by_label("+ line 0").rect();
+        assert!(
+            h.query_by_label("+ line 499").is_none(),
+            "laid out though not in view"
+        );
+        assert!(
+            h.query_by_label("+ line 300").is_none(),
+            "laid out though not in view"
+        );
+        let over = first.center();
+        for _ in 0..200 {
+            if h.query_by_label("+ line 499").is_some() {
+                break;
+            }
+            h.event(egui::Event::PointerMoved(over));
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            for _ in 0..5 {
+                h.step();
+            }
+        }
+        let last = h.get_by_label("+ line 499").rect();
+        let before = h.get_by_label("+ line 498").rect();
+        assert!(
+            h.query_by_label("+ line 0").is_none(),
+            "laid out though scrolled away"
+        );
+        assert!(
+            (last.top() - before.bottom()) < 10.0 && last.top() > before.top(),
+            "the last lines overlap or have a gap: {before:?} {last:?}"
+        );
+        // The end of the diff is reachable: its last line is inside the box, not cut off below it.
+        assert!(
+            last.bottom() <= first.top() + 220.0 + 1.0,
+            "{first:?} {last:?}"
+        );
+        // Where the lines went is let go with the plan.
+        assert!(!h.state().diff_tops.files.is_empty());
+        h.state_mut().plan = None;
+        h.run();
+        assert!(h.state().diff_tops.files.is_empty());
+    }
+
+    #[test]
     fn the_plan_dialog_shows_exactly_what_will_change_and_nothing_is_sent_yet() {
         let (_h, engine) = {
             let (h, engine) = with_plan(
@@ -8844,6 +9067,7 @@ mod tests {
             h.get_by_label_contains("Review the change");
             h.get_by_label_contains("disabledMcpServers");
             h.get_by_label("+ alpha");
+            h.get_by_label("Changes in .claude.json · 2 lines");
             h.get_by_label_contains("may need a restart");
             (h, engine)
         };

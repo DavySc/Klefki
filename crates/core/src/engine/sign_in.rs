@@ -1,7 +1,7 @@
 //! Signing in to a server from Klefki: `claude mcp login` in a pseudo-terminal, one at a time (decision 005).
 use super::{
-    Command, Emitter, Event, Input, OpenUrl, Shared, SignInFailure, SignInStep, State, lock,
-    where_to_run,
+    Command, Emitter, Event, Folders, Input, OpenUrl, Shared, SignInFailure, SignInStep, State,
+    lock, where_to_run,
 };
 use crate::api::{Approval, Scope, ServerId, TransportKind};
 use crate::cli::login::{self, LoginSpec, Message, Outcome, Progress};
@@ -72,7 +72,7 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
             false,
         );
     }
-    let (name, cwd) = match where_to_run(shared, row, Some(file)) {
+    let (name, cwd) = match where_to_run(shared, &mut Folders::default(), row, Some(file)) {
         Ok(found) => found,
         Err(why) => return fail(format!("Klefki cannot sign in to it: {why}."), false),
     };

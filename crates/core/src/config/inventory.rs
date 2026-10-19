@@ -523,6 +523,19 @@ fn merged_projects(root: &serde_json::Map<String, Value>) -> BTreeMap<String, Pr
     out
 }
 
+/// [`normalise_project`] without a copy when the path is already spelled that way, as it mostly is.
+pub(crate) fn project_key(path: &str) -> std::borrow::Cow<'_, str> {
+    let b = path.as_bytes();
+    let normal = !path.contains('\\')
+        && !(b.len() > 1 && b.ends_with(b"/") && !path.ends_with(":/"))
+        && !(b.len() >= 2 && b[0].is_ascii_lowercase() && b[1] == b':');
+    if normal {
+        std::borrow::Cow::Borrowed(path)
+    } else {
+        std::borrow::Cow::Owned(normalise_project(path))
+    }
+}
+
 pub(crate) fn normalise_project(path: &str) -> String {
     let mut p = path.replace('\\', "/");
     while p.len() > 1 && p.ends_with('/') && !p.ends_with(":/") {
@@ -987,6 +1000,43 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_key_is_the_normalised_path_and_borrows_when_it_is_already_that() {
+        for path in [
+            "/",
+            "/a",
+            "/a/",
+            "/a//",
+            "C:/",
+            "c:/",
+            "C:",
+            "c:",
+            "c:\\",
+            "C:\\x\\",
+            "c:/x/",
+            "C:/x",
+            "\\\\nas\\s",
+            "/home/u/proj",
+            "d:/Repos",
+            "D:/Repos",
+            "x",
+            "",
+            "/a:/",
+            "1:/x",
+            "é:/x",
+            "/ü/",
+            "ä",
+        ] {
+            let key = project_key(path);
+            assert_eq!(key, normalise_project(path), "{path:?}");
+            assert_eq!(
+                matches!(key, std::borrow::Cow::Borrowed(_)),
+                normalise_project(path) == path,
+                "{path:?}"
+            );
+        }
+    }
     use serde_json::json;
     use std::path::PathBuf;
 

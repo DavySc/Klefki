@@ -501,7 +501,7 @@ impl Emitter {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum JobKind {
     Check,
     Diagnose,
@@ -517,6 +517,8 @@ struct Job {
     announce: bool,
     /// Nobody asked for it: it runs only while no other background job does.
     background: bool,
+    /// Asked for on its own ([`Queue::push_now`]): ahead of every other job, after earlier such asks.
+    now: bool,
 }
 
 #[derive(Default)]
@@ -539,25 +541,28 @@ impl Queue {
     /// room for it.
     /// Queues checks, leaving out servers that already have one queued (a server switched off and on again).
     fn add(&mut self, jobs: Vec<Job>) {
+        let mut queued: HashSet<_> = self
+            .jobs
+            .iter()
+            .map(|q| (q.kind, q.id.connection.clone()))
+            .collect();
         for job in jobs {
-            let queued = self
-                .jobs
-                .iter()
-                .any(|q| q.kind == job.kind && q.id.connection == job.id.connection);
-            if !queued {
+            if queued.insert((job.kind, job.id.connection.clone())) {
                 self.jobs.push_back(job);
             }
         }
         self.order();
     }
 
-    /// Puts a job the user asked for in front. A check of the same server still waiting is dropped: it would run the
-    /// server again, and its later answer would replace this one.
+    /// Puts a job the user asked for in front, behind those asked for the same way before it, so that they run in the
+    /// order asked. A check of the same server still waiting is dropped: it would run the server again, and its later
+    /// answer would replace this one.
     fn push_now(&mut self, job: Job) {
         let connection = &job.id.connection;
         self.jobs
             .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
-        self.jobs.push_front(job);
+        let at = self.jobs.iter().take_while(|q| q.now).count();
+        self.jobs.insert(at, Job { now: true, ..job });
     }
 
     fn take(&mut self) -> Option<Job> {
@@ -1863,6 +1868,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
 
     let mut jobs = Vec::new();
     let mut tried = HashSet::new();
+    let mut folders = Folders::default();
     let keys = &state.keys;
     for row in &snapshot.servers {
         let edit = edited.contains(&row.connection);
@@ -1876,6 +1882,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
         if wanted
             && let Some(mut job) = build_job(
                 shared,
+                &mut folders,
                 row,
                 keys.get(&row.connection),
                 JobKind::Check,
@@ -1899,19 +1906,22 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
     }
     let (before, edited) = state.reload(shared);
     let snapshot = &state.snapshot;
+    // The same server in both snapshots is the same connection, as the file spells it, not the shown name.
+    let was_on: HashSet<_> = before
+        .servers
+        .iter()
+        .filter(|old| old.enabled)
+        .map(|old| &old.connection)
+        .collect();
     let mut jobs = Vec::new();
     let mut tried = HashSet::new();
+    let mut folders = Folders::default();
     for row in &snapshot.servers {
         let edit = edited.contains(&row.connection);
         let wanted = shared.config.background_checks
             && row.scope != Scope::Project
             && row.enabled
-            && (edit
-                || (needs_check(row)
-                    && !before
-                        .servers
-                        .iter()
-                        .any(|old| old.enabled && same_row(old, row))));
+            && (edit || (needs_check(row) && !was_on.contains(&row.connection)));
         if !wanted {
             continue;
         }
@@ -1920,6 +1930,7 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
         }
         if let Some(job) = build_job(
             shared,
+            &mut folders,
             row,
             state.keys.get(&row.connection),
             JobKind::Check,
@@ -1993,17 +2004,12 @@ fn needs_check(row: &ServerRow) -> bool {
     row.status == Status::Unknown || row.status_cached
 }
 
-/// The same server in two snapshots: by connection, as the file spells it, not by the shown name.
-fn same_row(a: &ServerRow, b: &ServerRow) -> bool {
-    a.connection == b.connection
-}
-
 /// A check or diagnosis the user asked for: ahead of the background checks.
 fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind) {
     let Some((row, file)) = inventory::locate(&state.snapshot, &state.keys, id) else {
         return;
     };
-    if let Some(job) = build_job(shared, row, Some(file), kind, true) {
+    if let Some(job) = build_job(shared, &mut Folders::default(), row, Some(file), kind, true) {
         lock(&shared.queue).push_now(job);
         shared.wake_workers.notify_one();
     }
@@ -2014,6 +2020,7 @@ fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind) {
 /// cleaned text shown (which could name another server, or another folder).
 fn build_job(
     shared: &Shared,
+    folders: &mut Folders,
     row: &ServerRow,
     file: Option<&FileKey>,
     kind: JobKind,
@@ -2042,7 +2049,7 @@ fn build_job(
         }
         None
     };
-    let (name, cwd) = match where_to_run(shared, row, file) {
+    let (name, cwd) = match where_to_run(shared, folders, row, file) {
         Ok(found) => found,
         Err(why) => return refuse(why),
     };
@@ -2053,6 +2060,7 @@ fn build_job(
         kind,
         announce,
         background: false,
+        now: false,
     })
 }
 
@@ -2060,6 +2068,7 @@ fn build_job(
 /// cannot run. Claude finds a local server through its working directory, so it runs in the project's folder.
 fn where_to_run(
     shared: &Shared,
+    folders: &mut Folders,
     row: &ServerRow,
     file: Option<&FileKey>,
 ) -> Result<(ServerName, PathBuf), String> {
@@ -2074,7 +2083,7 @@ fn where_to_run(
             None => return Err("no home folder".to_owned()),
         },
         (_, Some(project)) => {
-            if !inventory::is_safe_project_path(project) || !Path::new(project).is_dir() {
+            if !folders.usable(project) {
                 return Err("the project folder was not found".to_owned());
             }
             PathBuf::from(project)
@@ -2082,6 +2091,21 @@ fn where_to_run(
         (_, None) => return Err("the project folder is unknown".to_owned()),
     };
     Ok((name, cwd))
+}
+
+/// Whether each project folder can be run in, looked up once per pass over the rows: a project has many servers.
+#[derive(Default)]
+struct Folders(HashMap<String, bool>);
+
+impl Folders {
+    fn usable(&mut self, project: &str) -> bool {
+        if let Some(&usable) = self.0.get(project) {
+            return usable;
+        }
+        let usable = inventory::is_safe_project_path(project) && Path::new(project).is_dir();
+        self.0.insert(project.to_owned(), usable);
+        usable
+    }
 }
 
 fn worker(shared: &Shared) {
@@ -3233,6 +3257,69 @@ mod tests {
         });
         let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
         assert_eq!(order, ["z", "z", "k0", "k1", "k2"]);
+    }
+
+    #[test]
+    fn checks_asked_for_one_after_another_run_in_the_order_asked() {
+        // Performance review: `push_now` put each new ask in front, so klefki-cli's checks ran in reverse.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "s": {"command": "x"}, "k0": {"command": "x"}, "k1": {"command": "x"}, "k2": {"command": "x"}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get","s"],"stdout_file":"c.txt","delay_ms":300},
+                        {"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                background_checks: false,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| !snapshots(e).is_empty());
+        for name in ["s", "k0", "k1", "k2"] {
+            core.send(Command::Check(user_id(name)));
+        }
+        collect(&core, |e| {
+            ["s", "k0", "k1", "k2"]
+                .iter()
+                .all(|n| final_status(e, n).is_some())
+        });
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(order, ["s", "k0", "k1", "k2"]);
+    }
+
+    #[test]
+    fn a_server_asked_for_again_while_waiting_moves_to_the_end_of_the_asks() {
+        // Variant: the second ask replaces the first, behind the asks made in between.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "s": {"command": "x"}, "k0": {"command": "x"}, "k1": {"command": "x"}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get","s"],"stdout_file":"c.txt","delay_ms":300},
+                        {"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                background_checks: false,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| !snapshots(e).is_empty());
+        for name in ["s", "k0", "k1", "k0"] {
+            core.send(Command::Check(user_id(name)));
+        }
+        collect(&core, |e| {
+            ["s", "k0", "k1"]
+                .iter()
+                .all(|n| final_status(e, n).is_some())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(order, ["s", "k1", "k0"]);
     }
 
     #[test]
