@@ -1289,3 +1289,34 @@ fn a_secret_klefki_could_not_move_is_not_left_where_the_server_was() {
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     assert!(!rig.world().klefki.contains_key(&connection(&a)));
 }
+
+#[test]
+fn an_earlier_renames_check_does_not_fail_on_a_copy_under_the_old_name() {
+    // Found by the model-based test: rename q to q_r, then copy p into its place under the name q. Checked together,
+    // the rename found q there again with its new name taken, and the check failed with "q_r already exists there".
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let pa = rig.projects[0].clone();
+    let p = (None, "p".to_owned());
+    let q = (Some(pa.clone()), "q".to_owned());
+    let renamed = (Some(pa.clone()), "q_r".to_owned());
+    let before = rig.world();
+    for change in [
+        Change::Rename {
+            id: rig.id(&q),
+            name: "q_r".into(),
+        },
+        Change::Duplicate {
+            id: rig.id(&p),
+            name: "q".into(),
+            targets: vec![Target::Local(pa.clone())],
+        },
+    ] {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    }
+    quiet_for(&rig, Duration::from_millis(1200));
+    let world = rig.world();
+    assert_eq!(world.servers.get(&renamed), before.servers.get(&q));
+    assert_eq!(world.servers.get(&q), before.servers.get(&p));
+}

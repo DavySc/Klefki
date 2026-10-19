@@ -440,8 +440,10 @@ impl Docstore {
     /// are all in place. Each plan is applied to the result of the one before, as it was when it was written.
     fn replay(&self, current: &Current, log: &[Plan]) -> Result<Option<Splices>, StoreError> {
         let mut redone: Option<Current> = None;
-        for ops in as_they_ended(log) {
+        let plans = as_they_ended(log);
+        for (j, ops) in plans.iter().enumerate() {
             let base = redone.as_ref().unwrap_or(current);
+            let ops = without_done_renames(base, ops.clone(), &plans[j + 1..])?;
             if let (Some(edits), _) = self.edit(base, &ops, Purpose::Verify)? {
                 redone = Some(Current {
                     text: spliced(&base.text, &edits),
@@ -1412,6 +1414,90 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
         .into_iter()
         .map(|ops| ops.into_iter().flatten().collect())
         .collect()
+}
+
+/// A plan's ops for a replay on `current`, without each rename that is in place (and the switch-off list changes
+/// that go with it): its server is there under its new name, or under the name `later` plans renamed it to since.
+/// The name was free when the rename was made, so a server under the old name is a later one (a copy, or another
+/// rename into it), which renaming again would take away. A rename whose server was deleted since is replayed: the
+/// delete then takes it, and a later server under the old name is put back by the plan that brought it.
+fn without_done_renames(
+    current: &Current,
+    ops: Vec<Op>,
+    later: &[Vec<Op>],
+) -> Result<Vec<Op>, StoreError> {
+    if !ops.iter().any(|op| matches!(op, Op::RenameServer { .. })) {
+        return Ok(ops);
+    }
+    let doc = current.parse()?;
+    let has = |project: &Option<String>, name: &str| match project {
+        None => doc["mcpServers"].get(name).is_some(),
+        Some(p) => doc["projects"].as_object().is_some_and(|projects| {
+            projects.iter().any(|(key, entry)| {
+                crate::api::same_project(key, p) && entry["mcpServers"].get(name).is_some()
+            })
+        }),
+    };
+    let done: Vec<(Option<String>, String, String)> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::RenameServer {
+                project,
+                name,
+                new_name,
+            } => renamed_since(later, project, new_name)
+                .is_some_and(|now| has(project, &now))
+                .then(|| (project.clone(), name.clone(), new_name.clone())),
+            _ => None,
+        })
+        .collect();
+    Ok(ops
+        .into_iter()
+        .filter(|op| match op {
+            Op::RenameServer {
+                project,
+                name,
+                new_name,
+            } => !done
+                .iter()
+                .any(|(p, n, to)| p == project && n == name && to == new_name),
+            Op::RenameDisabled {
+                project,
+                name,
+                new_name,
+            } => !done.iter().any(|(p, n, to)| {
+                n == name
+                    && to == new_name
+                    && p.as_ref()
+                        .is_none_or(|p| crate::api::same_project(p, project))
+            }),
+            _ => true,
+        })
+        .collect())
+}
+
+/// The name the server `name` in `project` has after the `later` plans rename it, or `None` if one deletes it.
+fn renamed_since(later: &[Vec<Op>], project: &Option<String>, name: &str) -> Option<String> {
+    let here = |p: &Option<String>| match (p, project) {
+        (Some(a), Some(b)) => crate::api::same_project(a, b),
+        (a, b) => a == b,
+    };
+    let mut name = name.to_owned();
+    for op in later.iter().flatten() {
+        match op {
+            Op::RenameServer {
+                project: p,
+                name: n,
+                new_name,
+            } if here(p) && *n == name => name.clone_from(new_name),
+            Op::RemoveServer {
+                project: p,
+                name: n,
+            } if here(p) && *n == name => return None,
+            _ => {}
+        }
+    }
+    Some(name)
 }
 
 /// A change being checked whose server is already gone. For a delete (or a rename) that is the change in place. For an
@@ -3946,6 +4032,111 @@ mod tests {
         ];
         let after = f.json();
         assert!(after["mcpServers"].get("gateway").is_none());
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_renames_check_accepts_a_later_server_under_the_old_name() {
+        // Found by the model-based test (engine/machine.rs): rename b to b_r, then copy another b into its place.
+        // Checked together, the rename found b there again and its new name taken, and the check reported
+        // "b_r already exists there" for a change that was in place.
+        let original = pretty(&sample());
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![rename_server(None, "gateway", "gw")]),
+            apply_ops(&f, vec![copy(None, "gw", None, "gateway")]),
+        ];
+        let after = f.json();
+        let text = f.text();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.text(), text);
+        // Claude Code overwrote both: the rename is put back, then the copy.
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+        // The variant: another server renamed into the old name.
+        let mut doc = sample();
+        doc["mcpServers"]["other"] = json!({"command": "other"});
+        let original = pretty(&doc);
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![rename_server(None, "gateway", "gw")]),
+            apply_ops(&f, vec![rename_server(None, "other", "gateway")]),
+        ];
+        let after = f.json();
+        assert_eq!(after["mcpServers"]["gateway"], json!({"command": "other"}));
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_renames_check_follows_its_server_through_later_renames() {
+        // Found by the model-based test: rename gateway to gw, copy another gateway in, rename gw to gz. Checked
+        // together, the first rename found gw gone and renamed the new gateway to gw.
+        let original = pretty(&sample());
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![rename_server(None, "gateway", "gw")]),
+            apply_ops(&f, vec![copy(None, "gw", None, "gateway")]),
+            apply_ops(&f, vec![rename_server(None, "gw", "gz")]),
+        ];
+        let after = f.json();
+        let text = f.text();
+        assert!(after["mcpServers"].get("gw").is_none());
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.text(), text);
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+        // The variant: the renamed server is deleted at the end. Nothing is lost or left behind.
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![rename_server(None, "gateway", "gw")]),
+            apply_ops(&f, vec![copy(None, "gw", None, "gateway")]),
+            apply_ops(&f, vec![remove(None, "gw")]),
+        ];
+        let after = f.json();
+        assert!(after["mcpServers"].get("gw").is_none());
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+        // Overwritten by Claude Code: the copy is of the same definition, so the file already ends as it should.
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_renames_check_leaves_the_switch_of_a_later_server_under_the_old_name() {
+        // The variant with a switch-off list: x (on) renamed to x_r, a new x copied in and switched off. Replaying the
+        // rename's list change would have moved the new x's switch to x_r.
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["mcpServers"] = json!({"x": {"command": "a"}});
+        let original = pretty(&doc);
+        let f = Fixture::new(&original);
+        let app = "C:/work/app";
+        let log = [
+            apply_ops(
+                &f,
+                vec![
+                    rename_server(Some(app), "x", "x_r"),
+                    rename_disabled(app, "x", "x_r"),
+                ],
+            ),
+            apply_ops(&f, vec![copy(Some(app), "x_r", Some(app), "x")]),
+            apply_ops(&f, vec![disable(app, "x")]),
+        ];
+        let after = f.json();
+        assert_eq!(
+            after["projects"][app]["disabledMcpServers"],
+            json!(["old", "x"])
+        );
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
         std::fs::write(&f.store.path, &original).unwrap();
         assert_eq!(f.store.verify(&log, &|| false), Ok(true));
         assert_eq!(f.json(), after);
