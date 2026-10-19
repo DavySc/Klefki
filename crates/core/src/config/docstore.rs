@@ -1417,10 +1417,11 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
 }
 
 /// A plan's ops for a replay on `current`, without each rename that is in place (and the switch-off list changes
-/// that go with it): its server is there under its new name, or under the name `later` plans renamed it to since.
-/// The name was free when the rename was made, so a server under the old name is a later one (a copy, or another
-/// rename into it), which renaming again would take away. A rename whose server was deleted since is replayed: the
-/// delete then takes it, and a later server under the old name is put back by the plan that brought it.
+/// that go with it): its server is there under its new name, or under any name `later` plans renamed it to since
+/// (Claude Code may have written the file back as it was between two of those renames). The name was free when the
+/// rename was made, so a server under the old name is a later one (a copy, or another rename into it), which
+/// renaming again would take away. A rename whose server was deleted since is replayed: the delete then takes it,
+/// and a later server under the old name is put back by the plan that brought it.
 fn without_done_renames(
     current: &Current,
     ops: Vec<Op>,
@@ -1445,8 +1446,8 @@ fn without_done_renames(
                 project,
                 name,
                 new_name,
-            } => renamed_since(later, project, new_name)
-                .is_some_and(|now| has(project, &now))
+            } => names_since(later, project, new_name)
+                .is_some_and(|names| names.iter().any(|now| has(project, now)))
                 .then(|| (project.clone(), name.clone(), new_name.clone())),
             _ => None,
         })
@@ -1476,28 +1477,30 @@ fn without_done_renames(
         .collect())
 }
 
-/// The name the server `name` in `project` has after the `later` plans rename it, or `None` if one deletes it.
-fn renamed_since(later: &[Vec<Op>], project: &Option<String>, name: &str) -> Option<String> {
+/// The names the server `name` in `project` has as the `later` plans rename it, `name` first, or `None` if one
+/// deletes it.
+fn names_since(later: &[Vec<Op>], project: &Option<String>, name: &str) -> Option<Vec<String>> {
     let here = |p: &Option<String>| match (p, project) {
         (Some(a), Some(b)) => crate::api::same_project(a, b),
         (a, b) => a == b,
     };
-    let mut name = name.to_owned();
+    let mut names = vec![name.to_owned()];
     for op in later.iter().flatten() {
+        let now = names.last().expect("starts with one");
         match op {
             Op::RenameServer {
                 project: p,
                 name: n,
                 new_name,
-            } if here(p) && *n == name => name.clone_from(new_name),
+            } if here(p) && n == now => names.push(new_name.clone()),
             Op::RemoveServer {
                 project: p,
                 name: n,
-            } if here(p) && *n == name => return None,
+            } if here(p) && n == now => return None,
             _ => {}
         }
     }
-    Some(name)
+    Some(names)
 }
 
 /// A change being checked whose server is already gone. For a delete (or a rename) that is the change in place. For an
@@ -4091,6 +4094,23 @@ mod tests {
         assert_eq!(f.store.verify(&log, &|| false), Ok(false));
         assert_eq!(f.text(), text);
         std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+        // Claude Code read the file between the copy and the second rename, and wrote it after: the first rename is
+        // in place under its first new name.
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![rename_server(None, "gateway", "gw")]),
+            apply_ops(&f, vec![copy(None, "gw", None, "gateway")]),
+        ];
+        let between = f.text();
+        let log = [
+            log[0].clone(),
+            log[1].clone(),
+            apply_ops(&f, vec![rename_server(None, "gw", "gz")]),
+        ];
+        let after = f.json();
+        std::fs::write(&f.store.path, &between).unwrap();
         assert_eq!(f.store.verify(&log, &|| false), Ok(true));
         assert_eq!(f.json(), after);
         // The variant: the renamed server is deleted at the end. Nothing is lost or left behind.
