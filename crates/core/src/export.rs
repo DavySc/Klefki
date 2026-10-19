@@ -84,7 +84,12 @@ pub(crate) fn sources(
             },
             None => Source {
                 name: id.name.clone(),
-                definition: Err("it is no longer in the configuration".to_owned()),
+                definition: Err(if id.scope == Scope::Plugin {
+                    "it comes from a plugin, which brings it wherever the plugin is installed"
+                        .to_owned()
+                } else {
+                    "it is no longer in the configuration".to_owned()
+                }),
             },
         })
         .collect()

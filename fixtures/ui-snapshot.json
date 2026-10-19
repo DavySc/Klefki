@@ -84,6 +84,26 @@
       "status": "unknown",
       "enabled": true,
       "approval": "rejected"
+    },
+    {
+      "name": "plugin:docs-search:search",
+      "scope": "plugin",
+      "transport": "stdio",
+      "target": "${CLAUDE_PLUGIN_ROOT}/bin/search --stdio",
+      "status": "unknown",
+      "enabled": true,
+      "plugin": "docs-search@team-plugins"
+    },
+    {
+      "name": "plugin:events:stream",
+      "scope": "plugin",
+      "transport": "sse",
+      "target": "https://events.example.com/sse/",
+      "status": "unknown",
+      "enabled": true,
+      "shadowed": true,
+      "plugin": "events@team-plugins",
+      "same_as": "legacy-events"
     }
   ],
   "project_count": 17

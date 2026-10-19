@@ -35,6 +35,8 @@ pub enum Scope {
     User,
     Local,
     Project,
+    /// A server a Claude Code plugin brings. Read-only: it is changed in the plugin.
+    Plugin,
 }
 
 impl Scope {
@@ -43,6 +45,7 @@ impl Scope {
             Self::User => "User",
             Self::Local => "Local",
             Self::Project => "Project",
+            Self::Plugin => "Plugin",
         }
     }
 }
@@ -207,6 +210,23 @@ pub struct ServerRow {
     /// Signs in with OAuth: the client id and scopes from its entry (not secrets; the client secret lives in the
     /// keyring and is never read into a row). `None` for a server without an `oauth` entry.
     pub oauth: Option<OAuthInfo>,
+    /// Plugin servers only: which plugin brings it. Such a row is read-only: Klefki holds no file key for it, so no
+    /// change can name it.
+    pub plugin: Option<PluginInfo>,
+}
+
+/// Where a plugin server comes from (decision 008). Sanitised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginInfo {
+    pub plugin: String,
+    pub marketplace: String,
+    /// Claude Code leaves this server out because another one has the same command and arguments, or the same
+    /// address: that server's name. A user server, or an earlier plugin's, hides it in every project; a local or
+    /// approved project server only in its project (see [`ServerRow::shadowed_in`]).
+    pub same_as: Option<String>,
+    /// The target as the plugin's files write it, when Claude Code runs it otherwise (`${CLAUDE_PLUGIN_ROOT}` in it).
+    /// [`ServerRow::target`] is the target as run.
+    pub written_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,8 +481,26 @@ mod tests {
         assert!(
             s.servers
                 .iter()
-                .filter(|r| r.scope != Scope::User)
+                .filter(|r| matches!(r.scope, Scope::Local | Scope::Project))
                 .all(|r| r.project.is_some())
+        );
+        // A plugin's server is one row for every project, like a user server, and says which plugin brings it.
+        let plugins: Vec<_> = s
+            .servers
+            .iter()
+            .filter(|r| r.scope == Scope::Plugin)
+            .collect();
+        assert!(!plugins.is_empty());
+        assert!(
+            plugins
+                .iter()
+                .all(|r| r.project.is_none() && r.plugin.is_some())
+        );
+        assert!(
+            s.servers
+                .iter()
+                .filter(|r| r.scope != Scope::Plugin)
+                .all(|r| r.plugin.is_none())
         );
     }
 

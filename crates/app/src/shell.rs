@@ -1023,7 +1023,13 @@ impl ShellApp {
         let mut last: Option<(Scope, Option<&str>)> = None;
         for i in self.visible() {
             let s = &self.snapshot.servers[i];
-            let key = (s.scope, s.project.as_deref());
+            // A plugin's servers are grouped by plugin, as the others are by project.
+            let key = (
+                s.scope,
+                s.project
+                    .as_deref()
+                    .or(s.plugin.as_ref().map(|p| p.plugin.as_str())),
+            );
             if last != Some(key) {
                 rows.push(GridRow::Group(group_of(s)));
                 last = Some(key);
@@ -1594,8 +1600,11 @@ impl ShellApp {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.can_prepare();
-        let can_edit = self.core.is_some() && self.selected.len() == 1;
+        let read_only_hint = self.read_only_hint();
+        let read_only = read_only_hint.is_some();
+        let can_toggle =
+            self.core.is_some() && !self.selected.is_empty() && self.can_prepare() && !read_only;
+        let can_edit = self.core.is_some() && self.selected.len() == 1 && !read_only;
         let can_duplicate = self.duplicable().is_some();
         let can_add = self.core.is_some() && self.can_prepare();
         let can_export = self.can_export();
@@ -1623,6 +1632,9 @@ impl ShellApp {
                 let button = egui::Button::new(RichText::new(glyph).size(16.0))
                     .min_size(egui::vec2(44.0, 38.0));
                 let (enabled, needs) = match glyph {
+                    _ if read_only && glyph != icon::PLUS && glyph != icon::TRAY_ARROW_DOWN => {
+                        (false, read_only_hint.as_deref().unwrap_or_default())
+                    }
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
                     }
@@ -1692,11 +1704,6 @@ impl ShellApp {
             .iter()
             .filter_map(|&i| self.snapshot.servers.get(i))
             .collect();
-        let names = selected
-            .iter()
-            .map(|r| r.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
         let live = self.core.is_some();
         let mut add = |icon: &'static str,
                        title: String,
@@ -1711,11 +1718,13 @@ impl ShellApp {
                 action,
             });
         };
-        if live && !selected.is_empty() {
-            let what = if selected.len() == 1 {
-                names.clone()
-            } else {
-                format!("{} servers", selected.len())
+        // A plugin's servers are read-only: nothing here changes, checks or exports them. With others selected, the
+        // actions on the selection take those.
+        let (changeable, _) = self.changeable_selected();
+        if live && !changeable.is_empty() {
+            let what = match changeable[..] {
+                [one] => one.name.clone(),
+                _ => format!("{} servers", changeable.len()),
             };
             add(
                 icon::TOGGLE_RIGHT,
@@ -1997,7 +2006,65 @@ impl ShellApp {
         if !self.can_prepare() {
             return None;
         }
-        self.single_selected().filter(|s| s.scope != Scope::Project)
+        self.single_selected()
+            .filter(|s| matches!(s.scope, Scope::User | Scope::Local))
+    }
+
+    /// The selected rows, without plugin servers, which Klefki only shows (decision 008); and how many those were.
+    fn changeable_selected(&self) -> (Vec<&ServerRow>, usize) {
+        let rows: Vec<&ServerRow> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .collect();
+        let all = rows.len();
+        let rows: Vec<&ServerRow> = rows
+            .into_iter()
+            .filter(|s| s.scope != Scope::Plugin)
+            .collect();
+        let left_out = all - rows.len();
+        (rows, left_out)
+    }
+
+    /// Why the buttons that change servers are off: everything selected comes from a plugin. `None` otherwise.
+    pub(crate) fn read_only_hint(&self) -> Option<String> {
+        let (rows, plugins) = self.changeable_selected();
+        if !rows.is_empty() || plugins == 0 {
+            return None;
+        }
+        Some(match self.single_selected() {
+            Some(s) => format!("{} comes from a plugin and is changed there", s.name),
+            None => "the selected servers come from plugins and are changed there".to_owned(),
+        })
+    }
+
+    /// Says what a change to the selection left out: the plugin servers in it. With none left to change, names the
+    /// one selected and where it can be changed.
+    fn note_plugins_left_out(&mut self, changed: usize, left_out: usize) {
+        if left_out == 0 {
+            return;
+        }
+        let text = if changed > 0 {
+            match left_out {
+                1 => "Left out 1 plugin server: a plugin's server is changed in its plugin."
+                    .to_owned(),
+                n => format!(
+                    "Left out {n} plugin servers: a plugin's server is changed in its plugin."
+                ),
+            }
+        } else if let Some(s) = self.single_selected() {
+            let plugin = s.plugin.as_ref().map_or("", |p| p.plugin.as_str());
+            format!(
+                "{} comes from the plugin {plugin}. Change it in the plugin, or turn the plugin off in Claude Code \
+                 (/plugin).",
+                s.name
+            )
+        } else {
+            "The selected servers come from plugins. Change them in their plugins, or turn the plugins off in \
+             Claude Code (/plugin)."
+                .to_owned()
+        };
+        self.note(text, false);
     }
 
     /// Opens the Duplicate dialog for the selected server: named `<name>_copy`, in the place it is now.
@@ -2071,19 +2138,29 @@ impl ShellApp {
     /// The rows Export takes, in the list's order: the selection (all of it, even rows the search hides now), or
     /// every row the list shows when nothing is selected.
     fn export_rows(&self) -> Vec<usize> {
-        if self.selected.is_empty() {
+        let rows = if self.selected.is_empty() {
             self.visible()
         } else {
             self.in_list_order(self.selected.iter().copied().collect())
-        }
+        };
+        // A plugin's servers come with the plugin; Klefki does not hold their definitions.
+        rows.into_iter()
+            .filter(|&i| self.snapshot.servers[i].scope != Scope::Plugin)
+            .collect()
     }
 
     /// Whether Export has anything to take; cheap enough for every frame (no sorting, no list built).
     fn can_export(&self) -> bool {
         let q = self.search.trim().to_lowercase();
         self.core.is_some()
-            && (!self.selected.is_empty()
-                || self.snapshot.servers.iter().any(|s| matches_search(s, &q)))
+            && if self.selected.is_empty() {
+                self.snapshot
+                    .servers
+                    .iter()
+                    .any(|s| s.scope != Scope::Plugin && matches_search(s, &q))
+            } else {
+                !self.changeable_selected().0.is_empty()
+            }
     }
 
     /// Opens the Export dialog and asks the engine for the block.
@@ -2113,6 +2190,18 @@ impl ShellApp {
                 1 => Some("Includes 1 selected server the search hides.".to_owned()),
                 n => Some(format!("Includes {n} selected servers the search hides.")),
             }
+        };
+        // A plugin's servers come with the plugin: said, not dropped silently.
+        let plugins = match self.changeable_selected().1 {
+            0 => None,
+            1 => Some("Leaves out 1 selected plugin server: it comes with its plugin.".to_owned()),
+            n => Some(format!(
+                "Leaves out {n} selected plugin servers: they come with their plugins."
+            )),
+        };
+        let scope = match (scope, plugins) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b),
         };
         self.exporting = Some(ExportView {
             file_name: klefki_core::api::export_file_name(&names),
@@ -3381,31 +3470,35 @@ impl ShellApp {
 
     /// Asks the engine what deleting the selected servers would change. Nothing is written yet.
     fn prepare_delete(&mut self) {
-        let changes: Vec<Change> = self
-            .selected
-            .iter()
-            .filter_map(|&i| self.snapshot.servers.get(i))
+        let (rows, left_out) = self.changeable_selected();
+        let changes: Vec<Change> = rows
+            .into_iter()
             .map(|row| Change::Delete { id: row.id() })
             .collect();
+        let changed = changes.len();
         if !changes.is_empty() {
             self.outcome = None;
             self.send(Command::Prepare(changes));
         }
+        self.note_plugins_left_out(changed, left_out);
     }
 
     /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
     fn prepare_toggle(&mut self, enabled: bool) {
-        let changes: Vec<Change> = self
-            .selected
-            .iter()
-            .filter_map(|&i| self.snapshot.servers.get(i))
+        let (rows, left_out) = self.changeable_selected();
+        let changes: Vec<Change> = rows
+            .into_iter()
             .map(|row| Change::SetEnabled {
                 id: row.id(),
                 enabled,
             })
             .collect();
-        if !changes.is_empty() {
+        let changed = changes.len();
+        if !changes.is_empty() && self.can_prepare() {
             self.prepare(changes);
+            self.note_plugins_left_out(changed, left_out);
+        } else if changes.is_empty() {
+            self.note_plugins_left_out(0, left_out);
         }
     }
 
@@ -4154,6 +4247,12 @@ impl ShellApp {
                 ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for (tab, title) in DetailTab::ALL {
+                    // A plugin's server has no definition here to show values or sign-in settings from.
+                    if s.scope == Scope::Plugin
+                        && !matches!(tab, DetailTab::General | DetailTab::Status)
+                    {
+                        continue;
+                    }
                     ui.selectable_value(&mut self.tab, tab, RichText::new(title).size(13.5));
                 }
             });
@@ -4215,8 +4314,22 @@ impl ShellApp {
         // Long values must wrap inside the panel; without a cap a grid cell grows to fit its text, and the whole
         // panel grows with it.
         let col_width = (ui.available_width() - 110.0).max(100.0);
-        match self.tab {
+        let tab = match self.tab {
+            DetailTab::HeadersEnv | DetailTab::Auth if s.scope == Scope::Plugin => {
+                DetailTab::General
+            }
+            tab => tab,
+        };
+        match tab {
             DetailTab::General => {
+                // First, before anyone looks for a way to edit it.
+                if let Some(p) = &s.plugin {
+                    ui.add(
+                        egui::Label::new(RichText::new(plugin_read_only(p)).color(pal.text_muted))
+                            .wrap(),
+                    );
+                    ui.add_space(8.0);
+                }
                 // A local or project server that runs where a user server of its name is hidden.
                 let replaces = s.scope != Scope::User
                     && !s.shadowed
@@ -4237,10 +4350,24 @@ impl ShellApp {
                             value
                         };
                         kv("Scope", s.scope.label().to_owned());
-                        kv("Project", s.project.clone().unwrap_or_else(|| "-".into()));
+                        match &s.plugin {
+                            Some(p) => {
+                                kv("Plugin", format!("{}, from {}", p.plugin, p.marketplace))
+                            }
+                            None => kv("Project", s.project.clone().unwrap_or_else(|| "-".into())),
+                        };
                         kv("Type", s.transport.label().to_owned());
-                        kv("Target", s.target.clone());
-                        let enabled = if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
+                        let target = kv("Target", s.target.clone());
+                        // As Claude Code runs it; what the plugin writes is a hover away.
+                        if let Some(written) =
+                            s.plugin.as_ref().and_then(|p| p.written_target.as_deref())
+                        {
+                            target.on_hover_text(format!("The plugin writes: {written}"));
+                        }
+                        let enabled = if matches!(s.scope, Scope::User | Scope::Plugin)
+                            && s.enabled
+                            && s.disabled_in > 0
+                        {
                             format!(
                                 "disabled in {} of {} projects",
                                 s.disabled_in, self.snapshot.project_count
@@ -4254,8 +4381,14 @@ impl ShellApp {
                         if let Some(approval) = s.approval {
                             kv("Approval", approval.label().to_owned());
                         }
-                        let shadowed =
-                            kv("Shadowed", shadowed_text(s, self.snapshot.project_count));
+                        let shadowed = kv(
+                            if s.scope == Scope::Plugin {
+                                "Left out"
+                            } else {
+                                "Shadowed"
+                            },
+                            shadowed_text(s, self.snapshot.project_count),
+                        );
                         if !s.shadowed_in.is_empty() {
                             shadowed.on_hover_text(shadowed_paths(s));
                         }
@@ -4332,7 +4465,7 @@ impl ShellApp {
                         self.start_sign_in(s);
                     }
                 }
-                if self.core.is_some() {
+                if s.plugin.is_none() && self.core.is_some() {
                     ui.add_space(12.0);
                     let form = ui.scope(|ui| self.definition_form(ui, s)).response;
                     self.reveal_definition(s, &form);
@@ -4345,7 +4478,9 @@ impl ShellApp {
                     .max_col_width(col_width)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Status").color(pal.text_muted));
-                        if self.last_known(i) {
+                        if s.scope == Scope::Plugin {
+                            ui.label(PLUGIN_STATUS);
+                        } else if self.last_known(i) {
                             ui.label(format!("{} (last known)", status.label()));
                         } else {
                             ui.label(status.label());
@@ -4365,6 +4500,13 @@ impl ShellApp {
                         )
                         .color(pal.warn),
                     );
+                }
+                if s.scope == Scope::Plugin {
+                    ui.add(
+                        egui::Label::new(RichText::new(PLUGIN_NOT_CHECKED).color(pal.text_muted))
+                            .wrap(),
+                    );
+                    return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
                 ui.horizontal_wrapped(|ui| {
@@ -4485,7 +4627,11 @@ impl ShellApp {
 
     /// Edit (toolbar, Ctrl+E, palette): the selected server's definition, in the form on the General tab.
     fn edit_selected(&mut self) {
-        let Some(s) = self.single_selected().cloned() else {
+        let Some(s) = self
+            .single_selected()
+            .filter(|s| s.scope != Scope::Plugin)
+            .cloned()
+        else {
             return;
         };
         self.tab = DetailTab::General;
@@ -7471,6 +7617,15 @@ fn folder_name(path: &str) -> &str {
 }
 
 fn group_of(s: &ServerRow) -> Group {
+    if let Some(p) = &s.plugin {
+        let title = format!("{} · {}", s.scope.label(), p.plugin);
+        return Group {
+            full: format!("{title}, from {}", p.marketplace),
+            title,
+            location: Some(p.marketplace.clone()),
+            count: 0,
+        };
+    }
     match (&s.scope, &s.project) {
         (scope, Some(p)) => {
             let trimmed = p.trim_end_matches(['/', '\\']);
@@ -7562,7 +7717,7 @@ struct Badge {
 fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     let pal = theme::palette(ui.ctx());
     let color = if s.enabled { pal.text } else { pal.disabled };
-    ui.add(egui::Label::new(RichText::new(&s.name).color(color)).truncate());
+    ui.add(egui::Label::new(RichText::new(short_name(s)).color(color)).truncate());
     let loud = |text: &str, fill: Color32, hover: Option<&str>| Badge {
         text: text.to_owned(),
         fill,
@@ -7577,7 +7732,16 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     if s.approval == Some(Approval::Rejected) {
         badges.push(loud("rejected", pal.danger, None));
     }
-    if s.shadowed {
+    let same_as = s.plugin.as_ref().and_then(|p| p.same_as.as_deref());
+    if let (true, Some(same)) = (s.shadowed, same_as) {
+        badges.push(loud(
+            "left out",
+            pal.warn,
+            Some(&format!(
+                "Claude Code leaves this server out: {same} has the same command or address"
+            )),
+        ));
+    } else if s.shadowed {
         badges.push(loud(
             "shadowed",
             pal.warn,
@@ -7602,14 +7766,25 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         ));
     }
     // The toggle is per project: a user server can be off in some and on in others.
-    if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
+    if matches!(s.scope, Scope::User | Scope::Plugin) && s.enabled && s.disabled_in > 0 {
         badges.push(loud(
             &format!("off in {}/{}", s.disabled_in, project_count),
             pal.warn,
             None,
         ));
     }
-    if !s.shadowed && !s.shadowed_in.is_empty() {
+    if let (false, false, Some(same)) = (s.shadowed, s.shadowed_in.is_empty(), same_as) {
+        badges.push(Badge {
+            text: format!("left out in {}/{}", s.shadowed_in.len(), project_count),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(format!(
+                "In {} of {project_count} projects, Claude Code leaves this server out: {same} has the same \
+                 command or address there. The details name the projects.",
+                s.shadowed_in.len()
+            )),
+        });
+    } else if !s.shadowed && !s.shadowed_in.is_empty() {
         // Often a deliberate per-project override, so quiet; hidden everywhere is the one worth acting on.
         badges.push(Badge {
             text: format!("shadowed in {}/{}", s.shadowed_in.len(), project_count),
@@ -7711,6 +7886,12 @@ fn status_cell(
         );
         return;
     }
+    // Never checked here: where its status is, not a check still to come.
+    if s.scope == Scope::Plugin {
+        ui.label(RichText::new(PLUGIN_STATUS).color(pal.text_muted))
+            .on_hover_text(PLUGIN_NOT_CHECKED);
+        return;
+    }
     let color = match status {
         Status::Connected => pal.success,
         Status::Degraded | Status::NeedsAuth | Status::PendingApproval => pal.warn,
@@ -7761,6 +7942,12 @@ fn status_cell(
         }
     }
 }
+
+/// A plugin's server's status, in the list and the details: where to see it.
+const PLUGIN_STATUS: &str = "See /mcp";
+/// Why Klefki has no status for a plugin's server, and where it is.
+const PLUGIN_NOT_CHECKED: &str =
+    "Klefki does not check a plugin's servers. In Claude Code, /mcp shows their status.";
 
 /// Seconds the pointer rests on a failed status before it is explained.
 const EXPLAIN_AFTER: f64 = 0.1;
@@ -7821,11 +8008,44 @@ fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::text::Layout
     job
 }
 
+/// The name the list shows: a plugin's server without the `plugin:<plugin>:` its group header already says. The
+/// details show the whole name, which is the one Claude Code's `/mcp` shows.
+fn short_name(s: &ServerRow) -> &str {
+    s.plugin
+        .as_ref()
+        .and_then(|p| {
+            s.name
+                .strip_prefix("plugin:")?
+                .strip_prefix(p.plugin.as_str())?
+                .strip_prefix(':')
+        })
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(&s.name)
+}
+
+/// What the details say under a plugin's server.
+fn plugin_read_only(p: &klefki_core::api::PluginInfo) -> String {
+    format!(
+        "Read-only: Claude Code reads this server from the plugin {}. Change it in the plugin, or turn the plugin \
+         off in Claude Code (/plugin).",
+        p.plugin
+    )
+}
+
 /// At most this many projects are named where a server is shadowed; the rest are counted.
 const SHADOWED_NAMED: usize = 5;
 
 /// Where another server of the same name is used instead of `s`, for the detail panel.
 fn shadowed_text(s: &ServerRow, project_count: usize) -> String {
+    if let Some(same) = s.plugin.as_ref().and_then(|p| p.same_as.as_deref()) {
+        return if s.shadowed {
+            format!("in every project: {same} has the same command or address")
+        } else {
+            let mut text = shadowed_in_text(s, project_count);
+            text.push_str(&format!(" ({same} has the same command or address)"));
+            text
+        };
+    }
     if s.shadowed_in.is_empty() {
         let text = if !s.shadowed {
             "no"
@@ -7836,6 +8056,11 @@ fn shadowed_text(s: &ServerRow, project_count: usize) -> String {
         };
         return text.to_owned();
     }
+    shadowed_in_text(s, project_count)
+}
+
+/// The projects `s` is shadowed in, by folder name, at most a few.
+fn shadowed_in_text(s: &ServerRow, project_count: usize) -> String {
     let count = s.shadowed_in.len();
     let mut text = if s.shadowed {
         format!("in all {count} projects: ")
@@ -8132,6 +8357,7 @@ mod tests {
             relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
+            plugin: None,
         };
         let mut h = harness_with(Snapshot {
             servers: vec![row("REMOTE_1"), row("REMOTE_2")],
@@ -8259,6 +8485,7 @@ mod tests {
             relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
+            plugin: None,
         }
     }
 
@@ -11032,6 +11259,160 @@ mod tests {
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::Delete { id: a.id() }])]
+        );
+    }
+
+    fn plugin_row(name: &str, same_as: Option<&str>) -> ServerRow {
+        ServerRow {
+            plugin: Some(klefki_core::api::PluginInfo {
+                plugin: "docs".into(),
+                marketplace: "team".into(),
+                same_as: same_as.map(str::to_owned),
+                written_target: None,
+            }),
+            shadowed: same_as.is_some(),
+            ..live_row(name, Scope::Plugin, None)
+        }
+    }
+
+    #[test]
+    fn a_plugins_server_is_shown_but_nothing_changes_checks_or_exports_it() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let p = plugin_row("plugin:docs:search", None);
+        engine.events.send(snapshot_of(vec![p.clone()])).unwrap();
+        h.run();
+        // Under its plugin, by its own name; the details give the name Claude Code uses.
+        h.get_by_label("Plugin · docs, from team");
+        h.get_by_label("search").click();
+        h.run();
+        drain(&engine);
+        h.get_by_label("plugin:docs:search");
+        h.get_by_label("docs, from team");
+        h.get_by_label_contains("Read-only: Claude Code reads this server from the plugin docs.");
+        // No form to edit it in.
+        assert!(h.query_by_label("Review and save…").is_none());
+        for glyph in [
+            icon::TOGGLE_RIGHT,
+            icon::TOGGLE_LEFT,
+            icon::TRASH,
+            icon::PENCIL_SIMPLE,
+            icon::COPY,
+            icon::ARROW_FAT_LINES_RIGHT,
+            icon::EXPORT,
+            icon::SIGN_IN,
+        ] {
+            assert!(
+                h.get_by_label(glyph).accesskit_node().is_disabled(),
+                "{glyph}"
+            );
+        }
+        // The list says where its status is.
+        h.get_by_label("See /mcp");
+        // The note saying so comes first, before anyone looks for Edit.
+        let note = h
+            .get_by_label_contains("Read-only: Claude Code reads this server")
+            .rect()
+            .top();
+        assert!(note < h.get_by_label("docs, from team").rect().top());
+        // Nor through the keyboard or the palette; Del says why it does nothing.
+        h.key_press(egui::Key::Delete);
+        h.run();
+        h.get_by_label_contains("plugin:docs:search comes from the plugin docs");
+        h.key_press(egui::Key::Space);
+        for key in [egui::Key::E, egui::Key::D] {
+            h.key_press_modifiers(egui::Modifiers::COMMAND, key);
+        }
+        h.key_press_modifiers(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::M,
+        );
+        h.run();
+        let offered: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
+        assert!(
+            !offered
+                .iter()
+                .any(|t| t.contains("plugin:docs:search") && !t.starts_with("Go to")),
+            "{offered:?}"
+        );
+        // The Status tab says where its status is; nothing to check it with.
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Klefki does not check a plugin's servers");
+        assert!(h.query_by_label("Check now").is_none());
+        assert!(h.query_by_label("Diagnose").is_none());
+        assert_eq!(drain(&engine), Vec::<Command>::new());
+    }
+
+    #[test]
+    fn a_plugins_server_claude_code_leaves_out_says_which_server_it_repeats() {
+        let (mut h, engine) = live_harness();
+        let user = live_row("events", Scope::User, None);
+        let p = plugin_row("plugin:docs:events", Some("events"));
+        engine.events.send(snapshot_of(vec![user, p])).unwrap();
+        h.run();
+        h.get_by_label("left out");
+        h.get_by_label("Plugin · docs, from team");
+        h.get_all_by_label("events").nth(1).unwrap().click();
+        h.run();
+        h.get_by_label("Left out");
+        h.get_by_label("in every project: events has the same command or address");
+        // No tabs for values or sign-in: there is no definition here to show them from.
+        assert!(h.query_by_label("Env").is_none());
+        assert!(h.query_by_label("Auth").is_none());
+    }
+
+    #[test]
+    fn a_selection_with_a_plugins_server_acts_on_the_others_and_says_what_it_left_out() {
+        let (mut h, engine) = live_harness();
+        let user = live_row("alpha", Scope::User, None);
+        let p = plugin_row("plugin:docs:search", None);
+        engine
+            .events
+            .send(snapshot_of(vec![user.clone(), p]))
+            .unwrap();
+        h.run();
+        h.state_mut().selected = BTreeSet::from([0, 1]);
+        h.run();
+        for glyph in [icon::TOGGLE_LEFT, icon::TRASH, icon::EXPORT] {
+            assert!(
+                !h.get_by_label(glyph).accesskit_node().is_disabled(),
+                "{glyph}"
+            );
+        }
+        // Edit takes one server; this selection holds two.
+        assert!(
+            h.get_by_label(icon::PENCIL_SIMPLE)
+                .accesskit_node()
+                .is_disabled()
+        );
+        drain(&engine);
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: user.id(),
+                enabled: false
+            }])]
+        );
+        h.get_by_label_contains("Left out 1 plugin server");
+        let offered: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
+        assert!(offered.contains(&"Turn on alpha".to_owned()), "{offered:?}");
+        // Export takes the rest too.
+        h.state_mut().plan = None;
+        h.state_mut().preparing = false;
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Export(vec![user.id()])]);
+
+        // Only plugin servers selected: the buttons are off, and their hint names the server.
+        h.state_mut().exporting = None;
+        h.state_mut().selected = BTreeSet::from([1]);
+        h.run();
+        assert_eq!(
+            h.state().read_only_hint().as_deref(),
+            Some("plugin:docs:search comes from a plugin and is changed there")
         );
     }
 

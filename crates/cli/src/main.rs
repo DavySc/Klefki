@@ -72,7 +72,13 @@ fn export(names: &[String], output: Option<&std::path::Path>, force: bool) -> u8
     let snapshot = api::load_snapshot();
     warn(&snapshot);
     let ids: Vec<_> = match select(&snapshot, names) {
-        Ok(rows) => rows.into_iter().map(ServerRow::id).collect(),
+        // Everything means every server Klefki can export: a plugin's come with the plugin. One named is tried,
+        // and the export says why it was left out.
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| !names.is_empty() || r.scope != Scope::Plugin)
+            .map(ServerRow::id)
+            .collect(),
         Err(why) => return usage(&why),
     };
     let exported = api::export(&ids);

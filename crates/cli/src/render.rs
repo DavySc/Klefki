@@ -45,6 +45,8 @@ pub enum Outcome {
     Rejected,
     /// A project server not named on the command line: checking it may run the repository's command.
     ProjectServer,
+    /// A plugin's server: Klefki does not check those (decision 008).
+    Plugin,
     /// Asked, but no answer came in time.
     NoAnswer,
 }
@@ -55,7 +57,7 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.status != Status::Connected,
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => false,
+            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => false,
         }
     }
 
@@ -64,7 +66,7 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.failed(),
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => false,
+            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => false,
         }
     }
 
@@ -75,7 +77,9 @@ impl Outcome {
 
 /// Why `status` leaves this row out, if it does. Named servers are checked unless Claude Code would not run them.
 pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
-    if !row.enabled {
+    if row.scope == Scope::Plugin {
+        Some(Outcome::Plugin)
+    } else if !row.enabled {
         Some(Outcome::Off)
     } else if row.approval == Some(Approval::Rejected) {
         Some(Outcome::Rejected)
@@ -217,13 +221,27 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         Some(Approval::Rejected) => notes.push("rejected".to_owned()),
         Some(Approval::Approved) | None => {}
     }
-    if row.scope == Scope::User && row.enabled && row.disabled_in > 0 {
+    // A plugin's server, like a user server, is one row for every project.
+    let everywhere = matches!(row.scope, Scope::User | Scope::Plugin);
+    if let Some(plugin) = &row.plugin {
+        notes.push(format!("from the plugin {}", plugin.plugin));
+    }
+    if everywhere && row.enabled && row.disabled_in > 0 {
         notes.push(format!(
             "off in {} of {project_count} projects",
             row.disabled_in
         ));
     }
-    if row.shadowed {
+    if let Some(same) = row.plugin.as_ref().and_then(|p| p.same_as.as_deref()) {
+        notes.push(if row.shadowed {
+            format!("left out: same as {same}")
+        } else {
+            format!(
+                "left out in {} of {project_count} projects: same as {same}",
+                row.shadowed_in.len()
+            )
+        });
+    } else if row.shadowed {
         notes.push(if row.scope == Scope::User {
             "shadowed in every project".to_owned()
         } else {
@@ -281,6 +299,7 @@ fn scope_key(scope: Scope) -> &'static str {
         Scope::User => "user",
         Scope::Local => "local",
         Scope::Project => "project",
+        Scope::Plugin => "plugin",
     }
 }
 
@@ -323,7 +342,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     o.insert("transport".into(), json!(transport_key(row.transport)));
     o.insert("target".into(), json!(row.target));
     o.insert("enabled".into(), json!(row.enabled));
-    if row.scope == Scope::User {
+    if matches!(row.scope, Scope::User | Scope::Plugin) {
         o.insert("disabled_in".into(), json!(row.disabled_in));
         o.insert("project_count".into(), json!(project_count));
     }
@@ -332,6 +351,13 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     if row.scope == Scope::User {
         o.insert("shadowed_in".into(), json!(row.shadowed_in));
         o.insert("relative_paths".into(), json!(row.relative_paths));
+    }
+    if let Some(plugin) = &row.plugin {
+        o.insert("shadowed_in".into(), json!(row.shadowed_in));
+        o.insert(
+            "plugin".into(),
+            json!({"name": plugin.plugin, "marketplace": plugin.marketplace, "same_as": plugin.same_as, "written_target": plugin.written_target}),
+        );
     }
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
@@ -411,6 +437,10 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
         Outcome::Rejected => (
             "Rejected".to_owned(),
             "not checked: rejected for this project, so Claude Code does not run it".to_owned(),
+        ),
+        Outcome::Plugin => (
+            NOT_CHECKED.to_owned(),
+            "not checked: it comes from a plugin; Claude Code's /mcp shows its status".to_owned(),
         ),
         Outcome::ProjectServer => {
             let label = match row.status {
@@ -495,7 +525,7 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
                 Status::Checking | Status::Unknown => "check failed",
             },
             Outcome::NoAnswer => "no answer",
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => {
+            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => {
                 skipped += 1;
                 continue;
             }
@@ -535,6 +565,7 @@ pub fn status_json(
                 Outcome::Off => Some("off"),
                 Outcome::Rejected => Some("rejected"),
                 Outcome::ProjectServer => Some("project_server"),
+                Outcome::Plugin => Some("plugin"),
                 Outcome::Checked(_) | Outcome::NoAnswer => None,
             };
             let (status, detail, hint) = match outcome {
@@ -550,7 +581,9 @@ pub fn status_json(
                     c.hint.as_ref(),
                 ),
                 Outcome::NoAnswer => (Some("no_answer"), Some(NO_ANSWER.to_owned()), None),
-                Outcome::Off | Outcome::Rejected | Outcome::ProjectServer => (None, None, None),
+                Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => {
+                    (None, None, None)
+                }
             };
             o.insert("checked".into(), json!(outcome.was_checked()));
             o.insert("skipped".into(), json!(skipped));
@@ -729,6 +762,40 @@ mod tests {
         let lines = text.lines().filter(|l| l.starts_with("  ")).count();
         assert_eq!(lines, s.servers.len(), "{text}");
         assert!(!text.lines().any(|l| l.ends_with(' ')), "{text:?}");
+    }
+
+    #[test]
+    fn a_plugins_servers_are_listed_after_the_users_say_where_from_and_are_not_checked() {
+        let s = fixture_snapshot();
+        let rows = ordered(&s.servers);
+        let heads: Vec<String> = rows.iter().map(|r| heading(r, None)).collect();
+        let first_plugin = heads.iter().position(|h| h == "Plugin").unwrap();
+        assert!(
+            heads[..first_plugin].iter().all(|h| h == "User"),
+            "{heads:?}"
+        );
+        let text = list_text(&s, &rows, None);
+        assert!(text.contains("\nPlugin\n"), "{text}");
+        assert!(text.contains("(from the plugin docs-search)"), "{text}");
+        assert!(
+            text.contains("(from the plugin events; left out: same as legacy-events)"),
+            "{text}"
+        );
+        let plugin = s.servers.iter().find(|r| r.scope == Scope::Plugin).unwrap();
+        assert!(matches!(skip(plugin, true), Some(Outcome::Plugin)));
+        let status = status_text(&[(plugin, Outcome::Plugin)], None);
+        assert!(
+            status.contains("not checked: it comes from a plugin"),
+            "{status}"
+        );
+        let json: Value = serde_json::from_str(&list_json(&s, &[plugin])).unwrap();
+        let row = &json["servers"][0];
+        assert_eq!(row["scope"], "plugin");
+        assert_eq!(
+            row["plugin"],
+            json!({"name": "docs-search", "marketplace": "team-plugins", "same_as": null, "written_target": null})
+        );
+        assert_eq!(row["disabled_in"], 0);
     }
 
     #[test]
