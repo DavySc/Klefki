@@ -54,6 +54,16 @@ and local scope, and PLAN's model-based test as the acceptance bar.
   secret leaves Claude Code without one, and Put back is the only way left to hand it over. Klefki never reads
   Claude Code's credentials, so it cannot tell that case from stopping between the add and moving its own copy;
   that window (milliseconds) now leaves the definition offered too, which is safe: Put back or Forget.
+- **A kept definition's place stays free** until it is put back or forgotten (2026-10-19): Klefki's copy of its
+  client secret is filed under that place, and a copy, move, rename or add of a server there would replace or delete
+  it (a copy without a Klefki secret deletes the one at its new place), or let that server claim it later (its Auth
+  tab, a move away). Such a change is refused at review, and again just before Claude Code's command runs, with
+  "Put it back or forget it on the Connections page first, or choose another name or place." Alternative not taken:
+  keeping the kept secret under the recovery record's own key, so the place could be reused; it needs a second key
+  scheme in the keyring and a migration, for a case the user can clear in one step.
+- **The listing opens the system's store** when a change got through (2026-10-19): it was given only a test's store,
+  so in the app it took every such change as done and never checked or moved Klefki's copy. A store that cannot be
+  opened keeps the definition listed.
 - **Klefki's keyring copy** is moved (or a stale copy at the new place deleted) before the recovery file is
   discarded; a keyring failure after Claude Code succeeded is a note, not a failure.
 - **Progress:** each of Claude Code's commands is announced (`Event::Applying`), and the dialog asks to keep Klefki

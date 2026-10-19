@@ -923,6 +923,14 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         let mut fresh = fresh;
         fresh.snapshot.kept = kept_list(shared);
         let mut resolved = ops::resolve(changes, &fresh.snapshot, &fresh.keys)?;
+        // A kept definition's place stays free until it is put back or forgotten: its client secret is filed there.
+        let arrivals = resolved.arrivals();
+        if !arrivals.is_empty() {
+            let dir = backup_dir(shared)?;
+            for spot in &arrivals {
+                swap::free_of_kept(&dir, spot)?;
+            }
+        }
         if let Ok(Some((text, _))) = &read {
             resolved.warnings.extend(stays_off(changes, text));
         }
@@ -1355,6 +1363,19 @@ fn add_with_claude(
             None => "for the user".to_owned(),
             Some(p) => format!("in {}", sanitize(&ops::folder_name(p))),
         };
+        // Checked again here: a change in another Klefki may have kept a definition there since the review.
+        let spot = swap::Spot {
+            project: add.project.clone(),
+            name: add.name.clone(),
+        };
+        if let Some(dir) = &shared.config.backup_dir
+            && let Err(why) = swap::free_of_kept(dir, &spot)
+        {
+            return Err(format!(
+                "{name} was not added {place}: {why}{}",
+                done(added)
+            ));
+        }
         let mut args = vec![
             "mcp",
             "add-json",
@@ -1574,7 +1595,8 @@ fn kept_list(shared: &Shared) -> Vec<crate::api::Kept> {
     let (Some(dir), Some(paths)) = (&shared.config.backup_dir, &shared.config.paths) else {
         return Vec::new();
     };
-    swap::Recovery::list(dir, &paths.claude_json, shared.config.secrets.as_deref())
+    // The system's store is opened only when a listing needs it: opening it can be slow, or ask the user.
+    swap::Recovery::list(dir, &paths.claude_json, &|| secret_store(shared).ok())
         .into_iter()
         .map(|(r, back)| crate::api::Kept {
             id: r.id,

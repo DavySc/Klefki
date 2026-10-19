@@ -770,6 +770,8 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
         let calls_before = lock(&rig.sim.calls).len();
         // What the step asks, and what the world should look like if it is done.
         let mut expected = before.clone();
+        // Where the step puts a server under a name it did not have there.
+        let mut arrives: Option<Key> = None;
         let changes = match step {
             Step::Edit {
                 pick,
@@ -801,6 +803,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 };
                 let entry = expected.servers.remove(&key).unwrap();
                 let moved = (project, key.1.clone());
+                arrives = Some(moved.clone());
                 expected.servers.insert(moved.clone(), entry);
                 // Klefki's copy of a client secret goes with a server that signs in.
                 if entry_signs_in(&before.servers[&key]) {
@@ -831,6 +834,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                     key.1.clone()
                 };
                 let copy = (project, name.clone());
+                arrives = Some(copy.clone());
                 expected
                     .servers
                     .insert(copy.clone(), before.servers[&key].clone());
@@ -854,6 +858,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 let key = picked(*pick);
                 let entry = expected.servers.remove(&key).unwrap();
                 let name = format!("{}_r", key.1);
+                arrives = Some((key.0.clone(), name.clone()));
                 expected
                     .servers
                     .insert((key.0.clone(), name.clone()), entry);
@@ -916,6 +921,18 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 }
             }
             _ => {}
+        }
+        // A kept definition's place stays free until it is put back or forgotten: Klefki's copy of its client secret
+        // is filed there, and a server arriving there would replace or delete it. The listing the review makes first
+        // may drop some (see [`settled`]).
+        if let Some((project, name)) = &arrives {
+            let waiting = settled(&before, &going, *store_fault)
+                .kept
+                .values()
+                .any(|(p, n, _)| same_place(p, project) && n == name);
+            if waiting {
+                prop_assert!(matches!(outcome, Outcome::Refused(_)), "{}", said);
+            }
         }
 
         // The configuration's other keys, their values and their order.
@@ -1589,6 +1606,195 @@ fn a_copy_left_behind_is_not_deleted_when_a_server_is_put_back_there_meanwhile()
     assert_eq!(world.servers.get(&from), Some(&definition(true, 0, 0)));
     assert_eq!(
         world.klefki.get(&connection(&from)).map(String::as_str),
+        Some("sec-a")
+    );
+}
+
+/// What a change into the place `a`'s kept definition came from (pb) must leave: refused, with nothing changed, and
+/// the kept definition still there with its client secret, so that putting it back hands that secret over again.
+fn refused_into_the_kept_place(rig: &Rig, from: &Key, changes: Vec<Change>) {
+    let before = rig.world();
+    let outcome = rig.run(changes);
+    let Outcome::Refused(why) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(why.contains("Put it back or forget it"), "{why}");
+    let after = rig.world();
+    assert_eq!(after.servers, before.servers);
+    assert_eq!(after.kept, before.kept);
+    assert_eq!(after.klefki, before.klefki);
+    assert_eq!(after.creds, before.creds);
+    let kept = after.kept.into_keys().next().expect("still kept");
+    let outcome = rig.run(vec![Change::PutBack { kept }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert_eq!(world.servers.get(from), Some(&definition(true, 0, 0)));
+    assert_eq!(
+        world
+            .creds
+            .get(&sign_in_key("a", &world.servers[from]))
+            .map(String::as_str),
+        Some("sec-a")
+    );
+    assert_eq!(
+        world.klefki.get(&connection(from)).map(String::as_str),
+        Some("sec-a")
+    );
+}
+
+#[test]
+fn a_copy_into_the_place_a_kept_definition_came_from_is_refused_and_its_secret_kept() {
+    // Seen while probing the seed above: a copy into the place a kept definition came from replaced Klefki's copy of
+    // its client secret with the copy's own, so putting it back handed Claude Code the wrong one. The model missed it,
+    // as its secrets were the same there.
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    let a = (None, "a".to_owned());
+    lock(&rig.store.inner.values).insert(connection(&a), "sec-other".to_owned());
+    refused_into_the_kept_place(
+        &rig,
+        &from,
+        vec![Change::Duplicate {
+            id: rig.id(&a),
+            name: "a".into(),
+            targets: vec![Target::Local(rig.projects[1].clone())],
+        }],
+    );
+}
+
+#[test]
+fn a_copy_without_a_secret_into_the_place_a_kept_definition_came_from_is_refused_and_its_secret_kept()
+ {
+    // The variant: the copy's source has no Klefki copy of a client secret, and the copy deleted the kept one.
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    let a = (None, "a".to_owned());
+    lock(&rig.store.inner.values).remove(&connection(&a));
+    refused_into_the_kept_place(
+        &rig,
+        &from,
+        vec![Change::Duplicate {
+            id: rig.id(&a),
+            name: "a".into(),
+            targets: vec![Target::Local(rig.projects[1].clone())],
+        }],
+    );
+}
+
+#[test]
+fn a_move_into_the_place_a_kept_definition_came_from_is_refused_and_its_secret_kept() {
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    let a = (None, "a".to_owned());
+    lock(&rig.store.inner.values).insert(connection(&a), "sec-other".to_owned());
+    refused_into_the_kept_place(
+        &rig,
+        &from,
+        vec![Change::Move {
+            id: rig.id(&a),
+            to: Target::Local(rig.projects[1].clone()),
+        }],
+    );
+}
+
+#[test]
+fn adding_a_server_into_the_place_a_kept_definition_came_from_is_refused_and_its_secret_kept() {
+    // A new server that signs in, with a client secret typed in, would take Klefki's store's place for the kept one.
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    refused_into_the_kept_place(
+        &rig,
+        &from,
+        vec![Change::Add {
+            name: "a".into(),
+            json: definition(true, 2, 0).to_string(),
+            targets: vec![Target::Local(rig.projects[1].clone())],
+            secret: Some(Secret::new("sec-new".to_owned())),
+        }],
+    );
+}
+
+#[test]
+fn a_plain_copy_into_the_place_a_kept_definition_came_from_is_refused() {
+    // A server that does not sign in touches no secret, but would stand where the kept one goes back, and the
+    // Auth tab and a later move of a server there would then take the kept secret for their own.
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    refused_into_the_kept_place(
+        &rig,
+        &from,
+        vec![Change::Duplicate {
+            id: rig.id(&(None, "p".to_owned())),
+            name: "a".into(),
+            targets: vec![Target::Local(rig.projects[1].clone())],
+        }],
+    );
+}
+
+#[test]
+fn a_rename_into_the_place_a_kept_definition_came_from_is_refused() {
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    refused_into_the_kept_place(
+        &rig,
+        &from,
+        vec![Change::Rename {
+            id: rig.id(&(Some(rig.projects[1].clone()), "c".to_owned())),
+            name: "a".into(),
+        }],
+    );
+}
+
+#[test]
+fn a_copy_reviewed_before_a_definition_was_kept_in_its_place_is_refused_when_applied() {
+    // The review saw the place free; by the time the copy runs, a failed move from there keeps a definition there.
+    let rig = start();
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let a = (None, "a".to_owned());
+    let pb = rig.projects[1].clone();
+    rig.core.send(Command::Prepare(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(pb.clone())],
+    }]));
+    let plan = loop {
+        match rig.next() {
+            Event::PlanReady(plan) => break plan,
+            Event::PlanFailed(why) => panic!("{why}"),
+            _ => {}
+        }
+    };
+    // `a` copied into pb, then that copy's move to pa fails three times, so its definition is kept.
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(pb.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let from = (Some(pb), "a".to_owned());
+    *lock(&rig.sim.faults) = [Fault::FailsAfter, Fault::FailsBefore, Fault::FailsBefore].into();
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&from),
+        to: Target::Local(rig.projects[0].clone()),
+    }]);
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    lock(&rig.store.inner.values).insert(connection(&a), "sec-other".to_owned());
+    let before = rig.world();
+    assert_eq!(before.kept.len(), 1);
+    rig.core.send(Command::Apply(plan.id));
+    let error = loop {
+        match rig.next() {
+            Event::ApplyFailed { plan: id, error } if id == plan.id => break error,
+            Event::Applied { plan: id, .. } if id == plan.id => panic!("applied"),
+            _ => {}
+        }
+    };
+    assert!(error.contains("Put it back or forget it"), "{error}");
+    let after = rig.world();
+    assert_eq!(after.servers, before.servers);
+    assert_eq!(after.kept, before.kept);
+    assert_eq!(
+        after.klefki.get(&connection(&from)).map(String::as_str),
         Some("sec-a")
     );
 }
