@@ -95,6 +95,10 @@ impl crate::secrets::SecretStore for Flaky {
         }
         self.inner.delete(id)
     }
+
+    fn list(&self) -> Result<Vec<ConnectionId>, crate::secrets::SecretError> {
+        self.inner.list()
+    }
 }
 
 /// The stand-in for Claude Code's `mcp add-json` and `mcp remove`: it changes `.claude.json` as Claude Code does

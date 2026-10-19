@@ -29,6 +29,7 @@ Store (MSIX) location, without ever writing to that file, and without costing an
   (no read at start-up; read twice; file bytes, mtime and folder unchanged) and 8 app tests in `desktop.rs`.
 - Full verify exit 0 on 99f3ab3 + this branch: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D
   warnings`, `cargo test --workspace` (core 673, app 323, cli 18 + 25), `cargo deny check` ok.
+- Merged main 4b8fb5a (Secrets page) in: nav, go(), events and the top bar filter keep both pages. Full verify exit 0 again (core 689, app 332, cli 18 + 25), `cargo deny` ok.
 - Real app under Xvfb with a temp `HOME`/`CLAUDE_CONFIG_DIR` and a sample config: page at 1200x720 and 800x480.
 
 ## Not verified here

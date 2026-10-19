@@ -54,18 +54,15 @@ impl Page {
     fn ready(self) -> bool {
         matches!(
             self,
-            Page::Connections | Page::Desktop | Page::Settings | Page::ActivityLog
+            Page::Connections | Page::Desktop | Page::Secrets | Page::Settings | Page::ActivityLog
         )
     }
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections | Page::Desktop | Page::ActivityLog => "",
+            Page::Connections | Page::Desktop | Page::Secrets | Page::ActivityLog => "",
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
-            }
-            Page::Secrets => {
-                "Coming soon: the secrets Klefki keeps in your system keychain, and any that nothing uses any more."
             }
             Page::Settings => {
                 "Coming soon: choosing where Claude Code is, and how often to check servers."
@@ -344,6 +341,8 @@ pub struct ShellApp {
     pub activity: Option<crate::activity::ActivityPage>,
     /// The Claude Desktop page while it is shown; like the Activity log, read when opened and let go when left.
     pub desktop: Option<crate::desktop::DesktopPage>,
+    /// The Secrets page while it is shown; `None` on every other page, like the Activity log.
+    pub secrets: Option<crate::secrets::SecretsPage>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -406,6 +405,7 @@ impl ShellApp {
             page: Page::Connections,
             activity: None,
             desktop: None,
+            secrets: None,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -427,8 +427,8 @@ impl ShellApp {
         }
     }
 
-    /// Shows `page`. The Activity log and Claude Desktop's servers are read each time their page is opened and let
-    /// go when it is left.
+    /// Shows `page`. The Activity log, Claude Desktop's servers and the Secrets page are read each time they are
+    /// opened and let go when they are left.
     fn go(&mut self, page: Page) {
         if page == Page::ActivityLog {
             if self.activity.is_none() {
@@ -446,7 +446,34 @@ impl ShellApp {
         } else {
             self.desktop = None;
         }
+        if page == Page::Secrets {
+            if self.secrets.is_none() {
+                self.secrets = Some(crate::secrets::SecretsPage::default());
+                self.send(Command::Secrets);
+            }
+        } else {
+            self.secrets = None;
+        }
         self.page = page;
+    }
+
+    /// `id` on the Connections page, selected and in view, at `tab`. Where the Secrets page's Open leads.
+    fn show_server(&mut self, id: &ServerId, tab: crate::secrets::Tab) {
+        self.go(Page::Connections);
+        let Some(i) = self.snapshot.servers.iter().position(|r| r.is(id)) else {
+            return;
+        };
+        if !self.visible().contains(&i) {
+            // A search that hides it would hide what was asked for.
+            self.search.clear();
+        }
+        self.selected = BTreeSet::from([i]);
+        self.reveal = Some(i);
+        self.tab = match tab {
+            crate::secrets::Tab::General => DetailTab::General,
+            crate::secrets::Tab::Env => DetailTab::HeadersEnv,
+            crate::secrets::Tab::Auth => DetailTab::Auth,
+        };
     }
 
     /// Re-reads the configuration and re-checks every server; on the Claude Desktop page, its file too.
@@ -479,11 +506,41 @@ impl ShellApp {
         {
             self.send(Command::Activity);
         }
+        // Anything that can change where secrets are, while the Secrets page is shown: read it again. What is shown
+        // stays until the answer arrives.
+        // A file change (Claude Code saves often) does not ask the system's store again: that can prompt to unlock it.
+        if self.secrets.is_some() {
+            match event {
+                Event::Snapshot(_) => self.send(Command::SecretsAfterFileChange),
+                Event::Applied { changed: true, .. }
+                | Event::ApplyFailed { .. }
+                | Event::SecretStatus { .. } => self.send(Command::Secrets),
+                _ => {}
+            }
+        }
         match event {
             Event::Desktop(desktop) => {
                 // Not kept once the page is left: it is read again when the page is opened.
                 if let Some(page) = &mut self.desktop {
                     page.set(desktop);
+                }
+            }
+            Event::Secrets(report) => {
+                if let Some(page) = &mut self.secrets {
+                    page.report = Some(report);
+                }
+            }
+            Event::UnusedSecretForgotten { connection, result } => {
+                if let Some(page) = &mut self.secrets {
+                    let name = page
+                        .report
+                        .as_ref()
+                        .and_then(|r| r.unused.iter().find(|u| u.connection == connection))
+                        .map_or_else(|| "the server".to_owned(), |u| u.name.clone());
+                    page.outcome = Some(match result {
+                        Ok(()) => (format!("Forgot the client secret kept for {name}."), false),
+                        Err(why) => (format!("Kept the client secret for {name}: {why}"), true),
+                    });
                 }
             }
             Event::Activity(log) => {
@@ -1122,6 +1179,23 @@ impl ShellApp {
                         page.show(ui, &self.snapshot);
                     }
                 }
+                Page::Secrets => {
+                    let live = self.core.is_some();
+                    let asked = self.secrets.as_mut().and_then(|page| page.show(ui, live));
+                    match asked {
+                        Some(crate::secrets::Asked::Open(id, tab)) => self.show_server(&id, tab),
+                        Some(crate::secrets::Asked::Forget(connection)) => {
+                            self.send(Command::ForgetUnusedSecret(connection));
+                        }
+                        Some(crate::secrets::Asked::Reload) => {
+                            if let Some(page) = &mut self.secrets {
+                                page.outcome = None;
+                            }
+                            self.send(Command::Secrets);
+                        }
+                        None => {}
+                    }
+                }
                 Page::ActivityLog => {
                     let restore = self.activity.as_mut().and_then(|page| page.show(ui));
                     if let Some(backup) = restore {
@@ -1200,19 +1274,26 @@ impl ShellApp {
                 // On the Activity log it filters the changes, and says so: a box that filtered the hidden list of
                 // servers would find nothing there.
                 // The shortcut is left out there, so the longer words fit the box.
-                let (query, hint) = match (&mut self.activity, &mut self.desktop) {
-                    (Some(page), _) => (
+                let (query, hint) = if let Some(page) = &mut self.activity {
+                    (
                         &mut page.filter,
                         format!("{} Filter changes", icon::MAGNIFYING_GLASS),
-                    ),
-                    (None, Some(page)) => (
+                    )
+                } else if let Some(page) = &mut self.secrets {
+                    (
+                        &mut page.filter,
+                        format!("{} Filter secrets", icon::MAGNIFYING_GLASS),
+                    )
+                } else if let Some(page) = &mut self.desktop {
+                    (
                         &mut page.filter,
                         format!("{} Filter servers", icon::MAGNIFYING_GLASS),
-                    ),
-                    (None, None) => (
+                    )
+                } else {
+                    (
                         &mut self.search,
                         format!("{} Filter  {}", icon::MAGNIFYING_GLASS, shortcut("F")),
-                    ),
+                    )
                 };
                 ui.add(
                     egui::TextEdit::singleline(query)
@@ -13387,7 +13468,7 @@ mod tests {
     fn a_page_that_is_not_built_says_what_it_will_do_and_leads_back() {
         let mut h = harness();
         h.run();
-        h.get_by_label_contains("Secrets").click();
+        h.get_by_label_contains("Scope drift").click();
         h.run();
         h.get_by_label_contains("Coming soon");
         h.get_by_label("Back to connections").click();
