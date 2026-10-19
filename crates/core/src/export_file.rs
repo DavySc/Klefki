@@ -68,6 +68,10 @@ impl ShownDialog {
     pub(crate) fn open(open: &OpenDialog, name: &str, owner: Option<&dyn Owner>) -> Self {
         let opened = Instant::now();
         let answer = open(name, owner);
+        Self::new(opened, answer)
+    }
+
+    pub(crate) fn new(opened: Instant, answer: Answer) -> Self {
         Self(Arc::new(Mutex::new(Some((opened, answer)))))
     }
 
@@ -94,7 +98,7 @@ impl std::fmt::Debug for ShownDialog {
 
 /// A dialog closed sooner than this was never seen: nobody cancels a save dialog this fast, while a system without
 /// one answers at once. Neither case says which it was, so the time tells them apart.
-const UNSEEN: Duration = Duration::from_millis(150);
+pub(crate) const UNSEEN: Duration = Duration::from_millis(150);
 
 /// No dialog was opened: a path is typed instead, starting from the suggested one.
 pub(crate) fn not_shown(name: &str, home: Option<&Path>) -> FileChoice {

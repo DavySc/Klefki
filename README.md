@@ -6,7 +6,7 @@ A fast, native, cross-platform manager for the MCP servers configured in Claude 
 
 - Built with Rust + egui, for Windows, macOS and Linux.
 - Catppuccin Mocha (dark) and Latte (light) with accents inspired by Klefki, set in JetBrains Mono. Switch with the theme dropdown in the top bar (System, Light, Dark), or `--theme light|dark|system`.
-- Lists every MCP server Claude Code knows about (user, local and project scope; stdio, HTTP, SSE and WebSocket) and lets you edit, duplicate, move, enable/disable, authorize, export and delete them.
+- Lists every MCP server Claude Code knows about (user, local and project scope; stdio, HTTP, SSE and WebSocket) and lets you edit, duplicate, move, enable/disable, authorize, export, import and delete them. Import reads an export (or any `mcpServers` block, or `claude mcp add` commands) from a file, shows what it would add, and adds it only after the same review as every other change.
 - Keeps the original app's security model:
   - the UI never touches files, network, secrets or processes
   - OAuth registrations go through the Claude Code CLI

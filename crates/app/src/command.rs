@@ -27,6 +27,8 @@ pub enum Action {
     /// Move the selected server to another project or the user.
     Move,
     Add,
+    /// Import servers from a file: the system's open dialog, then a preview.
+    Import,
     FixCasing,
     /// Move every old switch-off list (`mcpServersDisabled`) into the one Claude Code reads.
     MigrateLegacy,

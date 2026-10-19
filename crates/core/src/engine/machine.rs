@@ -483,6 +483,7 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             secrets: Some(store.clone()),
             open_url: Arc::new(|_| Ok(())),
             open_dialog: Arc::new(|_, _| Box::pin(std::future::ready(None))),
+            pick_dialog: Arc::new(|_| Box::pin(std::future::ready(None))),
             sign_in_timeout: Duration::from_secs(5),
             changer: Some(changer),
             desktop: crate::desktop::DesktopRoots::default(),

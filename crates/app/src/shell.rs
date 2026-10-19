@@ -9,9 +9,9 @@ use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
     Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Exported,
-    FileChoice, Hint, LegacyDisabled, Part, Pasted, PastedServer, PlanView, SaveError, Scope,
-    Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
-    same_project, secret_reference,
+    FileChoice, Hint, ImportFile, LegacyDisabled, Part, Pasted, PastedServer, PlanView, SaveError,
+    Scope, Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status, Target,
+    TransportKind, same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -196,6 +196,8 @@ struct Outcome {
     undo: Option<Change>,
     /// The change is in the Activity log, with its backup: the card offers to open it.
     logged: bool,
+    /// No file came of asking for one to import: the card offers to type its path instead.
+    type_path: bool,
 }
 
 /// How long a success message stays.
@@ -213,6 +215,7 @@ enum OutcomeChoice {
     SignIn,
     Undo,
     OpenLog,
+    TypePath,
     Dismiss,
 }
 
@@ -336,6 +339,10 @@ pub struct ShellApp {
     /// The file name for a save dialog asked for in this frame: it is opened after drawing, where Klefki's window is
     /// at hand, so that the dialog belongs to it.
     export_choice_asked: Option<String>,
+    /// Import asked for a file: the system's open dialog is opened next, over the window, by its thread.
+    import_choice_asked: bool,
+    /// A file to import was asked for (the dialog, or a path to read) and the engine has not answered yet.
+    import_waiting: bool,
     pub page: Page,
     /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
     pub activity: Option<crate::activity::ActivityPage>,
@@ -401,6 +408,8 @@ impl ShellApp {
             exports_pending: 0,
             export_choices_pending: 0,
             export_choice_asked: None,
+            import_choice_asked: false,
+            import_waiting: false,
             snapshot,
             page: Page::Connections,
             activity: None,
@@ -651,6 +660,7 @@ impl ShellApp {
                             undo: None,
                             sign_in: None,
                             logged: false,
+                            type_path: false,
                         })
                     }
                 }
@@ -736,6 +746,7 @@ impl ShellApp {
                     undo: self.undo_move(changed),
                     sign_in,
                     logged: changed,
+                    type_path: false,
                 });
             }
             Event::Applying { plan, step } => {
@@ -766,6 +777,7 @@ impl ShellApp {
                     undo: None,
                     sign_in: None,
                     logged: false,
+                    type_path: false,
                 });
             }
             Event::Reapplied { .. } => {
@@ -778,6 +790,7 @@ impl ShellApp {
                     undo: None,
                     sign_in: None,
                     logged: false,
+                    type_path: false,
                 });
             }
             Event::Entry { id, json, editable } => {
@@ -814,6 +827,18 @@ impl ShellApp {
                         _ => {}
                     }
                     editor.moved = false;
+                }
+            }
+            Event::ImportFile(file) => {
+                self.import_waiting = false;
+                let in_dialog = self.add.as_ref().is_some_and(|f| f.mode == AddMode::Import);
+                if file != ImportFile::Cancelled {
+                    self.open_import(file);
+                } else if !in_dialog {
+                    // A dialog closed without a file may have been one that could not show a file chooser (a
+                    // desktop portal without one fails slowly, like a cancel): a way on is offered, at no cost to a
+                    // real cancel.
+                    self.note("No file chosen.".to_owned(), true);
                 }
             }
             Event::Exported(exported) => {
@@ -927,6 +952,7 @@ impl ShellApp {
                         undo: None,
                         sign_in: None,
                         logged: false,
+                        type_path: false,
                     });
                 }
             }
@@ -1032,6 +1058,7 @@ impl ShellApp {
             self.refresh();
         }
         let ctx = ui.ctx().clone();
+        self.take_dropped_file(&ctx);
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K))
             && self.plan.is_none()
             && self.duplicate.is_none()
@@ -1089,12 +1116,15 @@ impl ShellApp {
                 self.open_move();
             }
         }
-        // Adding needs no selection, so it works from any page.
+        // Adding and importing need no selection, so they work from any page.
         if idle
             && self.core.is_some()
             && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N))
         {
             self.open_add();
+        }
+        if idle && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+            self.ask_import();
         }
         let pal = theme::palette(ui.ctx());
         self.save_bar_shown = false;
@@ -1603,6 +1633,10 @@ impl ShellApp {
                         (can_sign_in, "select one server that needs you to sign in")
                     }
                     g if g == icon::PLUS => (can_add, "wait for the change under way"),
+                    g if g == icon::TRAY_ARROW_DOWN => (
+                        can_add && !self.import_waiting,
+                        "wait for the change under way",
+                    ),
                     g if g == icon::EXPORT => (can_export, "no server to export"),
                     _ => (can_edit, "select one server"),
                 };
@@ -1619,6 +1653,7 @@ impl ShellApp {
                         g if g == icon::COPY => self.open_duplicate(),
                         g if g == icon::ARROW_FAT_LINES_RIGHT => self.open_move(),
                         g if g == icon::PLUS => self.open_add(),
+                        g if g == icon::TRAY_ARROW_DOWN => self.ask_import(),
                         g if g == icon::EXPORT => self.open_export(),
                         g if g == icon::SIGN_IN => {
                             if let Some(s) = self.single_selected().cloned() {
@@ -1630,11 +1665,21 @@ impl ShellApp {
                 }
             }
             if !self.selected.is_empty() {
-                ui.separator();
-                ui.label(
-                    RichText::new(format!("{} selected", self.selected.len()))
-                        .color(pal.text_muted),
+                // Only beside the buttons: the detail panel says it too, so a line of its own would only push the
+                // list down.
+                let text = RichText::new(format!("{} selected", self.selected.len()))
+                    .color(pal.text_muted);
+                let galley = egui::WidgetText::from(text.clone()).into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::TextStyle::Body,
                 );
+                let needed = galley.size().x + 2.0 * ui.spacing().item_spacing.x + 8.0;
+                if ui.available_width() >= needed {
+                    ui.separator();
+                    ui.add(egui::Label::new(text).extend());
+                }
             }
         });
     }
@@ -1853,6 +1898,13 @@ impl ShellApp {
                 Some(shortcut("N")),
                 command::Action::Add,
             );
+            add(
+                icon::TRAY_ARROW_DOWN,
+                "Import servers from a file".into(),
+                "An export, or any mcpServers block; reviewed before anything is added".into(),
+                Some(shortcut("O")),
+                command::Action::Import,
+            );
             // With a selection, Export is among the actions on it, above.
             if self.selected.is_empty() && self.can_export() {
                 add(
@@ -1911,6 +1963,7 @@ impl ShellApp {
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),
+            A::Import => self.ask_import(),
             A::FixCasing => self.open_casing(),
             A::MigrateLegacy => self.migrate_legacy(),
             A::Export => self.open_export(),
@@ -2790,9 +2843,20 @@ impl ShellApp {
         let addable: Vec<usize> = (0..checked.len())
             .filter(|&i| checked[i] == Check::Ready)
             .collect();
+        let import = form.mode == AddMode::Import;
+        let (conflicts, import_plan) = if import {
+            (
+                form.conflicts(&self.snapshot.servers),
+                form.import_plan(&self.snapshot.servers, &checked, false),
+            )
+        } else {
+            (Vec::new(), None)
+        };
         let ready = !addable.is_empty()
             && places.is_some()
-            && checked.iter().all(|c| !matches!(c, Check::Name(_)));
+            && checked.iter().all(|c| !matches!(c, Check::Name(_)))
+            && (!import || import_plan.is_some());
+        let mut choose_again = false;
         let mut review = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
         let mut discard_now = false;
@@ -2813,6 +2877,10 @@ impl ShellApp {
         let modal = egui::Modal::new(id).area(area).show(ctx, |ui| {
             ui.set_width(640.0);
             ui.horizontal(|ui| {
+                if import {
+                    ui.heading("Import servers");
+                    return;
+                }
                 for (mode, label) in [(AddMode::Paste, "Paste"), (AddMode::Fill, "Fill in")] {
                     let tab = egui::Button::new(label)
                         .selected(form.mode == mode)
@@ -2827,7 +2895,7 @@ impl ShellApp {
                 }
                 ui.add_space(12.0);
                 ui.heading(match form.mode {
-                    AddMode::Paste => "Add servers",
+                    AddMode::Paste | AddMode::Import => "Add servers",
                     AddMode::Fill => "Add a server",
                 });
             });
@@ -2850,11 +2918,19 @@ impl ShellApp {
                     match form.mode {
                         AddMode::Paste => form.paste_ui(ui, pal, &checked),
                         AddMode::Fill => form.fill_ui(ui, pal, &checked),
+                        AddMode::Import => {
+                            choose_again = form.import_ui(ui, pal, &checked, &conflicts);
+                        }
+                    }
+                    // Where they go is asked once there is something to import.
+                    if import && form.read.is_err() {
+                        return;
                     }
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(match form.mode {
                             AddMode::Paste => "Add them",
+                            AddMode::Import => "Import them",
                             AddMode::Fill => "Add it",
                         })
                         .color(pal.text_muted),
@@ -2882,9 +2958,9 @@ impl ShellApp {
             }
             // What Review will lead to, or why it cannot yet.
             let count = |f: fn(&Check) -> bool| checked.iter().filter(|c| f(c)).count();
-            let skipped = count(|c| matches!(c, Check::Skipped(_)));
+            let skipped = count(|c| matches!(c, Check::Skipped(why) if !why.is_empty()));
             let unfinished = count(|c| matches!(c, Check::FillIn(_)));
-            if form.mode == AddMode::Paste && form.read.is_ok() && skipped + unfinished > 0 {
+            if form.mode != AddMode::Fill && form.read.is_ok() && skipped + unfinished > 0 {
                 let mut parts = Vec::new();
                 if skipped > 0 {
                     parts.push(if skipped == 1 {
@@ -2911,6 +2987,9 @@ impl ShellApp {
                 None => {
                     ui.label(RichText::new("Tick at least one place.").color(stop));
                 }
+                Some(places) if ready && let Some(plan) = &import_plan => {
+                    ui.add(egui::Label::new(plan.in_words(places)).wrap());
+                }
                 Some(places) if ready => {
                     let names = form.names_to_add(&addable);
                     ui.add(
@@ -2919,6 +2998,26 @@ impl ShellApp {
                             list_in_words(&names, "server")
                         ))
                         .wrap(),
+                    );
+                }
+                // Every server ticked is already there, and kept: Review would change nothing.
+                Some(_) if import && import_plan.is_none() && !addable.is_empty() => {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Each server ticked is there already and kept, so nothing would change. Replace them, or import them under other names.",
+                            )
+                            .color(stop),
+                        )
+                        .wrap(),
+                    );
+                }
+                Some(_) if form.tried && import => {
+                    ui.label(
+                        RichText::new(
+                            "Tick a server that can be imported, and fix what is marked above.",
+                        )
+                        .color(stop),
                     );
                 }
                 Some(_) if form.tried && form.mode == AddMode::Paste => {
@@ -2991,7 +3090,23 @@ impl ShellApp {
                 ctx.request_discard("the Add dialog's body height");
             }
         }
-        self.add_mode = form.mode;
+        if !import {
+            self.add_mode = form.mode;
+        }
+        let path_wanted = if std::mem::take(&mut form.path_wanted) {
+            // Quotes from a copied path ("Copy as path" on Windows) are not part of it. A path that is not whole
+            // would be read from wherever Klefki was started.
+            let path = std::path::PathBuf::from(form.path.trim().trim_matches('"'));
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                form.file_problem =
+                    Some("Give the whole path, starting from the drive or /.".to_owned());
+                None
+            }
+        } else {
+            None
+        };
         // The text and names may have changed in this frame: what is sent is checked again as it is now.
         let changes = review
             .then(|| form.changes(&self.snapshot.servers))
@@ -3018,10 +3133,25 @@ impl ShellApp {
             form.port_pending = Some(port);
             self.send(Command::CheckCallbackPort(port));
         }
+        if let Some(path) = path_wanted
+            && !self.import_waiting
+        {
+            self.import_waiting = true;
+            self.send(Command::ReadImportFile(path));
+        } else if choose_again {
+            self.ask_import();
+        }
         if let Some(changes) = changes {
             if self.can_prepare() {
                 self.prepare(changes);
                 self.adding_signs_in = signs_in;
+                if import {
+                    self.adding_verb = "Imported";
+                    // Replaced ones are selected with the rest once it is done.
+                    if let Some(plan) = import_plan {
+                        self.adding.extend(plan.replaces);
+                    }
+                }
                 if let Some(form) = &mut self.add {
                     form.reviewing = true;
                     form.asking_to_discard = false;
@@ -3031,6 +3161,97 @@ impl ShellApp {
         } else if close {
             self.close_add();
         }
+    }
+
+    /// Whether a file to import can be asked for now: nothing else is open or under way, or the Import dialog is open
+    /// (to read another file into it).
+    fn can_import(&self) -> bool {
+        self.core.is_some()
+            && self.can_prepare()
+            && !self.import_waiting
+            && self
+                .add
+                .as_ref()
+                .is_none_or(|f| f.mode == AddMode::Import && !f.reviewing)
+            && self.duplicate.is_none()
+            && self.moving.is_none()
+            && self.casing.is_none()
+            && self.sign_in.is_none()
+            && self.exporting.is_none()
+            && !self.command.is_open()
+    }
+
+    /// Asks for a file to import, in the system's open dialog, opened next by [`eframe::App::ui`] over the window.
+    fn ask_import(&mut self) {
+        if self.can_import() {
+            self.import_waiting = true;
+            self.import_choice_asked = true;
+        }
+    }
+
+    /// A file dropped on the window is read for an import, when one could be asked for; otherwise it says why not.
+    fn take_dropped_file(&mut self, ctx: &egui::Context) {
+        let paths: Vec<std::path::PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_path_buf())
+                .collect()
+        });
+        let [path] = paths.as_slice() else {
+            if !paths.is_empty() {
+                self.note("Drop one file at a time to import it.".to_owned(), false);
+            }
+            return;
+        };
+        if self.can_import() {
+            self.import_waiting = true;
+            self.send(Command::ReadImportFile(path.clone()));
+        } else {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.note(
+                format!("To import {name}, close what is open, then drop it again."),
+                false,
+            );
+        }
+    }
+
+    /// Something to know that is not the outcome of a change, on the outcome message; it stays until dismissed.
+    /// With `type_path`, it offers to type the path of a file to import.
+    fn note(&mut self, text: String, type_path: bool) {
+        self.outcome = Some(Outcome {
+            text,
+            ok: true,
+            shown_at: None,
+            sign_in: None,
+            warn: true,
+            undo: None,
+            logged: false,
+            type_path,
+        });
+    }
+
+    /// Opens the Import dialog on what came of asking for a file, or puts it into the one open.
+    fn open_import(&mut self, file: ImportFile) {
+        if let Some(form) = self.open_import_form() {
+            form.load(file);
+        }
+    }
+
+    /// The Import dialog, opened if it can be.
+    fn open_import_form(&mut self) -> Option<&mut AddForm> {
+        if self.add.is_none() {
+            if !self.can_import() {
+                return None;
+            }
+            let mut places = Places::new(&self.snapshot.projects, None);
+            places.user = true;
+            self.add = Some(AddForm::new(AddMode::Import, places));
+        }
+        self.add.as_mut().filter(|f| f.mode == AddMode::Import)
     }
 
     /// Closes the Add dialog, and has egui forget what it remembers of the secrets typed into it.
@@ -3264,16 +3485,24 @@ impl ShellApp {
         if self.adding.is_empty() {
             return None;
         }
-        let names: Vec<&str> = self.adding.iter().map(|(n, _)| n.as_str()).collect();
-        let targets = &self.adding[0].1;
-        let user = targets.contains(&Target::User);
-        let folders: Vec<&str> = targets
-            .iter()
-            .filter_map(|t| match t {
-                Target::Local(p) => Some(folder_name(p)),
-                Target::User => None,
-            })
-            .collect();
+        let mut names: Vec<&str> = Vec::new();
+        for (name, _) in &self.adding {
+            if !names.contains(&name.as_str()) {
+                names.push(name);
+            }
+        }
+        // Every place any of them went (an import adds some only where none of that name was).
+        let targets = self.adding.iter().flat_map(|(_, t)| t);
+        let user = targets.clone().any(|t| *t == Target::User);
+        let mut folders: Vec<&str> = Vec::new();
+        for folder in targets.filter_map(|t| match t {
+            Target::Local(p) => Some(folder_name(p)),
+            Target::User => None,
+        }) {
+            if !folders.contains(&folder) {
+                folders.push(folder);
+            }
+        }
         let verb = self.adding_verb;
         // A move goes to one place: "to webapp", "to the user".
         let places = match (verb, user, &folders[..]) {
@@ -3390,6 +3619,13 @@ impl ShellApp {
                 self.outcome = None;
                 self.go(Page::ActivityLog);
             }
+            Some(OutcomeChoice::TypePath) => {
+                self.outcome = None;
+                if let Some(form) = self.open_import_form() {
+                    form.typing = true;
+                    form.focus = true;
+                }
+            }
             Some(OutcomeChoice::Dismiss) => self.outcome = None,
             None => {}
         }
@@ -3458,6 +3694,9 @@ impl ShellApp {
                     chosen = Some(OutcomeChoice::Dismiss);
                 }
                 // The backup's place stays on the Activity log after this card is gone.
+                if outcome.type_path && ui.small_button("Type a path instead").clicked() {
+                    chosen = Some(OutcomeChoice::TypePath);
+                }
                 if outcome.logged
                     && self.page != Page::ActivityLog
                     && ui.small_button("Open activity log").clicked()
@@ -3585,7 +3824,9 @@ impl ShellApp {
                                 };
                                 ui.visuals_mut().extreme_bg_color = pal.border;
                                 egui::ScrollArea::vertical()
-                                    .id_salt(("plan_diff", plan.id, &file.path))
+                                    // By its place in the plan: one file can have two diffs (what Klefki
+                                    // writes, and what Claude Code's own command will).
+                                    .id_salt(("plan_diff", plan.id, at))
                                     .max_height(220.0)
                                     // As wide as the box, so the bar is at its edge, not after the widest line in view.
                                     .auto_shrink([false, true])
@@ -4751,6 +4992,12 @@ impl eframe::App for ShellApp {
         {
             core.choose_export_file(name, Some(frame));
         }
+        // The open dialog, likewise.
+        if std::mem::take(&mut self.import_choice_asked)
+            && let Some(core) = &self.core
+        {
+            core.choose_import_file(Some(frame));
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -4870,7 +5117,9 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
 
 /// The outcome message's color and glyph: a problem, a warning or a success.
 fn outcome_look(pal: &Palette, outcome: &Outcome) -> (Color32, &'static str) {
-    if outcome.ok && outcome.warn {
+    if outcome.type_path {
+        (pal.primary, icon::INFO)
+    } else if outcome.ok && outcome.warn {
         (pal.warn, icon::WARNING)
     } else if outcome.ok {
         (pal.success, icon::CHECK_CIRCLE)
@@ -4978,12 +5227,14 @@ impl CasingForm {
     }
 }
 
-/// How the Add dialog takes a server: pasted (a command or JSON, several at once), or filled in, part by part.
+/// How the Add dialog takes a server: pasted (a command or JSON, several at once), or filled in, part by part; or
+/// read from a file (Import), which the dialog is then about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum AddMode {
     #[default]
     Paste,
     Fill,
+    Import,
 }
 
 /// A field of the form, for what is said under it and for giving it the keyboard.
@@ -5007,6 +5258,9 @@ fn secret_id() -> egui::Id {
 fn value_id(noun: &str, row: usize) -> egui::Id {
     egui::Id::new(("add_value", noun, row))
 }
+
+/// The most servers an import holds (a paste of more is refused), so the most client secret fields it has.
+const IMPORT_ROWS: usize = 100;
 
 /// The most value rows whose text-field memory is forgotten on close; a server has a handful.
 const FORGET_ROWS: usize = 64;
@@ -5081,6 +5335,25 @@ struct AddForm {
     port_pending: Option<u16>,
     /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`]).
     port_checked: Option<(u16, Option<String>)>,
+    /// Import: the file read, as it can be shown.
+    file: Option<String>,
+    /// Import: why the last file chosen could not be read.
+    file_problem: Option<String>,
+    /// Import: no open dialog could be shown, so a path is typed.
+    no_dialog: bool,
+    /// Import: the path is typed in, as asked for after a file dialog closed without a file.
+    typing: bool,
+    path: String,
+    /// Import: Read was pressed for the path typed; it is sent to the engine after this frame.
+    path_wanted: bool,
+    /// Import, one per server read: whether it is imported.
+    include: Vec<bool>,
+    /// Import, one per server read: a server already there under its name is replaced rather than kept.
+    replace: Vec<bool>,
+    /// Import, one per server read: its client secret, typed hidden. Only one that signs in with OAuth gets one.
+    secrets: Vec<Secret>,
+    /// Import: the server whose client secret is shown as typed.
+    secret_shown: Option<usize>,
 }
 
 struct Filled {
@@ -5100,6 +5373,113 @@ enum Check {
     Name(String),
     /// Pasted, it asks for a client secret: it is finished in the form, where the secret is typed.
     FillIn(String),
+}
+
+/// Import: a server whose name is taken in a ticked place.
+struct Conflict {
+    /// Where, in words: `for the user`, `in app`.
+    place: String,
+    /// A name it could be imported under instead.
+    free: String,
+}
+
+/// Import: what Review sends, and what it comes to, by server name.
+#[derive(Default)]
+struct ImportPlan {
+    /// Built only for Review (`build`): each holds a server's whole definition.
+    changes: Vec<Change>,
+    /// Something would be written.
+    writes: bool,
+    /// Added where there is none of that name yet.
+    adds: Vec<String>,
+    /// Replacing the one there, in those places.
+    replaces: Vec<(String, Vec<Target>)>,
+    /// Left as they are where there is one of that name already.
+    keeps: Vec<String>,
+}
+
+impl ImportPlan {
+    /// One line: what is added where, and what is replaced or kept.
+    fn in_words(&self, places: &str) -> String {
+        let mut out = Vec::new();
+        if !self.adds.is_empty() {
+            let names: Vec<&str> = self.adds.iter().map(String::as_str).collect();
+            out.push(format!(
+                "Adds {} {places}.",
+                list_in_words(&names, "server")
+            ));
+        }
+        if !self.replaces.is_empty() {
+            let names: Vec<&str> = self.replaces.iter().map(|(n, _)| n.as_str()).collect();
+            let mut user = false;
+            let mut folders: Vec<&str> = Vec::new();
+            for target in self.replaces.iter().flat_map(|(_, t)| t) {
+                match target {
+                    Target::User => user = true,
+                    Target::Local(p) => {
+                        let folder = folder_name(p);
+                        if !folders.contains(&folder) {
+                            folders.push(folder);
+                        }
+                    }
+                }
+            }
+            out.push(format!(
+                "Replaces {} {}.",
+                list_in_words(&names, "server"),
+                places_in_words(user, &folders).unwrap_or_default()
+            ));
+        }
+        if !self.keeps.is_empty() {
+            let names: Vec<&str> = self.keeps.iter().map(String::as_str).collect();
+            out.push(format!(
+                "Keeps the {} that {} there.",
+                list_in_words(&names, "server"),
+                if names.len() == 1 { "is" } else { "are" },
+            ));
+        }
+        out.join(" ")
+    }
+}
+
+/// The servers already in the ticked places, by name: where each is, as a target, and which it is.
+struct Existing<'a> {
+    by_name: HashMap<&'a str, Vec<(Target, ServerId)>>,
+}
+
+impl<'a> Existing<'a> {
+    fn new(places: &Places, servers: &'a [ServerRow]) -> Self {
+        let ticked: Vec<&str> = places.ticked().collect();
+        let mut by_name: HashMap<&str, Vec<(Target, ServerId)>> = HashMap::new();
+        for s in servers {
+            let at = match (s.scope, s.project.as_deref()) {
+                (Scope::User, None) if places.user => Some(Target::User),
+                (Scope::Local, Some(project)) => ticked
+                    .iter()
+                    .find(|t| {
+                        klefki_core::api::project_key(t) == klefki_core::api::project_key(project)
+                    })
+                    .map(|t| Target::Local((*t).to_owned())),
+                _ => None,
+            };
+            if let Some(at) = at {
+                by_name
+                    .entry(s.name.as_str())
+                    .or_default()
+                    .push((at, s.id()));
+            }
+        }
+        Self { by_name }
+    }
+
+    fn of(&self, name: &str) -> Vec<(Target, ServerId)> {
+        self.by_name.get(name).cloned().unwrap_or_default()
+    }
+}
+
+/// An imported server's client secret field: what egui remembers of it is forgotten when the dialog closes.
+fn import_secret_id(row: usize) -> egui::Id {
+    egui::Id::new(("import_client_secret", row))
 }
 
 impl AddForm {
@@ -5133,12 +5513,51 @@ impl AddForm {
             port_wanted: None,
             port_pending: None,
             port_checked: None,
+            file: None,
+            file_problem: None,
+            no_dialog: false,
+            typing: false,
+            path: String::new(),
+            path_wanted: false,
+            include: Vec::new(),
+            replace: Vec::new(),
+            secrets: Vec::new(),
+            secret_shown: None,
+        }
+    }
+
+    /// Import: takes what came of asking for a file. A file that could not be read leaves what was read before.
+    fn load(&mut self, file: ImportFile) {
+        match file {
+            ImportFile::Read { shown, text } => {
+                self.file = Some(shown);
+                self.file_problem = None;
+                self.no_dialog = false;
+                self.typing = false;
+                self.failed = None;
+                self.tried = false;
+                self.text = text;
+                // Read again even when the text is the same: a file chosen again starts afresh.
+                self.read_for = String::from("\0");
+                self.reread();
+            }
+            ImportFile::Failed { why, .. } => self.file_problem = Some(why),
+            ImportFile::NoDialog => {
+                self.no_dialog = true;
+                self.focus = true;
+            }
+            ImportFile::Cancelled => {}
         }
     }
 
     /// Something was pasted or typed that closing would throw away. How the server connects and where it goes are
     /// choices, quickly made again, not typing.
     fn has_typing(&self) -> bool {
+        if self.mode == AddMode::Import {
+            // The file is there to be read again; only what was typed is lost.
+            return self.secrets.iter().any(|s| !s.is_empty())
+                || ((self.no_dialog || self.typing) && !self.path.trim().is_empty());
+        }
         let empty = |rows: &[(String, String)]| {
             rows.iter()
                 .all(|(k, v)| k.trim().is_empty() && v.trim().is_empty())
@@ -5201,6 +5620,11 @@ impl AddForm {
             self.places.user = !(local && self.places.tick_here());
         }
         self.names = names;
+        let count = read.as_ref().map_or(0, |r| r.servers.len());
+        self.include = vec![true; count];
+        self.replace = vec![false; count];
+        self.secrets = vec![Secret::new(String::new()); count];
+        self.secret_shown = None;
         self.read = read;
         self.read_for.clone_from(&self.text);
     }
@@ -5249,6 +5673,7 @@ impl AddForm {
                     })
                     .collect()
             }
+            AddMode::Import => self.import_plan(servers, &checked, true)?.changes,
             AddMode::Fill => {
                 let filled = self.filled.as_ref()?;
                 if checked != [Check::Ready] {
@@ -5277,6 +5702,12 @@ impl AddForm {
                 .as_ref()
                 .is_ok_and(|r| r.servers.iter().any(|s| s.oauth)),
             AddMode::Fill => self.filled.as_ref().is_some_and(|f| f.read.oauth),
+            AddMode::Import => self.read.as_ref().is_ok_and(|r| {
+                r.servers
+                    .iter()
+                    .zip(&self.include)
+                    .any(|(s, &on)| on && s.oauth)
+            }),
         }
     }
 
@@ -5320,6 +5751,7 @@ impl AddForm {
                     })
                     .collect()
             }
+            AddMode::Import => self.import_check(),
             AddMode::Fill => {
                 let Some(filled) = &self.filled else {
                     return Vec::new();
@@ -5361,7 +5793,9 @@ impl AddForm {
     /// The names of the servers at `addable`, for the line above the buttons.
     fn names_to_add(&self, addable: &[usize]) -> Vec<&str> {
         match self.mode {
-            AddMode::Paste => addable.iter().map(|&i| self.names[i].as_str()).collect(),
+            AddMode::Paste | AddMode::Import => {
+                addable.iter().map(|&i| self.names[i].as_str()).collect()
+            }
             AddMode::Fill => vec![self.name.as_str()],
         }
     }
@@ -5407,6 +5841,363 @@ impl AddForm {
         self.focus_on = Some(Field::Secret);
         self.reveal_oauth = true;
         true
+    }
+
+    /// Import: each server, in order. One left unticked is skipped without a reason; one already in a ticked place
+    /// is ready, as what happens to it there is chosen beside it.
+    fn import_check(&self) -> Vec<Check> {
+        let Ok(read) = &self.read else {
+            return Vec::new();
+        };
+        let counts = |j: usize| read.servers[j].problem.is_none() && self.include[j];
+        read.servers
+            .iter()
+            .enumerate()
+            .map(|(i, server)| {
+                if let Some(problem) = &server.problem {
+                    return Check::Skipped(problem.clone());
+                }
+                if !self.include[i] {
+                    return Check::Skipped(String::new());
+                }
+                if server.asks_secret && self.secrets[i].is_empty() {
+                    return Check::Name(
+                        "Type the client secret it asks for, or untick it.".to_owned(),
+                    );
+                }
+                let name = &self.names[i];
+                if (0..i).any(|j| counts(j) && self.names[j] == *name) {
+                    return Check::Name(format!("{name} is in the file twice. Rename one."));
+                }
+                if name.is_empty() {
+                    return Check::Name("Give it a name.".to_owned());
+                }
+                name_problem(name).map_or(Check::Ready, Check::Name)
+            })
+            .collect()
+    }
+
+    /// Import: what it comes to in words for the servers ready to import, and with `build`, what Review sends.
+    fn import_plan(
+        &self,
+        servers: &[ServerRow],
+        checked: &[Check],
+        build: bool,
+    ) -> Option<ImportPlan> {
+        let read = self.read.as_ref().ok()?;
+        let targets = self.places.targets();
+        let existing = Existing::new(&self.places, servers);
+        let mut plan = ImportPlan::default();
+        for (i, server) in read.servers.iter().enumerate() {
+            if checked.get(i) != Some(&Check::Ready) {
+                continue;
+            }
+            let name = &self.names[i];
+            let there = existing.of(name);
+            let free: Vec<Target> = targets
+                .iter()
+                .filter(|t| !there.iter().any(|(at, _)| at == *t))
+                .cloned()
+                .collect();
+            if !free.is_empty() {
+                plan.adds.push(name.clone());
+                plan.writes = true;
+            }
+            if !free.is_empty() && build {
+                plan.changes.push(Change::Add {
+                    name: name.clone(),
+                    json: server.json.clone(),
+                    targets: free,
+                    // Only a server that signs in with OAuth takes one; an empty field means none.
+                    secret: (server.oauth && !self.secrets[i].is_empty())
+                        .then(|| self.secrets[i].clone()),
+                });
+            }
+            if there.is_empty() {
+                continue;
+            }
+            let places: Vec<Target> = there.iter().map(|(at, _)| at.clone()).collect();
+            if self.replace[i] {
+                plan.replaces.push((name.clone(), places));
+                plan.writes = true;
+                if build {
+                    plan.changes
+                        .extend(there.into_iter().map(|(_, id)| Change::Replace {
+                            id,
+                            json: server.json.clone(),
+                        }));
+                }
+            } else {
+                plan.keeps.push(name.clone());
+            }
+        }
+        plan.writes.then_some(plan)
+    }
+
+    /// Import: for each server, where one of its name is already, and a name that is free; `None` when none is.
+    fn conflicts(&self, servers: &[ServerRow]) -> Vec<Option<Conflict>> {
+        let taken = Taken::new(&self.places, servers.iter());
+        (0..self.names.len())
+            .map(|i| {
+                taken.of(&self.names[i]).map(|place| Conflict {
+                    place,
+                    free: self.free_name(i, &taken),
+                })
+            })
+            .collect()
+    }
+
+    /// Import: a name for server `i` that nothing in the ticked places, and no other server in the file, has.
+    fn free_name(&self, i: usize, taken: &Taken) -> String {
+        let base = &self.names[i];
+        (2..)
+            .map(|n| format!("{base}_{n}"))
+            .find(|name| {
+                taken.of(name).is_none()
+                    && !self.names.iter().any(|other| other == name)
+                    && name_problem(name).is_none()
+            })
+            .expect("some number is free")
+    }
+
+    /// Import: the file, and each server read from it, with what to do about it.
+    fn import_ui(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        checked: &[Check],
+        conflicts: &[Option<Conflict>],
+    ) -> bool {
+        let mut choose_again = false;
+        ui.horizontal(|ui| {
+            if let Some(file) = &self.file {
+                ui.add(egui::Label::new(RichText::new(format!("From {file}")).strong()).truncate());
+            }
+            // Without a dialog, asking again only says so again.
+            if !self.no_dialog {
+                let label = if self.file.is_some() {
+                    "Choose another file…"
+                } else {
+                    "Choose a file…"
+                };
+                choose_again = ui.button(label).clicked();
+            }
+        });
+        if let Some(problem) = &self.file_problem {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(icon::WARNING_CIRCLE).color(pal.danger));
+                ui.add(egui::Label::new(RichText::new(problem).color(pal.danger)).wrap());
+            });
+        }
+        if self.no_dialog || self.typing {
+            let said = if self.no_dialog {
+                "No file dialog is available here. Type the path of the file to import."
+            } else {
+                "Type the path of the file to import."
+            };
+            ui.add(egui::Label::new(RichText::new(said).color(pal.text_muted)).wrap());
+            ui.horizontal(|ui| {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.path)
+                        .id(egui::Id::new("import_path"))
+                        .hint_text("/path/to/mcp-servers.json")
+                        .desired_width(480.0),
+                );
+                if std::mem::take(&mut self.focus) {
+                    field.request_focus();
+                }
+                let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Read").clicked() || entered) && !self.path.trim().is_empty() {
+                    self.path_wanted = true;
+                }
+            });
+        }
+        ui.add_space(6.0);
+        let read = match &self.read {
+            Err(why) if !why.is_empty() => {
+                ui.add(egui::Label::new(RichText::new(why).color(pal.danger)).wrap());
+                return choose_again;
+            }
+            Err(_) => return choose_again,
+            Ok(read) => read,
+        };
+        let usable: Vec<usize> = (0..read.servers.len())
+            .filter(|&i| read.servers[i].problem.is_none())
+            .collect();
+        if usable.len() > 1 {
+            let ticked = usable.iter().filter(|&&i| self.include[i]).count();
+            let mut all = ticked == usable.len();
+            let label = format!("All {}", usable.len());
+            let detail = if all {
+                String::new()
+            } else {
+                format!("{ticked} ticked")
+            };
+            if place_mark(ui, &mut all, &label, &detail, None, Mark::Tick, true).changed() {
+                for &i in &usable {
+                    self.include[i] = all;
+                }
+            }
+            ui.add_space(4.0);
+        }
+        let conflicting: Vec<usize> = (0..read.servers.len())
+            .filter(|&i| checked[i] == Check::Ready && conflicts[i].is_some())
+            .collect();
+        if conflicting.len() > 1 {
+            // The question on a line of its own, so the two answers stay together on the next.
+            ui.label(
+                RichText::new(format!(
+                    "{} already exist. For all of them:",
+                    conflicting.len()
+                ))
+                .color(pal.text_muted),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let all_replaced = conflicting.iter().all(|&i| self.replace[i]);
+                let none_replaced = conflicting.iter().all(|&i| !self.replace[i]);
+                // Neither is chosen while the servers differ.
+                if ui.radio(none_replaced, "Keep the ones there").clicked() {
+                    conflicting.iter().for_each(|&i| self.replace[i] = false);
+                }
+                if ui.radio(all_replaced, "Replace them").clicked() {
+                    conflicting.iter().for_each(|&i| self.replace[i] = true);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        let mut rename = None;
+        for (i, server) in read.servers.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if server.problem.is_some() {
+                    ui.label(RichText::new(&server.name).strikethrough());
+                } else {
+                    let label = format!("Import {}", self.names[i]);
+                    tick_box(ui, &mut self.include[i], &label);
+                    ui.add_enabled(
+                        self.include[i],
+                        egui::TextEdit::singleline(&mut self.names[i])
+                            .hint_text("name")
+                            .desired_width(180.0),
+                    );
+                }
+            });
+            // What it runs or connects to, whole: this is what is about to be added.
+            ui.add(egui::Label::new(RichText::new(&server.summary).color(pal.text_muted)).wrap());
+            let shown = server.problem.is_some() || self.include[i];
+            match &checked[i] {
+                Check::Skipped(why) | Check::Name(why) if !why.is_empty() => {
+                    ui.add(egui::Label::new(RichText::new(why).small().color(pal.danger)).wrap());
+                }
+                _ => {}
+            }
+            if !shown {
+                ui.add_space(4.0);
+                continue;
+            }
+            if checked[i] == Check::Ready
+                && let Some(conflict) = &conflicts[i]
+            {
+                let name = &self.names[i];
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{name} already exists {}.", conflict.place))
+                            .color(pal.warn),
+                    )
+                    .wrap(),
+                );
+                let free = conflict.free.clone();
+                // One choice of two, as radio buttons; importing it under another name instead is not a third
+                // choice of the same kind (it renames the server, and the question goes), so it is a link apart.
+                ui.horizontal_wrapped(|ui| {
+                    if ui.radio(!self.replace[i], "Keep the one there").clicked() {
+                        self.replace[i] = false;
+                    }
+                    if ui.radio(self.replace[i], "Replace it").clicked() {
+                        self.replace[i] = true;
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Or").color(pal.text_muted));
+                    if ui.link(format!("import it as {free}")).clicked() {
+                        rename = Some((i, free));
+                    }
+                });
+            }
+            if !server.needs.is_empty() {
+                let names: Vec<&str> = server.needs.iter().map(String::as_str).collect();
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!(
+                            "Set {} where Claude Code runs: it fills {} in when it starts the server.",
+                            list_in_words(&names, "variable"),
+                            if names.len() == 1 { "it" } else { "them" }
+                        ))
+                        .small()
+                        .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+            }
+            for hint in &server.hints {
+                ui.add(egui::Label::new(RichText::new(hint).small().color(pal.warn)).wrap());
+            }
+            if server.oauth || server.asks_secret {
+                let label = format!("Client secret of {}", self.names[i]);
+                let show = self.secret_shown == Some(i);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Client secret").color(pal.text_muted));
+                    let field = ui.add(
+                        egui::TextEdit::singleline(self.secrets[i].edit())
+                            .id(import_secret_id(i))
+                            .password(!show)
+                            .hint_text(if server.asks_secret {
+                                "it asks for one"
+                            } else {
+                                "optional"
+                            })
+                            .desired_width(260.0),
+                    );
+                    field.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, &label)
+                    });
+                    let (glyph, word) = if show {
+                        (icon::EYE_SLASH, "Hide")
+                    } else {
+                        (icon::EYE, "Show")
+                    };
+                    let tip = format!("{word} the client secret of {}", self.names[i]);
+                    let button = ui
+                        .small_button(format!("{glyph} {word}"))
+                        .on_hover_text(&tip);
+                    button.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &tip)
+                    });
+                    if button.clicked() {
+                        self.secret_shown = (!show).then_some(i);
+                    }
+                });
+                if self.replace[i] && conflicts[i].is_some() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Where it replaces one, it keeps the client secret Klefki has for that one.",
+                            )
+                            .small()
+                            .color(pal.text_muted),
+                        )
+                        .wrap(),
+                    );
+                }
+            }
+            ui.add_space(6.0);
+        }
+        for note in &read.notes {
+            ui.add(egui::Label::new(RichText::new(note).small().color(pal.text_muted)).wrap());
+        }
+        if let Some((i, name)) = rename {
+            self.names[i] = name;
+        }
+        choose_again
     }
 
     /// The text field and what was read from it.
@@ -5795,6 +6586,10 @@ fn forget_typed(ctx: &egui::Context) {
     ctx.data_mut(|d| {
         d.remove::<egui::text_edit::TextEditState>(secret_id());
         d.remove::<egui::text_edit::TextEditState>(egui::Id::new("add_paste"));
+        d.remove::<egui::text_edit::TextEditState>(egui::Id::new("import_path"));
+        for row in 0..IMPORT_ROWS {
+            d.remove::<egui::text_edit::TextEditState>(import_secret_id(row));
+        }
         for row in 0..FORGET_ROWS {
             for noun in ["variable", "header"] {
                 d.remove::<egui::text_edit::TextEditState>(value_id(noun, row));
@@ -6193,10 +6988,10 @@ struct DuplicateForm {
     focus: bool,
 }
 
-/// The toolbar's buttons: icon and hover text. Only what works today: a button that can never be pressed is noise
-/// (Import is Add's paste, which reads what Export gives).
-const ACTIONS: [(&str, &str); 9] = [
+/// The toolbar's buttons: icon and hover text. Only what works today: a button that can never be pressed is noise.
+const ACTIONS: [(&str, &str); 10] = [
     (icon::PLUS, "Add (Ctrl+N)"),
+    (icon::TRAY_ARROW_DOWN, "Import from a file (Ctrl+O)"),
     (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
     (icon::COPY, "Duplicate (Ctrl+D)"),
     (icon::ARROW_FAT_LINES_RIGHT, "Move (Ctrl+Shift+M)"),
@@ -6447,6 +7242,50 @@ enum Mark {
     Radio,
 }
 
+/// A tick box, as the places a dialog lists have: filled when ticked, an outline when not.
+fn paint_tick(painter: &egui::Painter, tick: egui::Rect, ticked: bool, pal: &Palette) {
+    if ticked {
+        painter.rect_filled(tick, 4.0, pal.primary);
+        painter.text(
+            tick.center(),
+            egui::Align2::CENTER_CENTER,
+            icon::CHECK,
+            egui::FontId::proportional(13.0),
+            pal.on_bright,
+        );
+    } else {
+        painter.rect_stroke(
+            tick,
+            4.0,
+            egui::Stroke::new(1.5, pal.text_muted),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// A tick box on its own, beside a field: `label` is what it is read out as.
+fn tick_box(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
+    let pal = theme::palette(ui.ctx());
+    let (rect, mut response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let ticked = *on;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, ticked, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        if response.hovered() || response.has_focus() {
+            painter.rect_filled(rect, 6.0, pal.hover);
+        }
+        let tick = egui::Rect::from_center_size(rect.center(), egui::vec2(18.0, 18.0));
+        paint_tick(&painter, tick, ticked, pal);
+    }
+    response.on_hover_text(label)
+}
+
 /// [`place_row`] drawn as `mark`; a row that is not `enabled` cannot be chosen and is drawn faded.
 fn place_mark(
     ui: &mut Ui,
@@ -6510,22 +7349,8 @@ fn place_mark(
         if ticked {
             painter.circle_filled(tick.center(), 4.5, pal.primary);
         }
-    } else if ticked {
-        painter.rect_filled(tick, 4.0, pal.primary);
-        painter.text(
-            tick.center(),
-            egui::Align2::CENTER_CENTER,
-            icon::CHECK,
-            egui::FontId::proportional(13.0),
-            pal.on_bright,
-        );
     } else {
-        painter.rect_stroke(
-            tick,
-            4.0,
-            egui::Stroke::new(1.5, pal.text_muted),
-            egui::StrokeKind::Inside,
-        );
+        paint_tick(&painter, tick, ticked, pal);
     }
     let name = painter.text(
         egui::pos2(tick.right() + 12.0, rect.center().y),
@@ -8918,6 +9743,7 @@ mod tests {
                     warn,
                     // With the button that opens the log, the widest the card's buttons get.
                     logged: kind != "success",
+                    type_path: false,
                     undo,
                 });
                 h.run();
@@ -9673,6 +10499,47 @@ mod tests {
         h.state_mut().plan = None;
         h.run();
         assert!(h.state().diff_tops.files.is_empty());
+    }
+
+    #[test]
+    fn two_diffs_of_one_file_scroll_on_their_own() {
+        // Found trying Import: a plan that adds one server by writing the file and another through Claude Code's
+        // own command has two diffs of .claude.json. Both boxes had one scroll position, so scrolling one moved the
+        // other (and egui flagged the clash).
+        let (mut h, engine) = live_harness();
+        engine.events.send(snapshot_of(vec![two_rows().0])).unwrap();
+        let mut plan = plan_view(7, &[], &[], false);
+        plan.files = ["a", "b"]
+            .iter()
+            .map(|which| klefki_core::api::FileDiff {
+                path: ".claude.json".to_owned(),
+                lines: (0..60).map(|i| format!("+ {which}{i}")).collect(),
+            })
+            .collect();
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        let over = h.get_by_label("+ a0").rect().center();
+        h.get_by_label("+ b0");
+        for _ in 0..3 {
+            h.event(egui::Event::PointerMoved(over));
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            for _ in 0..5 {
+                h.step();
+            }
+        }
+        assert!(
+            h.query_by_label("+ a0").is_none(),
+            "the first did not scroll"
+        );
+        assert!(
+            h.query_by_label("+ b0").is_some(),
+            "the second scrolled with it"
+        );
     }
 
     #[test]
@@ -15443,5 +16310,393 @@ mod tests {
                 .iter()
                 .any(|r| r.contains(&icon::ARROWS_LEFT_RIGHT.chars().next().unwrap()))
         );
+    }
+
+    // ---- import
+
+    /// An export of three servers: alpha (the user has one), docs (needs a variable) and notion (OAuth).
+    const IMPORTED: &str = r#"{
+  "mcpServers": {
+    "alpha": {"command": "node", "args": ["a.js"]},
+    "docs": {"type": "http", "url": "https://docs.example.com/mcp", "headers": {"Authorization": "Bearer ${AUTH_TOKEN}"}},
+    "notion": {"type": "http", "url": "https://mcp.notion.com/mcp", "oauth": {"clientId": "abc"}}
+  }
+}"#;
+
+    /// The Import dialog, open on `text` as read from `mcp-servers.json`.
+    fn import_open(text: &str) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label(icon::TRAY_ARROW_DOWN).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseImportFile { shown: None }]
+        );
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::Read {
+                shown: "mcp-servers.json".into(),
+                text: text.into(),
+            }))
+            .unwrap();
+        h.run();
+        h.run();
+        (h, engine)
+    }
+
+    #[test]
+    fn import_shows_what_a_file_holds_and_adds_it_as_one_plan() {
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label_contains("Import servers");
+        h.get_by_label_contains("From mcp-servers.json");
+        // Each server, what it runs or connects to, and what must be set where Claude Code runs.
+        h.get_by_label_contains("https://docs.example.com/mcp");
+        h.get_by_label_contains("AUTH_TOKEN");
+        // alpha is there already: kept unless asked otherwise, and said so.
+        h.get_by_label_contains("alpha already exists for the user.");
+        h.get_by_label_contains("Adds docs and notion for the user.");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(waits_behind_review(&h));
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![
+                Change::Add {
+                    name: "docs".into(),
+                    json: pasted_json(IMPORTED, 1),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+                Change::Add {
+                    name: "notion".into(),
+                    json: pasted_json(IMPORTED, 2),
+                    targets: vec![Target::User],
+                    secret: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_server_that_exists_is_kept_replaced_or_imported_under_another_name() {
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label("Replace it").click();
+        h.run();
+        h.get_by_label_contains("Replaces alpha for the user.");
+        h.get_by_label("Review").click();
+        h.run();
+        let alpha = live_row("alpha", Scope::User, None).id();
+        let changes = duplicate_requested(&engine);
+        assert!(
+            changes.contains(&Change::Replace {
+                id: alpha,
+                json: pasted_json(IMPORTED, 0)
+            }),
+            "{changes:?}"
+        );
+        assert_eq!(changes.len(), 3, "{changes:?}");
+        // Once done, what was imported is selected, replaced ones included, and the message says so.
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &["+ docs"], &[], false)))
+            .unwrap();
+        h.run();
+        let mut rows = h.state().snapshot.servers.clone();
+        rows.push(live_row("docs", Scope::User, None));
+        rows.push(live_row("notion", Scope::User, None));
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: rows,
+                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 7,
+                changed: true,
+                backup: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+        assert!(h.state().add.is_none());
+        assert_eq!(h.state().selected, BTreeSet::from([0, 3, 4]));
+        h.get_by_label_contains("Imported docs, notion and alpha for the user.");
+
+        // Nearby: under a free name it is added like the others.
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label("import it as alpha_2").click();
+        h.run();
+        h.get_by_label_contains("Adds alpha_2, docs and notion for the user.");
+        h.get_by_label("Review").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                Change::Add { name, targets, .. } if name == "alpha_2" && *targets == [Target::User]
+            )),
+            "{changes:?}"
+        );
+
+        // Kept where it is, it still goes where it is not: a project ticked as well.
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label("notes").click();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert!(
+            changes.iter().any(|c| matches!(
+                c,
+                Change::Add { name, targets, .. }
+                    if name == "alpha" && *targets == [Target::Local("/home/me/notes".into())]
+            )),
+            "{changes:?}"
+        );
+        assert!(!changes.iter().any(|c| matches!(c, Change::Replace { .. })));
+
+        // Nearby: when everything is kept, it says nothing would change, and Review asks for nothing.
+        let (mut h, engine) = import_open(r#"{"mcpServers": {"alpha": {"command": "node"}}}"#);
+        h.get_by_label_contains("nothing would change");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn each_oauth_server_asks_for_its_client_secret_and_only_it_gets_one() {
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label_contains("Client secret of notion");
+        assert!(h.query_by_label_contains("Client secret of docs").is_none());
+        *h.state_mut().add.as_mut().unwrap().secrets[2].edit() = "s3cret".into();
+        h.run();
+        // Never shown as typed unless asked.
+        assert!(h.query_by_label_contains("s3cret").is_none());
+        h.get_by_label("Review").click();
+        h.run();
+        let changes = duplicate_requested(&engine);
+        assert_eq!(
+            changes.iter().find_map(|c| match c {
+                Change::Add { name, secret, .. } if name == "notion" => Some(secret.clone()),
+                _ => None,
+            }),
+            Some(Some(Secret::new("s3cret".into())))
+        );
+        assert!(changes.iter().any(|c| matches!(
+            c,
+            Change::Add { name, secret: None, .. } if name == "docs"
+        )));
+
+        // Nearby: a command that asks for a client secret is not imported until one is typed.
+        let (mut h, engine) = import_open(
+            "claude mcp add --transport http --client-id abc --client-secret -s user sso https://sso.example.com/mcp",
+        );
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+        h.get_by_label_contains("Type the client secret it asks for");
+        *h.state_mut().add.as_mut().unwrap().secrets[0].edit() = "x".into();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(duplicate_requested(&engine).len(), 1);
+    }
+
+    #[test]
+    fn a_server_unticked_is_left_out_and_nothing_ticked_imports_nothing() {
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label("Import docs").click();
+        h.run();
+        h.get_by_label_contains("Adds notion for the user.");
+        h.get_by_label("Import notion").click();
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+        // Nearby: one tick puts them all back.
+        h.get_by_label_contains("All 3").click();
+        h.run();
+        h.get_by_label_contains("Adds docs and notion for the user.");
+    }
+
+    #[test]
+    fn the_palette_offers_import() {
+        let (mut h, engine) = duplicate_harness();
+        drain(&engine);
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "import");
+        h.get_by_label_contains("Import servers from a file");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseImportFile { shown: None }]
+        );
+        // Nearby: while the dialog is open, another is not asked for.
+        h.get_by_label(icon::TRAY_ARROW_DOWN).click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+        assert!(
+            h.get_by_label(icon::TRAY_ARROW_DOWN)
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_says_why_and_another_can_be_chosen() {
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label("Choose another file…").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseImportFile { shown: None }]
+        );
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::Failed {
+                shown: "big.json".into(),
+                why: "big.json is larger than 256 KiB.".into(),
+            }))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("big.json is larger than 256 KiB.");
+        // Nearby: a file that holds no server says what it read instead, and Review adds nothing.
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::Read {
+                shown: "notes.txt".into(),
+                text: "just some notes".into(),
+            }))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("From notes.txt");
+        h.get_by_label_contains("Nothing here adds a server");
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn without_a_file_dialog_a_path_is_typed_and_a_dropped_file_is_read() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseImportFile { shown: None }]
+        );
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::NoDialog))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Type the path of the file to import");
+        // Quotes from a copied path are not part of it.
+        let typed = whole("/home/me/servers.json");
+        h.state_mut().add.as_mut().unwrap().path = format!("\"{typed}\"");
+        h.run();
+        h.get_by_label("Read").click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::ReadImportFile(typed.into())]);
+        // Nearby: a path that is not whole would be read from wherever Klefki was started, so it is refused.
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::NoDialog))
+            .unwrap();
+        h.run();
+        h.state_mut().add.as_mut().unwrap().path = "servers.json".into();
+        h.run();
+        h.get_by_label("Read").click();
+        h.run();
+        assert!(drain(&engine).is_empty());
+        h.get_by_label_contains("Give the whole path, starting from the drive or /.");
+
+        // A file dropped on the window is read for an import.
+        let (mut h, engine) = duplicate_harness();
+        /// A file dropped on the window: only its path is ever looked at.
+        #[derive(Debug)]
+        struct Dropped(std::path::PathBuf);
+        impl egui::DroppedFile for Dropped {
+            fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+            fn bytes(&self) -> Result<Vec<u8>, String> {
+                panic!("the UI reads no file")
+            }
+        }
+        let drop = |h: &mut Harness<'_, ShellApp>, paths: &[&str]| {
+            for path in paths {
+                h.input_mut()
+                    .dropped_files
+                    .push(Arc::new(Dropped(path.into())));
+            }
+            h.run();
+        };
+        drop(&mut h, &["/home/me/dropped.json"]);
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ReadImportFile("/home/me/dropped.json".into())]
+        );
+        // Nearby: more than one file, or a file dropped while something else is open, is not read, and says so.
+        let (mut h, engine) = duplicate_harness();
+        drop(&mut h, &["/home/me/a.json", "/home/me/b.json"]);
+        assert!(drain(&engine).is_empty());
+        h.get_by_label_contains("Drop one file at a time to import it.");
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        assert!(h.state().add.is_some());
+        drain(&engine);
+        drop(&mut h, &["/home/me/dropped.json"]);
+        assert!(drain(&engine).is_empty());
+        h.get_by_label_contains("To import dropped.json, close what is open, then drop it again.");
+    }
+
+    #[test]
+    fn a_dialog_closed_without_a_file_leaves_a_way_to_type_the_path() {
+        // Found in review: a desktop portal without a file chooser fails slowly, which looks like a cancel; without
+        // a word, Import would seem to do nothing at all.
+        let (mut h, engine) = duplicate_harness();
+        h.get_by_label(icon::TRAY_ARROW_DOWN).click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::Cancelled))
+            .unwrap();
+        h.run();
+        assert!(h.state().add.is_none());
+        h.get_by_label_contains("No file chosen.");
+        h.get_by_label("Type a path instead").click();
+        h.run();
+        let form = h.state().add.as_ref().expect("the Import dialog");
+        assert_eq!(form.mode, AddMode::Import);
+        h.get_by_label_contains("Type the path of the file to import");
+        assert!(h.query_by_label_contains("No file chosen.").is_none());
+        // The system's dialog can still be tried again from there.
+        h.get_by_label("Choose a file…").click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::ChooseImportFile { shown: None }]
+        );
+
+        // Nearby: closing the dialog asked for from the Import dialog leaves that dialog as it was, with no notice.
+        let (mut h, engine) = import_open(IMPORTED);
+        h.get_by_label("Choose another file…").click();
+        h.run();
+        drain(&engine);
+        engine
+            .events
+            .send(Event::ImportFile(ImportFile::Cancelled))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("From ");
+        assert!(h.query_by_label_contains("No file chosen.").is_none());
     }
 }
