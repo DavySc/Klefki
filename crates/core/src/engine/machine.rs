@@ -326,6 +326,14 @@ enum Step {
     Forget {
         pick: usize,
     },
+    /// Switches the plugin's server on or off.
+    TogglePlugin {
+        on: bool,
+    },
+    /// Asks for a change Klefki never makes to a plugin's server (edit, delete, rename, copy, move).
+    ChangePlugin {
+        kind: u8,
+    },
 }
 
 fn fault() -> impl Strategy<Value = Fault> {
@@ -354,6 +362,8 @@ fn step() -> impl Strategy<Value = Step> {
         2 => pick.clone().prop_map(|pick| Step::PutBack { pick }),
         1 => (pick.clone(), 0usize..3).prop_map(|(pick, kept)| Step::CopyToKept { pick, kept }),
         1 => pick.prop_map(|pick| Step::Forget { pick }),
+        1 => any::<bool>().prop_map(|on| Step::TogglePlugin { on }),
+        1 => (0u8..5).prop_map(|kind| Step::ChangePlugin { kind }),
     ]
 }
 
@@ -386,6 +396,24 @@ struct World {
     creds: BTreeMap<String, String>,
     /// The configuration's other contents: everything but the server lists and switch-off lists.
     rest: Value,
+    /// The projects whose switch-off list holds the plugin's server.
+    plugin_off: std::collections::BTreeSet<String>,
+    /// The plugin's own files and the files saying it is on, as text: Klefki never writes them.
+    plugin_files: Vec<String>,
+}
+
+/// The server of the plugin `pl@m`, which the rig turns on, by the name Claude Code gives it.
+const PLUGIN: &str = "plugin:pl:s";
+
+/// The files of the plugin, from the rig's folder.
+fn plugin_files(dir: &Path) -> [PathBuf; 3] {
+    [
+        dir.join("cfg").join("settings.json"),
+        dir.join("cfg")
+            .join("plugins")
+            .join("installed_plugins.json"),
+        dir.join("plugin").join(".mcp.json"),
+    ]
 }
 
 struct Rig {
@@ -440,6 +468,23 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
     });
     let config = cfg.join(".claude.json");
     std::fs::write(&config, serde_json::to_string_pretty(&root).unwrap()).unwrap();
+    // A plugin that is on, with one server.
+    let [settings, installed, plugin] = plugin_files(dir.path());
+    for file in [&installed, &plugin] {
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    }
+    std::fs::write(&settings, r#"{"enabledPlugins": {"pl@m": true}}"#).unwrap();
+    std::fs::write(
+        &installed,
+        json!({"version": 2, "plugins": {"pl@m": [{"scope": "user", "installPath": plugin.parent().unwrap().to_string_lossy()}]}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        &plugin,
+        r#"{"s": {"command": "node", "args": ["plug.js"]}}"#,
+    )
+    .unwrap();
     let store = Arc::new(Flaky::default());
     let sim = Arc::new(Sim {
         config,
@@ -534,6 +579,21 @@ impl Rig {
                 servers.insert((Some(p.clone()), name.clone()), e.clone());
             }
         }
+        let plugin_off = root["projects"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(_, project)| {
+                project["disabledMcpServers"]
+                    .as_array()
+                    .is_some_and(|list| list.iter().any(|n| n == PLUGIN))
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        let plugin_files = plugin_files(self.dir.path())
+            .iter()
+            .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+            .collect();
         let mut rest = root.clone();
         rest.as_object_mut().unwrap().remove("mcpServers");
         rest.as_object_mut().unwrap().remove("numStartups");
@@ -552,6 +612,8 @@ impl Rig {
             klefki: lock(&self.store.inner.values).clone(),
             creds: lock(&self.sim.creds).clone(),
             rest,
+            plugin_off,
+            plugin_files,
         }
     }
 
@@ -923,6 +985,40 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                     }],
                 }]
             }
+            Step::TogglePlugin { on } => {
+                expected.plugin_off = if *on {
+                    Default::default()
+                } else {
+                    rig.projects.iter().cloned().collect()
+                };
+                vec![Change::SetEnabled {
+                    id: ServerId::new(Scope::Plugin, None, PLUGIN),
+                    enabled: *on,
+                }]
+            }
+            Step::ChangePlugin { kind } => {
+                let id = ServerId::new(Scope::Plugin, None, PLUGIN);
+                vec![match kind {
+                    0 => Change::Replace {
+                        id,
+                        json: r#"{"command": "other"}"#.into(),
+                    },
+                    1 => Change::Delete { id },
+                    2 => Change::Rename {
+                        id,
+                        name: "renamed".into(),
+                    },
+                    3 => Change::Duplicate {
+                        id,
+                        name: "copied".into(),
+                        targets: vec![Target::User],
+                    },
+                    _ => Change::Move {
+                        id,
+                        to: rig.place(1),
+                    },
+                }]
+            }
             Step::PutBack { pick } | Step::Forget { pick } => {
                 let Some((id, (project, name, entry))) =
                     before.kept.iter().nth(pick % before.kept.len().max(1))
@@ -1006,6 +1102,25 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                     said
                 );
             }
+        }
+
+        // A plugin's files are never written; its server is only switched, and only when asked.
+        prop_assert_eq!(&after.plugin_files, &first.plugin_files, "{}", said);
+        if let Step::ChangePlugin { .. } = step {
+            prop_assert!(
+                matches!(&outcome, Outcome::Refused(why) if why.contains("comes from the plugin pl")),
+                "{}",
+                said
+            );
+        }
+        match (step, &outcome) {
+            (Step::TogglePlugin { .. }, Outcome::Done | Outcome::Unchanged) => {
+                prop_assert_eq!(&after.plugin_off, &expected.plugin_off, "{}", said);
+            }
+            (Step::TogglePlugin { .. }, _) => {
+                prop_assert!(false, "switching a plugin's server: {}", said);
+            }
+            _ => prop_assert_eq!(&after.plugin_off, &before.plugin_off, "{}", said),
         }
 
         // The configuration's other keys, their values and their order.

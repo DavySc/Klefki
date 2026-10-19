@@ -34,14 +34,16 @@ marketplace and from a plugin with a git source; each result was read back with 
   configured by hand that is loaded there, or an earlier plugin's server that is loaded there, with the same
   definition. It names a server configured by hand first, else the earlier plugin's. The target shown is the one
   Claude Code runs (`${CLAUDE_PLUGIN_ROOT}` expanded); what the plugin writes is on hover.
-- The toggle state is shown as for a user server (off in N of M projects); turning it on and off is the next slice,
-  now that finding 2 shows it works.
+- The toggle state is shown as for a user server (off in N of M projects), and Klefki **turns it on and off** like
+  a user server (slice 2): the full name in `disabledMcpServers` of every project Claude Code knows, through the usual
+  review. Only `.claude.json` changes; the plugin's files and `settings.json` are never written. The name comes from
+  the row's connection (as the plugin's files spell it), never from the cleaned name shown, and goes into JSON only:
+  it is not a `ServerName` and is never passed to `claude`.
 - All plugin files are untrusted: 1 MiB per file, 256 plugins, 500 servers per plugin, 16 manifest sources, paths
   from the files must stay inside the folder they are relative to, and an install path with `..` is not followed.
 
 ## Not yet (next slices)
 - Plugins on only in a project's `.claude/settings.json` or `settings.local.json`, or off there (finding 3).
-- Turning a plugin's server on and off through `disabledMcpServers` (finding 2), with the model-based test.
 - Organisation servers (`managed-mcp.json`, `managedMcpServers`), plugins from managed settings, and `.mcpb` bundles.
 - "Blocked by policy" (finding 7), naming the rule and its file.
 - claude.ai connectors (finding 9), from a cache only, never a new `mcp list`.

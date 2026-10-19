@@ -1602,8 +1602,8 @@ impl ShellApp {
         let pal = theme::palette(ui.ctx());
         let read_only_hint = self.read_only_hint();
         let read_only = read_only_hint.is_some();
-        let can_toggle =
-            self.core.is_some() && !self.selected.is_empty() && self.can_prepare() && !read_only;
+        // A plugin's server is switched like any other (decision 008).
+        let can_toggle = self.core.is_some() && !self.selected.is_empty() && self.can_prepare();
         let can_edit = self.core.is_some() && self.selected.len() == 1 && !read_only;
         let can_duplicate = self.duplicable().is_some();
         let can_add = self.core.is_some() && self.can_prepare();
@@ -1632,7 +1632,15 @@ impl ShellApp {
                 let button = egui::Button::new(RichText::new(glyph).size(16.0))
                     .min_size(egui::vec2(44.0, 38.0));
                 let (enabled, needs) = match glyph {
-                    _ if read_only && glyph != icon::PLUS && glyph != icon::TRAY_ARROW_DOWN => {
+                    _ if read_only
+                        && ![
+                            icon::PLUS,
+                            icon::TRAY_ARROW_DOWN,
+                            icon::TOGGLE_RIGHT,
+                            icon::TOGGLE_LEFT,
+                        ]
+                        .contains(&glyph) =>
+                    {
                         (false, read_only_hint.as_deref().unwrap_or_default())
                     }
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
@@ -1718,14 +1726,13 @@ impl ShellApp {
                 action,
             });
         };
-        // A plugin's servers are read-only: nothing here changes, checks or exports them. With others selected, the
-        // actions on the selection take those.
-        let (changeable, _) = self.changeable_selected();
-        if live && !changeable.is_empty() {
-            let what = match changeable[..] {
-                [one] => one.name.clone(),
-                _ => format!("{} servers", changeable.len()),
-            };
+        let named = |rows: &[&ServerRow]| match rows {
+            [one] => one.name.clone(),
+            _ => format!("{} servers", rows.len()),
+        };
+        // Every server is switched, a plugin's too.
+        if live && !selected.is_empty() {
+            let what = named(&selected);
             add(
                 icon::TOGGLE_RIGHT,
                 format!("Turn on {what}"),
@@ -1740,6 +1747,12 @@ impl ShellApp {
                 None,
                 command::Action::TurnOff,
             );
+        }
+        // Beyond switching, a plugin's servers are read-only: nothing here changes, checks or exports them. With
+        // others selected, the actions on the selection take those.
+        let (changeable, _) = self.changeable_selected();
+        if live && !changeable.is_empty() {
+            let what = named(&changeable);
             if selected.len() == 1 {
                 let s = selected[0];
                 add(
@@ -3485,20 +3498,17 @@ impl ShellApp {
 
     /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
     fn prepare_toggle(&mut self, enabled: bool) {
-        let (rows, left_out) = self.changeable_selected();
-        let changes: Vec<Change> = rows
-            .into_iter()
+        let changes: Vec<Change> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
             .map(|row| Change::SetEnabled {
                 id: row.id(),
                 enabled,
             })
             .collect();
-        let changed = changes.len();
-        if !changes.is_empty() && self.can_prepare() {
+        if !changes.is_empty() {
             self.prepare(changes);
-            self.note_plugins_left_out(changed, left_out);
-        } else if changes.is_empty() {
-            self.note_plugins_left_out(0, left_out);
         }
     }
 
@@ -8026,8 +8036,8 @@ fn short_name(s: &ServerRow) -> &str {
 /// What the details say under a plugin's server.
 fn plugin_read_only(p: &klefki_core::api::PluginInfo) -> String {
     format!(
-        "Read-only: Claude Code reads this server from the plugin {}. Change it in the plugin, or turn the plugin \
-         off in Claude Code (/plugin).",
+        "Claude Code reads this server from the plugin {}. Klefki switches it on and off; to change it, change the \
+         plugin, or turn the plugin off in Claude Code (/plugin).",
         p.plugin
     )
 }
@@ -11276,7 +11286,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plugins_server_is_shown_but_nothing_changes_checks_or_exports_it() {
+    fn a_plugins_server_is_switched_on_and_off_but_nothing_else_changes_checks_or_exports_it() {
         use egui::accesskit::Role;
         let (mut h, engine) = live_harness();
         let p = plugin_row("plugin:docs:search", None);
@@ -11289,12 +11299,16 @@ mod tests {
         drain(&engine);
         h.get_by_label("plugin:docs:search");
         h.get_by_label("docs, from team");
-        h.get_by_label_contains("Read-only: Claude Code reads this server from the plugin docs.");
+        h.get_by_label_contains("Claude Code reads this server from the plugin docs.");
         // No form to edit it in.
         assert!(h.query_by_label("Review and save…").is_none());
+        for glyph in [icon::TOGGLE_RIGHT, icon::TOGGLE_LEFT] {
+            assert!(
+                !h.get_by_label(glyph).accesskit_node().is_disabled(),
+                "{glyph}"
+            );
+        }
         for glyph in [
-            icon::TOGGLE_RIGHT,
-            icon::TOGGLE_LEFT,
             icon::TRASH,
             icon::PENCIL_SIMPLE,
             icon::COPY,
@@ -11311,7 +11325,7 @@ mod tests {
         h.get_by_label("See /mcp");
         // The note saying so comes first, before anyone looks for Edit.
         let note = h
-            .get_by_label_contains("Read-only: Claude Code reads this server")
+            .get_by_label_contains("Claude Code reads this server")
             .rect()
             .top();
         assert!(note < h.get_by_label("docs, from team").rect().top());
@@ -11329,10 +11343,13 @@ mod tests {
         );
         h.run();
         let offered: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
-        assert!(
-            !offered
-                .iter()
-                .any(|t| t.contains("plugin:docs:search") && !t.starts_with("Go to")),
+        let about: Vec<&String> = offered
+            .iter()
+            .filter(|t| t.contains("plugin:docs:search") && !t.starts_with("Go to"))
+            .collect();
+        assert_eq!(
+            about,
+            ["Turn on plugin:docs:search", "Turn off plugin:docs:search"],
             "{offered:?}"
         );
         // The Status tab says where its status is; nothing to check it with.
@@ -11342,6 +11359,16 @@ mod tests {
         assert!(h.query_by_label("Check now").is_none());
         assert!(h.query_by_label("Diagnose").is_none());
         assert_eq!(drain(&engine), Vec::<Command>::new());
+        // Switched like a user server, through a review.
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: p.id(),
+                enabled: false
+            }])]
+        );
     }
 
     #[test]
@@ -11369,7 +11396,7 @@ mod tests {
         let p = plugin_row("plugin:docs:search", None);
         engine
             .events
-            .send(snapshot_of(vec![user.clone(), p]))
+            .send(snapshot_of(vec![user.clone(), p.clone()]))
             .unwrap();
         h.run();
         h.state_mut().selected = BTreeSet::from([0, 1]);
@@ -11387,18 +11414,39 @@ mod tests {
                 .is_disabled()
         );
         drain(&engine);
+        // Switching takes both.
         h.get_by_label(icon::TOGGLE_LEFT).click();
         h.run();
         assert_eq!(
             drain(&engine),
-            vec![Command::Prepare(vec![Change::SetEnabled {
-                id: user.id(),
-                enabled: false
-            }])]
+            vec![Command::Prepare(vec![
+                Change::SetEnabled {
+                    id: user.id(),
+                    enabled: false
+                },
+                Change::SetEnabled {
+                    id: p.id(),
+                    enabled: false
+                }
+            ])]
+        );
+        assert!(h.query_by_label_contains("Left out").is_none());
+        let offered: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
+        assert!(
+            offered.contains(&"Turn on 2 servers".to_owned()),
+            "{offered:?}"
+        );
+        assert!(offered.contains(&"Delete alpha".to_owned()), "{offered:?}");
+        // Deleting takes the other, and says what it left out.
+        h.state_mut().plan = None;
+        h.state_mut().preparing = false;
+        h.key_press(egui::Key::Delete);
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::Delete { id: user.id() }])]
         );
         h.get_by_label_contains("Left out 1 plugin server");
-        let offered: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
-        assert!(offered.contains(&"Turn on alpha".to_owned()), "{offered:?}");
         // Export takes the rest too.
         h.state_mut().plan = None;
         h.state_mut().preparing = false;
