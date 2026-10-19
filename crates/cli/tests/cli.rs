@@ -46,7 +46,7 @@ impl Env {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let project = root.join("repo");
+        let project = root.join("Repo");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("cfg")).unwrap();
@@ -126,7 +126,7 @@ impl Env {
 
     fn project(&self) -> String {
         self.root()
-            .join("repo")
+            .join("Repo")
             .to_string_lossy()
             .replace('\\', "/")
     }
@@ -148,8 +148,14 @@ impl Env {
                 s.to_owned()
             }
         };
-        match fold(&project).strip_prefix(&fold(home)) {
-            Some(rest) if !home.is_empty() && rest.starts_with('/') => format!("~{rest}"),
+        // Compared folded, but the rest keeps its case, as the CLI prints it.
+        match project.get(..home.len()) {
+            Some(head) if !home.is_empty() && fold(head) == fold(home) => {
+                match &project[home.len()..] {
+                    rest if rest.starts_with('/') => format!("~{rest}"),
+                    _ => project,
+                }
+            }
             _ => project,
         }
     }
@@ -277,7 +283,7 @@ fn list_shortens_a_project_under_the_home_folder() {
         .expect("run klefki-cli");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let shown = env.shown_project(Some(env.root()));
-    assert_eq!(shown, "~/repo");
+    assert_eq!(shown, "~/Repo");
     assert_groups_in_order(&text(&out.stdout), &shown);
     let json = env
         .command(&["list", "--json"])
@@ -635,7 +641,7 @@ fn a_named_server_that_is_off_is_not_checked() {
 #[test]
 fn a_rejected_project_server_is_not_checked_even_when_named() {
     let env = Env::new();
-    let settings = env.root().join("repo").join(".claude");
+    let settings = env.root().join("Repo").join(".claude");
     std::fs::create_dir_all(&settings).unwrap();
     std::fs::write(
         settings.join("settings.local.json"),

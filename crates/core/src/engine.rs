@@ -6201,7 +6201,8 @@ mod tests {
         config["projects"][&key]["mcpServers"] = serde_json::json!({"sso": serde_json::from_str::<serde_json::Value>(SSO_ENTRY).unwrap()});
         write_config(&env, &config);
         core.send(Command::Refresh { live_all: false });
-        let events = collect(&core, |e| !snapshots(e).is_empty());
+        // A refresh the watcher started before the write above can still come first, and rightly lists it as kept.
+        let events = collect(&core, |e| snapshots(e).iter().any(|s| s.kept.is_empty()));
         assert!(snapshots(&events).last().unwrap().kept.is_empty());
         assert_eq!(
             std::fs::read_dir(env.dir.path().join("recovery"))
