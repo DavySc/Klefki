@@ -21,12 +21,15 @@ Two should-fixes, both done:
 - Optional, done (the sort commit, checked by the performance thread): the borrow alone did not speed up the sort; splitting each name once does. Test `rows_in_a_group_sort_as_people_count` checks `ordered` against `natural` (fails when the name order is reversed).
 - Taking the captured output instead of copying it let a reader thread still draining a pipe (a grandchild holds it) keep another full buffer. The copy stays; it was one copy of up to 64 KiB per run.
 
+## Cross-review (UI fixes thread, on the pull request)
+No blockers. Folded in: the reserved-word line now says who turns the name down and why ("Klefki turns down constructor, a name JavaScript treats as special"), and `transport_key` says why it is kept apart from `TransportKind::label()`. Kept: "rename it in the repository's .mcp.json" (the reviewer preferred it too).
+
 ## Checks (Linux, 2026-10-19)
 - Each new test failed before its fix (quoted above).
 - Verify all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0, deny ok; 703 tests before and after the pre-review fixes, 704 with the sort test.
 - End to end: `klefki-cli status` with fake-claude as `claude`, a temporary `CLAUDE_CONFIG_DIR` and a repository whose `.mcp.json` names `docs`, `x$(echo INJECTED)` and `-a;echo INJECTED`. `docs` gets "to check it: klefki-cli status docs"; the other two get the rename line naming `'$'` and `';'`. Exit 0.
 - Merges cleanly with #26, #28, #29 and #30 (`git merge-tree`).
-- On main `2208801` with the patches applied: verify all exits 0, deny ok, 801 tests passed, 0 failed (Linux, 2026-10-19).
+- On main `2208801` with the patches applied: verify all exits 0, deny ok, 801 tests passed, 0 failed (Linux, 2026-10-19); the same after the cross-review changes.
 - Not run: Windows and macOS. The command is offered only for `[A-Za-z0-9_-]` names without a leading dash, which are inert in sh, cmd and PowerShell (reasoned, not run).
 
 ## Open

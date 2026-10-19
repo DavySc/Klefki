@@ -269,6 +269,7 @@ fn scope_key(scope: Scope) -> &'static str {
     }
 }
 
+/// The JSON value, kept apart from `TransportKind::label()` so a changed table label cannot change what scripts read.
 fn transport_key(kind: TransportKind) -> &'static str {
     match kind {
         TransportKind::Stdio => "stdio",
@@ -365,7 +366,9 @@ fn name_rule(name: &str, why: NameError) -> String {
         NameError::BadChar(' ') => "a name cannot hold a space".to_owned(),
         NameError::BadChar(c) => format!("a name can hold only A-Z a-z 0-9 _ -, not {c:?}"),
         NameError::LeadingDash => "a name cannot start with a dash".to_owned(),
-        NameError::Reserved => format!("{name} is a reserved word"),
+        NameError::Reserved => {
+            format!("Klefki turns down {name}, a name JavaScript treats as special")
+        }
     }
 }
 
@@ -698,7 +701,10 @@ mod tests {
             ("a\"b", "not '\"')\n"),
             ("my server", "(a name cannot hold a space)\n"),
             ("-x", "(a name cannot start with a dash)\n"),
-            ("constructor", "(constructor is a reserved word)\n"),
+            (
+                "constructor",
+                "(Klefki turns down constructor, a name JavaScript treats as special)\n",
+            ),
             (&long, "(a name can be at most 64 characters)\n"),
         ] {
             row.name = name.to_owned();
