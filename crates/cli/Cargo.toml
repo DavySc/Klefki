@@ -14,5 +14,4 @@ klefki-core = { path = "../core" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
-serde_json = "1"
 tempfile = "3"

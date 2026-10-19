@@ -74,11 +74,14 @@ pub(crate) fn read_limited_bom(path: &Path, max_bytes: u64) -> io::Result<Option
             "file grew past the size limit while reading",
         ));
     }
-    let text = String::from_utf8(buf).map_err(|_| io::Error::other("file is not valid UTF-8"))?;
-    Ok(Some(match text.strip_prefix('\u{feff}') {
-        Some(rest) => (rest.to_owned(), true),
-        None => (text, false),
-    }))
+    let mut text =
+        String::from_utf8(buf).map_err(|_| io::Error::other("file is not valid UTF-8"))?;
+    // Removed in place: the file can be large.
+    let bom = text.starts_with('\u{feff}');
+    if bom {
+        text.drain(..'\u{feff}'.len_utf8());
+    }
+    Ok(Some((text, bom)))
 }
 
 /// Is the opened file (`opened`, from its handle) the regular file the path named when it was checked

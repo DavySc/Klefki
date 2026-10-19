@@ -1,7 +1,9 @@
 //! What `list` and `status` print: a table for people, JSON for scripts (docs/decisions/006-cli-output.md). Pure
 //! functions of the snapshot and the answers, so they are tested without running anything. All text in a snapshot
 //! and in the engine's answers is already sanitised by core.
-use klefki_core::api::{Approval, Hint, Scope, ServerRow, Snapshot, Status, TransportKind};
+use klefki_core::api::{
+    Approval, Hint, NameError, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind,
+};
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -84,21 +86,29 @@ pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
     }
 }
 
-/// Orders names as people count: `server-9` before `server-10`. Case is ignored first, then decides a tie.
+/// Orders names as people count: `server-9` before `server-10`. Case is ignored first, then decides a tie. This is
+/// the order [`ordered`] gives names within a group, where each name is split once.
+#[cfg(test)]
 fn natural(a: &str, b: &str) -> Ordering {
-    fn chunks(s: &str) -> Vec<(bool, String)> {
-        let mut out: Vec<(bool, String)> = Vec::new();
-        for c in s.chars() {
-            let digit = c.is_ascii_digit();
-            match out.last_mut() {
-                Some((d, text)) if *d == digit => text.push(c),
-                _ => out.push((digit, c.to_string())),
-            }
+    by_chunks(&chunks(a), &chunks(b)).then_with(|| a.cmp(b))
+}
+
+/// A name, lower-cased, as runs of digits and of other characters.
+fn chunks(name: &str) -> Vec<(bool, String)> {
+    let mut out: Vec<(bool, String)> = Vec::new();
+    for c in name.to_lowercase().chars() {
+        let digit = c.is_ascii_digit();
+        match out.last_mut() {
+            Some((d, text)) if *d == digit => text.push(c),
+            _ => out.push((digit, c.to_string())),
         }
-        out
     }
-    let (x, y) = (chunks(&a.to_lowercase()), chunks(&b.to_lowercase()));
-    for ((xd, xs), (yd, ys)) in x.iter().zip(&y) {
+    out
+}
+
+/// Compares runs of digits by their number and other runs as text.
+fn by_chunks(x: &[(bool, String)], y: &[(bool, String)]) -> Ordering {
+    for ((xd, xs), (yd, ys)) in x.iter().zip(y) {
         let order = if *xd && *yd {
             let (xt, yt) = (xs.trim_start_matches('0'), ys.trim_start_matches('0'));
             xt.len().cmp(&yt.len()).then_with(|| xt.cmp(yt))
@@ -109,20 +119,23 @@ fn natural(a: &str, b: &str) -> Ordering {
             return order;
         }
     }
-    x.len().cmp(&y.len()).then_with(|| a.cmp(b))
+    x.len().cmp(&y.len())
 }
 
 /// The rows to show, in the order they are shown: user servers, then per project its local and project servers;
 /// by name within a group.
 pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
-    let mut rows: Vec<&ServerRow> = rows.into_iter().collect();
-    rows.sort_by(|a, b| {
-        let group = |r: &ServerRow| (r.scope != Scope::User, r.project.clone(), r.scope);
+    // Each name is split once, not at every comparison.
+    let mut keyed: Vec<(&ServerRow, Vec<(bool, String)>)> =
+        rows.into_iter().map(|r| (r, chunks(&r.name))).collect();
+    keyed.sort_by(|(a, x), (b, y)| {
+        let group = |r: &'a ServerRow| (r.scope != Scope::User, &r.project, r.scope);
         group(a)
             .cmp(&group(b))
-            .then_with(|| natural(&a.name, &b.name))
+            .then_with(|| by_chunks(x, y))
+            .then_with(|| a.name.cmp(&b.name))
     });
-    rows
+    keyed.into_iter().map(|(r, _)| r).collect()
 }
 
 /// A path as shown in a heading: `~/…` under the home folder, which keeps lines short. JSON keeps the full path.
@@ -256,8 +269,15 @@ fn scope_key(scope: Scope) -> &'static str {
     }
 }
 
+/// The JSON value, kept apart from `TransportKind::label()` so a changed table label cannot change what scripts read.
 fn transport_key(kind: TransportKind) -> &'static str {
-    kind.label()
+    match kind {
+        TransportKind::Stdio => "stdio",
+        TransportKind::Http => "http",
+        TransportKind::Sse => "sse",
+        TransportKind::Ws => "ws",
+        TransportKind::Invalid => "invalid",
+    }
 }
 
 fn approval_key(approval: Approval) -> &'static str {
@@ -338,6 +358,20 @@ pub fn command_word(name: &str) -> String {
     }
 }
 
+/// Why Klefki does not pass `name` to Claude Code, as the rule it breaks.
+fn name_rule(name: &str, why: NameError) -> String {
+    match why {
+        NameError::Empty => "a name cannot be empty".to_owned(),
+        NameError::TooLong => "a name can be at most 64 characters".to_owned(),
+        NameError::BadChar(' ') => "a name cannot hold a space".to_owned(),
+        NameError::BadChar(c) => format!("a name can hold only A-Z a-z 0-9 _ -, not {c:?}"),
+        NameError::LeadingDash => "a name cannot start with a dash".to_owned(),
+        NameError::Reserved => {
+            format!("Klefki turns down {name}, a name JavaScript treats as special")
+        }
+    }
+}
+
 /// The status column and the message after it.
 fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
     match outcome {
@@ -364,12 +398,23 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
                 Status::Unknown | Status::Checking => NOT_CHECKED,
                 status => status.label(),
             };
+            // The name comes from the repository's `.mcp.json`. Only a name Klefki passes to Claude Code can be
+            // checked, and such a name is the same word in any shell.
+            let how = match ServerName::parse(&row.name) {
+                Ok(name) => format!(
+                    "to check it: klefki-cli status {}",
+                    command_word(name.as_str())
+                ),
+                Err(why) => format!(
+                    "to check it, rename it in the repository's .mcp.json ({})",
+                    name_rule(&row.name, why)
+                ),
+            };
             (
                 label.to_owned(),
                 format!(
-                    "not checked: it may run the repository's own command ({}); to check it: klefki-cli status {}",
-                    row.target,
-                    command_word(&row.name)
+                    "not checked: it may run the repository's own command ({}); {how}",
+                    row.target
                 ),
             )
         }
@@ -567,6 +612,32 @@ mod tests {
     }
 
     #[test]
+    fn rows_in_a_group_sort_as_people_count() {
+        // `ordered` splits each name once instead of using `natural`, so it is checked on its own.
+        let s = fixture_snapshot();
+        let row = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let names = [
+            "server-10",
+            "Server-2",
+            "server-9",
+            "alpha",
+            "server-02b",
+            "Alpha",
+        ];
+        let rows: Vec<ServerRow> = names
+            .iter()
+            .map(|n| ServerRow {
+                name: (*n).to_owned(),
+                ..row.clone()
+            })
+            .collect();
+        let mut expected = names.to_vec();
+        expected.sort_by(|a, b| natural(a, b));
+        let got: Vec<&str> = ordered(&rows).iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
     fn every_row_of_the_fixture_is_listed_once() {
         let s = fixture_snapshot();
         let rows = ordered(&s.servers);
@@ -599,6 +670,59 @@ mod tests {
         assert_eq!(command_word("-x"), "-- -x");
         assert_eq!(command_word("a\"b"), "\"a\\\"b\"");
         assert_eq!(command_word(""), "\"\"");
+    }
+
+    #[test]
+    fn a_project_server_gets_a_check_command_only_when_its_name_can_be_checked() {
+        // Core review 3: a name from the repository's `.mcp.json` was quoted in a way a shell still expands, so
+        // copying the suggestion could run what the name held. Only a name Klefki passes to Claude Code can be
+        // checked, and such a name needs no quoting.
+        let s = fixture_snapshot();
+        let mut row = s
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Project)
+            .unwrap()
+            .clone();
+        let long = "a".repeat(65);
+        for (name, said) in [
+            ("docs", "; to check it: klefki-cli status docs\n"),
+            (
+                "my_server-2",
+                "; to check it: klefki-cli status my_server-2\n",
+            ),
+            (
+                "x$(echo INJECTED)",
+                "(a name can hold only A-Z a-z 0-9 _ -, not '$')\n",
+            ),
+            ("x`echo INJECTED`", "not '`')\n"),
+            ("-a$HOME", "not '$')\n"),
+            ("-a;echo INJECTED", "not ';')\n"),
+            ("a\"b", "not '\"')\n"),
+            ("my server", "(a name cannot hold a space)\n"),
+            ("-x", "(a name cannot start with a dash)\n"),
+            (
+                "constructor",
+                "(Klefki turns down constructor, a name JavaScript treats as special)\n",
+            ),
+            (&long, "(a name can be at most 64 characters)\n"),
+        ] {
+            row.name = name.to_owned();
+            let text = status_text(&[(&row, Outcome::ProjectServer)], None);
+            let offered = said.starts_with("; to check it:");
+            assert_eq!(
+                text.contains("klefki-cli status"),
+                offered,
+                "{name}: {text}"
+            );
+            assert!(text.contains(said), "{name}: {text}");
+            if !offered {
+                assert!(
+                    text.contains("; to check it, rename it in the repository's .mcp.json ("),
+                    "{name}: {text}"
+                );
+            }
+        }
     }
 
     fn checked(status: Status, detail: &str) -> Outcome {
