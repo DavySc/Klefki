@@ -381,7 +381,7 @@ fn oauth_info(entry: &Value) -> Option<OAuthInfo> {
     Some(OAuthInfo { client_id, scopes })
 }
 
-fn classify(entry: &Value) -> (TransportKind, String) {
+pub(crate) fn classify(entry: &Value) -> (TransportKind, String) {
     let Some(obj) = entry.as_object() else {
         return (TransportKind::Invalid, "entry is not an object".into());
     };
@@ -665,7 +665,7 @@ type ProjectServerList = Vec<(String, Value)>;
 /// Names of servers in a project's `.mcp.json`, plus each name defined more than once.
 type ProjectServers = (Vec<(String, Value)>, Vec<String>);
 
-fn read_project_servers(path: &Path) -> Result<Option<ProjectServers>, String> {
+pub(crate) fn read_project_servers(path: &Path) -> Result<Option<ProjectServers>, String> {
     let Some(text) = fsx::read_limited(path, MAX_MCP_JSON).map_err(|e| e.to_string())? else {
         return Ok(None);
     };

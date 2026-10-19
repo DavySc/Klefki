@@ -4,6 +4,7 @@ use std::sync::Arc;
 pub use crate::activity::{Activity, ActivityEntry, Backup};
 pub use crate::config::ConfigPaths;
 pub use crate::config::definition::Definition;
+pub use crate::desktop::{Desktop, DesktopServer};
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
     SignInFailure, SignInStep,
@@ -316,6 +317,7 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         open_dialog: std::sync::Arc::new(open_save_dialog),
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
+        desktop: crate::desktop::DesktopRoots::discover(),
     }
 }
 

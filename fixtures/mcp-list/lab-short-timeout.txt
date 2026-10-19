@@ -1,0 +1,16 @@
+Checking MCP server health…
+
+ok: python C:\lab\srv.py ok - ✔ Connected
+exit: python C:\lab\srv.py exit - ✘ Failed to connect — CONNECTION_CLOSED: Connection closed
+hang: python C:\lab\srv.py hang - ✘ Failed to connect — MCP server "[redacted]" connection timed out after 3000ms
+badinit: python C:\lab\srv.py badinit - ✘ Failed to connect — -32603: nope
+toolsfail: python C:\lab\srv.py toolsfail - ! Connected · tools fetch failed — no tools
+slowtools5: python C:\lab\srv.py slowtools 5 - ! Connected · tools fetch failed — Request timed out
+noargs: python  - ✘ Failed to connect — MCP server "noargs" connection timed out after 3000ms
+slowtools3: python C:\lab\srv.py slowtools 3 - ✔ Connected
+slow4: python C:\lab\srv.py slow 4 - ✘ Failed to connect — Request timed out
+
+
+
+
+
