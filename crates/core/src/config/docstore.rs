@@ -1601,6 +1601,10 @@ fn edit_servers<'o>(
                     sanitize(name)
                 )));
             }
+            // A server renamed to this name earlier in the plan takes it too.
+            if renamed.iter().any(|(_, n)| *n == name) {
+                return Err(invalid(format!("{} already exists there", sanitize(name))));
+            }
             // A new definition has no earlier values, so `<hidden>` in it is refused.
             let new = entry::unmasked(new, &Value::Null).map_err(invalid)?;
             if purpose == Purpose::Preview {
@@ -2464,6 +2468,20 @@ mod tests {
                     "the add is refused, the name is taken"
                 );
             }
+        }
+        // A rename and an add to the same new name, in either order: refused, never two keys of one name.
+        let rename = Op::RenameServer {
+            project: None,
+            name: "a".into(),
+            new_name: "d".into(),
+        };
+        for ops in [
+            vec![rename.clone(), add("d", "d")],
+            vec![add("d", "d"), rename.clone()],
+        ] {
+            let f = Fixture::new(&pretty(&doc(three.clone())));
+            assert!(f.store.prepare(ops.clone()).is_err(), "{ops:?}");
+            assert_eq!(f.text(), pretty(&doc(three.clone())));
         }
         // Every member removed and one added, the edits would overlap: refused, the file left as it is.
         let f = Fixture::new(&pretty(&doc(json!({"a": entry("a")}))));

@@ -3117,6 +3117,17 @@ impl ShellApp {
                             "The configuration already looks like this. Nothing would be written.",
                         );
                     }
+                    // Warnings first: what a change costs is read before the details (cross-review of the restore).
+                    for warning in &plan.warnings {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("{} {warning}", icon::WARNING))
+                                    .color(pal.warn),
+                            )
+                            .wrap(),
+                        );
+                    }
                     for review in &plan.reviews {
                         ui.add_space(4.0);
                         Frame::new()
@@ -3132,16 +3143,6 @@ impl ShellApp {
                                     );
                                 }
                             });
-                    }
-                    for warning in &plan.warnings {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("{} {warning}", icon::WARNING))
-                                    .color(pal.warn),
-                            )
-                            .wrap(),
-                        );
                     }
                     for (at, file) in plan.files.iter().enumerate() {
                         if file.lines.is_empty() {
@@ -8991,6 +8992,26 @@ mod tests {
             .unwrap();
         h.run();
         (h, engine)
+    }
+
+    #[test]
+    fn warnings_come_before_what_each_server_would_run() {
+        // Cross-review of the restore, U1: a reverted token was only said after every "would run" card.
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        let mut plan = plan_view(7, &["+ alpha"], &["alpha: the token goes back"], false);
+        plan.reviews = (0..4)
+            .map(|i| klefki_core::api::Review {
+                title: format!("server{i} would run:"),
+                lines: vec!["Command: x".to_owned()],
+            })
+            .collect();
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        let warning = h.get_by_label_contains("alpha: the token goes back").rect();
+        let card = h.get_by_label("server0 would run:").rect();
+        assert!(warning.bottom() <= card.top(), "{warning:?} {card:?}");
     }
 
     #[test]

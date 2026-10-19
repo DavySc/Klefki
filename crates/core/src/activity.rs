@@ -134,6 +134,7 @@ fn append(path: &Path, line: &[u8]) -> io::Result<()> {
     if let Ok(meta) = std::fs::symlink_metadata(path)
         && meta.len() + line.len() as u64 > MAX_BYTES
         && !compact(path)?
+        && unreadable(path)
     {
         set_aside(path)?;
     }
@@ -177,6 +178,16 @@ fn compact(path: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Whether the file at `path` itself cannot be read as a log: not a plain file, larger than the log may be, or not
+/// text. Not a read that failed for a moment (another program holding the file): that log is left where it is.
+fn unreadable(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() || meta.len() > READ_LIMIT => true,
+        Ok(_) => std::fs::read(path).is_ok_and(|bytes| std::str::from_utf8(&bytes).is_err()),
+        Err(_) => false,
+    }
+}
+
 /// Moves a log that cannot be read out of the way, as it is, next to it (`activity.unreadable-<ms>-<n>.jsonl`), so
 /// a new one can start and nothing in it is lost. Returns where it went.
 fn set_aside(path: &Path) -> io::Result<PathBuf> {
@@ -194,6 +205,17 @@ fn set_aside(path: &Path) -> io::Result<PathBuf> {
     unreachable!("some name is free")
 }
 
+/// What the change logged with the backup called `name` (a file name) did, as its summary says; `None` when no
+/// change in the log mentions it.
+pub(crate) fn summary_of(backup_dir: &Path, name: &str) -> Option<Vec<String>> {
+    let text = fsx::read_limited(&log_path(backup_dir), READ_LIMIT).ok()??;
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Record>(line).ok())
+        .find(|r| r.backups.iter().any(|b| file_name(b) == name))
+        .map(|r| r.summary)
+}
+
 /// Reads the log and the backup folder: every change, and every backup no change mentions, newest first.
 pub(crate) fn load(backup_dir: &Path) -> Activity {
     let now = now_ms();
@@ -202,12 +224,18 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
         Ok(text) => text.unwrap_or_default(),
         Err(e) => {
             let why = sanitize_line(&e.to_string());
-            problem = Some(match set_aside(&log_path(backup_dir)) {
-                Ok(aside) => format!(
+            let path = log_path(backup_dir);
+            let aside = if unreadable(&path) {
+                set_aside(&path).ok()
+            } else {
+                None
+            };
+            problem = Some(match aside {
+                Some(aside) => format!(
                     "The activity log could not be read ({why}), so Klefki moved it to {} and starts a new one.",
                     clip(&sanitize_line(&aside.display().to_string()), MAX_PATH)
                 ),
-                Err(_) => format!("The activity log could not be read: {why}"),
+                None => format!("The activity log could not be read: {why}"),
             });
             String::new()
         }
@@ -889,6 +917,48 @@ mod tests {
         std::fs::write(log_path(&backups), junk).unwrap();
         load(&backups);
         assert_eq!(set_aside(&backups).len(), 2);
+    }
+
+    #[test]
+    fn only_a_log_that_is_itself_unreadable_is_set_aside() {
+        // Cross-review U3: a read that fails for a moment (another program holds the file) is not a broken log.
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        record(&backups, &summary("Turn off alpha"), None, &[]).unwrap();
+        let log = log_path(&backups);
+        assert!(!unreadable(&log), "a good log");
+        std::fs::write(&log, [0xffu8, 0x80]).unwrap();
+        assert!(unreadable(&log), "not text");
+        std::fs::write(&log, vec![b' '; READ_LIMIT as usize + 1]).unwrap();
+        assert!(unreadable(&log), "too large");
+        std::fs::remove_file(&log).unwrap();
+        assert!(!unreadable(&log), "not there");
+        std::fs::create_dir(&log).unwrap();
+        assert!(unreadable(&log), "not a file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_cannot_be_opened_for_now_is_reported_and_left_where_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        record(&backups, &summary("Turn off alpha"), None, &[]).unwrap();
+        let log = log_path(&backups);
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&log).is_ok() {
+            // Running as root, nothing is refused; `only_a_log_that_is_itself_unreadable_is_set_aside` covers it.
+            return;
+        }
+        let read = load(&backups);
+        assert!(set_aside(&backups).is_empty(), "{:?}", set_aside(&backups));
+        let problem = read.problem.unwrap();
+        assert!(
+            problem.starts_with("The activity log could not be read:"),
+            "{problem}"
+        );
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(load(&backups).entries.len(), 1, "all still there");
     }
 
     #[cfg(unix)]

@@ -31,3 +31,13 @@ Roadmap slice (follow-up of the Activity log, #15): restore Claude Code's server
 ## Open / next
 - Approvals (`enabledMcpjsonServers`, a project's `settings.local.json`) and the legacy `mcpServersDisabled` list are not restored; only servers and their switches.
 - Not tried with a real Claude Code (OAuth put-back runs the same `add-json` path as Put back, covered with fake-claude).
+
+## Cross-review round 1 (review on #27 at `beee064`)
+- B1 fixed: with the add-and-change limit lifted, a rename to `d` followed by an add of `d` in one list wrote `"d"` twice. `AddServer` now also refuses a name an earlier rename in the plan took. Test: the docstore test covers both orders.
+- B2 fixed: a restore turned on a repository server the user switched off after the backup. Only switches of servers the backup defines (a user server, or a local one of that project) go back; others are left and said ("Leave the switch of from-repo in a as it is: the backup does not define that server"). Test `a_server_the_backup_does_not_define_keeps_its_switch_either_way`; `switches_go_back_except_for_servers_added_since` now expects the backup's `repo-server` to be left too.
+- U1: the review dialog shows warnings right after the summary, before the "would run" cards, for every plan. Test `warnings_come_before_what_each_server_would_run`.
+- U2: the buttons say "Restore all servers to before this…" / "Restore all servers to this copy…", and when a restore touches servers its change does not name, the summary says "This also undoes changes made after that one, to …" (from the logged summary of that backup's change). Test `a_restore_that_undoes_more_than_its_change_says_so`.
+- U3: a log is set aside only when the file itself is unreadable (not a plain file, too large, not UTF-8); any other read error is reported as before and the log stays. Tests `only_a_log_that_is_itself_unreadable_is_set_aside`, `a_log_that_cannot_be_opened_for_now_is_reported_and_left_where_it_is` (skips its check when run as root).
+- Non-blocking taken: putting back a server that is now somewhere else warns that both stay. Test `a_server_put_back_that_is_now_somewhere_else_says_both_stay`.
+- Each new test was seen failing with its fix reverted.
+- Checks: full verify exit 0 (305 app + 625 core + 17 + 22 cli tests, deny ok); Windows clippy exit 0. Real app screenshots in `reviews/2026-10-19-restore/round2/`.

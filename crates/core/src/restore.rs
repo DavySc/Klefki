@@ -78,6 +78,19 @@ impl Servers {
     fn project(&self, normal: &str) -> Option<&Project> {
         self.projects.iter().find(|p| p.normal == normal)
     }
+
+    /// Where else a server called `name` is: `for the user`, `in app`, leaving out `except` (`None` for the user,
+    /// else a project as normalised).
+    fn places_of(&self, name: &str, except: Option<&str>) -> Vec<String> {
+        let user =
+            (except.is_some() && find(&self.user, name).is_some()).then(|| swap::place(None));
+        let projects = self
+            .projects
+            .iter()
+            .filter(|p| Some(p.normal.as_str()) != except && find(&p.servers, name).is_some())
+            .map(|p| swap::place(Some(&p.key)));
+        user.into_iter().chain(projects).collect()
+    }
 }
 
 fn entries(list: Option<&Value>) -> Vec<(String, Value)> {
@@ -124,8 +137,50 @@ pub(crate) fn resolve(backup_dir: &Path, backup: &str, now: &str) -> Result<Reso
     } else {
         parse(now, "The configuration")?
     };
-    compare(&backup, &now, &crate::activity::moment(at), &|folder| {
+    let mut out = compare(&backup, &now, &crate::activity::moment(at), &|folder| {
         Path::new(folder).is_dir()
+    })?;
+    // Restoring to before a change also undoes what came after it: said when it touches servers that change does
+    // not name.
+    if let Some(said) = crate::activity::summary_of(backup_dir, name) {
+        let mut later: Vec<String> = Vec::new();
+        for touched in touched(&out) {
+            let shown = sanitize(touched);
+            if !mentions(&said, &shown) && !later.contains(&shown) {
+                later.push(shown);
+            }
+        }
+        if !later.is_empty() {
+            out.summary.insert(
+                1,
+                format!(
+                    "This also undoes changes made after that one, to {}",
+                    ops::some_of(&later)
+                ),
+            );
+        }
+    }
+    Ok(out)
+}
+
+/// The names of the servers a restore puts back, changes back or switches.
+fn touched(out: &Resolved) -> impl Iterator<Item = &str> {
+    let written = out.claude.iter().filter_map(|op| match op {
+        Op::AddServer { name, .. }
+        | Op::ReplaceServer { name, .. }
+        | Op::SetDisabled { name, .. } => Some(name.as_str()),
+        _ => None,
+    });
+    written
+        .chain(out.cli.iter().map(|a| a.name.as_str()))
+        .chain(out.swaps.iter().map(|s| s.from.name.as_str()))
+}
+
+/// Whether one of `lines` names `name` as a word of its own.
+fn mentions(lines: &[String], name: &str) -> bool {
+    lines.iter().any(|line| {
+        line.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+            .any(|word| word == name)
     })
 }
 
@@ -152,6 +207,7 @@ fn compare(
             name,
             entry,
             find(&here.user, name),
+            &here.places_of(name, None),
             folder_exists,
             &mut out,
         );
@@ -167,6 +223,7 @@ fn compare(
                         name,
                         entry,
                         current,
+                        &here.places_of(name, Some(&now.normal)),
                         folder_exists,
                         &mut out,
                     );
@@ -211,8 +268,22 @@ fn compare(
         let Some(before) = before else {
             continue;
         };
-        let keeps =
-            |n: &String| !new_user.contains(&n.as_str()) && !new_local.contains(&n.as_str());
+        // Only the switches of servers the backup defines go back: one it does not (a repository's own server, say)
+        // was switched since by someone who meant it.
+        let keeps = |n: &String| {
+            !new_user.contains(&n.as_str())
+                && !new_local.contains(&n.as_str())
+                && (find(&then.user, n).is_some() || find(&before.servers, n).is_some())
+        };
+        let undefined: Vec<String> = before
+            .off
+            .iter()
+            .filter(|n| !project.off.contains(n))
+            .chain(project.off.iter().filter(|n| !before.off.contains(n)))
+            .filter(|n| find(&then.user, n).is_none() && find(&before.servers, n).is_none())
+            .filter(|n| !new_user.contains(&n.as_str()) && !new_local.contains(&n.as_str()))
+            .map(|n| sanitize(n))
+            .collect();
         let off: Vec<&String> = before
             .off
             .iter()
@@ -247,6 +318,17 @@ fn compare(
                 "Turn off {} in {folder}, and turn on {} there",
                 shown(&off),
                 shown(&on)
+            )),
+        }
+        match undefined.len() {
+            0 => {}
+            1 => out.summary.push(format!(
+                "Leave the switch of {} in {folder} as it is: the backup does not define that server",
+                undefined[0]
+            )),
+            _ => out.summary.push(format!(
+                "Leave the switches of {} in {folder} as they are: the backup does not define those servers",
+                ops::some_of(&undefined)
             )),
         }
     }
@@ -301,6 +383,7 @@ fn server(
     name: &str,
     entry: &Value,
     current: Option<&Value>,
+    elsewhere: &[String],
     folder_exists: &dyn Fn(&str) -> bool,
     out: &mut Resolved,
 ) {
@@ -386,6 +469,15 @@ fn server(
                 out.claude.push(op);
             }
             out.summary.push(format!("Put back {words}"));
+            // Moved since, say: the put-back one does not replace it.
+            if !elsewhere.is_empty() {
+                out.warnings.push(format!(
+                    "{} is {} now; putting it back {} keeps both.",
+                    sanitize(name),
+                    ops::and_list(elsewhere),
+                    swap::place(project)
+                ));
+            }
         }
         Some(current) => {
             if by_claude {
@@ -594,18 +686,20 @@ mod tests {
             name: n.into(),
             disabled: d,
         };
+        // The project's own server is not the backup's: its switch stays as it is (cross-review B2).
         assert_eq!(
             out.claude,
             vec![
                 set("c:\\work\\a\\", "gw", true),
-                set("c:\\work\\a\\", "repo-server", true),
                 set("c:\\work\\a\\", "tool", false),
                 set("/work/b", "tool", false),
             ]
         );
         assert!(
             out.summary
-                .contains(&"Turn off gw and repo-server in a, and turn on tool there".to_owned())
+                .contains(&"Turn off gw in a, and turn on tool there".to_owned()),
+            "{:?}",
+            out.summary
         );
         assert!(out.summary.contains(&"Turn on tool in b".to_owned()));
         assert!(
@@ -613,6 +707,37 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, Op::SetDisabled { name, .. } if name == "newer")),
             "a server added since keeps its switch"
+        );
+    }
+
+    #[test]
+    fn a_server_the_backup_does_not_define_keeps_its_switch_either_way() {
+        // Cross-review B2: a repository server switched off after the backup was switched back on.
+        let backup = json!({"projects": {"/work/a": {"disabledMcpServers": ["was-off"]}}});
+        let now = json!({"projects": {"/work/a": {"disabledMcpServers": ["from-repo"]}}});
+        let out = restore(&backup, &now);
+        assert!(out.claude.is_empty(), "{:?}", out.claude);
+        assert!(
+            out.summary.contains(
+                &"Leave the switches of was-off and from-repo in a as they are: the backup does not define those servers"
+                    .to_owned()
+            ),
+            "{:?}",
+            out.summary
+        );
+    }
+
+    #[test]
+    fn a_server_put_back_that_is_now_somewhere_else_says_both_stay() {
+        let backup = json!({"mcpServers": {"gw": stdio("gw")}, "projects": {"/work/a": {}}});
+        let now = json!({"projects": {"/work/a": {"mcpServers": {"gw": stdio("gw")}}}});
+        let out = restore(&backup, &now);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "gw is in a now; putting it back for the user keeps both."),
+            "{:?}",
+            out.warnings
         );
     }
 
@@ -751,6 +876,41 @@ mod tests {
             .err()
             .unwrap();
         assert!(gone.contains("no longer kept"), "{gone}");
+    }
+
+    #[test]
+    fn a_restore_that_undoes_more_than_its_change_says_so() {
+        // Cross-review U2: restoring to before "Delete gw" also changed tool back, which that change never touched.
+        let dir = tempfile::tempdir().unwrap();
+        let backups = backups(dir.path());
+        let name = "claude.json.0001760000000000-0.bak";
+        std::fs::write(
+            backups.join(name),
+            r#"{"mcpServers": {"gw": {"command": "g"}, "tool": {"command": "t1"}}}"#,
+        )
+        .unwrap();
+        let path = backups.join(name);
+        crate::activity::record(
+            &backups,
+            &["Delete gw (user server)".to_owned()],
+            None,
+            &[path],
+        )
+        .unwrap();
+        let just_gw = r#"{"mcpServers": {"tool": {"command": "t1"}}}"#;
+        let out = resolve(&backups, name, just_gw).unwrap();
+        assert!(
+            !out.summary.iter().any(|l| l.contains("also undoes")),
+            "{:?}",
+            out.summary
+        );
+        let more = r#"{"mcpServers": {"tool": {"command": "t2"}}}"#;
+        let out = resolve(&backups, name, more).unwrap();
+        assert_eq!(
+            out.summary[1], "This also undoes changes made after that one, to tool",
+            "{:?}",
+            out.summary
+        );
     }
 
     #[test]

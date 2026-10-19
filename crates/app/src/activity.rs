@@ -254,9 +254,9 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>, change: bool)
         }
         if backup.of == ".claude.json" {
             let label = if change {
-                "Restore to before this…"
+                "Restore all servers to before this…"
             } else {
-                "Restore this copy…"
+                "Restore all servers to this copy…"
             };
             if ui
                 .small_button(format!("{} {label}", icon::CLOCK_COUNTER_CLOCKWISE))
@@ -457,7 +457,7 @@ mod tests {
         prepared(&engine);
         // Only for a copy of .claude.json that is still kept: not the gone one, not a project's settings.
         let [button] = &h
-            .get_all_by_label_contains("Restore to before this…")
+            .get_all_by_label_contains("Restore all servers to before this…")
             .collect::<Vec<_>>()[..]
         else {
             panic!("one restore button");
@@ -474,7 +474,8 @@ mod tests {
         // A backup no change mentions is a copy as it was then.
         h.get_by_label("Other backups (1)").click();
         h.run();
-        h.get_by_label_contains("Restore this copy…").click();
+        h.get_by_label_contains("Restore all servers to this copy…")
+            .click();
         h.run();
         // The first review is still on its way: one review at a time.
         assert!(prepared(&engine).is_empty());
