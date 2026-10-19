@@ -76,6 +76,10 @@ Checks for this round:
   out in both, in both.
 - Full verify on this round: fmt, clippy `-D warnings` and deny ok; tests 348 + 20 + 25 + 755 passed, 0 failed. Then
   main (`f516b5e`, release files only) merged in.
+- CI on `66e015f`: Windows failed `a_plugin_server_is_compared_with_its_root_variable_expanded`. The test built the
+  hand-written path with `Path::join` (`…\p1\s.js`), while Claude Code puts the folder in as text before `/s.js`
+  (`…\p1/s.js`). Test fixed to write what Claude Code expands; whether Claude Code on Windows treats the two spellings
+  as the same is added to 008's Not verified.
 
 ## Open
 - Plugins on or off only in a project's settings files are not read yet (decision 008, finding 3).

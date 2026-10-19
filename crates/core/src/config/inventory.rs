@@ -2634,7 +2634,8 @@ mod tests {
     fn a_plugin_server_is_compared_with_its_root_variable_expanded() {
         let e = Env::new();
         let root = e.dir.path().join("plugins/cache/mkt/p1");
-        let script = root.join("s.js").to_string_lossy().into_owned();
+        // Claude Code puts the folder in as text, as `installed_plugins.json` spells it, before the `/s.js`.
+        let script = format!("{}/s.js", root.to_string_lossy());
         e.plugin(
             "p1",
             json!({"rooted": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/s.js"]}}),

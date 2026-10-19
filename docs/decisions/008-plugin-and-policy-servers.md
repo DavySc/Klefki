@@ -47,7 +47,9 @@ marketplace and from a plugin with a git source; each result was read back with 
 - claude.ai connectors (finding 9), from a cache only, never a new `mcp list`.
 
 ## Not verified
-- Windows and macOS; Claude Code versions other than 2.1.304.
+- Windows and macOS; Claude Code versions other than 2.1.304. On Windows, whether Claude Code compares
+  `${CLAUDE_PLUGIN_ROOT}/s.js` (a `/` after a folder with `\`) with a hand-written `...\s.js` as the same: Klefki
+  compares the text, so it does not.
 - A plugin from a GitHub marketplace (no network in the spike); a git source was used instead.
 - Which definition wins when two of a manifest's own sources define one name (Klefki takes the later, as the manifest
   over `.mcp.json`).
