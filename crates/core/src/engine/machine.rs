@@ -52,15 +52,33 @@ enum StoreFault {
     DeleteFails,
 }
 
+/// What another program does while Klefki is at work.
+type Meanwhile = Box<dyn FnOnce() + Send>;
+
 /// Klefki's secret store, failing as told.
 #[derive(Default)]
 struct Flaky {
     inner: crate::secrets::MemoryStore,
     fault: Mutex<Option<StoreFault>>,
+    /// Runs once, on the next read of that connection: another program at work in between.
+    on_get: Mutex<Option<(ConnectionId, Meanwhile)>>,
 }
 
 impl crate::secrets::SecretStore for Flaky {
     fn get(&self, id: &ConnectionId) -> Result<Option<Secret>, crate::secrets::SecretError> {
+        let meanwhile = {
+            let mut on_get = lock(&self.on_get);
+            match on_get.take() {
+                Some((at, f)) if at == *id => Some(f),
+                other => {
+                    *on_get = other;
+                    None
+                }
+            }
+        };
+        if let Some(meanwhile) = meanwhile {
+            meanwhile();
+        }
         self.inner.get(id)
     }
 
@@ -524,6 +542,17 @@ impl Rig {
         }
     }
 
+    /// Where each kept definition's server was going, and as what, by id.
+    fn going(&self) -> BTreeMap<String, (Key, Value)> {
+        swap::Recovery::files(&self.dir.path().join("data").join("backups"))
+            .into_iter()
+            .filter_map(|r| {
+                let (to, new) = r.next?;
+                Some((r.id, ((to.project, to.name), new)))
+            })
+            .collect()
+    }
+
     fn id(&self, (project, name): &(Option<String>, String)) -> ServerId {
         match project {
             None => ServerId::new(Scope::User, None, name),
@@ -654,6 +683,75 @@ fn copy_secret(
             klefki.remove(&to);
         }
         (None, StoreFault::DeleteFails) => {}
+    }
+}
+
+/// `world` once the listing has dropped the kept definitions whose change got through after all: each one's server
+/// is where it was going, as it was going to be, and gone from where it was (decision 007). A later step can bring
+/// that about too, such as a copy of the same definition to where a failed move was going. The server is then where
+/// the user sent it, and putting it back would bring it back where they moved it from. Only with its client secret,
+/// though: when Klefki's copy of it is not also where the server went, the definition stays, as putting it back is
+/// the only way to hand the secret to Claude Code again. Once it is there, the copy left where the server was goes,
+/// and until it could be deleted the definition stays too, to be tried again at the next listing.
+fn settled(
+    world: &World,
+    going: &BTreeMap<String, (Key, Value)>,
+    store_fault: StoreFault,
+) -> World {
+    let mut world = world.clone();
+    let gone: Vec<String> = world
+        .kept
+        .iter()
+        .filter(|(id, (project, name, _))| {
+            let Some(((to_project, to_name), new)) = going.get(*id) else {
+                return false;
+            };
+            let arrived = world
+                .servers
+                .iter()
+                .any(|((p, n), e)| same_place(p, to_project) && n == to_name && e == new);
+            let from = (project.clone(), name.clone());
+            let to = (to_project.clone(), to_name.clone());
+            let in_place = same_place(project, to_project) && name == to_name;
+            let left = !world
+                .servers
+                .keys()
+                .any(|(p, n)| same_place(p, project) && n == name);
+            let secret = match world.klefki.get(&connection(&from)) {
+                None => true,
+                Some(_) if in_place => true,
+                Some(secret) => {
+                    world.klefki.get(&connection(&to)) == Some(secret)
+                        && store_fault != StoreFault::DeleteFails
+                }
+            };
+            arrived && (in_place || left) && secret
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in gone {
+        let (project, name, _) = world.kept.remove(&id).unwrap();
+        let ((to_project, to_name), _) = &going[&id];
+        let from = connection(&(project, name));
+        if from != connection(&(to_project.clone(), to_name.clone())) {
+            world.klefki.remove(&from);
+        }
+    }
+    world
+}
+
+/// What a step that changed nothing leaves: `before`, or, when it listed the kept definitions again, `before` with
+/// the ones dropped that an earlier listing could not (see [`settled`]).
+fn unchanged(
+    before: &World,
+    after: &World,
+    going: &BTreeMap<String, (Key, Value)>,
+    store_fault: StoreFault,
+) -> World {
+    if after.kept == before.kept {
+        before.clone()
+    } else {
+        settled(before, going, store_fault)
     }
 }
 
@@ -793,6 +891,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 }
             }
         };
+        let going = rig.going();
         let outcome = rig.run(changes);
         let after = rig.world();
 
@@ -851,24 +950,28 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
         }
         match &outcome {
             Outcome::Done => {
+                let expected = settled(&expected, &going, *store_fault);
                 prop_assert_eq!(&after.servers, &expected.servers, "{}", said);
                 prop_assert_eq!(&after.kept, &expected.kept, "{}", said);
                 prop_assert_eq!(&after.klefki, &expected.klefki, "{}", said);
             }
             Outcome::Refused(why) => {
                 prop_assert!(!why.is_empty() && sanitize(why) == *why, "{}", said);
+                let before = &unchanged(&before, &after, &going, *store_fault);
                 prop_assert_eq!(&after.servers, &before.servers, "{}", said);
                 prop_assert_eq!(&after.kept, &before.kept, "{}", said);
                 prop_assert_eq!(&after.klefki, &before.klefki, "{}", said);
                 prop_assert_eq!(&after.creds, &before.creds, "{}", said);
             }
             Outcome::Unchanged => {
+                let before = &unchanged(&before, &after, &going, *store_fault);
                 prop_assert_eq!(&after.servers, &before.servers, "{}", said);
                 prop_assert_eq!(&after.kept, &before.kept, "{}", said);
                 prop_assert_eq!(&after.klefki, &before.klefki, "{}", said);
                 prop_assert_eq!(&after.creds, &before.creds, "{}", said);
             }
             Outcome::Failed(why) => {
+                let before = &unchanged(&before, &after, &going, *store_fault);
                 // Each server is where it was, or kept, and the failure says so.
                 for (key, entry) in &before.servers {
                     match after.servers.get(key) {
@@ -1059,6 +1162,122 @@ fn a_kept_definition_says_which_server_lost_its_shared_sign_in_and_putting_it_ba
     let world = rig.world();
     assert_eq!(world.creds.get(&shared).map(String::as_str), Some("sec-a"));
     assert!(world.kept.is_empty());
+}
+
+/// `a` copied into pb, then a move of that copy to pa that fails three times, so its definition is kept.
+fn a_failed_move_to_pa(rig: &Rig) -> (Key, Key) {
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let (pa, pb) = (rig.projects[0].clone(), rig.projects[1].clone());
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&(None, "a".to_owned())),
+        name: "a".into(),
+        targets: vec![Target::Local(pb.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let (from, to) = (
+        (Some(pb), "a".to_owned()),
+        (Some(pa.clone()), "a".to_owned()),
+    );
+    *lock(&rig.sim.faults) = [Fault::FailsAfter, Fault::FailsBefore, Fault::FailsBefore].into();
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&from),
+        to: Target::Local(pa),
+    }]);
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(rig.world().kept.len(), 1);
+    (from, to)
+}
+
+#[test]
+fn a_kept_definition_is_not_offered_once_a_copy_puts_it_where_its_move_was_going() {
+    // Found by the model-based test (seed 19dc2de0): a copy then puts the same definition where the failed move was
+    // going. That is what the move asked, so the kept definition is no longer offered: putting it back would bring
+    // the server back where it was moved from.
+    let rig = start();
+    let (from, to) = a_failed_move_to_pa(&rig);
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&(None, "a".to_owned())),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert!(world.kept.is_empty(), "{:?}", world.kept);
+    assert_eq!(world.servers.get(&to), Some(&definition(true, 0, 0)));
+    assert!(!world.servers.contains_key(&from));
+    // With its client secret, in Claude Code and in Klefki's store.
+    let secret = Some("sec-a");
+    assert_eq!(
+        world
+            .creds
+            .get(&sign_in_key("a", &world.servers[&to]))
+            .map(String::as_str),
+        secret
+    );
+    assert_eq!(
+        world.klefki.get(&connection(&to)).map(String::as_str),
+        secret
+    );
+    // And none is left where it was, for a server put there later to claim.
+    assert!(!world.klefki.contains_key(&connection(&from)));
+}
+
+#[test]
+fn a_kept_definition_stays_offered_when_a_copy_without_its_secret_puts_it_where_its_move_was_going()
+{
+    // Found while checking the seed above: the copy came from a server Klefki holds no client secret for, so Claude
+    // Code has none for it. Dropping the kept definition would leave its secret only in Klefki's store, under a
+    // server that is gone. It stays, and putting it back hands the secret to Claude Code again, for the copy too.
+    let rig = start();
+    let a = (None, "a".to_owned());
+    let (from, to) = a_failed_move_to_pa(&rig);
+    lock(&rig.store.inner.values).remove(&connection(&a));
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert_eq!(world.servers.get(&to), Some(&definition(true, 0, 0)));
+    let kept = world.kept.into_keys().next().expect("still kept");
+    let outcome = rig.run(vec![Change::PutBack { kept }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert!(world.kept.is_empty());
+    assert_eq!(world.servers.get(&from), Some(&definition(true, 0, 0)));
+    assert_eq!(
+        world
+            .creds
+            .get(&sign_in_key("a", &world.servers[&to]))
+            .map(String::as_str),
+        Some("sec-a")
+    );
+}
+
+#[test]
+fn a_kept_definition_stays_offered_when_a_copy_puts_another_definition_where_its_move_was_going() {
+    // The variant: the copy at the move's place is not the kept definition, so it stays, and can be put back.
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    let a = (None, "a".to_owned());
+    let outcome = rig.run(vec![Change::Replace {
+        id: rig.id(&a),
+        json: definition(true, 1, 0).to_string(),
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let kept = rig.world().kept.into_keys().next().expect("still kept");
+    let outcome = rig.run(vec![Change::PutBack { kept }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert!(world.kept.is_empty());
+    assert_eq!(world.servers.get(&from), Some(&definition(true, 0, 0)));
 }
 
 #[test]
@@ -1288,4 +1507,88 @@ fn a_secret_klefki_could_not_move_is_not_left_where_the_server_was() {
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     assert!(!rig.world().klefki.contains_key(&connection(&a)));
+}
+
+#[test]
+fn a_kept_definition_whose_left_copy_could_not_be_deleted_goes_at_the_next_listing() {
+    // Cross-review of the fix above: when Klefki's copy left where the server was cannot be deleted, the definition
+    // stays listed and goes at a later listing, here one a refused step makes. The model expected it to stay.
+    use Fault::*;
+    let base = vec![
+        (
+            Step::Copy {
+                pick: 5,
+                to: 2,
+                rename: false,
+            },
+            vec![],
+            StoreFault::Works,
+        ),
+        (
+            Step::Move { pick: 4, to: 1 },
+            vec![FailsAfter, FailsBefore, FailsBefore],
+            StoreFault::Works,
+        ),
+        (
+            Step::Copy {
+                pick: 0,
+                to: 1,
+                rename: false,
+            },
+            vec![],
+            StoreFault::DeleteFails,
+        ),
+    ];
+    // Refused (taken name, a sign-in server's rename), done, and a toggle.
+    let tails = [
+        Step::Copy {
+            pick: 0,
+            to: 1,
+            rename: false,
+        },
+        Step::Rename { pick: 2 },
+        Step::Delete { pick: 1 },
+        Step::Toggle { pick: 0, on: false },
+    ];
+    for tail in tails {
+        let mut cases = base.clone();
+        cases.push((tail.clone(), vec![], StoreFault::Works));
+        if let Err(e) = check(&cases) {
+            panic!("{tail:?}: {e}");
+        }
+    }
+}
+
+#[test]
+fn a_copy_left_behind_is_not_deleted_when_a_server_is_put_back_there_meanwhile() {
+    // Cross-review: the listing read the configuration, then the store. If another Klefki put the server back where
+    // it was in between, it must not delete the copy that server now uses: it reads the configuration again first.
+    let rig = start();
+    let (from, to) = a_failed_move_to_pa(&rig);
+    let sim = Arc::clone(&rig.sim);
+    let project = from.0.clone().unwrap();
+    *lock(&rig.store.fault) = Some(StoreFault::Works);
+    // The listing reads Klefki's copy where the server went just before it would delete the one left behind.
+    let at = ConnectionId::new(Scope::Local, to.0.as_deref(), &to.1);
+    *lock(&rig.store.on_get) = Some((
+        at,
+        Box::new(move || {
+            sim.with_lock(|root| {
+                root["projects"][&project]["mcpServers"]["a"] = definition(true, 0, 0);
+            });
+        }),
+    ));
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&(None, "a".to_owned())),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    assert!(lock(&rig.store.on_get).is_none(), "the listing read it");
+    let world = rig.world();
+    assert_eq!(world.servers.get(&from), Some(&definition(true, 0, 0)));
+    assert_eq!(
+        world.klefki.get(&connection(&from)).map(String::as_str),
+        Some("sec-a")
+    );
 }
