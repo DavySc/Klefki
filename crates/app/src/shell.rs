@@ -940,7 +940,23 @@ impl ShellApp {
                     .or(self.snapshot.cli_version.as_deref())
                     .filter(|_| self.cli_problem.is_none())
                 {
-                    ui.label(RichText::new(format!("Claude CLI {version}")).color(pal.text_muted));
+                    // Only where it fits: in a narrow window it would be drawn over the title. Where the whole
+                    // of it does not, the number alone, named in full on hover.
+                    let full = format!("Claude CLI {version}");
+                    let fitting = [full.as_str(), version].into_iter().find_map(|text| {
+                        let galley =
+                            egui::WidgetText::from(RichText::new(text).color(pal.text_muted))
+                                .into_galley(
+                                    ui,
+                                    Some(egui::TextWrapMode::Extend),
+                                    f32::INFINITY,
+                                    egui::TextStyle::Body,
+                                );
+                        (galley.size().x <= ui.available_width()).then_some(galley)
+                    });
+                    if let Some(galley) = fitting {
+                        ui.label(galley).on_hover_text(full);
+                    }
                 }
             });
         });
@@ -6233,6 +6249,82 @@ mod tests {
         h.run();
         assert!(h.query_by_label("gone").is_none());
         h.get_by_label("stays");
+    }
+
+    #[test]
+    fn the_top_bar_never_draws_one_thing_over_another() {
+        // Found in the UI review: at the smallest size the page's title ran into "Claude CLI 2.1.303". Every width
+        // from the smallest to the one Klefki opens at, and the longest version the engine passes on (32 characters).
+        use egui::accesskit::Role;
+        let widths = (SMALLEST_SIZE.x as usize..=OPENING_SIZE.x as usize).step_by(50);
+        for size in widths.map(|w| egui::vec2(w as f32, SMALLEST_SIZE.y)) {
+            for version in ["2.1.303", "10.200.3000-beta.4+build.2026101"] {
+                let (mut h, engine) = live_harness();
+                h.set_size(size);
+                engine
+                    .events
+                    .send(klefki_core::api::Event::CliVersion(Some(
+                        version.to_owned(),
+                    )))
+                    .unwrap();
+                h.run();
+                let row = h.get_by_label("Klefki").rect();
+                let items: Vec<(String, egui::Rect)> = h
+                    .query_all_by(|n| {
+                        matches!(
+                            n.role(),
+                            Role::Label | Role::Button | Role::TextInput | Role::ComboBox
+                        )
+                    })
+                    .filter(|n| n.rect().top() < row.bottom() && n.rect().bottom() > row.top())
+                    .map(|n| (format!("{n:?}"), n.rect()))
+                    .collect();
+                assert!(items.len() >= 6, "{size:?}: {items:#?}");
+                for (i, (a, ra)) in items.iter().enumerate() {
+                    for (b, rb) in &items[i + 1..] {
+                        let both = ra.intersect(*rb);
+                        assert!(
+                            both.width() <= 0.0 || both.height() <= 0.0,
+                            "{size:?}: {a} at {ra:?} is drawn over {b} at {rb:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // Where there is room, it is there.
+        let (mut h, engine) = live_harness();
+        h.set_size(OPENING_SIZE);
+        engine
+            .events
+            .send(klefki_core::api::Event::CliVersion(Some(
+                "2.1.303".to_owned(),
+            )))
+            .unwrap();
+        h.run();
+        h.get_by_label("Claude CLI 2.1.303");
+        // Where the whole of it does not fit, the number alone, which says what it is on hover. Where that starts
+        // depends on the platform's shortcut labels, so it is looked for across the widths.
+        let mut number_only = 0;
+        for width in (SMALLEST_SIZE.x as usize..=OPENING_SIZE.x as usize).step_by(10) {
+            let (mut h, engine) = live_harness();
+            h.set_size(egui::vec2(width as f32, SMALLEST_SIZE.y));
+            engine
+                .events
+                .send(klefki_core::api::Event::CliVersion(Some(
+                    "2.1.303".to_owned(),
+                )))
+                .unwrap();
+            h.run();
+            if h.query_by_label("Claude CLI 2.1.303").is_none()
+                && h.query_by_label("2.1.303").is_some()
+            {
+                number_only += 1;
+                h.get_by_label("2.1.303").hover();
+                h.run();
+                h.get_by_label("Claude CLI 2.1.303");
+            }
+        }
+        assert!(number_only > 0, "the number alone was never shown");
     }
 
     #[test]
