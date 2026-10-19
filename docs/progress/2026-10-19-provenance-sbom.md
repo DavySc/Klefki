@@ -19,4 +19,14 @@ restarted from main after #40 merged.
   the SBOM files are; `docs/RELEASING.md` describes both.
 
 ## Checks run
-(filled in below as they run)
+- Local: SBOMs generated with the same command; `check-release.py linux` OK with them (exit 0), and reports
+  missing SBOMs, an SBOM for the wrong program and a non-CycloneDX file (exit 1). `cargo fmt --check` exit 0.
+  No Rust code changed in this slice.
+- CI, manual run 39332472155 on 8ef983a: all three builds green, `check-release.py` OK on each; the publish job
+  attested and then verified all 9 files (`SHA256SUMS`, 6 packages, 2 SBOMs) with `gh attestation verify`
+  against the release workflow; draft-release step skipped as intended (not a tag). Attestation
+  https://github.com/DavySc/Klefki/attestations/57570117, Rekor log index 3327068904.
+
+## Not verified / open
+- The draft-release step itself still first runs on a real tag.
+- Next slice: minisign signature on `SHA256SUMS`, which needs a key from the owner.
