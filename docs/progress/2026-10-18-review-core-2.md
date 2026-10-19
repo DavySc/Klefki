@@ -11,6 +11,7 @@ Branch `claude/review-core-y2uzla`, restarted from main `5c27260` after part 1 (
 - **Paste preview** (`paste.rs`, e876b3c). The summary used no masking, and problems quoted back `-k=SECRET`, `-e SECRET`, `-H "Bearer SECRET"`. It now uses the list's rules (and `display_url` for addresses) and cleans each word on its own.
 - **Diagnose, from #27's round 2** (`diagnose/redact.rs`, bf21f22). A plain-quoted value with an escaped quote in it (`"x\"y horse battery"`) was hidden only up to that quote; it is now read as a JSON string.
 - **Paste reading** (`paste.rs`, see the commit "Paste: prose, web typography, missing values and Git Bash switches"). An apostrophe in a README line (`Don't run as root.`) opened a quote that swallowed every command after it; when pasting, a line not starting with `claude` is now skipped whole, unread (not in the form). Non-breaking spaces separate words outside quotes; a curly quote or long dash starting a word is the problem, saying what to type instead. `-e`, `-H`, `-t`, `--client-id` and add-json's `-s` without a value are a problem, as in Claude Code. Every `X:/` switch Git Bash made right after `cmd` is put back (`cmd /s /c`).
+- **Windows lock race** (`config/docstore.rs`, 4fd7534). Asked for by the coordinator after main went red on Windows: `two_writers_at_once_both_get_their_change_in` failed with `Access is denied. (os error 5)` (run 39178339976). Creating the lock folder while the previous holder's folder is still being removed (another process, or Klefki's own `is_stale` check, has it open) is refused on Windows as access denied, and `Lock::acquire` returned that at once. It is now waited out like a held lock; a refusal that lasts the whole wait is still returned as the error. The code dates from f23ebf8 (2026-10-17); #27 did not touch it, and the same tree passed Windows CI before. Unverified on Windows until CI runs again.
 - **Duplicate-key flood** (`config/inventory.rs`, 83b82c3). One warning per repeat (174,750 for a 1 MiB file) buried every other warning; now one per name.
 
 ## Tests (each failed first; the later assertions in each were confirmed by temporarily reverting one rule at a time)
@@ -22,9 +23,10 @@ Branch `claude/review-core-y2uzla`, restarted from main `5c27260` after part 1 (
 - `diagnose::redact::tests::a_quoted_value_is_hidden_to_its_closing_quote` gained the escaped-quote case.
 - `paste::tests::prose_with_an_apostrophe_hides_none_of_the_commands_after_it` (main: "Nothing here adds a server"), `every_switch_git_bash_turned_into_a_drive_is_undone`, `an_option_without_its_value_is_a_problem`, `typography_from_a_web_page_is_read_or_named`.
 - `paste::tests::the_summary_hides_what_the_list_hides`, `a_problem_never_repeats_a_secret`.
+- `config::docstore::tests::a_lock_folder_still_being_removed_is_waited_for` (main: `Some(Io("permission denied"))` on the first refusal); with a refusal that lasts, the error is still returned, and off Windows it is returned at once.
 
 ## Checks
 See the pull request (#30): the full verify is run on the final head, after main is brought in. CI could not run from about 23:55Z (no runners assigned); Windows and macOS are unverified until it does.
 
 ## Not done here (findings for Davy, in `reviews/2026-10-19-core/findings.md` in the project folder)
-Anything in files #26 changes (docstore, engine, api, ops), behaviour changes users would notice (Windows-style paste lexing, invisible characters), and decisions such as running `cargo deny` in CI.
+Anything else in files #26 changes (docstore, engine, api, ops; the lock fix touches only `Lock::acquire` and its tests, and merges cleanly with #26, #28 and #29's docstore), behaviour changes users would notice (Windows-style paste lexing, invisible characters), and decisions such as running `cargo deny` in CI.
