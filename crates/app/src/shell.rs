@@ -94,6 +94,9 @@ struct Editor {
     /// Asked for with Edit: brought into view when it arrives, for it is drawn below the summary, which can leave it
     /// under the save bar.
     reveal: bool,
+    /// Its server was moved or renamed under a draft: the definition is read again from the new place, and the draft
+    /// carried onto it ([`Definition::rebase`]).
+    moved: bool,
 }
 
 enum EditorState {
@@ -274,6 +277,9 @@ pub struct ShellApp {
     moving: Option<MoveForm>,
     /// The server a move under review takes away, and whether it signs in: what Undo moves back.
     moved_from: Option<(ServerId, bool)>,
+    /// The servers the change under review moves or renames, with the name and place each lands at: an open
+    /// definition follows its server there, unsaved edits and all.
+    relocating: Vec<(ServerId, String, Target)>,
     /// What a slow change (through Claude Code's commands) is doing now, while it is applied.
     applying_step: Option<String>,
     /// The kept definition a Forget… under review lets go of, in words.
@@ -338,6 +344,7 @@ impl ShellApp {
             adding_verb: "Added",
             moving: None,
             moved_from: None,
+            relocating: Vec::new(),
             applying_step: None,
             forgetting: None,
             forget_typed: false,
@@ -451,12 +458,27 @@ impl ShellApp {
                 self.live = live;
                 // Positions now mean other servers: tell the engine again.
                 self.on_screen.clear();
-                if self
-                    .editor
-                    .as_ref()
-                    .is_some_and(|e| !new_index.contains_key(&e.id.connection))
+                if let Some(e) = &mut self.editor
+                    && !new_index.contains_key(&e.id.connection)
                 {
-                    self.editor = None;
+                    // Gone from where it was: moved or renamed by the change being applied, it is followed there.
+                    let landed = self
+                        .relocating
+                        .iter()
+                        .filter(|_| self.applying)
+                        .find(|(id, ..)| *id == e.id)
+                        .and_then(|(_, name, to)| {
+                            snapshot.servers.iter().position(|r| lands_at(r, name, to))
+                        });
+                    match landed {
+                        Some(i) => {
+                            e.id = snapshot.servers[i].id();
+                            e.moved = true;
+                            self.selected = BTreeSet::from([i]);
+                            self.reveal = Some(i);
+                        }
+                        None => self.editor = None,
+                    }
                 }
                 self.grid_cache = None;
                 self.command.invalidate();
@@ -526,13 +548,18 @@ impl ShellApp {
                         .filter(|e| self.single_selected().is_some_and(|s| s.is(&e.id)));
                     if let Some(mut e) = open {
                         if !saved_draft && e.state.edited() {
-                            // Edits not saved yet stay: what was applied was another change.
+                            // Edits not saved yet stay: what was applied was another change. Moved or renamed,
+                            // what the new place holds is read, to compare them with and revert to.
+                            if e.moved {
+                                self.send(Command::Inspect(e.id.clone()));
+                            }
                             self.editor = Some(e);
                         } else {
                             self.editor = Some(Editor {
                                 id: e.id.clone(),
                                 state: EditorState::Loading,
                                 reveal: false,
+                                moved: false,
                             });
                             self.send(Command::Inspect(e.id));
                         }
@@ -637,13 +664,34 @@ impl ShellApp {
                     && self.single_selected().is_some_and(|s| s.is(&id));
                 if let Some(editor) = &mut self.editor
                     && editor.id == id
-                    && matches!(editor.state, EditorState::Loading)
                 {
-                    editor.state = match json {
-                        Ok(text) => EditorState::ready(text, editable),
-                        Err(why) => EditorState::Failed(why),
-                    };
-                    editor.reveal &= shown;
+                    match (&mut editor.state, json) {
+                        (EditorState::Loading, json) => {
+                            editor.state = match json {
+                                Ok(text) => EditorState::ready(text, editable),
+                                Err(why) => EditorState::Failed(why),
+                            };
+                            editor.reveal &= shown;
+                        }
+                        // Read again after a move under a draft: the draft is carried onto what is there now.
+                        (
+                            EditorState::Ready {
+                                original,
+                                text,
+                                editable: can_edit,
+                                ..
+                            },
+                            Ok(now),
+                        ) if editor.moved => {
+                            if let Some(rebased) = Definition::rebase(original, &now, text) {
+                                *text = rebased;
+                            }
+                            *original = now;
+                            *can_edit = editable;
+                        }
+                        _ => {}
+                    }
+                    editor.moved = false;
                 }
             }
             Event::Exported(exported) => {
@@ -1908,6 +1956,7 @@ impl ShellApp {
 
     fn casing_dialog(&mut self, ctx: &egui::Context) {
         let pal = theme::palette(ctx);
+        let draft = self.drafted();
         let Some(form) = &mut self.casing else {
             return;
         };
@@ -1966,6 +2015,12 @@ impl ShellApp {
                     ))
                     .wrap(),
                 );
+                let renamed = form.changes().into_iter().any(
+                    |c| matches!(c, Change::Rename { id, .. } if Some(&id) == draft.as_ref()),
+                );
+                if renamed {
+                    ui.label(RichText::new(GOES_ALONG).small().color(pal.text_muted));
+                }
             } else {
                 ui.add(
                     egui::Label::new(
@@ -2125,9 +2180,11 @@ impl ShellApp {
 
     fn move_dialog(&mut self, ctx: &egui::Context) {
         let pal = theme::palette(ctx);
+        let draft = self.drafted();
         let Some(form) = &mut self.moving else {
             return;
         };
+        let draft_goes = draft.as_ref() == Some(&form.source);
         let name = form.source.name.clone();
         let taken = form.places.taken(&name, &self.snapshot.servers);
         let ready = taken.is_none() && form.places.targets().len() == 1;
@@ -2184,6 +2241,9 @@ impl ShellApp {
                     )
                     .wrap(),
                 );
+            }
+            if draft_goes {
+                ui.label(RichText::new(GOES_ALONG).small().color(pal.text_muted));
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -2632,6 +2692,21 @@ impl ShellApp {
                     _ => None,
                 })
                 .collect();
+            self.relocating = changes
+                .iter()
+                .filter_map(|c| match c {
+                    Change::Move { id, to } => Some((id.clone(), id.name.clone(), to.clone())),
+                    Change::Rename { id, name } => {
+                        let here = match (id.scope, &id.project) {
+                            (Scope::User, _) => Target::User,
+                            (Scope::Local, Some(p)) => Target::Local(p.clone()),
+                            _ => return None,
+                        };
+                        Some((id.clone(), name.clone(), here))
+                    }
+                    _ => None,
+                })
+                .collect();
             self.adding_verb = match changes.first() {
                 Some(Change::Move { .. }) => "Moved",
                 Some(Change::Duplicate { .. }) => "Copied",
@@ -2703,16 +2778,9 @@ impl ShellApp {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                adding.iter().any(|(name, targets)| {
-                    row.name == *name
-                        && targets.iter().any(|t| match t {
-                            Target::User => row.scope == Scope::User,
-                            Target::Local(p) => {
-                                row.scope == Scope::Local
-                                    && row.project.as_deref().is_some_and(|r| same_project(r, p))
-                            }
-                        })
-                })
+                adding
+                    .iter()
+                    .any(|(name, targets)| targets.iter().any(|t| lands_at(row, name, t)))
             })
             .map(|(i, _)| i)
             .collect();
@@ -3655,12 +3723,21 @@ impl ShellApp {
         }
     }
 
+    /// The server whose definition has edits not saved yet.
+    fn drafted(&self) -> Option<ServerId> {
+        self.editor
+            .as_ref()
+            .filter(|e| matches!(&e.state, EditorState::Ready { text, original, .. } if text != original))
+            .map(|e| e.id.clone())
+    }
+
     /// Asks the engine for `s`'s definition, for the form and the JSON editor.
     fn open_editor(&mut self, s: &ServerRow) {
         self.editor = Some(Editor {
             id: s.id(),
             state: EditorState::Loading,
             reveal: true,
+            moved: false,
         });
         self.send(Command::Inspect(s.id()));
     }
@@ -5244,6 +5321,21 @@ fn closed_on_purpose<T>(modal: &egui::ModalResponse<T>) -> bool {
     }
     !modal.backdrop_response.clicked() && modal.should_close()
 }
+
+/// Whether `row` is the server named `name` at `target`.
+fn lands_at(row: &ServerRow, name: &str, target: &Target) -> bool {
+    row.name == name
+        && match target {
+            Target::User => row.scope == Scope::User,
+            Target::Local(p) => {
+                row.scope == Scope::Local
+                    && row.project.as_deref().is_some_and(|r| same_project(r, p))
+            }
+        }
+}
+
+/// Said in the Move and Fix casing dialogs when the server they change has an unsaved edit.
+const GOES_ALONG: &str = "Your unsaved edit goes with it.";
 
 /// How long a dialog's outline flashes after a click beside it.
 const NUDGE_SECS: f64 = 0.2;
@@ -9400,6 +9492,249 @@ mod tests {
         drain(&engine);
         apply_another_change(&mut h, &engine, 6);
         assert!(drain(&engine).is_empty());
+        assert_eq!(form(&mut h).command, "node22");
+    }
+
+    /// `change`, asked for from the toolbar or a dialog while the form is open, applied with `after` as the list
+    /// the engine sends first.
+    fn apply_while_editing(
+        h: &mut Harness<'static, ShellApp>,
+        engine: &klefki_core::api::Detached,
+        change: Change,
+        after: Vec<ServerRow>,
+    ) {
+        h.state_mut().prepare(vec![change]);
+        h.run();
+        drain(engine);
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(4, &["+ alpha"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(drain(engine), vec![Command::Apply(4)]);
+        engine.events.send(snapshot_of(after)).unwrap();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 4,
+                changed: true,
+                backup: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+    }
+
+    fn editing(h: &Harness<'static, ShellApp>) -> Option<ServerId> {
+        h.state().editor.as_ref().map(|e| e.id.clone())
+    }
+
+    #[test]
+    fn a_draft_not_yet_saved_follows_its_server_when_it_is_moved() {
+        // Found in the UI review: a command edited, then the same server moved, and the edit was gone.
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        // Somewhere else in the list once moved, after a server that was not there before.
+        let moved = live_row("alpha", Scope::Local, Some("C:/Repos/WebApp"));
+        let before = live_row("aaa", Scope::Local, Some("C:/Repos/WebApp"));
+        apply_while_editing(
+            &mut h,
+            &engine,
+            Change::Move {
+                id: a.id(),
+                to: Target::Local("C:/Repos/WebApp".into()),
+            },
+            vec![before, moved.clone()],
+        );
+        // Read again from the new place, to compare the draft with and to revert to.
+        assert_eq!(drain(&engine), vec![Command::Inspect(moved.id())]);
+        assert_eq!(editing(&h), Some(moved.id()));
+        assert_eq!(h.state().selected, BTreeSet::from([1]));
+        assert_eq!(form(&mut h).command, "node22");
+        h.get_by_label("Unsaved");
+        engine
+            .events
+            .send(entry_event(&moved, FORM_ORIGINAL, true))
+            .unwrap();
+        h.run();
+        assert_eq!(form(&mut h).command, "node22");
+        h.get_by_label("Unsaved");
+    }
+
+    #[test]
+    fn a_draft_that_follows_a_move_is_compared_with_what_the_new_place_holds() {
+        // From the review of #16: a move through Claude Code can leave settings out, and the draft was still
+        // compared with, reverted to and saved over the old place's definition.
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        let moved = live_row("alpha", Scope::Local, Some("C:/Repos/WebApp"));
+        apply_while_editing(
+            &mut h,
+            &engine,
+            Change::Move {
+                id: a.id(),
+                to: Target::Local("C:/Repos/WebApp".into()),
+            },
+            vec![moved.clone()],
+        );
+        assert_eq!(drain(&engine), vec![Command::Inspect(moved.id())]);
+        let without_cwd = FORM_ORIGINAL.replace("\"cwd\": \"/w\",\n  ", "");
+        assert!(!without_cwd.contains("cwd"));
+        engine
+            .events
+            .send(entry_event(&moved, &without_cwd, true))
+            .unwrap();
+        h.run();
+        // The edit is kept; what the move left out is not brought back as if it were an edit.
+        assert_eq!(form(&mut h).command, "node22");
+        assert!(!json_text(&h).contains("cwd"), "{}", json_text(&h));
+        h.state_mut().outcome = None;
+        h.run();
+        h.get_by_label("Review and save…").click();
+        h.run();
+        match &drain(&engine)[..] {
+            [Command::Prepare(changes)] => match &changes[..] {
+                [Change::Replace { id, json }] => {
+                    assert_eq!(*id, moved.id());
+                    assert_eq!(*json, without_cwd.replace("\"node\"", "\"node22\""));
+                }
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        // Revert goes back to what the new place holds.
+        h.state_mut().plan = None;
+        h.state_mut().preparing = false;
+        h.run();
+        h.get_by_label("Revert").click();
+        h.run();
+        assert_eq!(json_text(&h), without_cwd);
+        assert!(h.query_by_label("Unsaved").is_none());
+    }
+
+    #[test]
+    fn a_draft_not_yet_saved_follows_its_server_when_it_is_renamed() {
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        let renamed = live_row("Alpha", Scope::User, None);
+        apply_while_editing(
+            &mut h,
+            &engine,
+            Change::Rename {
+                id: a.id(),
+                name: "Alpha".into(),
+            },
+            vec![live_row("Aaa", Scope::User, None), renamed.clone()],
+        );
+        assert_eq!(drain(&engine), vec![Command::Inspect(renamed.id())]);
+        assert_eq!(editing(&h), Some(renamed.id()));
+        assert_eq!(h.state().selected, BTreeSet::from([1]));
+        assert_eq!(form(&mut h).command, "node22");
+    }
+
+    #[test]
+    fn a_server_renamed_under_a_draft_is_brought_into_view() {
+        // From the review of #16: a move brought its row into view, a rename did not.
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        let mut after: Vec<ServerRow> = (0..80)
+            .map(|i| live_row(&format!("a{i:02}"), Scope::User, None))
+            .collect();
+        after.push(live_row("Alpha", Scope::User, None));
+        apply_while_editing(
+            &mut h,
+            &engine,
+            Change::Rename {
+                id: a.id(),
+                name: "Alpha".into(),
+            },
+            after,
+        );
+        assert_eq!(h.state().selected, BTreeSet::from([80]));
+        h.run();
+        assert!(
+            h.state().on_screen.contains(&80),
+            "{:?}",
+            h.state().on_screen
+        );
+    }
+
+    #[test]
+    fn the_move_and_casing_dialogs_say_an_unsaved_edit_goes_along() {
+        // From the review of #16: said before the change is confirmed, not only seen afterwards.
+        let (mut h, _engine, _) = form_harness(FORM_ORIGINAL, true);
+        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
+        h.run();
+        assert!(h.query_by_label(GOES_ALONG).is_none(), "nothing edited");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        form(&mut h).command = "node22".into();
+        h.run();
+        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
+        h.run();
+        h.get_by_label(GOES_ALONG);
+
+        let (mut h, engine) = casing_harness(vec![]);
+        let local = h.state().snapshot.servers[1].clone();
+        press_edit(&mut h, "gateway");
+        engine
+            .events
+            .send(entry_event(&local, FORM_ORIGINAL, true))
+            .unwrap();
+        h.run();
+        form(&mut h).command = "node22".into();
+        h.run();
+        h.get_by_label("Fix casing…").click();
+        h.run();
+        // Kept as it is spelled, the edited server is not renamed: nothing goes anywhere.
+        h.get_by_label("Keep gateway").click();
+        h.run();
+        assert!(h.query_by_label(GOES_ALONG).is_none());
+        h.get_by_label("Keep Gateway").click();
+        h.run();
+        h.get_by_label(GOES_ALONG);
+    }
+
+    #[test]
+    fn an_unedited_definition_is_read_again_from_where_its_server_was_moved() {
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        let moved = live_row("alpha", Scope::Local, Some("C:/Repos/WebApp"));
+        apply_while_editing(
+            &mut h,
+            &engine,
+            Change::Move {
+                id: a.id(),
+                to: Target::Local("C:/Repos/WebApp".into()),
+            },
+            vec![moved.clone()],
+        );
+        assert_eq!(drain(&engine), vec![Command::Inspect(moved.id())]);
+        assert_eq!(editing(&h), Some(moved.id()));
+    }
+
+    #[test]
+    fn a_draft_stays_with_its_server_when_another_one_is_renamed() {
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        let other = live_row("beta", Scope::User, None);
+        apply_while_editing(
+            &mut h,
+            &engine,
+            Change::Rename {
+                id: other.id(),
+                name: "Beta".into(),
+            },
+            vec![a.clone(), live_row("Beta", Scope::User, None)],
+        );
+        assert!(drain(&engine).is_empty());
+        assert_eq!(editing(&h), Some(a.id()));
         assert_eq!(form(&mut h).command, "node22");
     }
 
