@@ -125,6 +125,27 @@ impl Definition {
         super::secretlike::suggestion(name, value)
     }
 
+    /// A draft edited from `before` (a definition as read), carried onto `now`, the same server's definition as it
+    /// is read again after a change made elsewhere (a move that left settings out, say): `now`, with each
+    /// top-level key the draft changed, added or removed taken from the draft, so only the user's edits differ
+    /// from `now`. `None` when one of the three is not a JSON object.
+    pub fn rebase(before: &str, now: &str, draft: &str) -> Option<String> {
+        let object = |json: &str| match serde_json::from_str(json) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        };
+        let (before, mut out, draft) = (object(before)?, object(now)?, object(draft)?);
+        for (key, value) in &draft {
+            if before.get(key) != Some(value) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+        for key in before.keys().filter(|k| !draft.contains_key(*k)) {
+            out.shift_remove(key);
+        }
+        serde_json::to_string_pretty(&Value::Object(out)).ok()
+    }
+
     /// Changed through Claude Code's own command (M2), not this form.
     pub fn signs_in_with_oauth(&self) -> bool {
         self.base.contains_key("oauth")
@@ -209,6 +230,38 @@ mod tests {
 
     fn def(v: Value) -> Definition {
         Definition::from_json(&pretty(&v)).unwrap()
+    }
+
+    #[test]
+    fn a_draft_rebased_onto_a_new_reading_keeps_only_the_users_edits() {
+        // Moved through Claude Code, which left out `cwd`: the draft changed `command`, added `timeout` and
+        // removed `args`; what it did not touch comes from the new reading.
+        let before =
+            pretty(&json!({"cwd": "/w", "command": "node", "args": ["a.js"], "env": {"T": "x"}}));
+        let now =
+            pretty(&json!({"command": "node", "args": ["a.js"], "env": {"T": "x"}, "added": 1}));
+        let draft =
+            pretty(&json!({"cwd": "/w", "command": "node22", "env": {"T": "x"}, "timeout": 5}));
+        let rebased: Value =
+            serde_json::from_str(&Definition::rebase(&before, &now, &draft).unwrap()).unwrap();
+        assert_eq!(
+            rebased,
+            json!({"command": "node22", "env": {"T": "x"}, "added": 1, "timeout": 5})
+        );
+        let keys: Vec<&String> = rebased.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            ["command", "env", "added", "timeout"],
+            "the new reading's order"
+        );
+        // Nothing changed anywhere: the new reading itself.
+        assert_eq!(
+            Definition::rebase(&before, &before, &before),
+            Some(before.clone())
+        );
+        // Not an object: nothing to rebase.
+        assert_eq!(Definition::rebase(&before, "[]", &draft), None);
+        assert_eq!(Definition::rebase(&before, &now, "{"), None);
     }
 
     #[test]
