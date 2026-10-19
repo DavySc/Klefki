@@ -2838,8 +2838,7 @@ mod tests {
 
     #[test]
     fn f5_checks_one_at_a_time_still_check_every_one() {
-        // The test above with F5's checks one after another instead of side by side: the second has not started
-        // when the first answers, so the test waits for both before counting.
+        // F5 with one check at a time still checks every one.
         let env = Env::new(
             &serde_json::json!({"mcpServers": {
                 "recent": http("https://a.example.com"),
