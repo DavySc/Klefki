@@ -20,4 +20,5 @@ Goal: PLAN "Nice to have" 6. A user-scope stdio server whose command names a pat
   - N4: doc comment on `anchored` says a `./data:/data` volume is decided by its `./` first.
   - N5 (merge order with #29): whichever merges second re-checks "Klefki checks them from your home folder" against `where_to_run`.
   - Full verify: no failures (app 325, core 694, cli 19 + 25), deny ok. Real app: `reviews/2026-10-19-relative-path/round2/` in the project files; the filesystem server with `.` has no badge.
+- Main `27d0992` (#36 Claude Desktop page, and #29 one list per folder) merged in. N5 re-checked: `where_to_run` still runs user servers from the home folder, and #29 groups checks by that folder, so the text holds. Full verify: no failures (app 336, core 730, cli 19 + 25), deny ok.
 - Next: re-review, then merge.
