@@ -1,3 +1,4 @@
+mod activity;
 mod command;
 mod explain;
 mod shell;

@@ -1,6 +1,7 @@
 //! The only surface the UI may use. The UI holds an immutable, sanitised [`Snapshot`].
 use std::sync::Arc;
 
+pub use crate::activity::{Activity, ActivityEntry, Backup};
 pub use crate::config::ConfigPaths;
 pub use crate::config::definition::Definition;
 pub use crate::engine::{

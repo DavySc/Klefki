@@ -78,6 +78,9 @@ pub enum Command {
     CancelSignIn(ServerId),
     /// Whether a sign-in could come back to this OAuth callback port now (see [`Event::CallbackPort`]).
     CheckCallbackPort(u16),
+    /// What Klefki changed, and the backups it kept (see [`Event::Activity`]). Read only when asked: the Activity log
+    /// page asks each time it is opened.
+    Activity,
 }
 
 /// Where a sign-in is ([`Event::SignIn`]). Text is sanitised.
@@ -354,6 +357,8 @@ pub enum Event {
         port: u16,
         warning: Option<String>,
     },
+    /// The activity log, after [`Command::Activity`].
+    Activity(crate::activity::Activity),
 }
 
 /// The UI's handle to the engine.
@@ -788,6 +793,15 @@ fn engine_main(
                 port,
                 warning: crate::form::callback_port_warning(port),
             }),
+            Command::Activity => shared
+                .emitter
+                .emit(Event::Activity(match backup_dir(&shared) {
+                    Ok(dir) => crate::activity::load(&dir),
+                    Err(problem) => crate::activity::Activity {
+                        problem: Some(problem),
+                        ..Default::default()
+                    },
+                })),
         }
     }
     // The UI is gone: a sign-in still running is stopped, so no `claude` keeps listening after Klefki closes.
@@ -892,6 +906,8 @@ struct Stored {
     cli: Option<CliSteps>,
     /// Kept definitions to forget, once everything else is done.
     forget: Vec<String>,
+    /// What the review said the plan does, for the activity log.
+    summary: Vec<String>,
 }
 
 /// What Claude Code does with its own commands: servers it adds, servers it removes and adds again (or copies), and
@@ -981,6 +997,20 @@ fn stays_off(changes: &[Change], text: &str) -> Vec<String> {
             format!("{name} is switched off in {folder}, so it stays off there. Switch it on there to use it.")
         })
         .collect()
+}
+
+/// Adds a change to the activity log. A log that cannot be written leaves the change as it is; what went wrong is
+/// returned, to be said with the result.
+fn log_activity(
+    shared: &Shared,
+    summary: &[String],
+    error: Option<&str>,
+    backups: &[PathBuf],
+) -> Option<String> {
+    let dir = shared.config.backup_dir.as_ref()?;
+    crate::activity::record(dir, summary, error, backups)
+        .err()
+        .map(|e| format!("The change is saved, but it could not be added to the activity log: {e}"))
 }
 
 fn backup_dir(shared: &Shared) -> Result<PathBuf, String> {
@@ -1169,7 +1199,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 cli.is_none() && forget.is_empty() && parts.iter().all(|(plan, _)| plan.is_empty());
             let view = PlanView {
                 id,
-                summary,
+                summary: summary.clone(),
                 action,
                 destructive,
                 notes: if nothing_to_do { Vec::new() } else { notes },
@@ -1196,6 +1226,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     guards,
                     cli,
                     forget,
+                    summary,
                 },
             );
             shared.emitter.emit(Event::PlanReady(view));
@@ -1213,6 +1244,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         guards,
         cli,
         forget,
+        summary,
     }) = plans.stored.remove(&id)
     else {
         return fail("This change was already applied or discarded. Prepare it again.".to_owned());
@@ -1243,6 +1275,9 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                 )
             });
         if let Err(e) = done {
+            if !added.is_empty() || !backups.is_empty() {
+                log_activity(shared, &summary, Some(&e), &backups);
+            }
             return fail(e);
         }
     }
@@ -1284,6 +1319,9 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                     ));
                     reload_after_change(shared, state);
                 }
+                if !added.is_empty() || !written.is_empty() {
+                    log_activity(shared, &summary, Some(&message), &backups);
+                }
                 // This change now numbers last on the file, so the earlier ones' checks stand down for it.
                 check_later(shared, id, started);
                 return fail(message);
@@ -1298,6 +1336,9 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         };
         for kept in &forget {
             if let Err(e) = swap::forget(&dir, kept) {
+                if !added.is_empty() || !written.is_empty() || forgot {
+                    log_activity(shared, &summary, Some(&e), &backups);
+                }
                 state.reload(shared);
                 return fail(e);
             }
@@ -1308,6 +1349,9 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         reload_after_change(shared, state);
     }
     let changed = !written.is_empty() || !added.is_empty() || forgot;
+    if changed && let Some(problem) = log_activity(shared, &summary, None, &backups) {
+        notes.push(problem);
+    }
     check_later(shared, id, started);
     shared.emitter.emit(Event::Applied {
         plan: id,
@@ -1374,7 +1418,9 @@ fn change_with_claude(
         .as_ref()
         .ok_or("Could not determine where Claude Code keeps its configuration.")?;
     let backup_dir = backup_dir(shared)?;
+    let made = std::cell::RefCell::new(Vec::new());
     let ctx = swap::Ctx {
+        backups: &made,
         claude_json: &paths.claude_json,
         backup_dir: &backup_dir,
         claude: steps.claude.as_ref(),
@@ -1405,9 +1451,10 @@ fn change_with_claude(
                 .map(|id| (swap::put_back(&ctx, id), "the kept definition".to_owned())),
         );
     for (result, what) in ran {
+        // Made whether the step finished or not: a failed one is logged with them.
+        backups.append(&mut made.borrow_mut());
         match result {
             Ok(d) => {
-                backups.extend(d.backup);
                 notes.extend(d.notes);
                 done.push(what);
             }
@@ -4139,6 +4186,74 @@ mod tests {
         assert!(!env.dir.path().join("backups").exists());
     }
 
+    fn activity(core: &Core) -> crate::activity::Activity {
+        core.send(Command::Activity);
+        let events = collect(core, |e| e.iter().any(|x| matches!(x, Event::Activity(_))));
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Activity(a) => Some(a),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_saved_change_is_in_the_activity_log_with_its_backup() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        assert_eq!(activity(&core), crate::activity::Activity::default());
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        core.send(Command::Apply(plan.id));
+        let events = collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        let backup = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Applied { backup, .. } => backup.clone(),
+                _ => None,
+            })
+            .unwrap();
+        let log = activity(&core);
+        assert_eq!(log.problem, None);
+        let [entry] = &log.entries[..] else {
+            panic!("one entry: {log:?}");
+        };
+        assert_eq!(entry.summary, plan.summary);
+        assert_eq!(entry.failed, None);
+        assert_eq!(entry.backups.len(), 1);
+        assert_eq!(entry.backups[0].path, backup);
+        assert!(entry.backups[0].kept);
+        assert_eq!(entry.backups[0].of, ".claude.json");
+    }
+
+    #[test]
+    fn a_change_that_writes_nothing_is_not_logged() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: true,
+            }],
+        );
+        assert!(plan.nothing_to_do);
+        core.send(Command::Apply(plan.id));
+        collect(&core, |e| {
+            e.iter().any(|x| matches!(x, Event::Applied { .. }))
+        });
+        assert!(activity(&core).entries.is_empty());
+        assert!(!env.dir.path().join("activity.jsonl").exists());
+    }
+
     #[test]
     fn a_user_server_cannot_be_switched_when_no_project_is_known() {
         let env = quiet_env(
@@ -6673,6 +6788,61 @@ mod tests {
     const REMOVE_THEN_ADDS_FAIL: &str = r#"{"rules":[
         {"args":["mcp","remove"],"delay_ms":600,"stdout_file":"removed.txt"},
         {"args":["mcp","add-json"],"exit_code":1,"stdout_file":"failed.txt"}]}"#;
+
+    #[test]
+    fn a_failed_move_that_removed_the_server_is_logged_with_its_backups() {
+        // Cross-review of the activity log, B1: the move's backups were dropped on failure, so the change was not
+        // logged and its backup showed as one from before the log.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        keep_sso(&env, &core, &key);
+        let log = activity(&core);
+        let [entry] = &log.entries[..] else {
+            panic!("one entry, every backup in it: {log:#?}");
+        };
+        assert_eq!(entry.summary.len(), 1, "{log:#?}");
+        assert!(
+            entry
+                .failed
+                .as_deref()
+                .is_some_and(|e| e.contains("Klefki kept")),
+            "{log:#?}"
+        );
+        assert!(!entry.backups.is_empty());
+    }
+
+    #[test]
+    fn a_plain_move_logs_every_backup_it_made() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("gw"),
+                to: Target::Local("/work/a".to_owned()),
+            }],
+        );
+        assert!(!plan.nothing_to_do, "{plan:?}");
+        core.send(Command::Apply(plan.id));
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        let log = activity(&core);
+        let [entry] = &log.entries[..] else {
+            panic!("one entry, every backup in it: {log:#?}");
+        };
+        assert_eq!(entry.failed, None);
+        assert!(!entry.backups.is_empty(), "{log:#?}");
+    }
 
     #[test]
     fn a_kept_definition_can_be_put_back() {

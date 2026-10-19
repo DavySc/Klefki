@@ -20,6 +20,7 @@ pub enum Action {
     Theme(crate::theme::ThemeChoice),
     Tone(crate::theme::Tone),
     Settings,
+    ActivityLog,
     Duplicate,
     /// Move the selected server to another project or the user.
     Move,

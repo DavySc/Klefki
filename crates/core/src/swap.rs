@@ -156,11 +156,21 @@ pub(crate) struct Ctx<'a> {
     pub home: Option<&'a Path>,
     /// Told what is under way before each of Claude Code's commands, which can take seconds.
     pub progress: &'a dyn Fn(String),
+    /// Every backup of `.claude.json` made on the way, whether the change finished or not, for the activity log.
+    pub backups: &'a std::cell::RefCell<Vec<PathBuf>>,
 }
 
 impl Ctx<'_> {
     fn recovery_dir(&self) -> PathBuf {
         recovery_dir(self.backup_dir)
+    }
+
+    fn kept(&self, backup: PathBuf) {
+        self.backups.borrow_mut().push(backup);
+    }
+
+    fn kept_all(&self, backups: impl IntoIterator<Item = PathBuf>) {
+        self.backups.borrow_mut().extend(backups);
     }
 
     fn docstore(&self) -> Docstore {
@@ -251,8 +261,6 @@ fn folders_problem<'a>(spots: impl IntoIterator<Item = &'a Spot>) -> Option<Stri
 /// What a swap did, when it did what was asked.
 #[derive(Debug, Default)]
 pub(crate) struct Done {
-    /// Where the copy of `.claude.json` taken first is.
-    pub backup: Option<PathBuf>,
     /// Good to know: settings Claude Code left out, a secret copy klefki could not move.
     pub notes: Vec<String>,
 }
@@ -333,10 +341,11 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
     } else {
         None
     };
-    let backup = ctx
-        .docstore()
-        .keep_copy()
-        .map_err(|e| format!("{shown} was not {verb}: {e}"))?;
+    ctx.kept(
+        ctx.docstore()
+            .keep_copy()
+            .map_err(|e| format!("{shown} was not {verb}: {e}"))?,
+    );
     let recovery = if swap.remove {
         Some(
             Recovery::save(ctx, &swap.from, &old, Some((&swap.to, &new)))
@@ -367,10 +376,7 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             }
         }
     }
-    let mut done = Done {
-        backup: Some(backup),
-        notes: Vec::new(),
-    };
+    let mut done = Done::default();
     let handed = secret.as_ref().filter(|_| signs_in(&new));
     match add(ctx, &swap.to, &new, handed) {
         Ok(left_out) => {
@@ -761,16 +767,14 @@ pub(crate) fn put_back(ctx: &Ctx, id: &str) -> Result<Done, String> {
     } else {
         None
     };
-    let backup = ctx
-        .docstore()
-        .keep_copy()
-        .map_err(|e| format!("{shown} was not put back: {e}"))?;
+    ctx.kept(
+        ctx.docstore()
+            .keep_copy()
+            .map_err(|e| format!("{shown} was not put back: {e}"))?,
+    );
     let left_out = add(ctx, &spot, &record.entry, secret.as_ref())
         .map_err(|why| format!("{shown} was not put back: {why}"))?;
-    let mut done = Done {
-        backup: Some(backup),
-        notes: Vec::new(),
-    };
+    let mut done = Done::default();
     if left_out.is_empty() {
         record.discard();
     } else {
@@ -934,7 +938,8 @@ fn remove(ctx: &Ctx, spot: &Spot, old: &Value) -> Result<(), String> {
                 name: spot.name.clone(),
             }])
             .map_err(|e| e.to_string())?;
-        store.apply(&plan).map_err(|e| e.to_string())?;
+        let applied = store.apply(&plan).map_err(|e| e.to_string())?;
+        ctx.kept_all(applied.backup);
         return Ok(());
     }
     let out = command(ctx, spot, "remove", None, None, None)?;
@@ -967,7 +972,8 @@ fn add(
                 entry: entry.clone(),
             }])
             .map_err(|e| e.to_string())?;
-        store.apply(&plan).map_err(|e| e.to_string())?;
+        let applied = store.apply(&plan).map_err(|e| e.to_string())?;
+        ctx.kept_all(applied.backup);
         return Ok(Vec::new());
     }
     let json = entry.to_string();
