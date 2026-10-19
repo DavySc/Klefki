@@ -49,12 +49,12 @@ impl Page {
 
     /// Pages that are not built yet say what they will do, so the menu is a map rather than a dead end.
     fn ready(self) -> bool {
-        matches!(self, Page::Connections | Page::Settings)
+        matches!(self, Page::Connections | Page::Settings | Page::ActivityLog)
     }
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections => "",
+            Page::Connections | Page::ActivityLog => "",
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
             }
@@ -64,7 +64,6 @@ impl Page {
             Page::Settings => {
                 "Coming soon: where to find the Claude CLI, and how often to check servers."
             }
-            Page::ActivityLog => "Coming soon: every change Klefki made, with its backup.",
         }
     }
 }
@@ -292,6 +291,8 @@ pub struct ShellApp {
     /// The outcome of the last change, shown until dismissed.
     outcome: Option<Outcome>,
     pub page: Page,
+    /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
+    pub activity: Option<crate::activity::ActivityPage>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -342,6 +343,7 @@ impl ShellApp {
             outcome: None,
             snapshot,
             page: Page::Connections,
+            activity: None,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -363,6 +365,19 @@ impl ShellApp {
         }
     }
 
+    /// Shows `page`. The Activity log is read each time it is opened and let go when it is left.
+    fn go(&mut self, page: Page) {
+        if page == Page::ActivityLog {
+            if self.activity.is_none() {
+                self.activity = Some(crate::activity::ActivityPage::default());
+                self.send(Command::Activity);
+            }
+        } else {
+            self.activity = None;
+        }
+        self.page = page;
+    }
+
     /// Re-reads the configuration and re-checks every server.
     fn refresh(&self) {
         self.send(Command::Refresh { live_all: true });
@@ -381,7 +396,22 @@ impl ShellApp {
     }
 
     fn apply_event(&mut self, event: Event) {
+        // A change saved while the Activity log is shown: read it again. What is shown stays until it arrives.
+        if self.activity.is_some()
+            && matches!(
+                event,
+                Event::Applied { changed: true, .. } | Event::ApplyFailed { .. }
+            )
+        {
+            self.send(Command::Activity);
+        }
         match event {
+            Event::Activity(log) => {
+                // Not kept once the page is left: it is read again when the page is opened.
+                if let Some(page) = &mut self.activity {
+                    page.log = Some(log);
+                }
+            }
             Event::Snapshot(snapshot) => {
                 // Rows are kept by position; carry selection, live results and diagnoses over by identity: the
                 // connection, as the file spells the server, since two servers can show the same name.
@@ -854,6 +884,11 @@ impl ShellApp {
                     self.grid(ui);
                 }
                 Page::Settings => self.settings(ui),
+                Page::ActivityLog => {
+                    if let Some(page) = &mut self.activity {
+                        page.show(ui);
+                    }
+                }
                 other => {
                     ui.add_space(48.0);
                     ui.vertical_centered(|ui| {
@@ -871,7 +906,7 @@ impl ShellApp {
                         );
                         ui.add_space(12.0);
                         if ui.button("Back to connections").clicked() {
-                            self.page = Page::Connections;
+                            self.go(Page::Connections);
                         }
                     });
                 }
@@ -1010,7 +1045,7 @@ impl ShellApp {
                 );
             }
             if resp.clicked() {
-                self.page = page;
+                self.go(page);
             }
         }
     }
@@ -1250,7 +1285,7 @@ impl ShellApp {
     }
 
     /// Everything the command palette offers right now: actions on the selection first, then the rest.
-    fn commands(&self) -> Vec<Entry> {
+    pub(crate) fn commands(&self) -> Vec<Entry> {
         let mut out = Vec::new();
         let selected: Vec<&ServerRow> = self
             .selected
@@ -1432,6 +1467,14 @@ impl ShellApp {
                 command::Action::Select(i),
             );
         }
+        // After the servers, so they stay in view of an empty search; typing "act" finds it.
+        add(
+            icon::LIST_BULLETS,
+            "Activity log".into(),
+            "Changes Klefki saved, and their backups".into(),
+            None,
+            command::Action::ActivityLog,
+        );
         // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
         if live {
             add(
@@ -1445,13 +1488,13 @@ impl ShellApp {
         out
     }
 
-    fn run(&mut self, ctx: &egui::Context, action: command::Action) {
+    pub(crate) fn run(&mut self, ctx: &egui::Context, action: command::Action) {
         use command::Action as A;
         match action {
             A::Select(i) => {
                 self.selected.clear();
                 self.selected.insert(i);
-                self.page = Page::Connections;
+                self.go(Page::Connections);
             }
             A::TurnOn => self.prepare_toggle(true),
             A::TurnOff => self.prepare_toggle(false),
@@ -1483,7 +1526,8 @@ impl ShellApp {
                 self.tone = tone;
                 theme::set_tone(ctx, tone);
             }
-            A::Settings => self.page = Page::Settings,
+            A::Settings => self.go(Page::Settings),
+            A::ActivityLog => self.go(Page::ActivityLog),
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),

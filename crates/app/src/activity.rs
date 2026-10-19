@@ -1,0 +1,439 @@
+//! The Activity log page: every change Klefki saved, newest first, with the backup it kept before each one.
+//! Asked of the engine each time the page is opened, and let go when it is left, so it costs nothing at start-up
+//! and holds no memory while not shown.
+use crate::theme;
+use egui::{RichText, Ui};
+use egui_phosphor::regular as icon;
+use klefki_core::api::{Activity, ActivityEntry, Backup};
+
+/// How long "Copied" shows after a path is copied, in seconds.
+const COPIED_SECONDS: f64 = 2.0;
+
+#[derive(Default)]
+pub struct ActivityPage {
+    /// `None` until the engine answers.
+    pub log: Option<Activity>,
+    /// The path last copied, and when.
+    copied: Option<(String, f64)>,
+}
+
+impl ActivityPage {
+    pub fn show(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        ui.add_space(8.0);
+        ui.label(RichText::new("Activity log").heading());
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Changes Klefki saved, newest first. Before each one it keeps a copy of every file it \
+                     changes; it keeps the newest 20 copies of each file.",
+                )
+                .color(pal.text_muted),
+            )
+            .wrap(),
+        );
+        ui.add_space(12.0);
+        let Some(log) = &self.log else {
+            // No spinner: reading takes a moment, and a spinner would keep the window repainting.
+            ui.label(RichText::new("Loading…").color(pal.text_muted));
+            return;
+        };
+        if let Some(problem) = &log.problem {
+            ui.label(RichText::new(format!("{} {problem}", icon::WARNING)).color(pal.warn));
+            ui.add_space(8.0);
+        }
+        if log.entries.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(icon::LIST_BULLETS)
+                        .size(32.0)
+                        .color(pal.text_muted),
+                );
+                ui.add_space(8.0);
+                ui.label("No changes yet");
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "When you save a change in Klefki, it shows up here with the backup taken first.",
+                        )
+                        .color(pal.text_muted),
+                    )
+                    .wrap(),
+                );
+            });
+            return;
+        }
+        let now = ui.input(|i| i.time);
+        if self
+            .copied
+            .as_ref()
+            .is_some_and(|(_, at)| now - at >= COPIED_SECONDS)
+        {
+            self.copied = None;
+        }
+        let mut copy = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, entry) in log.entries.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    let copied = self.copied.as_ref().map(|(path, _)| path.as_str());
+                    if let Some(path) = row(ui, entry, copied) {
+                        copy = Some(path);
+                    }
+                }
+            });
+        if let Some(path) = copy {
+            ui.ctx().copy_text(path.clone());
+            self.copied = Some((path, now));
+        }
+        if let Some((_, at)) = &self.copied {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(
+                    (COPIED_SECONDS - (now - at)).max(0.0),
+                ));
+        }
+    }
+}
+
+/// One change. Returns the path to copy when its button was clicked.
+fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<String> {
+    let pal = theme::palette(ui.ctx());
+    let mut copy = None;
+    ui.add_space(6.0);
+    ui.horizontal_top(|ui| {
+        // Wide enough for "Yesterday 23:59" and "13 Oct 2025 18:40", so the changes line up.
+        ui.allocate_ui_with_layout(
+            egui::vec2(150.0, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(150.0);
+                ui.label(RichText::new(&entry.when).color(pal.text_muted));
+            },
+        );
+        ui.vertical(|ui| {
+            if entry.summary.is_empty() {
+                ui.label(RichText::new("A backup from before this log was kept").italics());
+            }
+            for line in &entry.summary {
+                ui.add(egui::Label::new(line.as_str()).wrap());
+            }
+            if let Some(why) = &entry.failed {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(format!("{} Did not finish: {why}", icon::WARNING))
+                            .color(pal.warn),
+                    )
+                    .wrap(),
+                );
+            }
+            for backup in &entry.backups {
+                if let Some(path) = backup_line(ui, backup, copied) {
+                    copy = Some(path);
+                }
+            }
+        });
+    });
+    ui.add_space(6.0);
+    copy
+}
+
+fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<String> {
+    let pal = theme::palette(ui.ctx());
+    if !backup.kept {
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "Backup of {} no longer kept: Klefki keeps the newest 20.",
+                    backup.of
+                ))
+                .small()
+                .color(pal.text_muted),
+            )
+            .wrap(),
+        );
+        return None;
+    }
+    let mut copy = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!("Backup of {}", backup.of))
+                .small()
+                .color(pal.text_muted),
+        );
+        if ui
+            .small_button(format!("{} Copy path", icon::COPY))
+            .on_hover_text("Copy where this backup is, to open or restore it yourself")
+            .clicked()
+        {
+            copy = Some(backup.path.clone());
+        }
+        if copied == Some(backup.path.as_str()) {
+            ui.label(RichText::new("Copied").small().color(pal.success));
+        }
+    });
+    ui.add(
+        egui::Label::new(
+            RichText::new(&backup.path)
+                .small()
+                .monospace()
+                .color(pal.text_muted),
+        )
+        .wrap(),
+    );
+    copy
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::shell::{Page, ShellApp};
+    use crate::theme::ThemeChoice;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+    use klefki_core::api::{
+        Activity, ActivityEntry, Backup, Command, Core, Detached, Event, Snapshot,
+    };
+    use std::sync::Arc;
+
+    fn harness() -> (Harness<'static, ShellApp>, Detached) {
+        let (core, engine) = Core::detached();
+        let h = Harness::builder()
+            .with_size(egui::vec2(1100.0, 900.0))
+            .build_eframe(move |cc| {
+                crate::theme::apply(&cc.egui_ctx, ThemeChoice::Dark);
+                ShellApp::with_core(core, ThemeChoice::Dark)
+            });
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot::default())))
+            .unwrap();
+        (h, engine)
+    }
+
+    fn activity_asked(engine: &Detached) -> usize {
+        std::iter::from_fn(|| engine.commands.try_recv().ok())
+            .filter(|c| *c == Command::Activity)
+            .count()
+    }
+
+    fn open(h: &mut Harness<'static, ShellApp>) {
+        h.get_by_label("Activity log").click();
+        h.run();
+    }
+
+    fn backup(path: &str, kept: bool) -> Backup {
+        Backup {
+            of: ".claude.json".to_owned(),
+            path: path.to_owned(),
+            kept,
+        }
+    }
+
+    fn sample() -> Activity {
+        Activity {
+            entries: vec![
+                ActivityEntry {
+                    when: "Today 10:44".to_owned(),
+                    summary: vec!["Turn off alpha in 2 projects".to_owned()],
+                    failed: None,
+                    backups: vec![backup("/data/backups/claude.json.1-0.bak", true)],
+                },
+                ActivityEntry {
+                    when: "Yesterday 18:02".to_owned(),
+                    summary: vec!["Move beta to user".to_owned()],
+                    failed: Some("Claude Code already added beta to user.".to_owned()),
+                    backups: vec![backup("/data/backups/claude.json.0-0.bak", false)],
+                },
+                ActivityEntry {
+                    when: "13 Oct 09:12".to_owned(),
+                    summary: Vec::new(),
+                    failed: None,
+                    backups: vec![backup("/data/backups/claude.json.9-0.bak", true)],
+                },
+            ],
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn the_log_is_read_only_once_the_page_is_opened() {
+        let (mut h, engine) = harness();
+        h.run();
+        assert_eq!(activity_asked(&engine), 0, "nothing is read at start-up");
+        open(&mut h);
+        assert_eq!(h.state().page, Page::ActivityLog);
+        assert_eq!(activity_asked(&engine), 1);
+        h.get_by_label("Loading…");
+        // Drawing the page again asks nothing more.
+        h.run();
+        assert_eq!(activity_asked(&engine), 0);
+    }
+
+    #[test]
+    fn changes_show_with_when_what_and_their_backup() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        h.get_by_label("Today 10:44");
+        h.get_by_label("Turn off alpha in 2 projects");
+        h.get_by_label("/data/backups/claude.json.1-0.bak");
+        h.get_by_label_contains("Did not finish: Claude Code already added beta");
+        h.get_by_label("Backup of .claude.json no longer kept: Klefki keeps the newest 20.");
+        assert!(
+            h.query_by_label("/data/backups/claude.json.0-0.bak")
+                .is_none(),
+            "a path that is gone is not offered"
+        );
+        h.get_by_label("A backup from before this log was kept");
+        assert!(h.query_by_label("Loading…").is_none());
+    }
+
+    #[test]
+    fn a_backup_path_can_be_copied() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        let buttons: Vec<_> = h.get_all_by_label_contains("Copy path").collect();
+        assert_eq!(buttons.len(), 2, "one per backup still kept");
+        buttons[0].click();
+        // The frame that sees the click copies.
+        h.step();
+        let copied: Vec<_> = h
+            .output()
+            .platform_output
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copied, ["/data/backups/claude.json.1-0.bak"]);
+        h.run();
+        h.get_by_label("Copied");
+        for _ in 0..30 {
+            h.step();
+        }
+        h.run();
+        assert!(h.query_by_label("Copied").is_none(), "the note goes away");
+    }
+
+    #[test]
+    fn an_empty_log_says_what_will_appear() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        engine
+            .events
+            .send(Event::Activity(Activity::default()))
+            .unwrap();
+        h.run();
+        h.get_by_label("No changes yet");
+        h.get_by_label_contains("shows up here with the backup taken first");
+    }
+
+    #[test]
+    fn a_log_that_could_not_be_read_says_so_and_shows_the_rest() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        let mut log = sample();
+        log.problem =
+            Some("2 lines of the activity log could not be read and are left out.".into());
+        engine.events.send(Event::Activity(log)).unwrap();
+        h.run();
+        h.get_by_label_contains("2 lines of the activity log could not be read");
+        h.get_by_label("Turn off alpha in 2 projects");
+    }
+
+    #[test]
+    fn leaving_the_page_lets_the_log_go_and_coming_back_reads_it_again() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        assert!(h.state().activity.is_some());
+        h.get_by_label("Connections").click();
+        h.run();
+        assert!(h.state().activity.is_none(), "nothing held while not shown");
+        activity_asked(&engine);
+        // A late answer, after the page was left, is not kept either.
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        assert!(h.state().activity.is_none());
+        open(&mut h);
+        assert_eq!(activity_asked(&engine), 1);
+        h.get_by_label("Loading…");
+    }
+
+    #[test]
+    fn a_change_saved_while_the_page_is_open_is_shown() {
+        let (mut h, engine) = harness();
+        h.run();
+        let applied = || Event::Applied {
+            plan: 1,
+            changed: true,
+            backup: None,
+            notes: Vec::new(),
+        };
+        engine.events.send(applied()).unwrap();
+        h.run();
+        assert_eq!(
+            activity_asked(&engine),
+            0,
+            "not while another page is shown"
+        );
+        open(&mut h);
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        activity_asked(&engine);
+        engine.events.send(applied()).unwrap();
+        h.run();
+        assert_eq!(activity_asked(&engine), 1);
+        // What was shown stays until the new log arrives: no flash of "Loading…".
+        h.get_by_label("Turn off alpha in 2 projects");
+        engine
+            .events
+            .send(Event::ApplyFailed {
+                plan: 2,
+                error: "No".into(),
+            })
+            .unwrap();
+        h.run();
+        assert_eq!(activity_asked(&engine), 1);
+    }
+
+    #[test]
+    fn the_command_palette_opens_the_page() {
+        let (mut h, engine) = harness();
+        h.run();
+        let titles: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
+        assert!(titles.iter().any(|t| t == "Activity log"), "{titles:?}");
+        h.state_mut().run(
+            &egui::Context::default(),
+            crate::command::Action::ActivityLog,
+        );
+        h.run();
+        assert_eq!(h.state().page, Page::ActivityLog);
+        assert_eq!(activity_asked(&engine), 1);
+    }
+
+    #[test]
+    fn the_page_is_built_not_promised() {
+        let (mut h, _engine) = harness();
+        h.run();
+        open(&mut h);
+        assert!(h.query_by_label_contains("Coming soon").is_none());
+        assert!(h.query_by_label("Back to connections").is_none());
+    }
+}
