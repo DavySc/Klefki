@@ -42,4 +42,4 @@ Klefki sent it behind, so the app looked stuck, and on Linux the desktop portal 
 Round 1 (Export save thread): no objection; folded in: `shown: None` opens no dialog off the UI thread.
 
 ## Next
-Merge after #25 and #30, merging main in first.
+Main 7becd59 merged in (after #25 and #30); full verify exit 0 (core 656, app 315, cli 18 + 25, deny ok). Merge #31 on green CI.
