@@ -795,7 +795,7 @@ pub(crate) fn free_of_kept(backup_dir: &Path, spot: &Spot) -> Result<(), String>
     });
     if waiting {
         return Err(format!(
-            "Klefki keeps the definition of {} that a change could not put back. Put it back or forget it on the Connections page first, or choose another name or place.",
+            "Klefki still keeps a definition of {} from an earlier change. Put it back or forget it on the Connections page first, or choose another name or place.",
             spot.words()
         ));
     }

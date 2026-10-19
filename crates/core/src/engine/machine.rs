@@ -969,6 +969,13 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 .any(|(p, n, _)| same_place(p, project) && n == name);
             if waiting {
                 prop_assert!(matches!(outcome, Outcome::Refused(_)), "{}", said);
+            } else {
+                // And only there: a place with nothing kept is not refused for it.
+                prop_assert!(
+                    !matches!(&outcome, Outcome::Refused(why) if why.contains("Put it back or forget it")),
+                    "{}",
+                    said
+                );
             }
         }
 

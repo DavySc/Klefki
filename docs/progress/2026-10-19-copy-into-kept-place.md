@@ -38,3 +38,8 @@ Goal: a copy into the place a kept definition came from overwrote Klefki's copy 
 - **Open:** none known in this slice. The app shows the refusal in the review; it does not grey out the target in the
   Move or Duplicate dialog beforehand.
 - **Next:** PR, CI on three systems, cross-review, merge.
+- **PR #11**, CI green on all three systems at 9b84b55. **Cross-review** (journal replay thread): no blockers. Folded
+  in: the refusal no longer says the definition "could not be put back", since it also covers a definition whose
+  server is back without the settings Claude Code drops (moving that server away and back is refused, with this
+  message; inferred by the reviewer, not run); the model also asserts that a place with nothing kept is never refused
+  for it. Checks after: clippy 0, 544 core tests, model soak 4000 cases passed.
