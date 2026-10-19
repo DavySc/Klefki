@@ -133,6 +133,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
   - Del delete, Space toggle, F5 refresh status
   - Ctrl+S apply, Esc cancel
 - **Export**: header, env and secret values are replaced with `${VAR}` or redacted. A plain, non-secret-looking env setting keeps its value as a default (`${LOG_LEVEL:-debug}`); anything secret-looking never does. Project entries are exported only as user/local candidates. The block can be copied or saved to a file (the system's save dialog; `klefki-cli export --output`); a file is never replaced without asking, and Claude Code's own files and `.mcp.json` files are never written.
+- **Secrets page**: per server, each secret it uses (env and header values, secret-looking arguments, address parts and settings, `headersHelper`, the OAuth client secret) and where it lives: typed into `.claude.json` or `.mcp.json` (with the `${VAR}` to use instead), filled in from an environment variable, made by a command, or in the system's secret store. Names and places only; no value reaches the UI. Read when the page is opened (the store is listed, never read), let go when it is left. Client secrets in the store that no server or kept definition uses are listed, and deleted only after the user confirms.
 - **Import**: parsed as untrusted and previewed (target, conflict handling, full stdio commands, a secret prompt per OAuth row), then applied as one plan.
 
 ## Milestones

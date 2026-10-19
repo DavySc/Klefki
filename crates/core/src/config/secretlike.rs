@@ -185,7 +185,7 @@ fn is_known_shape(credential: &str) -> bool {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
 }
 
-fn sounds_secret(name: &str) -> bool {
+pub(crate) fn sounds_secret(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Without separators or invisible characters, so "api_key" and "t\u{202e}oken" read as they are meant.
     let joined: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
@@ -408,7 +408,7 @@ fn names_a_setting(flag: &str) -> bool {
 
 /// A value after a secret-sounding name that is worth hiding: not a reference, not a path, not a plain word such
 /// as `true`.
-fn hideable(value: &str) -> bool {
+pub(crate) fn hideable(value: &str) -> bool {
     !(only_references("", value)
         || value.starts_with(['/', '~', '.'])
         || value.contains('\\')

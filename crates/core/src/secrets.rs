@@ -72,6 +72,22 @@ pub(crate) trait SecretStore: Send + Sync {
     fn set(&self, id: &ConnectionId, secret: &Secret) -> Result<(), SecretError>;
     /// Whether there was one to delete.
     fn delete(&self, id: &ConnectionId) -> Result<bool, SecretError>;
+    /// Every connection a secret is kept for, read from the store's list without reading any secret.
+    fn list(&self) -> Result<Vec<ConnectionId>, SecretError>;
+}
+
+/// The connection a stored credential is for, from the service and user the store lists it under; `None` for one
+/// that is not Klefki's.
+fn listed(service: &str, user: &str) -> Option<ConnectionId> {
+    // Windows names a credential `<user>.<service>` and, listing it, splits that at the last dot.
+    let joined;
+    let user = if service == SERVICE {
+        user
+    } else {
+        joined = format!("{user}.{service}");
+        joined.strip_suffix(&format!(".{SERVICE}"))?
+    };
+    ConnectionId::from_stored(user.strip_prefix("conn:")?)
 }
 
 /// The operating system's store, through `keyring-core`. Holds its store itself rather than setting a process-wide
@@ -149,6 +165,26 @@ impl SecretStore for Keyring {
             Err(e) => Err(failed(e)),
         }
     }
+
+    fn list(&self) -> Result<Vec<ConnectionId>, SecretError> {
+        // Each store searches by its own attributes. Windows matches the credential's whole name.
+        let spec: std::collections::HashMap<&str, &str> = if cfg!(windows) {
+            [("pattern", r"^conn:[A-Za-z0-9_-]+\.dev\.klefki$")].into()
+        } else {
+            [("service", SERVICE)].into()
+        };
+        let mut found: Vec<ConnectionId> = self
+            .0
+            .search(&spec)
+            .map_err(failed)?
+            .iter()
+            .filter_map(|entry| entry.get_specifiers())
+            .filter_map(|(service, user)| listed(&service, &user))
+            .collect();
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
 }
 
 /// An in-memory store for tests, which can be told to fail.
@@ -195,6 +231,17 @@ impl SecretStore for MemoryStore {
         self.check()?;
         Ok(self.values.lock().unwrap().remove(&user_for(id)).is_some())
     }
+
+    fn list(&self) -> Result<Vec<ConnectionId>, SecretError> {
+        self.check()?;
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter_map(|user| listed(SERVICE, user))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +285,42 @@ mod tests {
         assert_eq!(store.get(&id).unwrap().unwrap().expose(), "two");
         assert_eq!(store.delete(&id), Ok(true));
         assert_eq!(store.get(&id), Ok(None));
+    }
+
+    #[test]
+    fn the_keyring_adapter_lists_its_own_connections_and_nothing_else() {
+        let mock: Arc<keyring_core::CredentialStore> = keyring_core::mock::Store::new().unwrap();
+        let store = Keyring::with(Arc::clone(&mock));
+        let a = ConnectionId::new(Scope::User, None, "a");
+        let b = ConnectionId::new(Scope::Local, Some("/w/app"), "b");
+        store.set(&a, &Secret::new("one".into())).unwrap();
+        store.set(&b, &Secret::new("two".into())).unwrap();
+        // Someone else's, and one of Klefki's service that is not a connection.
+        for (service, user) in [("other.app", "conn:x"), (SERVICE, "settings")] {
+            mock.build(service, user, None)
+                .unwrap()
+                .set_password("x")
+                .unwrap();
+        }
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(store.list().unwrap(), want);
+    }
+
+    #[test]
+    fn a_listed_credential_is_read_back_as_its_connection_on_every_store() {
+        let id = ConnectionId::new(Scope::Local, Some("C:/w/app"), "acme");
+        let user = user_for(&id);
+        assert_eq!(listed(SERVICE, &user), Some(id.clone()));
+        // Windows: `conn:<id>.dev.klefki`, split at the last dot.
+        let (head, tail) = format!("{user}.{SERVICE}")
+            .rsplit_once('.')
+            .map(|(h, t)| (h.to_owned(), t.to_owned()))
+            .unwrap();
+        assert_eq!(listed(&tail, &head), Some(id));
+        assert_eq!(listed("klefki", "conn:abc.other"), None);
+        assert_eq!(listed(SERVICE, "conn:not-an-id"), None);
+        assert_eq!(listed(SERVICE, "settings"), None);
     }
 
     #[test]
