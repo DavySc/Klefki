@@ -23,6 +23,9 @@ open = { version = "5", features = ["shellexecute-on-windows"] }
 # The system's own save dialog for Export: the common dialog on Windows, NSSavePanel on macOS, the desktop portal
 # (libdbus, loaded when used) or zenity on Linux. No GTK.
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+# The save dialog belongs to Klefki's window: its handle, and waiting for the dialog's answer off the UI thread.
+raw-window-handle = "0.6"
+pollster = "0.4"
 
 # Ending a process together with what it started: a process group on Unix, a job object on Windows.
 [target.'cfg(unix)'.dependencies]
@@ -50,6 +53,13 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
+wayland-backend = { version = "0.3", optional = true, features = ["dlopen"] }
+
+[features]
+# On Wayland, the save dialog is told which window it belongs to. Only the app turns this on: libwayland is loaded
+# when the dialog opens (dlopen), as the app's window loads it already, so nothing new is linked and klefki-cli
+# never needs it.
+wayland = ["rfd/wayland", "dep:wayland-backend"]
 
 [dev-dependencies]
 filetime = "0.2"

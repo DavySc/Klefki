@@ -56,8 +56,12 @@ pub enum Command {
     /// `${VAR}` references (see [`Event::Exported`]). Writes nothing.
     Export(Vec<ServerId>),
     /// Ask the user, in the system's save dialog, where to save an export; `name` is the file name to start from
-    /// (see [`Event::ExportFileChosen`]).
-    ChooseExportFile { name: String },
+    /// (see [`Event::ExportFileChosen`]). `shown` is the dialog when the UI already opened it over its window
+    /// ([`Core::choose_export_file`]); without it no dialog is opened, and a path is asked for instead.
+    ChooseExportFile {
+        name: String,
+        shown: Option<crate::export_file::ShownDialog>,
+    },
     /// Write an exported block to `path` (see [`Event::ExportSaved`]). An existing file is replaced only with
     /// `replace`; Claude Code's own files and `.mcp.json` files are never written.
     SaveExport {
@@ -388,11 +392,25 @@ pub enum Event {
 pub struct Core {
     tx: Sender<Command>,
     rx: Receiver<Event>,
+    /// Opens the system's save dialog; `None` for a detached `Core` that opens none.
+    open_dialog: Option<crate::export_file::OpenDialog>,
 }
 
 impl Core {
     pub fn send(&self, command: Command) {
         let _ = self.tx.send(command);
+    }
+
+    /// [`Command::ChooseExportFile`] with the system's save dialog opened here, over `owner` (Klefki's window), so it
+    /// belongs to that window: a click on the window cannot send it behind, and on macOS it is the window's sheet.
+    /// Call it on the thread that owns the window. It returns once the dialog is open; the engine waits for the
+    /// answer.
+    pub fn choose_export_file(&self, name: String, owner: Option<&dyn crate::export_file::Owner>) {
+        let shown = self
+            .open_dialog
+            .as_ref()
+            .map(|open| crate::export_file::ShownDialog::open(open, &name, owner));
+        self.send(Command::ChooseExportFile { name, shown });
     }
 
     /// The next event, if one is ready. Never blocks.
@@ -406,7 +424,25 @@ impl Core {
     pub fn detached() -> (Core, Detached) {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
-        (Core { tx, rx }, Detached { commands, events })
+        let core = Core {
+            tx,
+            rx,
+            open_dialog: None,
+        };
+        (core, Detached { commands, events })
+    }
+
+    /// [`Core::detached`], with `open` showing the save dialog instead of the system: it is told the file name and
+    /// whether the dialog has an owner window.
+    #[doc(hidden)]
+    pub fn detached_with_dialog(
+        open: impl Fn(&str, bool) -> Option<PathBuf> + Send + Sync + 'static,
+    ) -> (Core, Detached) {
+        let (mut core, engine) = Core::detached();
+        core.open_dialog = Some(Arc::new(move |name, owner| {
+            Box::pin(std::future::ready(open(name, owner.is_some())))
+        }));
+        (core, engine)
     }
 }
 
@@ -445,8 +481,8 @@ pub(crate) struct EngineConfig {
     pub secrets: Option<Arc<dyn SecretStore>>,
     /// Opens a checked sign-in page in the browser. Tests record the link instead.
     pub open_url: OpenUrl,
-    /// Shows the system's save dialog. Tests answer for the user instead.
-    pub choose_file: crate::export_file::ChooseFile,
+    /// Opens the system's save dialog. Tests answer for the user instead.
+    pub open_dialog: crate::export_file::OpenDialog,
     /// How long a sign-in may wait for the user before it is stopped.
     pub sign_in_timeout: Duration,
     /// Runs Claude Code's own commands that change servers (`mcp add-json`, `mcp remove`) instead of the CLI found
@@ -485,8 +521,13 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
             let _ = ui.send(Input::Closed);
         })
         .expect("start the command relay");
+    let open_dialog = Some(Arc::clone(&config.open_dialog));
     std::thread::spawn(move || engine_main(config, input_rx, input_tx, emitter));
-    Core { tx, rx }
+    Core {
+        tx,
+        rx,
+        open_dialog,
+    }
 }
 
 /// What the engine thread reacts to.
@@ -809,15 +850,31 @@ fn engine_main(
                     .emitter
                     .emit(Event::Exported(crate::export::export(sources)));
             }
-            Command::ChooseExportFile { name } => {
-                // The dialog waits for the user, so it runs on a thread of its own: the engine keeps going.
-                let choose = Arc::clone(&shared.config.choose_file);
+            Command::ChooseExportFile { name, shown } => {
                 let home = shared.config.home.clone();
-                let emitter = shared.emitter.clone();
-                std::thread::spawn(move || {
-                    let choice = crate::export_file::choose(&choose, &name, home.as_deref());
-                    emitter.emit(Event::ExportFileChosen(choice));
-                });
+                // Only the UI's thread may open a dialog (on macOS, AppKit is main-thread only), so without one
+                // opened there, a path is asked for instead.
+                match shown.and_then(|s| s.take()) {
+                    None => {
+                        let choice = crate::export_file::not_shown(&name, home.as_deref());
+                        shared.emitter.emit(Event::ExportFileChosen(choice));
+                    }
+                    // The dialog waits for the user, so its answer is waited for on a thread of its own: the engine
+                    // keeps going.
+                    Some((opened, answer)) => {
+                        let emitter = shared.emitter.clone();
+                        std::thread::spawn(move || {
+                            let picked = pollster::block_on(answer);
+                            let choice = crate::export_file::answered(
+                                opened,
+                                picked,
+                                &name,
+                                home.as_deref(),
+                            );
+                            emitter.emit(Event::ExportFileChosen(choice));
+                        });
+                    }
+                }
             }
             Command::SaveExport {
                 path,
@@ -2558,9 +2615,9 @@ mod tests {
                         Ok(())
                     })
                 },
-                choose_file: {
+                open_dialog: {
                     let chosen = Arc::clone(&self.chosen);
-                    Arc::new(move |_: &str| lock(&chosen).clone())
+                    Arc::new(move |_, _| Box::pin(std::future::ready(lock(&chosen).clone())))
                 },
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
@@ -5659,6 +5716,101 @@ mod tests {
             .unwrap()
     }
 
+    /// A window as the UI hands it over. Its handles are not there (as for a window not shown yet), which is all a
+    /// test can give without one.
+    struct Window;
+
+    impl raw_window_handle::HasWindowHandle for Window {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    impl raw_window_handle::HasDisplayHandle for Window {
+        fn display_handle(
+            &self,
+        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn the_save_dialog_opens_over_the_window_where_it_lives_and_its_answer_is_awaited_elsewhere() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let opened: Arc<Mutex<Vec<(String, bool, std::thread::ThreadId)>>> = Arc::default();
+        let (answer, user) = mpsc::channel::<Option<PathBuf>>();
+        let user = Arc::new(Mutex::new(user));
+        let mut config = env.config();
+        config.open_dialog = {
+            let opened = Arc::clone(&opened);
+            Arc::new(move |name, owner| {
+                lock(&opened).push((
+                    name.to_owned(),
+                    owner.is_some(),
+                    std::thread::current().id(),
+                ));
+                let user = Arc::clone(&user);
+                // The user answers when the test says so.
+                Box::pin(async move { lock(&user).recv().ok().flatten() })
+            })
+        };
+        let core = start_with(config, || {});
+        core.choose_export_file("github-mcp.json".into(), Some(&Window));
+        // Opened here, on the thread that has the window, over it; and this thread did not wait for the user.
+        assert_eq!(
+            *lock(&opened),
+            vec![(
+                "github-mcp.json".to_owned(),
+                true,
+                std::thread::current().id()
+            )]
+        );
+        let file = env.dir.path().join("home").join("github-mcp.json");
+        answer.send(Some(file.clone())).unwrap();
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert_eq!(chosen, crate::export_file::FileChoice::Chosen(file));
+
+        // Nearby: a dialog with no window to belong to opens all the same, and closing it offers a path to type.
+        core.choose_export_file("x.json".into(), None);
+        assert_eq!(lock(&opened).last().map(|o| o.1), Some(false));
+        answer.send(None).unwrap();
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                &chosen,
+                crate::export_file::FileChoice::NoDialog { suggested }
+                    | crate::export_file::FileChoice::Cancelled { suggested }
+                    if suggested.ends_with("x.json")
+            ),
+            "{chosen:?}"
+        );
+
+        // A command with no dialog opened by the UI opens none here, off the UI's thread (on macOS, AppKit is
+        // main-thread only): a path is asked for instead.
+        let before = lock(&opened).len();
+        core.send(Command::ChooseExportFile {
+            name: "y.json".into(),
+            shown: None,
+        });
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(&chosen, crate::export_file::FileChoice::NoDialog { suggested } if suggested.ends_with("y.json")),
+            "{chosen:?}"
+        );
+        assert_eq!(lock(&opened).len(), before);
+    }
+
     #[test]
     fn an_export_is_saved_where_the_user_chose_and_never_over_claudes_own_file() {
         let env = Env::new(&serde_json::json!({}), "{}", &[]);
@@ -5675,9 +5827,10 @@ mod tests {
                 _ => None,
             })
         };
-        // No dialog could be shown: a path to start from instead.
+        // No dialog opened by the UI: a path to start from instead, and no dialog is opened here.
         core.send(Command::ChooseExportFile {
             name: "mcp-servers.json".into(),
+            shown: None,
         });
         assert!(matches!(
             chosen(&core),
@@ -5685,9 +5838,7 @@ mod tests {
         ));
         let file = env.dir.path().join("home").join("servers.json");
         *lock(&env.chosen) = Some(file.clone());
-        core.send(Command::ChooseExportFile {
-            name: "servers.json".into(),
-        });
+        core.choose_export_file("servers.json".into(), None);
         assert_eq!(
             chosen(&core),
             crate::export_file::FileChoice::Chosen(file.clone())

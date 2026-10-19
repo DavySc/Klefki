@@ -6,7 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-klefki-core = { path = "../core" }
+klefki-core = { path = "../core", features = ["wayland"] }
 egui = "0.36"
 eframe = { version = "=0.36.1", default-features = false, features = ["glow", "accesskit", "persistence", "default_fonts", "wayland", "x11"] }
 egui_extras = "=0.36.1"
