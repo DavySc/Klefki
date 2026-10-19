@@ -18,4 +18,8 @@ Goal: model seed `e896270e` (found by another session, hit on Windows CI of a UI
   Model soak 2 × 4000 cases passed (134 s, 127 s). Windows and macOS: CI only.
 - **Open:** Klefki cannot delete or rename a server that signs in, so the refusal names Put back as the way out;
   changing the other server's address also frees it.
-- **Next:** PR, CI, cross-review, merge.
+- **PR #19**, CI green on all three systems at f1b18b9. **Cross-review** (another thread): correct, one fold-in done:
+  the refusal says the other server's secret *may* be gone (Klefki cannot read Claude Code's credentials; the other
+  server may have been added later with its own). The reviewer's "Put back, then Delete" does not apply: Klefki
+  refuses to delete a server that signs in ("only Claude Code's own commands change it", seen in the variant test).
+- **Next:** merge.

@@ -842,7 +842,7 @@ pub(crate) fn forget_problem(claude_json: &Path, kept: &Recovery) -> Option<Stri
     let others = sharing(&root, &spot, &kept.entry);
     (!others.is_empty()).then(|| {
         format!(
-            "{} {} shares this definition's sign-in, and Claude Code took its client secret when this one was removed. Put this one back instead: that gives both their client secret again.",
+            "{} {} shares this definition's sign-in, so removing this one may also have removed that server's client secret in Claude Code. Put this one back instead: that gives both their client secret again.",
             sanitize(&kept.name),
             others.join(" and ")
         )
