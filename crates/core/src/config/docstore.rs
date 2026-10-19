@@ -353,22 +353,19 @@ impl Docstore {
         let (text, lines) = match self.kind {
             // Possibly tens of megabytes: only the bytes of the changed lists are replaced.
             Kind::ClaudeJson => edit_claude_json(&current.text, ops, purpose)?,
-            // A small file: parse, change, write it out whole.
+            // A small file, but Claude Code's and the user's: only the bytes of the changed lists are replaced.
             Kind::ProjectSettings => {
-                let mut doc = current.parse()?;
+                current.parse()?;
+                let names = ops
+                    .iter()
+                    .map(|op| match op {
+                        Op::Approve { name } => Ok(name.as_str()),
+                        _ => Err(wrong_file()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut lines = Vec::new();
-                for op in ops {
-                    match op {
-                        Op::Approve { name } => approve(&mut doc, name, &mut lines)?,
-                        _ => return Err(wrong_file()),
-                    }
-                }
-                let text = if lines.is_empty() {
-                    None
-                } else {
-                    Some(vec![(0..current.text.len(), current.render(&doc)?)])
-                };
-                (text, lines)
+                let splices = approve(&current.text, &names, current.missing, &mut lines)?;
+                (splices, lines)
             }
         };
         let path = match self.kind {
@@ -775,7 +772,13 @@ fn make_private(path: &Path) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
-#[cfg(not(unix))]
+/// Best effort, as on Unix: a file system without access lists (a FAT drive) keeps what it has.
+#[cfg(windows)]
+fn make_private(path: &Path) {
+    let _ = super::owner_only::restrict(path, false);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn make_private(_path: &Path) {}
 
 #[cfg(unix)]
@@ -787,7 +790,19 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
         .create(path)
 }
 
-#[cfg(not(unix))]
+/// The folder is made owner-only when this makes it; what is made in it inherits that. A folder that was already
+/// there is left as it is, as on Unix.
+#[cfg(windows)]
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    let _ = super::owner_only::restrict(path, true);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
@@ -802,7 +817,18 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
+/// Owner-only even in a folder that was made before Klefki restricted its folders.
+#[cfg(windows)]
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let _ = super::owner_only::restrict(path, false);
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
@@ -845,20 +871,6 @@ impl Current {
         }
         hasher.update(self.text.as_bytes());
         format!("{:x}", hasher.finalize())
-    }
-
-    /// Claude writes 2-space JSON with LF and no trailing newline; a file that has CRLF or a final newline keeps
-    /// them (and a byte-order mark, which `write` adds back).
-    fn render(&self, doc: &Value) -> Result<String, StoreError> {
-        let mut out = serde_json::to_string_pretty(doc)
-            .map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))?;
-        if self.text.ends_with('\n') || self.missing {
-            out.push('\n');
-        }
-        if self.text.contains("\r\n") {
-            out = out.replace('\n', "\r\n");
-        }
-        Ok(out)
     }
 }
 
@@ -2208,45 +2220,94 @@ fn insert_members(
     }
 }
 
-fn approve(doc: &mut Value, name: &str, lines: &mut Vec<String>) -> Result<(), StoreError> {
-    let root = doc
-        .as_object_mut()
-        .ok_or_else(|| StoreError::Invalid("the settings file is not a JSON object".to_owned()))?;
-    let wrong_shape = |key: &str| {
-        StoreError::Invalid(format!(
-            "{key} in the settings file is not a list; refusing to change it"
-        ))
-    };
-    // Check both lists before changing either, so a refusal leaves the document alone.
-    for key in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
-        if root.get(key).is_some_and(|v| !v.is_array()) {
-            return Err(wrong_shape(key));
+/// Approves `names` in a project's settings: each is added to `enabledMcpjsonServers` and taken out of
+/// `disabledMcpjsonServers`. Only the bytes of the lists that change are replaced, so everything else in the file
+/// (duplicate keys, huge integers, its layout) stays exactly as it was. `None` when nothing changes. A file just
+/// created (`missing`) ends with a line break, as Claude Code writes it.
+fn approve(
+    text: &str,
+    names: &[&str],
+    missing: bool,
+    lines: &mut Vec<String>,
+) -> Result<Option<Splices>, StoreError> {
+    const ENABLED: &str = "enabledMcpjsonServers";
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let root = jsonspan::object_with(text, jsonspan::skip_ws(text.as_bytes(), 0), &mut |_, _| {
+        false
+    })
+    .map_err(|e| StoreError::Invalid(sanitize(&e)))?;
+    // Both lists are checked before either is changed, so a refusal leaves the file alone.
+    let list = |key: &str| -> Result<Option<(&jsonspan::Member, Vec<Value>)>, StoreError> {
+        let Some(member) = single(&root, key, "the settings file")? else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&text[member.value.clone()]) {
+            Ok(Value::Array(items)) => Ok(Some((member, items))),
+            _ => Err(StoreError::Invalid(format!(
+                "{key} in the settings file is not a list; refusing to change it"
+            ))),
         }
-    }
-    let is_name = |v: &Value| v.as_str() == Some(name);
-    let enabled = root
-        .entry("enabledMcpjsonServers")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let enabled = enabled
-        .as_array_mut()
-        .ok_or_else(|| wrong_shape("enabledMcpjsonServers"))?;
-    if !enabled.iter().any(is_name) {
-        enabled.push(Value::String(name.to_owned()));
-        lines.push("  enabledMcpjsonServers".to_owned());
-        lines.push(format!("+ {}", sanitize(name)));
-    }
-    if let Some(rejected) = root
-        .get_mut("disabledMcpjsonServers")
-        .and_then(Value::as_array_mut)
-    {
-        let before = rejected.len();
-        rejected.retain(|v| !is_name(v));
-        if rejected.len() != before {
-            lines.push("  disabledMcpjsonServers".to_owned());
+    };
+    let (enabled, rejected) = (list(ENABLED)?, list(REJECTED)?);
+    let mut enabled_items = enabled.as_ref().map_or_else(Vec::new, |(_, i)| i.clone());
+    let mut rejected_items = rejected.as_ref().map_or_else(Vec::new, |(_, i)| i.clone());
+    let (mut enabled_changed, mut rejected_changed) = (false, false);
+    for &name in names {
+        let is_name = |v: &Value| v.as_str() == Some(name);
+        if !enabled_items.iter().any(is_name) {
+            enabled_items.push(Value::String(name.to_owned()));
+            enabled_changed = true;
+            lines.push(format!("  {ENABLED}"));
+            lines.push(format!("+ {}", sanitize(name)));
+        }
+        let before = rejected_items.len();
+        rejected_items.retain(|v| !is_name(v));
+        if rejected_items.len() != before {
+            rejected_changed = true;
+            lines.push(format!("  {REJECTED}"));
             lines.push(format!("- {}", sanitize(name)));
         }
     }
-    Ok(())
+    let replaced = |member: &jsonspan::Member, items: &[Value]| {
+        let indent = jsonspan::line_indent(text, member.key_start);
+        Ok::<_, StoreError>((member.value.clone(), render_list(items, indent, nl)?))
+    };
+    let mut splices = Splices::new();
+    if enabled_changed {
+        splices.push(match &enabled {
+            Some((member, _)) => replaced(member, &enabled_items)?,
+            None => {
+                let key = serde_json::to_string(ENABLED)
+                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                // An empty file object is written out like Claude would, on lines of its own.
+                let first_line = &text[..root.open];
+                let outer = jsonspan::line_indent(text, root.open).or_else(|| {
+                    first_line
+                        .bytes()
+                        .all(|c| matches!(c, b' ' | b'\t'))
+                        .then_some(first_line)
+                });
+                insert_members(
+                    text,
+                    &root,
+                    outer,
+                    &[(key, Value::Array(enabled_items))],
+                    nl,
+                )?
+            }
+        });
+    }
+    if rejected_changed && let Some((member, _)) = &rejected {
+        splices.push(replaced(member, &rejected_items)?);
+    }
+    if splices.is_empty() {
+        return Ok(None);
+    }
+    if missing {
+        splices.push((text.len()..text.len(), nl.to_owned()));
+    }
+    splices.sort_by_key(|(range, _)| (range.start, range.end));
+    Ok(Some(splices))
 }
 
 #[cfg(test)]
@@ -2936,6 +2997,31 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&backup), 0o600);
         assert_eq!(mode(&f.store.backup_dir), 0o700);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn backups_and_their_folder_are_owner_only_on_windows() {
+        use crate::config::owner_only::tests::is_owner_only;
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        // A link to the configuration itself, which keeps the access list of the profile until made private.
+        let backup = f.store.apply(&plan).unwrap().backup.unwrap();
+        assert!(is_owner_only(&backup), "the backup");
+        assert!(is_owner_only(&f.store.backup_dir), "the backup folder");
+        // A copy kept before Claude Code's own commands.
+        let copy = f.store.keep_copy().unwrap();
+        assert!(is_owner_only(&copy), "the kept copy");
+        // A file made in a folder from before this change, which other accounts can read.
+        let old = f.dir.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        assert!(!is_owner_only(&old));
+        let file = old.join("x");
+        drop(create_private_file(&file).unwrap());
+        assert!(is_owner_only(&file), "a private file in an open folder");
     }
 
     #[test]
@@ -3949,6 +4035,64 @@ mod tests {
         let store = settings_store(dir.path());
         std::fs::write(&store.path, "[]").unwrap();
         assert!(store.prepare(vec![approve_op("ps")]).is_err());
+    }
+
+    #[test]
+    fn approving_changes_only_the_two_lists_and_keeps_every_other_byte() {
+        // A rewrite of the whole file collapsed duplicate keys, turned huge integers into floats and restyled
+        // everything; Claude Code and the user may rely on any of it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let store = settings_store(dir.path());
+        let head = "{\n    \"permissions\": {\"allow\": [\"Bash(ls)\"], \"deny\": []},\n    \"n\": 123456789012345678901234567890,\n    \"f\": 1.0e2,\n    \"dup\": 1,\n    \"dup\": 2,\n    \"enabledMcpjsonServers\": ";
+        let middle = ",\n    \"disabledMcpjsonServers\": ";
+        let tail = ",\n    \"after\": \"x\"\n}";
+        let original =
+            format!("{head}[\"a\"]{middle}[\n        \"ps\",\n        \"z\"\n    ]{tail}");
+        std::fs::write(&store.path, &original).unwrap();
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        store.apply(&plan).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&store.path).unwrap(),
+            format!(
+                "{head}[\n      \"a\",\n      \"ps\"\n    ]{middle}[\n      \"z\"\n    ]{tail}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_list_added_to_a_one_line_settings_file_keeps_the_rest_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let store = settings_store(dir.path());
+        let original = "{\"permissions\":{\"allow\":[]},\"n\":123456789012345678901234567890}\n";
+        std::fs::write(&store.path, original).unwrap();
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        store.apply(&plan).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&store.path).unwrap(),
+            "{\"permissions\":{\"allow\":[]},\"n\":123456789012345678901234567890,\"enabledMcpjsonServers\":[\"ps\"]}\n"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_with_a_list_twice_is_refused_untouched() {
+        // Which one Claude Code reads is a guess; collapsing them would drop one.
+        for key in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".claude")).unwrap();
+            let store = settings_store(dir.path());
+            let original = format!("{{\n  \"{key}\": [\"a\"],\n  \"{key}\": [\"ps\"]\n}}");
+            std::fs::write(&store.path, &original).unwrap();
+            assert!(
+                matches!(
+                    store.prepare(vec![approve_op("ps")]),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{key}"
+            );
+            assert_eq!(std::fs::read_to_string(&store.path).unwrap(), original);
+        }
     }
 
     #[cfg(unix)]
