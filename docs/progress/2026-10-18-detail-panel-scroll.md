@@ -61,3 +61,9 @@ Guard, passing before and checked by mutation: `a_definition_that_arrives_while_
 - Full verify exit 0, 718 tests passed, deny "advisories ok, bans ok, licenses ok, sources ok". `cargo test -p klefki` 228 passed.
 - Trial merge into #26's head `349e33d`: no conflicts; `cargo clippy -p klefki --all-targets -- -D warnings` 0 and `cargo test -p klefki` 243 passed on the result.
 - Real app (release, Xvfb): at 800x480 Edit definition shows the Definition heading under the tabs, Type, Command and both arguments, over a one-line save bar; a second click at the same place lands on the disabled Review and save…. At 1200x720 the panel moves up 72 px, so the summary from Type down stays and the form ends with Edit as JSON above the bar. Ctrl+E at 800x480 with a long target in the summary brings the form in from its top.
+
+## Main brought in (#30 and #29 merged)
+- Merged `565be39` (main with #30 and #29) into the branch with a merge commit; no conflicts. The merged tree `07749cd` is the same tree a trial merge with #29's head `d000692` gave, before #29 merged.
+- Full verify on that tree: exit 0, 750 tests passed, 0 failed, deny "advisories ok, bans ok, licenses ok, sources ok".
+- Trial merge with #26's head `349e33d`: no conflicts.
+- Next: CI on this push, on all three systems; then merge.
