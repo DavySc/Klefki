@@ -771,3 +771,100 @@ fn export_with_names_holds_only_those_and_an_unknown_name_is_a_usage_error() {
         text(&out.stderr)
     );
 }
+
+/// Is a process with this id still running? A zombie (ended, not yet reaped) is not.
+fn pid_alive(pid: u32) -> bool {
+    if cfg!(windows) {
+        let out = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("run tasklist");
+        String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+    } else {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        let stat = String::from_utf8_lossy(&out.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+}
+
+#[test]
+fn status_ended_early_leaves_no_check_running() {
+    // Regression: Ctrl+C during `status` ended klefki-cli but not the checks it had started (they lead a process
+    // group of their own, so the terminal's Ctrl+C never reaches them), nor the servers those started.
+    // On Windows a check is ended with klefki-cli however it ends; the test ends it outright.
+    let ways: &[&str] = if cfg!(windows) {
+        &["kill"]
+    } else {
+        &["INT", "TERM", "HUP"]
+    };
+    for way in ways {
+        let env = Env::new();
+        let pid_file = env.root().join("claude.pid");
+        std::fs::write(
+            env.root().join("scenario.json"),
+            serde_json::json!({"rules": [
+                {"args": ["--version"], "stdout_file": "version.txt"},
+                {"args": ["mcp", "get", "alpha"], "hang": true, "write_pid_to": pid_file},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let claude = fake_claude().to_string_lossy().into_owned();
+        let mut cli = env
+            .command(&["status", "--claude", &claude, "alpha"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start klefki-cli");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let claude_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(std::time::Instant::now() < until, "the check never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        if *way == "kill" {
+            cli.kill().unwrap();
+        } else {
+            let sent = Command::new("kill")
+                .args([&format!("-{way}"), &cli.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success());
+        }
+        let ended = cli.wait().unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pid_alive(claude_pid) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let left = pid_alive(claude_pid);
+        if left {
+            let _ = if cfg!(windows) {
+                Command::new("taskkill")
+                    .args(["/F", "/PID", &claude_pid.to_string()])
+                    .output()
+            } else {
+                Command::new("kill")
+                    .args(["-KILL", &claude_pid.to_string()])
+                    .output()
+            };
+        }
+        assert!(
+            !left,
+            "SIG{way}: the check {claude_pid} still ran after klefki-cli ended ({ended})"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // Ended by the signal, as the shell expects of a program that was interrupted.
+            assert!(ended.signal().is_some(), "SIG{way}: {ended}");
+        }
+    }
+}

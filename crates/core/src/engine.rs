@@ -2220,6 +2220,7 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
         env: &cli_env(shared),
         timeout: VERSION_TIMEOUT,
         max_output: 1024,
+        end_leftovers: false,
     })
     .ok()?;
     let token = out.stdout.split_whitespace().next()?;
@@ -2250,6 +2251,7 @@ fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
         env: &cli_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     interpret(result, timeout)
 }
@@ -2341,6 +2343,7 @@ fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
         env: &cli_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     let stderr = result
         .as_ref()
