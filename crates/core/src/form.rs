@@ -860,7 +860,15 @@ mod tests {
             );
             assert!(warning.contains("Signing in will fail"), "{warning}");
             drop(held);
-            assert_eq!(callback_port_warning(port), None, "{at}:{port} once let go");
+            // Another holder can have the number for a moment: a child process another test starts keeps a copy of
+            // the listener until it runs its program, and another test can take the address family not held here.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut warning = callback_port_warning(port);
+            while warning.is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                warning = callback_port_warning(port);
+            }
+            assert_eq!(warning, None, "{at}:{port} once let go");
         }
         assert_eq!(callback_port_warning(0), None);
     }
