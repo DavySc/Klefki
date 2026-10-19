@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Runs Claude Code's own commands. The client secret, when given, travels only in `MCP_CLIENT_SECRET`.
@@ -302,6 +303,10 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             "{shown} was not {verb}: there is already a server called {}.",
             swap.to.words()
         ));
+    }
+    // Checked again here: a change in another Klefki may have kept a definition there since the review.
+    if !replaces_itself && let Err(why) = free_of_kept(ctx.backup_dir, &swap.to) {
+        return Err(format!("{shown} was not {verb}: {why}"));
     }
     // Claude Code runs from the project's folder: checked before anything is removed.
     let removed_by_claude = swap.remove && signs_in(&old);
@@ -777,6 +782,26 @@ pub(crate) fn put_back(ctx: &Ctx, id: &str) -> Result<Done, String> {
     Ok(done)
 }
 
+/// Why no server may go to `spot` yet, if a kept definition waits to be put back there: Klefki's copy of its client
+/// secret is filed under that place, and a server arriving there would replace or delete it (a copy, a move, an add
+/// with a secret), or claim it later (its Auth tab, a move away). Put back would also find the place taken.
+pub(crate) fn free_of_kept(backup_dir: &Path, spot: &Spot) -> Result<(), String> {
+    let waiting = Recovery::files(backup_dir).into_iter().any(|r| {
+        r.name == spot.name
+            && spot.same_place(&Spot {
+                project: r.project.clone(),
+                name: r.name.clone(),
+            })
+    });
+    if waiting {
+        return Err(format!(
+            "Klefki still keeps a definition of {} from an earlier change. Put it back or forget it on the Connections page first, or choose another name or place.",
+            spot.words()
+        ));
+    }
+    Ok(())
+}
+
 /// Deletes a recovery file the user no longer needs.
 pub(crate) fn forget(backup_dir: &Path, id: &str) -> Result<(), String> {
     Recovery::load(&recovery_dir(backup_dir), id)?.discard();
@@ -1112,11 +1137,12 @@ impl Recovery {
     /// deleting the file, or a later change put the same server there. Without that copy there, the definition is
     /// still listed: putting it back is then the only way to hand its secret to Claude Code again.
     /// With each, whether its server is back where it was, without the settings Claude Code does not keep: the file
-    /// then only holds the rest of the definition, until the user forgets it.
+    /// then only holds the rest of the definition, until the user forgets it. `store` opens Klefki's secret store,
+    /// only when a change got through: `None` when it cannot, and then nothing is dropped.
     pub(crate) fn list(
         backup_dir: &Path,
         claude_json: &Path,
-        store: Option<&dyn SecretStore>,
+        store: &dyn Fn() -> Option<Arc<dyn SecretStore>>,
     ) -> Vec<(Self, bool)> {
         let root: Option<Value> = fsx::read_limited(claude_json, inventory::MAX_CLAUDE_JSON)
             .ok()
@@ -1185,10 +1211,13 @@ impl Recovery {
     }
 
     /// Whether Klefki's copy of the client secret, if it holds one where the server was, is also where the server
-    /// went (the one left behind is then deleted). Unsure counts as no. Without a store Klefki holds no copy, so
-    /// there is none to lose.
-    fn secret_went_along(&self, claude_json: &Path, store: Option<&dyn SecretStore>) -> bool {
-        let (Some((to, _)), Some(store)) = (&self.next, store) else {
+    /// went (the one left behind is then deleted). Unsure counts as no, a store that cannot be opened included.
+    fn secret_went_along(
+        &self,
+        claude_json: &Path,
+        store: &dyn Fn() -> Option<Arc<dyn SecretStore>>,
+    ) -> bool {
+        let Some((to, _)) = &self.next else {
             return true;
         };
         let from = Spot {
@@ -1200,6 +1229,9 @@ impl Recovery {
         if from == to {
             return true;
         }
+        let Some(store) = store() else {
+            return false;
+        };
         match (store.get(&from), store.get(&to)) {
             (Ok(None), _) => true,
             // Read again just before: another Klefki may have put a server there since, with this secret.
@@ -1213,5 +1245,72 @@ impl Recovery {
 
     fn discard(&self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::secrets::MemoryStore;
+
+    /// A kept definition of `a` from the project `pb`, whose move to the user's `a` got through: the configuration
+    /// has it there and not in pb. Returns the backup folder, the configuration, and where `a` was and went.
+    fn got_through(dir: &Path) -> (PathBuf, PathBuf, Spot, Spot) {
+        let pb = dir.join("pb").to_string_lossy().into_owned();
+        let entry =
+            json!({"type": "http", "url": "https://h.example/mcp", "oauth": {"clientId": "c"}});
+        let claude_json = dir.join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            json!({"mcpServers": {"a": entry}, "projects": {&pb: {"mcpServers": {}}}}).to_string(),
+        )
+        .unwrap();
+        let backup_dir = dir.join("data").join("backups");
+        let recovery = recovery_dir(&backup_dir);
+        std::fs::create_dir_all(&recovery).unwrap();
+        std::fs::write(
+            recovery.join("0000000000000001-0.json"),
+            json!({"name": "a", "project": &pb, "entry": entry, "next": {"name": "a", "project": null, "entry": entry}})
+                .to_string(),
+        )
+        .unwrap();
+        let from = Spot {
+            project: Some(pb),
+            name: "a".into(),
+        };
+        let to = Spot {
+            project: None,
+            name: "a".into(),
+        };
+        (backup_dir, claude_json, from, to)
+    }
+
+    #[test]
+    fn a_kept_definition_whose_change_got_through_stays_listed_while_the_secret_store_cannot_be_opened()
+     {
+        // The app opens the system's store when first needed, and the listing was given none: it then took the
+        // change as done and dropped the definition, leaving Klefki's copy of its client secret under a server
+        // that is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let (backup_dir, claude_json, _, _) = got_through(dir.path());
+        let listed = Recovery::list(&backup_dir, &claude_json, &|| None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(Recovery::files(&backup_dir).len(), 1);
+    }
+
+    #[test]
+    fn a_kept_definition_whose_change_got_through_goes_with_its_secret_once_the_store_opens() {
+        // The variant: the store opens, the copy is where the server went, and the one left behind is deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let (backup_dir, claude_json, from, to) = got_through(dir.path());
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        let secret = Secret::new("sec-a".to_owned());
+        store.set(&from.connection(), &secret).unwrap();
+        store.set(&to.connection(), &secret).unwrap();
+        let open = || Some(Arc::clone(&store));
+        assert!(Recovery::list(&backup_dir, &claude_json, &open).is_empty());
+        assert!(Recovery::files(&backup_dir).is_empty());
+        assert_eq!(store.get(&from.connection()).unwrap(), None);
+        assert_eq!(store.get(&to.connection()).unwrap(), Some(secret));
     }
 }

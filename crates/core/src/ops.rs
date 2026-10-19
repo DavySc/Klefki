@@ -48,6 +48,32 @@ pub(crate) struct Resolved {
     pub forget: Vec<String>,
 }
 
+impl Resolved {
+    /// Every place a server arrives in `.claude.json` under a name it did not have there: added, copied, moved or
+    /// renamed, by Klefki or by Claude Code's commands.
+    pub(crate) fn arrivals(&self) -> Vec<Spot> {
+        let spot = |project: &Option<String>, name: &str| Spot {
+            project: project.clone(),
+            name: name.to_owned(),
+        };
+        let written = self.claude.iter().filter_map(|op| match op {
+            Op::AddServer { project, name, .. } => Some(spot(project, name)),
+            Op::CopyServer { to, new_name, .. } => Some(spot(to, new_name)),
+            Op::RenameServer {
+                project, new_name, ..
+            } => Some(spot(project, new_name)),
+            _ => None,
+        });
+        let added = self.cli.iter().map(|a| spot(&a.project, &a.name));
+        let swapped = self
+            .swaps
+            .iter()
+            .filter(|s| !(s.remove && s.from == s.to))
+            .map(|s| s.to.clone());
+        written.chain(added).chain(swapped).collect()
+    }
+}
+
 /// A server Claude Code adds with its own command, `claude mcp add-json`, because it signs in with OAuth: Claude
 /// Code keeps the client secret in its own secure storage, out of `~/.claude.json`.
 pub(crate) struct CliAdd {
