@@ -478,6 +478,7 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             watch_settle: Duration::from_millis(50),
             secrets: Some(store.clone()),
             open_url: Arc::new(|_| Ok(())),
+            choose_file: Arc::new(|_| None),
             sign_in_timeout: Duration::from_secs(5),
             changer: Some(changer),
         },

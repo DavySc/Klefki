@@ -17,6 +17,10 @@ pub enum Cmd {
     /// The definitions, as one `{"mcpServers": {…}}` block with secrets replaced by `${VAR}` references.
     Export {
         names: Vec<String>,
+        /// Write the block to this file instead of stdout.
+        output: Option<PathBuf>,
+        /// Replace the file if it is there.
+        force: bool,
     },
     Help,
     Version,
@@ -42,12 +46,12 @@ Examples:
   klefki-cli status                 check every server that is on
   klefki-cli status docs            check one server, a project server too
   klefki-cli status --json | jq '.servers[] | select(.status == \"failed\") | .name'
-  klefki-cli export github > servers.json
+  klefki-cli export github -o servers.json
 
 Usage:
   klefki-cli list   [NAME...] [--json]
   klefki-cli status [NAME...] [--json] [--claude PATH]
-  klefki-cli export [NAME...]
+  klefki-cli export [NAME...] [-o FILE [--force]]
   klefki-cli help
   klefki-cli --version
 
@@ -61,12 +65,16 @@ Commands:
            shape a .mcp.json has and Klefki's Add reads. Every environment and
            header value, and anything else that looks like a secret, is written
            as a ${VAR} reference; stderr lists the variables to set. Reads the
-           configuration only; runs nothing, writes nothing.
+           configuration only and runs nothing; writes only the --output file.
 
 Options:
   NAME           Only these servers (by name, in every scope).
   --json         Print JSON for scripts instead of the table (list, status).
   --claude PATH  The Claude CLI to use (default: found like the Klefki app does).
+  -o, --output FILE
+                 Write the export to FILE instead of stdout. An existing file
+                 is kept unless you confirm, or add --force. Claude Code's own
+                 files and .mcp.json files are never written.
   -h, --help     Show this help.
   -V, --version  Show the version.
 
@@ -78,6 +86,7 @@ Exit status:
   1  status found a server that is not connected; export left one out.
   2  The command line was wrong, or a NAME matches no server.
   3  Claude Code could not be used: not found, or no check got an answer.
+  4  export could not write the --output file (it is there, or not allowed).
 
 Reads CLAUDE_CONFIG_DIR like Claude Code does.
 ";
@@ -109,6 +118,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
     let mut json = false;
     let mut claude = None;
     let mut only_names = false;
+    let mut output = None;
+    let mut force = false;
+    let export = kind == Kind::Export;
     while let Some(arg) = args.next() {
         // A path may not be text the platform can show; it is kept as given.
         if !only_names
@@ -116,6 +128,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--claude="))
         {
             claude = Some(claude_path(Some(path.into()))?);
+            continue;
+        }
+        if !only_names
+            && export
+            && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--output="))
+        {
+            set_output(&mut output, Some(path.into()))?;
             continue;
         }
         let arg = text(arg)?;
@@ -133,6 +152,18 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
                     "--claude is only for status: {command} starts no program"
                 )));
             }
+            "-o" | "--output" if export => set_output(&mut output, args.next())?,
+            "--force" if export => force = true,
+            "-o" | "--output" | "--force" => {
+                let option = if arg == "--force" {
+                    "--force"
+                } else {
+                    "--output"
+                };
+                return Err(bad(format!(
+                    "{option} is only for export: {command} writes nothing"
+                )));
+            }
             option if option.starts_with('-') && option.len() > 1 => {
                 return Err(bad(format!("unknown option {option}")));
             }
@@ -146,7 +177,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             claude,
         },
         Kind::List => Cmd::List { names, json },
-        Kind::Export => Cmd::Export { names },
+        Kind::Export if force && output.is_none() => {
+            return Err(bad(
+                "--force is only with --output: it lets the file be replaced".to_owned(),
+            ));
+        }
+        Kind::Export => Cmd::Export {
+            names,
+            output,
+            force,
+        },
     })
 }
 
@@ -155,6 +195,19 @@ enum Kind {
     List,
     Status,
     Export,
+}
+
+fn set_output(output: &mut Option<PathBuf>, value: Option<OsString>) -> Result<(), Usage> {
+    match value {
+        _ if output.is_some() => Err(bad("--output is given once: one file".to_owned())),
+        Some(path) if !path.is_empty() => {
+            *output = Some(PathBuf::from(path));
+            Ok(())
+        }
+        _ => Err(bad(
+            "--output needs the path of the file to write".to_owned()
+        )),
+    }
 }
 
 fn claude_path(value: Option<OsString>) -> Result<PathBuf, Usage> {
@@ -216,14 +269,53 @@ mod tests {
     }
 
     #[test]
+    fn export_takes_an_output_file() {
+        let out = |path: &str, force| Cmd::Export {
+            names: vec!["a".into()],
+            output: Some(PathBuf::from(path)),
+            force,
+        };
+        assert_eq!(
+            p(&["export", "a", "-o", "x.json"]),
+            Ok(out("x.json", false))
+        );
+        assert_eq!(
+            p(&["export", "--output", "x.json", "a"]),
+            Ok(out("x.json", false))
+        );
+        assert_eq!(
+            p(&["export", "--output=x.json", "a", "--force"]),
+            Ok(out("x.json", true))
+        );
+        let refused = |args: &[&str]| match p(args) {
+            Err(Usage::Bad(why)) => why,
+            other => panic!("{other:?}"),
+        };
+        assert!(refused(&["export", "-o"]).contains("--output needs"));
+        assert!(refused(&["export", "--output="]).contains("--output needs"));
+        assert!(refused(&["export", "--force"]).contains("--force is only with --output"));
+        assert!(refused(&["list", "-o", "x"]).contains("--output is only for export"));
+        assert!(refused(&["export", "-o", "a", "-o", "b"]).contains("once"));
+    }
+
+    #[test]
     fn export_takes_names_only() {
         assert_eq!(
             p(&["export", "a", "b"]),
             Ok(Cmd::Export {
-                names: vec!["a".into(), "b".into()]
+                names: vec!["a".into(), "b".into()],
+                output: None,
+                force: false,
             })
         );
-        assert_eq!(p(&["export"]), Ok(Cmd::Export { names: vec![] }));
+        assert_eq!(
+            p(&["export"]),
+            Ok(Cmd::Export {
+                names: vec![],
+                output: None,
+                force: false,
+            })
+        );
         let refused = |args: &[&str]| match p(args) {
             Err(Usage::Bad(why)) => why,
             other => panic!("{args:?} gave {other:?}"),

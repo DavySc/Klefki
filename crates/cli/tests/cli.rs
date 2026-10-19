@@ -771,3 +771,86 @@ fn export_with_names_holds_only_those_and_an_unknown_name_is_a_usage_error() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn export_output_writes_the_block_to_a_new_file_and_never_over_one_without_force() {
+    let env = Env::new();
+    let file = env.root().join("servers.json");
+    let path = file.to_string_lossy().into_owned();
+    let out = env.run(&["export", "alpha", "--output", &path]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(out.stdout.is_empty(), "the block goes to the file only");
+    let written = std::fs::read_to_string(&file).unwrap();
+    let block: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(block["mcpServers"]["alpha"]["args"][3], "${API_KEY}");
+    assert!(!written.contains(API_KEY), "{written}");
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains(&format!("Saved alpha to {path}")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("API_KEY  (alpha: argument --api-key)"),
+        "{stderr}"
+    );
+
+    // There now: kept, and the way to replace it is named.
+    let out = env.run(&["export", "-o", &path]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("--force"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+
+    let out = env.run(&["export", &format!("--output={path}"), "--force"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Saved 6 servers to"),
+        "{}",
+        text(&out.stderr)
+    );
+    let block: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(block["mcpServers"].as_object().unwrap().len(), 6);
+}
+
+#[test]
+fn export_output_refuses_claude_codes_own_files_and_a_missing_folder() {
+    let env = Env::new();
+    let claude_json = env.root().join("cfg").join(".claude.json");
+    let before = std::fs::read(&claude_json).unwrap();
+    let out = env.run(&["export", "-o", &claude_json.to_string_lossy(), "--force"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out.stderr).contains("Claude Code's own"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&claude_json).unwrap(), before);
+
+    let mcp_json = env.root().join("Repo").join(".mcp.json");
+    let before = std::fs::read(&mcp_json).unwrap();
+    let out = env.run(&["export", "-o", &mcp_json.to_string_lossy(), "--force"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out.stderr).contains(".mcp.json"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&mcp_json).unwrap(), before);
+
+    let out = env.run(&[
+        "export",
+        "-o",
+        &env.root().join("nope").join("x.json").to_string_lossy(),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out.stderr).contains("does not exist"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+}
