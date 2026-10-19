@@ -46,5 +46,6 @@ are only listed, deleting one is an explicit user action) plus a read-only map o
   - Tests: engine `unused_means_unused_in_this_configuration_and_the_report_names_it` (the reviewer's probe),
     `a_file_change_reads_the_definitions_again_but_not_the_store`; app tests assert the B1 wording, the reason
     line and `SecretsAfterFileChange` on a snapshot.
-  - Checks after the fold-in (Linux): full verify + `cargo clippy -p klefki` exit 0 (670 core, 323 app, 18 + 25 cli).
+  - Checks after the fold-in and main 950b096 merged in (Linux): full verify + `cargo clippy -p klefki` exit 0 (673
+    core, 324 app, 18 + 25 cli).
 - **Next:** merge main in, re-verify, reviewer re-checks B1, merge.
