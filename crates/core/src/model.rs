@@ -168,7 +168,8 @@ impl ServerName {
 mod tests {
     use super::*;
 
-    /// Made by v1's own `makeId` (Source code/src/main/services/connections.js), run with Node 22.
+    /// Made by v1's own `makeId` (Source code/src/main/services/connections.js), run with Node 22. The two
+    /// example names were later renamed, their ids made again with the same encoding (`JSON.stringify`, base64url).
     const V1_IDS: [(&str, Option<&str>, &str, &str); 8] = [
         (
             "user",
