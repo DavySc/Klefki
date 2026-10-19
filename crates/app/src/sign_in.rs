@@ -11,7 +11,7 @@ use klefki_core::api::{
 
 /// Whether a server signs in through Claude Code: those reached over HTTP or SSE.
 pub(crate) fn can_sign_in(row: &ServerRow) -> bool {
-    matches!(row.transport, TransportKind::Http | TransportKind::Sse)
+    matches!(row.transport, TransportKind::Http | TransportKind::Sse) && row.plugin.is_none()
 }
 
 /// Whether signing in is offered up front (Status tab, toolbar): when Claude Code said the server needs it, or the

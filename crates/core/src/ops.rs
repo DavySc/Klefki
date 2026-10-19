@@ -415,12 +415,33 @@ fn find<'a>(
     snapshot: &'a Snapshot,
     keys: &'a FileKeys,
 ) -> Result<(&'a ServerRow, &'a FileKey), String> {
+    if let Some(row) = snapshot
+        .servers
+        .iter()
+        .find(|r| r.is(id) && r.scope == Scope::Plugin)
+    {
+        return Err(from_plugin(row));
+    }
     inventory::locate(snapshot, keys, id).ok_or_else(|| {
         format!(
             "{} is no longer in the configuration. Refresh and try again.",
             sanitize(&id.name)
         )
     })
+}
+
+/// Why a plugin's server cannot be changed here: Claude Code reads it from the plugin's own files.
+fn from_plugin(row: &ServerRow) -> String {
+    match &row.plugin {
+        Some(p) => format!(
+            "{} comes from the plugin {}, and Klefki does not change a plugin's files. Change it in the plugin, or turn the plugin off in Claude Code.",
+            row.name, p.plugin
+        ),
+        None => format!(
+            "{} comes from a plugin, and Klefki does not change a plugin's files.",
+            row.name
+        ),
+    }
 }
 
 fn set_enabled(
@@ -450,6 +471,7 @@ fn set_enabled(
                 ));
             }
         }
+        Scope::Plugin => return Err(from_plugin(row)),
         Scope::User => {
             if snapshot.projects.is_empty() {
                 return Err(format!(
@@ -486,6 +508,7 @@ fn own_server<'a>(
         Scope::User => Ok(file),
         Scope::Local if file.project.is_some() => Ok(file),
         Scope::Local => Err(format!("{} has no project", row.name)),
+        Scope::Plugin => Err(from_plugin(row)),
         Scope::Project => Err(format!(
             "{} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here.",
             row.name
@@ -790,6 +813,7 @@ fn duplicate(
     let (row, file) = find(id, snapshot, keys)?;
     let shown = &row.name;
     let from = match row.scope {
+        Scope::Plugin => return Err(from_plugin(row)),
         Scope::User => None,
         Scope::Local => Some(
             file.project
@@ -906,6 +930,7 @@ fn new_places(
                 Scope::User => "user",
                 Scope::Local => "local",
                 Scope::Project => "project",
+                Scope::Plugin => "plugin",
             };
             match (&to, other.scope) {
                 (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
@@ -1408,6 +1433,73 @@ fn ignored_by_git(project: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn no_change_can_name_a_plugins_server() {
+        use crate::engine::Change;
+        use crate::model::Target;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins/cache/p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".mcp.json"), r#"{"s":{"command":"x"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("plugins/installed_plugins.json"),
+            json!({"plugins": {"p@m": [{"scope": "user", "installPath": root.to_string_lossy()}]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".claude.json"), r#"{"projects":{"/q":{}}}"#).unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Plugin)
+            .unwrap();
+        let id = row.id();
+        for change in [
+            Change::SetEnabled {
+                id: id.clone(),
+                enabled: false,
+            },
+            Change::SetEnabled {
+                id: id.clone(),
+                enabled: true,
+            },
+            Change::Approve { id: id.clone() },
+            Change::Delete { id: id.clone() },
+            Change::Replace {
+                id: id.clone(),
+                json: r#"{"command":"y"}"#.into(),
+            },
+            Change::Rename {
+                id: id.clone(),
+                name: "other".into(),
+            },
+            Change::Duplicate {
+                id: id.clone(),
+                name: "copy".into(),
+                targets: vec![Target::User],
+            },
+            Change::Move {
+                id: id.clone(),
+                to: Target::User,
+            },
+        ] {
+            let Err(why) = resolve(std::slice::from_ref(&change), &inv.snapshot, &inv.keys) else {
+                panic!("{change:?} was planned");
+            };
+            assert!(
+                why.contains("comes from the plugin p") && why.contains("plugin:p:s"),
+                "{change:?}: {why}"
+            );
+        }
+    }
 
     #[test]
     fn a_long_list_of_names_is_cut_to_the_first_few() {

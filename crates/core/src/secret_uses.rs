@@ -132,7 +132,13 @@ pub(crate) fn read(
     snapshot: &Snapshot,
     keys: &FileKeys,
 ) -> Secrets {
-    let ids: Vec<ServerId> = snapshot.servers.iter().map(|r| r.id()).collect();
+    // A plugin's servers are read from the plugin, not from a file Klefki manages (decision 008).
+    let rows: Vec<&crate::api::ServerRow> = snapshot
+        .servers
+        .iter()
+        .filter(|r| r.scope != Scope::Plugin)
+        .collect();
+    let ids: Vec<ServerId> = rows.iter().map(|r| r.id()).collect();
     let sources = crate::export::sources(paths, snapshot, keys, &ids);
     let mut secrets = Secrets {
         config: paths.map_or_else(
@@ -141,7 +147,7 @@ pub(crate) fn read(
         ),
         ..Secrets::default()
     };
-    for (row, source) in snapshot.servers.iter().zip(sources) {
+    for (row, source) in rows.into_iter().zip(sources) {
         let definition = match source.definition {
             Ok(Value::Object(definition)) => definition,
             Ok(_) => continue,
@@ -602,6 +608,7 @@ mod tests {
                 client_id: Some("c".into()),
                 scopes: Vec::new(),
             }),
+            plugin: None,
         }
     }
 

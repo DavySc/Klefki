@@ -33,6 +33,9 @@ struct RawServer {
     casing_collision: bool,
     #[serde(default)]
     relative_paths: Vec<String>,
+    /// Plugin servers: `"<plugin>@<marketplace>"`.
+    plugin: Option<String>,
+    same_as: Option<String>,
 }
 
 pub(crate) fn load() -> Snapshot {
@@ -86,6 +89,14 @@ pub(crate) fn load() -> Snapshot {
                 relative_paths: s.relative_paths.iter().map(|p| sanitize(p)).collect(),
                 status_cached: false,
                 oauth: None,
+                plugin: s.plugin.as_deref().map(|p| {
+                    let (plugin, marketplace) = p.split_once('@').unwrap_or((p, ""));
+                    crate::api::PluginInfo {
+                        plugin: sanitize(plugin),
+                        marketplace: sanitize(marketplace),
+                        same_as: s.same_as.as_deref().map(sanitize),
+                    }
+                }),
             })
             .collect(),
         warnings: Vec::new(),
@@ -96,6 +107,7 @@ fn scope_of(word: &str) -> Scope {
     match word {
         "user" => Scope::User,
         "local" => Scope::Local,
+        "plugin" => Scope::Plugin,
         _ => Scope::Project,
     }
 }

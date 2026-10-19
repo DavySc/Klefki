@@ -2260,8 +2260,9 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
     let keys = &state.keys;
     for row in &snapshot.servers {
         let edit = edited.contains(&row.connection);
-        // Project servers run the repository's own command: only on an explicit request.
-        let wanted = row.scope != Scope::Project
+        // Project servers run the repository's own command: only on an explicit request. A plugin's servers are not
+        // checked: their names are not ones Klefki passes to `claude` (decision 008).
+        let wanted = matches!(row.scope, Scope::User | Scope::Local)
             && row.enabled
             && (live_all || (shared.config.background_checks && (edit || needs_check(row))));
         if wanted && edit {
@@ -2307,7 +2308,7 @@ fn reload_after_change(shared: &Shared, state: &mut State) {
     for row in &snapshot.servers {
         let edit = edited.contains(&row.connection);
         let wanted = shared.config.background_checks
-            && row.scope != Scope::Project
+            && matches!(row.scope, Scope::User | Scope::Local)
             && row.enabled
             && (edit || (needs_check(row) && !was_on.contains(&row.connection)));
         if !wanted {
@@ -4407,6 +4408,68 @@ mod tests {
         assert_eq!(
             std::path::Path::new(start["cwd"].as_str().unwrap()).file_name(),
             project.file_name()
+        );
+    }
+
+    #[test]
+    fn a_plugins_servers_are_never_checked_not_even_on_request() {
+        // Decision 008: their names (`plugin:p:s`) are not ones Klefki passes to `claude`, and they have no file key.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {"ok": {"command": "x"}}, "projects": {"/p": {}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let cfg = env.dir.path().join("cfg");
+        let root = cfg.join("plugins").join("cache").join("p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers":{"web":{"type":"http","url":"https://w.example.com"},"cmd":{"command":"y"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("plugins").join("installed_plugins.json"),
+            serde_json::json!({"plugins": {"p@m": [{"scope": "user", "installPath": root.to_string_lossy()}]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("settings.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        )
+        .unwrap();
+        let core = env.start();
+        let events = collect(&core, |e| final_status(e, "ok").is_some());
+        let snap = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Snapshot(s) => Some(Arc::clone(s)),
+                _ => None,
+            })
+            .unwrap();
+        let plugin_rows: Vec<&ServerRow> = snap
+            .servers
+            .iter()
+            .filter(|r| r.scope == Scope::Plugin)
+            .collect();
+        assert_eq!(plugin_rows.len(), 2, "{:#?}", snap.servers);
+        for row in &plugin_rows {
+            core.send(Command::Check(row.id()));
+            core.send(Command::Diagnose(row.id()));
+        }
+        core.send(Command::Check(ServerId::new(Scope::User, None, "ok")));
+        let later = collect(&core, |e| final_status(e, "ok").is_some());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            env.gets().into_iter().map(|g| g.0).collect::<Vec<_>>(),
+            ["ok", "ok"],
+            "only the user server ran"
+        );
+        // Not even a "not checked": nothing was tried.
+        assert!(
+            !events.iter().chain(&later).any(|e| matches!(e,
+                Event::Status { id, .. } | Event::Diagnosis { id, .. } if id.scope == Scope::Plugin)),
+            "{events:?} {later:?}"
         );
     }
 
