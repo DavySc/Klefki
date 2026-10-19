@@ -96,6 +96,9 @@ pub enum Command {
     /// What Klefki changed, and the backups it kept (see [`Event::Activity`]). Read only when asked: the Activity log
     /// page asks each time it is opened.
     Activity,
+    /// Claude Desktop's servers (see [`Event::Desktop`]). Read only when asked: the Claude Desktop page asks each time
+    /// it is opened. Klefki never writes Claude Desktop's configuration.
+    Desktop,
     /// Which servers use secrets and where each lives, and the client secrets nothing uses (see [`Event::Secrets`]).
     /// Read only when asked: the Secrets page asks each time it is opened. No secret is read.
     Secrets,
@@ -397,6 +400,8 @@ pub enum Event {
     },
     /// The activity log, after [`Command::Activity`].
     Activity(crate::activity::Activity),
+    /// Claude Desktop's servers, after [`Command::Desktop`].
+    Desktop(crate::desktop::Desktop),
     /// What the Secrets page shows, after [`Command::Secrets`].
     Secrets(crate::secret_uses::Secrets),
     /// Whether [`Command::ForgetUnusedSecret`] deleted the secret, or why not (sanitised).
@@ -506,6 +511,8 @@ pub(crate) struct EngineConfig {
     /// Runs Claude Code's own commands that change servers (`mcp add-json`, `mcp remove`) instead of the CLI found
     /// on disk. Tests give a stand-in that changes the configuration as Claude Code would.
     pub changer: Option<Arc<dyn swap::Claude>>,
+    /// Where Claude Desktop's configuration can be. Tests give folders of their own, or none.
+    pub desktop: crate::desktop::DesktopRoots,
 }
 
 /// Opens an https link in the user's browser.
@@ -983,6 +990,9 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
+            Command::Desktop => shared
+                .emitter
+                .emit(Event::Desktop(crate::desktop::load(&shared.config.desktop))),
             Command::Secrets => secrets(&shared, &state, SecretsAsk::List),
             Command::SecretsAfterFileChange => secrets(&shared, &state, SecretsAsk::Reuse),
             Command::ForgetUnusedSecret(connection) => {
@@ -2927,6 +2937,7 @@ mod tests {
                 },
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
+                desktop: crate::desktop::DesktopRoots::default(),
             }
         }
 
@@ -5182,6 +5193,54 @@ mod tests {
                 _ => None,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn claude_desktop_is_read_only_when_asked_and_never_written() {
+        let env = quiet_env(&two_projects("end"));
+        let roaming = env.dir.path().join("Roaming");
+        let file = roaming.join("Claude").join(crate::desktop::FILE_NAME);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let text = r#"{"mcpServers": {"files": {"command": "npx", "args": ["-y", "fs"]}}}"#;
+        std::fs::write(&file, text).unwrap();
+        let before = std::fs::metadata(&file).unwrap().modified().unwrap();
+        let core = start_with(
+            EngineConfig {
+                desktop: crate::desktop::DesktopRoots {
+                    roaming: Some(roaming),
+                    packages: None,
+                },
+                ..env.config()
+            },
+            || {},
+        );
+        // Starting up reads Claude Code's configuration, not Claude Desktop's.
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert!(!events.iter().any(|e| matches!(e, Event::Desktop(_))));
+        for _ in 0..2 {
+            core.send(Command::Desktop);
+            let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Desktop(_))));
+            let desktop = events
+                .into_iter()
+                .find_map(|e| match e {
+                    Event::Desktop(d) => Some(d),
+                    _ => None,
+                })
+                .unwrap();
+            let names: Vec<&str> = desktop.servers.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["files"]);
+            assert_eq!(desktop.servers[0].target, "npx -y fs");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            before
+        );
+        // Nothing else was put next to it either.
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub enum Action {
     Tone(crate::theme::Tone),
     Settings,
     ActivityLog,
+    /// Show the servers in Claude Desktop's configuration.
+    Desktop,
     Duplicate,
     /// Move the selected server to another project or the user.
     Move,
