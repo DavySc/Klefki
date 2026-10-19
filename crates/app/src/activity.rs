@@ -13,6 +13,8 @@ const COPIED_SECONDS: f64 = 2.0;
 pub struct ActivityPage {
     /// `None` until the engine answers.
     pub log: Option<Activity>,
+    /// What the top bar's filter box holds on this page: it filters the changes, not the hidden list of servers.
+    pub filter: String,
     /// The path last copied, and when.
     copied: Option<(String, f64)>,
 }
@@ -74,18 +76,59 @@ impl ActivityPage {
         {
             self.copied = None;
         }
+        let query = self.filter.trim().to_lowercase();
+        let shown = |e: &&ActivityEntry| query.is_empty() || matches(e, &query);
+        // Changes first; backups no logged change mentions (kept before the log existed) after them, folded away.
+        let changes: Vec<&ActivityEntry> = log
+            .entries
+            .iter()
+            .filter(|e| !e.summary.is_empty())
+            .filter(shown)
+            .collect();
+        let others: Vec<&ActivityEntry> = log
+            .entries
+            .iter()
+            .filter(|e| e.summary.is_empty())
+            .filter(shown)
+            .collect();
+        let copied = self.copied.as_ref().map(|(path, _)| path.as_str());
         let mut copy = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (i, entry) in log.entries.iter().enumerate() {
+                if changes.is_empty() && others.is_empty() {
+                    ui.label(
+                        RichText::new(format!("No changes match \"{}\".", self.filter.trim()))
+                            .color(pal.text_muted),
+                    );
+                }
+                for (i, entry) in changes.iter().enumerate() {
                     if i > 0 {
                         ui.separator();
                     }
-                    let copied = self.copied.as_ref().map(|(path, _)| path.as_str());
-                    if let Some(path) = row(ui, entry, copied) {
-                        copy = Some(path);
-                    }
+                    copy = row(ui, entry, copied).or(copy.take());
+                }
+                if !others.is_empty() {
+                    ui.add_space(12.0);
+                    egui::CollapsingHeader::new(format!("Other backups ({})", others.len()))
+                        .id_salt("other-backups")
+                        // Open while filtering, so a match is not hidden.
+                        .open((!query.is_empty()).then_some(true))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(
+                                        "Copies Klefki kept that no change in this log mentions, such as ones \
+                                         from before the log existed.",
+                                    )
+                                    .color(pal.text_muted),
+                                )
+                                .wrap(),
+                            );
+                            for entry in &others {
+                                copy = row(ui, entry, copied).or(copy.take());
+                            }
+                        });
                 }
             });
         if let Some(path) = copy {
@@ -101,6 +144,15 @@ impl ActivityPage {
     }
 }
 
+/// Whether `entry` has `query` (lower case) in what it says, its time or a backup's path.
+fn matches(entry: &ActivityEntry, query: &str) -> bool {
+    let has = |s: &str| s.to_lowercase().contains(query);
+    entry.summary.iter().any(|s| has(s))
+        || entry.failed.as_deref().is_some_and(has)
+        || has(&entry.when)
+        || entry.backups.iter().any(|b| has(&b.path) || has(&b.of))
+}
+
 /// One change. Returns the path to copy when its button was clicked.
 fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<String> {
     let pal = theme::palette(ui.ctx());
@@ -113,13 +165,11 @@ fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<Strin
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(150.0);
-                ui.label(RichText::new(&entry.when).color(pal.text_muted));
+                ui.label(RichText::new(&entry.when).color(pal.text_muted))
+                    .on_hover_text(&entry.exact);
             },
         );
         ui.vertical(|ui| {
-            if entry.summary.is_empty() {
-                ui.label(RichText::new("A backup from before this log was kept").italics());
-            }
             for line in &entry.summary {
                 ui.add(egui::Label::new(line.as_str()).wrap());
             }
@@ -133,9 +183,7 @@ fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<Strin
                 );
             }
             for backup in &entry.backups {
-                if let Some(path) = backup_line(ui, backup, copied) {
-                    copy = Some(path);
-                }
+                copy = backup_line(ui, backup, copied).or(copy.take());
             }
         });
     });
@@ -143,6 +191,8 @@ fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<Strin
     copy
 }
 
+/// What a backup is, with a button that copies where it is; the path itself shows on hover, so it does not take
+/// over the page.
 fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<String> {
     let pal = theme::palette(ui.ctx());
     if !backup.kept {
@@ -168,7 +218,7 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<Str
         );
         if ui
             .small_button(format!("{} Copy path", icon::COPY))
-            .on_hover_text("Copy where this backup is, to open or restore it yourself")
+            .on_hover_text(backup.path.as_str())
             .clicked()
         {
             copy = Some(backup.path.clone());
@@ -177,15 +227,6 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<Str
             ui.label(RichText::new("Copied").small().color(pal.success));
         }
     });
-    ui.add(
-        egui::Label::new(
-            RichText::new(&backup.path)
-                .small()
-                .monospace()
-                .color(pal.text_muted),
-        )
-        .wrap(),
-    );
     copy
 }
 
@@ -239,18 +280,21 @@ mod tests {
             entries: vec![
                 ActivityEntry {
                     when: "Today 10:44".to_owned(),
+                    exact: "19 Oct 2026, 10:44:29 (UTC+02:00)".to_owned(),
                     summary: vec!["Turn off alpha in 2 projects".to_owned()],
                     failed: None,
                     backups: vec![backup("/data/backups/claude.json.1-0.bak", true)],
                 },
                 ActivityEntry {
                     when: "Yesterday 18:02".to_owned(),
+                    exact: "18 Oct 2026, 18:02:11 (UTC+02:00)".to_owned(),
                     summary: vec!["Move beta to user".to_owned()],
                     failed: Some("Claude Code already added beta to user.".to_owned()),
                     backups: vec![backup("/data/backups/claude.json.0-0.bak", false)],
                 },
                 ActivityEntry {
                     when: "13 Oct 09:12".to_owned(),
+                    exact: "13 Oct 2026, 09:12:40 (UTC+02:00)".to_owned(),
                     summary: Vec::new(),
                     failed: None,
                     backups: vec![backup("/data/backups/claude.json.9-0.bak", true)],
@@ -283,15 +327,11 @@ mod tests {
         h.run();
         h.get_by_label("Today 10:44");
         h.get_by_label("Turn off alpha in 2 projects");
-        h.get_by_label("/data/backups/claude.json.1-0.bak");
         h.get_by_label_contains("Did not finish: Claude Code already added beta");
         h.get_by_label("Backup of .claude.json no longer kept: Klefki keeps the newest 20.");
-        assert!(
-            h.query_by_label("/data/backups/claude.json.0-0.bak")
-                .is_none(),
-            "a path that is gone is not offered"
-        );
-        h.get_by_label("A backup from before this log was kept");
+        // The path shows on hover and is copied by its button; it does not take over the page (cross-review U2).
+        assert!(h.query_by_label_contains("/data/backups/").is_none());
+        assert_eq!(h.get_all_by_label_contains("Copy path").count(), 1);
         assert!(h.query_by_label("Loading…").is_none());
     }
 
@@ -302,9 +342,7 @@ mod tests {
         open(&mut h);
         engine.events.send(Event::Activity(sample())).unwrap();
         h.run();
-        let buttons: Vec<_> = h.get_all_by_label_contains("Copy path").collect();
-        assert_eq!(buttons.len(), 2, "one per backup still kept");
-        buttons[0].click();
+        h.get_by_label_contains("Copy path").click();
         // The frame that sees the click copies.
         h.step();
         let copied: Vec<_> = h
@@ -325,6 +363,79 @@ mod tests {
         }
         h.run();
         assert!(h.query_by_label("Copied").is_none(), "the note goes away");
+    }
+
+    #[test]
+    fn backups_no_change_mentions_are_folded_away_after_the_changes() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        let changes = h.get_by_label("Move beta to user").rect();
+        let others = h.get_by_label("Other backups (1)").rect();
+        assert!(others.top() > changes.bottom());
+        assert!(h.query_by_label("13 Oct 09:12").is_none(), "folded");
+        h.get_by_label("Other backups (1)").click();
+        h.run();
+        h.get_by_label("13 Oct 09:12");
+        h.get_by_label_contains("no change in this log mentions");
+        assert_eq!(h.get_all_by_label_contains("Copy path").count(), 2);
+    }
+
+    #[test]
+    fn the_filter_box_filters_the_changes_on_this_page() {
+        let (mut h, engine) = harness();
+        h.run();
+        let says = |h: &Harness<'static, ShellApp>, what: &str| {
+            h.query_by(|n| n.placeholder().is_some_and(|p| p.contains(what)))
+                .is_some()
+        };
+        assert!(says(&h, "Filter"));
+        assert!(!says(&h, "Filter changes"), "the servers' filter elsewhere");
+        open(&mut h);
+        engine.events.send(Event::Activity(sample())).unwrap();
+        h.run();
+        assert!(says(&h, "Filter changes"));
+        h.state_mut().activity.as_mut().unwrap().filter = "BETA".into();
+        h.run();
+        h.get_by_label("Move beta to user");
+        assert!(h.query_by_label("Turn off alpha in 2 projects").is_none());
+        h.state_mut().activity.as_mut().unwrap().filter = "claude.json.9".into();
+        h.run();
+        h.get_by_label("13 Oct 09:12");
+        assert!(h.query_by_label("Move beta to user").is_none());
+        h.state_mut().activity.as_mut().unwrap().filter = "postgres".into();
+        h.run();
+        h.get_by_label("No changes match \"postgres\".");
+        // The servers' own filter is left as it was.
+        assert_eq!(h.state().search, "");
+    }
+
+    #[test]
+    fn a_saved_change_offers_the_activity_log_from_its_message() {
+        let (mut h, engine) = harness();
+        h.run();
+        engine
+            .events
+            .send(Event::Applied {
+                plan: 1,
+                changed: true,
+                backup: Some("/data/backups/claude.json.1-0.bak".into()),
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+        activity_asked(&engine);
+        h.get_by_label("Open activity log").click();
+        h.run();
+        assert_eq!(h.state().page, Page::ActivityLog);
+        assert_eq!(activity_asked(&engine), 1);
+        assert!(
+            h.query_by_label_contains("The previous file is kept")
+                .is_none(),
+            "message closed"
+        );
     }
 
     #[test]

@@ -12,14 +12,17 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The log is cut back to its newest [`KEEP`] changes once it grows past this.
+/// Once the log grows past this, it is cut back to the newest changes that fit in half of it (some 400 typical
+/// ones), so a cut is not needed again at the next change.
 const MAX_BYTES: u64 = 256 * 1024;
-const KEEP: usize = 200;
-/// Never read more than this: the log is ours, but anyone can write to the file.
+/// Never read more than this: the log is ours, but anyone can write to the file. Records are capped when written
+/// (see below), so the log never comes near it by itself.
 const READ_LIMIT: u64 = 1024 * 1024;
-/// Per change, at most this many sentences and backups are shown, each at most `MAX_TEXT` characters.
+/// Per change, at most this many sentences and backups are kept, each sentence at most `MAX_TEXT` characters and
+/// the error at most `MAX_ERROR`: when written, and again when read.
 const MAX_LINES: usize = 20;
 const MAX_TEXT: usize = 500;
+const MAX_ERROR: usize = 2000;
 /// Paths are copied, so they are kept whole up to a length no real path reaches.
 const MAX_PATH: usize = 4096;
 
@@ -36,6 +39,8 @@ pub struct Activity {
 pub struct ActivityEntry {
     /// When, in local time: "Today 14:05", "Yesterday 09:12", "13 Oct 18:40" or "13 Oct 2025 18:40".
     pub when: String,
+    /// The exact time, to the second, with its offset from UTC: "19 Oct 2026, 11:07:23 (UTC+02:00)".
+    pub exact: String,
     /// What was done, one sentence per change, as the review said it. Empty for a backup no change in the log
     /// mentions: one kept before the log existed.
     pub summary: Vec<String>,
@@ -79,15 +84,23 @@ pub(crate) fn record(
     error: Option<&str>,
     backups: &[PathBuf],
 ) -> io::Result<()> {
+    // Capped here too, so one large change (a bulk delete of a hundred servers) cannot crowd out the rest.
     let record = Record {
         at: now_ms(),
-        summary: summary.to_vec(),
-        error: error.map(str::to_owned),
-        backups: backups.iter().map(|b| b.display().to_string()).collect(),
+        summary: capped(summary.iter().map(String::as_str), MAX_TEXT),
+        error: error.map(|e| clip(e, MAX_ERROR)),
+        backups: capped(backups.iter().map(|b| b.to_string_lossy()), MAX_PATH),
     };
     let mut line = serde_json::to_string(&record).map_err(io::Error::other)?;
     line.push('\n');
     append(&log_path(backup_dir), line.as_bytes())
+}
+
+fn capped<S: AsRef<str>>(lines: impl Iterator<Item = S>, max: usize) -> Vec<String> {
+    lines
+        .take(MAX_LINES)
+        .map(|l| clip(l.as_ref(), max))
+        .collect()
 }
 
 fn append(path: &Path, line: &[u8]) -> io::Result<()> {
@@ -109,14 +122,25 @@ fn append(path: &Path, line: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Keeps the newest [`KEEP`] lines, written whole to a new file that then replaces the log.
+/// Keeps the newest whole lines that fit in half of [`MAX_BYTES`], written to a new file that then replaces the
+/// log. A log that cannot be read (too large, not text) is left as it is: the page says it cannot be read, and
+/// nothing in it is lost.
 fn compact(path: &Path) -> io::Result<()> {
-    let text = fsx::read_limited(path, READ_LIMIT)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let Ok(Some(text)) = fsx::read_limited(path, READ_LIMIT) else {
+        return Ok(());
+    };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    let kept = &lines[lines.len().saturating_sub(KEEP)..];
+    let mut size = 0;
+    let fit = lines
+        .iter()
+        .rev()
+        .take_while(|l| {
+            size += l.len() as u64 + 1;
+            size <= MAX_BYTES / 2
+        })
+        .count();
+    // The newest line is always kept, however large.
+    let kept = &lines[lines.len() - fit.max(1).min(lines.len())..];
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
     for line in kept {
@@ -171,13 +195,17 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
             (record.at, seq),
             ActivityEntry {
                 when: String::new(),
+                exact: String::new(),
                 summary: record
                     .summary
                     .iter()
                     .take(MAX_LINES)
                     .map(|s| shown(s))
                     .collect(),
-                failed: record.error.as_deref().map(shown),
+                failed: record
+                    .error
+                    .as_deref()
+                    .map(|e| clip(&sanitize_line(e), MAX_ERROR)),
                 backups,
             },
         ));
@@ -190,6 +218,7 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
             (at, 0),
             ActivityEntry {
                 when: String::new(),
+                exact: String::new(),
                 summary: Vec::new(),
                 failed: None,
                 backups: vec![Backup {
@@ -217,6 +246,7 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
             .into_iter()
             .map(|((at, _), mut entry)| {
                 entry.when = when(at, now, local_offset_secs);
+                entry.exact = exact(at, local_offset_secs);
                 entry
             })
             .collect(),
@@ -298,6 +328,25 @@ fn when(at_ms: u64, now_ms: u64, offset: impl Fn(i64) -> i64) -> String {
     } else {
         format!("{d} {} {y} {clock}", MONTHS[m as usize - 1])
     }
+}
+
+/// `at` to the second, in local time, with the offset it had then.
+fn exact(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
+    let secs = (at_ms / 1000) as i64;
+    let off = offset(secs);
+    let local = secs + off;
+    let (day, time) = (local.div_euclid(86_400), local.rem_euclid(86_400));
+    let (y, m, d) = civil(day);
+    let sign = if off < 0 { '-' } else { '+' };
+    format!(
+        "{d} {} {y}, {:02}:{:02}:{:02} (UTC{sign}{:02}:{:02})",
+        MONTHS[m as usize - 1],
+        time / 3600,
+        time % 3600 / 60,
+        time % 60,
+        off.abs() / 3600,
+        off.abs() % 3600 / 60
+    )
 }
 
 /// Year, month (1-12) and day of a day number counted from 1970-01-01 (Howard Hinnant's `civil_from_days`).
@@ -423,6 +472,19 @@ mod tests {
         };
         assert_eq!(when(NOW, winter, offset), "19 Oct 12:44");
         assert_eq!(when(winter, winter, offset), "Today 11:44");
+    }
+
+    #[test]
+    fn the_exact_time_has_seconds_and_its_offset() {
+        assert_eq!(exact(NOW, utc), "19 Oct 2026, 10:44:29 (UTC+00:00)");
+        assert_eq!(
+            exact(NOW, |_| 2 * HOUR),
+            "19 Oct 2026, 12:44:29 (UTC+02:00)"
+        );
+        assert_eq!(
+            exact(NOW, |_| -(9 * HOUR + 30 * 60)),
+            "19 Oct 2026, 01:14:29 (UTC-09:30)"
+        );
     }
 
     #[test]
@@ -578,7 +640,7 @@ mod tests {
         assert_eq!(activity.entries.len(), 1);
         let entry = &activity.entries[0];
         assert_eq!(entry.summary, ["Turn off redevil next"]);
-        assert!(entry.failed.as_ref().unwrap().chars().count() <= MAX_TEXT + 1);
+        assert!(entry.failed.as_ref().unwrap().chars().count() <= MAX_ERROR + 1);
         assert_eq!(entry.backups.len(), MAX_LINES);
         assert_eq!(entry.backups[0].of, ".claude.json");
         assert_eq!(
@@ -614,9 +676,65 @@ mod tests {
             assert!(std::fs::metadata(log_path(&backups)).unwrap().len() <= MAX_BYTES + 1024);
         }
         let activity = load(&backups);
-        assert!(activity.entries.len() >= KEEP, "{}", activity.entries.len());
+        assert!(activity.entries.len() >= 200, "{}", activity.entries.len());
         assert!(activity.entries[0].summary[0].starts_with("change 999 "));
         assert_eq!(activity.problem, None);
+    }
+
+    #[test]
+    fn big_changes_never_erase_the_log() {
+        // Cross-review B2: records were capped only when read, and a log the cut could not read was replaced by an
+        // empty one. 205 deletes of 120 servers each left 92 of them, and said nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let big: Vec<String> = (0..120)
+            .map(|i| {
+                format!(
+                    "Delete server-number-{i:03} from the project /home/someone/work/repository-{i}"
+                )
+            })
+            .collect();
+        let long_error = "e".repeat(50_000);
+        for i in 0..205 {
+            let error = (i % 2 == 0).then_some(long_error.as_str());
+            record(&backups, &big, error, &[]).unwrap();
+        }
+        record(&backups, &summary("Turn off alpha"), None, &[]).unwrap();
+        let text = std::fs::read_to_string(log_path(&backups)).unwrap();
+        let activity = load(&backups);
+        assert_eq!(activity.problem, None);
+        assert_eq!(activity.entries.len(), text.lines().count());
+        assert!(activity.entries.len() > 20, "{}", activity.entries.len());
+        assert_eq!(activity.entries[0].summary, ["Turn off alpha"]);
+        let bulk = &activity.entries[1];
+        assert_eq!(bulk.summary.len(), MAX_LINES);
+        let longest = text.lines().map(str::len).max().unwrap();
+        assert!(
+            longest < 30_000,
+            "a record is capped when written: {longest}"
+        );
+        assert!(
+            text.len() as u64 <= MAX_BYTES / 2 + 30_000,
+            "{}",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn a_log_too_large_to_read_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        let line = format!(
+            "{}\n",
+            serde_json::json!({"at": NOW, "summary": ["x".repeat(1000)]})
+        );
+        let old = line.repeat(READ_LIMIT as usize / line.len() + 1);
+        std::fs::write(log_path(&backups), &old).unwrap();
+        record(&backups, &summary("Turn off alpha"), None, &[]).unwrap();
+        let now = std::fs::read_to_string(log_path(&backups)).unwrap();
+        assert!(now.starts_with(&old), "nothing that was there is lost");
+        assert_eq!(now.lines().count(), old.lines().count() + 1);
+        assert!(load(&backups).problem.is_some());
     }
 
     #[cfg(unix)]

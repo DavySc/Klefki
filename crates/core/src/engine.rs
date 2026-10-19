@@ -1334,7 +1334,9 @@ fn change_with_claude(
         .as_ref()
         .ok_or("Could not determine where Claude Code keeps its configuration.")?;
     let backup_dir = backup_dir(shared)?;
+    let made = std::cell::RefCell::new(Vec::new());
     let ctx = swap::Ctx {
+        backups: &made,
         claude_json: &paths.claude_json,
         backup_dir: &backup_dir,
         claude: steps.claude.as_ref(),
@@ -1365,9 +1367,10 @@ fn change_with_claude(
                 .map(|id| (swap::put_back(&ctx, id), "the kept definition".to_owned())),
         );
     for (result, what) in ran {
+        // Made whether the step finished or not: a failed one is logged with them.
+        backups.append(&mut made.borrow_mut());
         match result {
             Ok(d) => {
-                backups.extend(d.backup);
                 notes.extend(d.notes);
                 done.push(what);
             }
@@ -6045,6 +6048,61 @@ mod tests {
     const REMOVE_THEN_ADDS_FAIL: &str = r#"{"rules":[
         {"args":["mcp","remove"],"delay_ms":600,"stdout_file":"removed.txt"},
         {"args":["mcp","add-json"],"exit_code":1,"stdout_file":"failed.txt"}]}"#;
+
+    #[test]
+    fn a_failed_move_that_removed_the_server_is_logged_with_its_backups() {
+        // Cross-review of the activity log, B1: the move's backups were dropped on failure, so the change was not
+        // logged and its backup showed as one from before the log.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        keep_sso(&env, &core, &key);
+        let log = activity(&core);
+        let [entry] = &log.entries[..] else {
+            panic!("one entry, every backup in it: {log:#?}");
+        };
+        assert_eq!(entry.summary.len(), 1, "{log:#?}");
+        assert!(
+            entry
+                .failed
+                .as_deref()
+                .is_some_and(|e| e.contains("Klefki kept")),
+            "{log:#?}"
+        );
+        assert!(!entry.backups.is_empty());
+    }
+
+    #[test]
+    fn a_plain_move_logs_every_backup_it_made() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("gw"),
+                to: Target::Local("/work/a".to_owned()),
+            }],
+        );
+        assert!(!plan.nothing_to_do, "{plan:?}");
+        core.send(Command::Apply(plan.id));
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        let log = activity(&core);
+        let [entry] = &log.entries[..] else {
+            panic!("one entry, every backup in it: {log:#?}");
+        };
+        assert_eq!(entry.failed, None);
+        assert!(!entry.backups.is_empty(), "{log:#?}");
+    }
 
     #[test]
     fn a_kept_definition_can_be_put_back() {

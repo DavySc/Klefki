@@ -188,6 +188,8 @@ struct Outcome {
     warn: bool,
     /// What undoes it (a move back), offered on the card, which then stays until used or dismissed.
     undo: Option<Change>,
+    /// The change is in the Activity log, with its backup: the card offers to open it.
+    logged: bool,
 }
 
 /// How long a success message stays.
@@ -498,6 +500,7 @@ impl ShellApp {
                             warn: false,
                             undo: None,
                             sign_in: None,
+                            logged: false,
                         })
                     }
                 }
@@ -577,6 +580,7 @@ impl ShellApp {
                     warn,
                     undo: self.undo_move(changed),
                     sign_in,
+                    logged: changed,
                 });
             }
             Event::Applying { plan, step } => {
@@ -606,6 +610,7 @@ impl ShellApp {
                     warn: false,
                     undo: None,
                     sign_in: None,
+                    logged: false,
                 });
             }
             Event::Reapplied { .. } => {
@@ -617,6 +622,7 @@ impl ShellApp {
                     warn: false,
                     undo: None,
                     sign_in: None,
+                    logged: false,
                 });
             }
             Event::Entry { id, json, editable } => {
@@ -663,6 +669,7 @@ impl ShellApp {
                         warn: false,
                         undo: None,
                         sign_in: None,
+                        logged: false,
                     });
                 }
             }
@@ -958,14 +965,23 @@ impl ShellApp {
                 {
                     self.command.open();
                 }
+                // On the Activity log it filters the changes, and says so: a box that filtered the hidden list of
+                // servers would find nothing there.
+                // The shortcut is left out there, so the longer words fit the box.
+                let (query, hint) = match &mut self.activity {
+                    Some(page) => (
+                        &mut page.filter,
+                        format!("{} Filter changes", icon::MAGNIFYING_GLASS),
+                    ),
+                    None => (
+                        &mut self.search,
+                        format!("{} Filter  {}", icon::MAGNIFYING_GLASS, shortcut("F")),
+                    ),
+                };
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
+                    egui::TextEdit::singleline(query)
                         .id(search_id())
-                        .hint_text(format!(
-                            "{} Filter  {}",
-                            icon::MAGNIFYING_GLASS,
-                            shortcut("F")
-                        ))
+                        .hint_text(hint)
                         .desired_width(220.0),
                 );
                 // Not while Claude Code cannot be found: the version would be of a program that is gone.
@@ -2429,6 +2445,7 @@ impl ShellApp {
         let mut dismiss = false;
         let mut sign_in = false;
         let mut undo = false;
+        let mut log = false;
         egui::Area::new(egui::Id::new("outcome"))
             .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
             .order(egui::Order::Foreground)
@@ -2457,6 +2474,13 @@ impl ShellApp {
                             if ui.small_button("Dismiss").clicked() {
                                 dismiss = true;
                             }
+                            // The backup's place stays on the Activity log after this card is gone.
+                            if outcome.logged
+                                && self.page != Page::ActivityLog
+                                && ui.small_button("Open activity log").clicked()
+                            {
+                                log = true;
+                            }
                             if outcome.undo.is_some() {
                                 undo = ui
                                     .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
@@ -2483,6 +2507,9 @@ impl ShellApp {
         } else if undo && let Some(change) = outcome.undo {
             self.outcome = None;
             self.prepare(vec![change]);
+        } else if log {
+            self.outcome = None;
+            self.go(Page::ActivityLog);
         } else if dismiss {
             self.outcome = None;
         }
