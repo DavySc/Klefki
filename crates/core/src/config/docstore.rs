@@ -12,7 +12,7 @@
 //!   moment later on whatever is there (each op is idempotent when checking), the way a database replays its
 //!   write-ahead log after a crash. Replaying the whole log in order puts back every change Claude overwrote and
 //!   keeps the user's last word when two changes touch the same thing.
-use super::inventory::{MAX_CLAUDE_JSON, normalise_project};
+use super::inventory::{MAX_CLAUDE_JSON, MAX_MCP_JSON, normalise_project};
 use super::{entry, fsx, jsonspan};
 use crate::sanitize::sanitize;
 use crate::watch;
@@ -33,6 +33,8 @@ const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
 const MAX_VERIFY_ROUNDS: usize = 3;
 /// How often a write is redone because the file changed between our read and our rename, before giving up.
 const VALIDATION_ATTEMPTS: usize = 3;
+/// How far ahead of the clock the newest backup's time may be and still be followed (a day).
+const CLOCK_BACK_FOLLOWED_MS: u128 = 86_400_000;
 /// Waits between attempts to replace the file while Windows refuses because someone has it open.
 const DENIED_RETRY_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
 const BOM: &str = "\u{feff}";
@@ -258,6 +260,9 @@ pub(crate) struct Docstore {
     /// Runs just before the validation and rename, so a test can write the file at that moment.
     #[cfg(test)]
     pub before_replace: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Runs before each try at the rename; `true` refuses that try as Windows does while someone has the file open.
+    #[cfg(test)]
+    pub refuse_replace: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Docstore {
@@ -271,6 +276,8 @@ impl Docstore {
             verify_delay: Duration::from_secs(1),
             #[cfg(test)]
             before_replace: None,
+            #[cfg(test)]
+            refuse_replace: None,
         }
     }
 
@@ -501,7 +508,23 @@ impl Docstore {
     fn read(&self) -> Result<Current, StoreError> {
         // Taken before reading: a write that lands while we read then shows as a change at validation.
         let stamp = watch::stamp(&self.path);
-        match fsx::read_limited_bom(&self.path, MAX_CLAUDE_JSON)? {
+        // No more than the inventory reads: a change is never made to what the list could not show.
+        let max = match self.kind {
+            Kind::ClaudeJson => MAX_CLAUDE_JSON,
+            Kind::ProjectSettings => MAX_MCP_JSON,
+        };
+        let read = fsx::read_limited_bom(&self.path, max).map_err(|e| {
+            if self.kind == Kind::ProjectSettings
+                && std::fs::metadata(&self.path).is_ok_and(|m| m.len() > max)
+            {
+                return StoreError::Invalid(format!(
+                    "{} is larger than 1 MB, so Klefki won't change it. Approve the server in Claude Code instead.",
+                    sanitize(&self.path.display().to_string())
+                ));
+            }
+            StoreError::from(e)
+        })?;
+        match read {
             Some((text, bom)) => Ok(Current {
                 text,
                 bom,
@@ -532,9 +555,10 @@ impl Docstore {
         if self.kind == Kind::ProjectSettings {
             ensure_plain_dir(dir)?;
         }
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".claude.json.tmp.")
-            .tempfile_in(dir)?;
+        let mut prefix = OsString::from(".");
+        prefix.push(self.path.file_name().unwrap_or_default());
+        prefix.push(".tmp.");
+        let mut tmp = tempfile::Builder::new().prefix(&prefix).tempfile_in(dir)?;
         if current.bom {
             tmp.write_all(BOM.as_bytes())?;
         }
@@ -562,18 +586,27 @@ impl Docstore {
         };
         let mut tmp = Some(tmp);
         let replaced = retry_denied(|| {
+            // Looked at again before every try: a refused rename is retried for a while (Windows), and a writer
+            // that ignored the lock may land in that wait.
+            if watch::stamp(&self.path) != current.stamp {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            if self.refuse_replace.as_ref().is_some_and(|refuse| refuse()) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
             let file = tmp.take().expect("put back after every failed attempt");
-            file.persist(&self.path).map(drop).map_err(|e| {
+            file.persist(&self.path).map(|_| true).map_err(|e| {
                 tmp = Some(e.file);
                 e.error
             })
         });
-        if let Err(e) = replaced {
-            // Nothing was replaced, so the backup is of a file still in place; it would only crowd out real ones.
+        if !matches!(replaced, Ok(true)) {
+            // Nothing was replaced, so the backup would only crowd out real ones; a redo makes its own.
             if let Some(backup) = &backup {
                 let _ = std::fs::remove_file(backup);
             }
-            return Err(e.into());
+            return replaced.map(|_| None).map_err(StoreError::from);
         }
         if let Some(backup) = &backup {
             // A hard link shares the old file's permissions until now; it is the only name of that file left.
@@ -591,14 +624,7 @@ impl Docstore {
     pub(crate) fn keep_copy(&self) -> Result<PathBuf, StoreError> {
         let current = self.read()?;
         create_private_dir(&self.backup_dir)?;
-        let ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        for n in 0u32.. {
-            let path = self
-                .backup_dir
-                .join(format!("{}.{ms:016}-{n}.bak", self.backup_label()));
+        for path in self.new_backup_names() {
             match create_private_file(&path) {
                 Ok(mut file) => {
                     if current.bom {
@@ -621,18 +647,10 @@ impl Docstore {
     /// file system without links) the text that was read is copied instead.
     fn backup(&self, current: &Current) -> Result<PathBuf, StoreError> {
         create_private_dir(&self.backup_dir)?;
-        let ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let mut n = 0u32;
-        loop {
-            let path = self
-                .backup_dir
-                .join(format!("{}.{ms:016}-{n}.bak", self.backup_label()));
+        for path in self.new_backup_names() {
             match std::fs::hard_link(&self.path, &path) {
                 Ok(()) => return Ok(path),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(_) => match create_private_file(&path) {
                     Ok(mut file) => {
                         if current.bom {
@@ -642,11 +660,57 @@ impl Docstore {
                         file.sync_all()?;
                         return Ok(path);
                     }
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => n += 1,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(e.into()),
                 },
             }
         }
+        unreachable!("some backup name is free")
+    }
+
+    /// Names for a new backup, to try in turn: `<label>.<ms>-<n>.bak`, after the newest there is. A clock that went
+    /// back keeps the newest backup's time, so the new one still comes last and is not rotated out first. A newest
+    /// backup more than a day ahead is taken for a clock that was wrong then; it is not followed, so it does not
+    /// date every later backup.
+    fn new_backup_names(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let (ms, first) = match self.backups_oldest_first().pop() {
+            Some(((ms, n), _)) if ms >= now && ms - now <= CLOCK_BACK_FOLLOWED_MS => {
+                (ms, n.saturating_add(1))
+            }
+            _ => (now, 0),
+        };
+        let label = self.backup_label();
+        (first..).map(move |n| self.backup_dir.join(format!("{label}.{ms:016}-{n}.bak")))
+    }
+
+    /// This file's backups, oldest first by the time and count in their names (as numbers: `-10` is after `-2`).
+    /// A name not in that form counts as oldest.
+    fn backups_oldest_first(&self) -> Vec<((u128, u32), OsString)> {
+        let Ok(entries) = std::fs::read_dir(&self.backup_dir) else {
+            return Vec::new();
+        };
+        let prefix = format!("{}.", self.backup_label());
+        let mut backups: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter_map(|name| {
+                let made = name
+                    .to_str()?
+                    .strip_prefix(&prefix)?
+                    .strip_suffix(".bak")?
+                    .split_once('-')
+                    .map_or((0, 0), |(ms, n)| {
+                        ms.parse().ok().zip(n.parse().ok()).unwrap_or((0, 0))
+                    });
+                Some((made, name))
+            })
+            .collect();
+        backups.sort();
+        backups
     }
 
     /// Backups of different files must not push each other out of the rotation.
@@ -661,21 +725,9 @@ impl Docstore {
     }
 
     fn rotate_backups(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.backup_dir) else {
-            return;
-        };
-        let prefix = format!("{}.", self.backup_label());
-        let mut names: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .filter(|n| {
-                let n = n.to_string_lossy();
-                n.starts_with(&prefix) && n.ends_with(".bak")
-            })
-            .collect();
-        names.sort();
-        let surplus = names.len().saturating_sub(self.keep_backups);
-        for name in names.into_iter().take(surplus) {
+        let backups = self.backups_oldest_first();
+        let surplus = backups.len().saturating_sub(self.keep_backups);
+        for (_, name) in backups.into_iter().take(surplus) {
             let _ = std::fs::remove_file(self.backup_dir.join(name));
         }
     }
@@ -794,9 +846,11 @@ impl Current {
     }
 }
 
-/// Claude's lock: a directory next to the file. Removed when dropped, but only if we made it.
+/// Claude's lock: a directory next to the file. Removed when dropped, but only if we made it and it is still ours.
 struct Lock {
     dir: PathBuf,
+    /// The directory as we made it. Held past the stale age, it can be taken over: someone else's is left alone.
+    made: Option<watch::Stamp>,
 }
 
 impl Lock {
@@ -819,6 +873,7 @@ impl Lock {
                 Ok(()) => {
                     return Ok(Self {
                         dir: dir.to_owned(),
+                        made: watch::stamp(dir),
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -848,7 +903,10 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.dir);
+        // Not looked at when made: removed as before.
+        if self.made.is_none() || watch::stamp(&self.dir) == self.made {
+            let _ = std::fs::remove_dir(&self.dir);
+        }
     }
 }
 
@@ -3078,6 +3136,152 @@ mod tests {
     }
 
     #[test]
+    fn a_write_landing_while_a_refused_replace_waits_is_not_overwritten() {
+        // Windows refuses the rename while someone has the file open, and we wait and try again. Claude writing
+        // without the lock in that wait must be noticed as at the first try: our change is redone on its version.
+        let mut f = Fixture::new(&pretty(&sample()));
+        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (path, seen) = (f.store.path.clone(), Arc::clone(&tries));
+        f.store.refuse_replace = Some(Arc::new(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return false;
+            }
+            let mut theirs = sample();
+            theirs["numStartups"] = json!(99);
+            std::fs::write(&path, pretty(&theirs)).unwrap();
+            true
+        }));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        f.store.apply(&plan).unwrap();
+        let j = f.json();
+        assert_eq!(j["numStartups"], 99, "Claude's write survives");
+        assert_eq!(
+            j["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway"]),
+            "and so does ours"
+        );
+        // The refused try, then the redo on Claude's version, which went through at once.
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Only the redo's backup is kept, and it is Claude's version.
+        let backups = f.backups();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        let kept: Value =
+            serde_json::from_str(&std::fs::read_to_string(&backups[0]).unwrap()).unwrap();
+        assert_eq!(kept["numStartups"], 99);
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
+    #[test]
+    fn a_refused_replace_with_no_write_meanwhile_goes_through_on_a_later_try() {
+        let mut f = Fixture::new(&pretty(&sample()));
+        let tries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&tries);
+        f.store.refuse_replace = Some(Arc::new(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+        }));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        let applied = f.store.apply(&plan).unwrap();
+        assert!(applied.wrote);
+        assert_eq!(
+            f.json()["projects"]["C:/work/app"]["disabledMcpServers"],
+            json!(["old", "gateway"])
+        );
+        assert_eq!(tries.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(f.backups(), [applied.backup.unwrap()]);
+        assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
+    #[test]
+    fn a_lock_someone_else_took_over_is_left_to_them() {
+        // Ours was taken over as stale (held too long) and replaced by theirs: releasing ours must not remove it.
+        let f = Fixture::new(&pretty(&sample()));
+        let lock = Lock::acquire(&f.lock(), Duration::ZERO).unwrap();
+        std::fs::remove_dir(f.lock()).unwrap();
+        let theirs = f.dir.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        let later = SystemTime::now() + Duration::from_secs(5);
+        filetime::set_file_mtime(&theirs, filetime::FileTime::from_system_time(later)).unwrap();
+        std::fs::rename(&theirs, f.lock()).unwrap();
+        drop(lock);
+        assert!(f.lock().is_dir(), "their lock is still there");
+        // Our own is released as before.
+        std::fs::remove_dir(f.lock()).unwrap();
+        drop(Lock::acquire(&f.lock(), Duration::ZERO).unwrap());
+        assert!(!f.lock().exists());
+    }
+
+    /// A backup in `f`'s folder named as made at `ms`, the `n`th in that millisecond.
+    fn backup_named(f: &Fixture, ms: u128, n: u32) -> PathBuf {
+        let path = f
+            .store
+            .backup_dir
+            .join(format!("claude.json.{ms:016}-{n}.bak"));
+        create_private_dir(&f.store.backup_dir).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        path
+    }
+
+    #[test]
+    fn a_backup_made_after_the_clock_went_back_is_kept_as_the_newest() {
+        let mut f = Fixture::new(&pretty(&sample()));
+        f.store.keep_backups = 2;
+        let ahead = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 3_600_000;
+        let older = backup_named(&f, ahead - 1, 0);
+        let newest = backup_named(&f, ahead, 0);
+        let made = f.store.keep_copy().unwrap();
+        assert!(made.exists(), "the backup just made is not rotated out");
+        assert_eq!(f.backups(), [newest, made], "{older:?} went instead");
+    }
+
+    #[test]
+    fn a_backup_far_ahead_of_the_clock_does_not_date_the_next_one() {
+        // The variant: a clock that was far ahead once (a wrong date at boot) does not pin every later backup's
+        // time, which the Activity log shows.
+        let f = Fixture::new(&pretty(&sample()));
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        backup_named(&f, now + 2 * 86_400_000, 0);
+        let made = f.store.keep_copy().unwrap();
+        let name = made.file_name().unwrap().to_str().unwrap().to_owned();
+        let ms: u128 = name
+            .strip_prefix("claude.json.")
+            .and_then(|r| r.split_once('-'))
+            .map(|(ms, _)| ms.parse().unwrap())
+            .unwrap();
+        assert!(ms < now + 60_000, "{name}");
+    }
+
+    #[test]
+    fn backups_made_in_one_millisecond_are_rotated_in_the_order_made() {
+        // The variant: `-10` and `-11` are newer than `-2`, though they sort before it as text.
+        let mut f = Fixture::new(&pretty(&sample()));
+        f.store.keep_backups = 2;
+        let ahead = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 3_600_000;
+        let made: Vec<_> = (0..=10).map(|n| backup_named(&f, ahead, n)).collect();
+        let copy = f.store.keep_copy().unwrap();
+        let kept = f.backups();
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept.contains(&made[10]), "{kept:?}");
+        assert!(kept.contains(&copy), "{kept:?}");
+    }
+
+    #[test]
     fn verify_puts_the_change_back_when_claude_overwrote_it() {
         let f = Fixture::new(&pretty(&sample()));
         let plan = f
@@ -3418,6 +3622,52 @@ mod tests {
         assert!(
             !dir.path().join(".claude").exists(),
             "a refused plan creates nothing"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_larger_than_the_inventory_reads_is_not_changed() {
+        // The inventory reads settings.local.json up to its limit and warns past it; approving must not go further.
+        let dir = tempfile::tempdir().unwrap();
+        let store = settings_store(dir.path());
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let big = format!("{{\"pad\": \"{}\"}}", "x".repeat(MAX_MCP_JSON as usize));
+        std::fs::write(&store.path, &big).unwrap();
+        let Err(StoreError::Invalid(why)) = store.prepare(vec![approve_op("ps")]) else {
+            panic!("an oversized settings file is refused");
+        };
+        // Which file, that it stays as it is, and what to do instead.
+        assert!(why.contains("settings.local.json"), "{why}");
+        assert!(why.contains("larger than 1 MB"), "{why}");
+        assert!(why.contains("Approve the server in Claude Code"), "{why}");
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), big);
+    }
+
+    #[test]
+    fn the_settings_temp_file_is_named_after_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = settings_store(dir.path());
+        let folder = dir.path().join(".claude");
+        let names = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, at) = (Arc::clone(&names), folder.clone());
+        store.before_replace = Some(Arc::new(move || {
+            let listed = std::fs::read_dir(&at)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
+            seen.lock().unwrap().extend(listed);
+        }));
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        store.apply(&plan).unwrap();
+        let names = names.lock().unwrap();
+        assert!(
+            names
+                .iter()
+                .any(|n| n.starts_with(".settings.local.json.tmp.")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains(".claude.json")),
+            "{names:?}"
         );
     }
 
