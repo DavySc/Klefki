@@ -11,3 +11,4 @@ Goal: two open paste items. (1) `false || claude mcp add …`, `echo x | claude 
 - Real app (debug, Xvfb 1200x720, temp HOME and CLAUDE_CONFIG_DIR): a guide typed into Add with an inline-code command, `false || claude mcp add web …`, an `npx @anthropic-ai/claude-code mcp add fetch …` line, `claude mcp list` and two sentences shows docs and fetch ready, web refused with "This command uses the shell (||) …", the `claude mcp list` line named and "Skipped 2 lines of other text." Screenshot `reviews/2026-10-19-paste-messages/01-readme-paste-1200.png` in the project files.
 - Open (not changed here): a server refused for the shell has no name in the list, so with several commands it is not clear which line it means; this was already so for `claude mcp add x -- node | tee log`.
 - Next: pull request, cross-review, merge after #31.
+- Main `f306c48` (with #31) merged in: verify all exit 0, 1019 passed, 0 failed, deny ok.
