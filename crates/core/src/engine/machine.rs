@@ -314,6 +314,11 @@ enum Step {
     PutBack {
         pick: usize,
     },
+    /// A copy of a server into the place a kept definition came from, under its name: random steps rarely aim there.
+    CopyToKept {
+        pick: usize,
+        kept: usize,
+    },
     Forget {
         pick: usize,
     },
@@ -343,6 +348,7 @@ fn step() -> impl Strategy<Value = Step> {
         1 => pick.clone().prop_map(|pick| Step::Delete { pick }),
         1 => (pick.clone(), any::<bool>()).prop_map(|(pick, on)| Step::Toggle { pick, on }),
         2 => pick.clone().prop_map(|pick| Step::PutBack { pick }),
+        1 => (pick.clone(), 0usize..3).prop_map(|(pick, kept)| Step::CopyToKept { pick, kept }),
         1 => pick.prop_map(|pick| Step::Forget { pick }),
     ]
 }
@@ -877,6 +883,37 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 vec![Change::SetEnabled {
                     id: rig.id(&key),
                     enabled: *on,
+                }]
+            }
+            Step::CopyToKept { pick, kept } => {
+                let Some((project, name, _)) =
+                    before.kept.values().nth(kept % before.kept.len().max(1))
+                else {
+                    continue;
+                };
+                let key = picked(*pick);
+                let copy = (project.clone(), name.clone());
+                arrives = Some(copy.clone());
+                expected
+                    .servers
+                    .insert(copy.clone(), before.servers[&key].clone());
+                if entry_signs_in(&before.servers[&key]) {
+                    copy_secret(
+                        &mut expected.klefki,
+                        &before.klefki,
+                        &key,
+                        &copy,
+                        false,
+                        *store_fault,
+                    );
+                }
+                vec![Change::Duplicate {
+                    id: rig.id(&key),
+                    name: name.clone(),
+                    targets: vec![match project {
+                        None => Target::User,
+                        Some(p) => Target::Local(p.clone()),
+                    }],
                 }]
             }
             Step::PutBack { pick } | Step::Forget { pick } => {
@@ -1828,4 +1865,29 @@ fn an_earlier_renames_check_does_not_fail_on_a_copy_under_the_old_name() {
     let world = rig.world();
     assert_eq!(world.servers.get(&renamed), before.servers.get(&q));
     assert_eq!(world.servers.get(&q), before.servers.get(&p));
+}
+
+#[test]
+fn a_copy_into_the_place_a_failed_edit_kept_is_refused() {
+    // Found by the model test once it aimed copies at kept places: an edit of a fails twice, so Klefki keeps it, and
+    // a copy of another server under its name into its place went through.
+    use Fault::*;
+    let cases = [
+        (
+            Step::Edit {
+                pick: 0,
+                oauth: true,
+                url: 0,
+                client: 1,
+            },
+            vec![Works, TimesOutBefore, FailsBefore],
+            StoreFault::Works,
+        ),
+        (
+            Step::CopyToKept { pick: 0, kept: 0 },
+            vec![],
+            StoreFault::Works,
+        ),
+    ];
+    check(&cases).unwrap();
 }

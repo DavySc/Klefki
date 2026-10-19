@@ -26,4 +26,15 @@ Goal: a copy into the place a kept definition came from overwrote Klefki's copy 
   (each then puts it back and checks `sec-a` in both stores), `a_copy_reviewed_before_a_definition_was_kept_in_its_place_is_refused_when_applied`
   (fails with the apply-time check removed); swap `a_kept_definition_whose_change_got_through_stays_listed_while_the_secret_store_cannot_be_opened`
   (fails with the old "no store, nothing to lose"); variant that passed before too: `…_goes_with_its_secret_once_the_store_opens`.
-  The model now predicts a refusal for a move, copy or rename into a kept place (after the review's own listing).
+  `a_copy_into_the_place_a_failed_edit_kept_is_refused` (the model's own find, below).
+- **Model:** predicts a refusal for a move, copy or rename into a kept place (after the review's own listing), and
+  has a step `CopyToKept` that aims a copy at one, as random steps almost never do.
+- **Soaks** (Linux, 4 cores): plain main 79b9a79, old model 3000 cases passed; with the refusal check only, 3000
+  and 20000 cases passed (never reached). With `CopyToKept`, plain main failed in under a second (the edit-then-copy
+  case above). This branch: 2 × 4000 cases passed (109 s, 113 s).
+- **Checks** (after merging main 7105902, #9): `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D
+  warnings` 0; `cargo test --workspace` 0 (544 core, 259 app, 20 + 15 cli); `cargo deny check` 0; `cargo clippy -p
+  klefki -- -D warnings` 0. Windows and macOS: CI only.
+- **Open:** none known in this slice. The app shows the refusal in the review; it does not grey out the target in the
+  Move or Duplicate dialog beforehand.
+- **Next:** PR, CI on three systems, cross-review, merge.
