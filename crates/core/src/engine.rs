@@ -2388,14 +2388,17 @@ fn check_listed(shared: &Shared, job: &Job) -> ListedCheck {
         return queue_again(shared, again, ListedCheck::Answer(answer));
     }
     // The job has no answer either: it waits for its turn like the others, so that a server that hangs does not
-    // hold the rest back with its 30 s.
-    again.push((
-        Job {
-            alone: true,
-            ..job.clone()
-        },
-        never_connected(own),
-    ));
+    // hold the rest back with its 30 s. It was taken before them, so it stays ahead of them.
+    again.insert(
+        0,
+        (
+            Job {
+                alone: true,
+                ..job.clone()
+            },
+            never_connected(own),
+        ),
+    );
     queue_again(shared, again, ListedCheck::Later)
 }
 
@@ -3205,6 +3208,27 @@ mod tests {
         assert_eq!(final_status(&events, "s4"), Some(Status::Connected));
         assert_eq!(env.gets().len(), 6);
         assert_eq!(env.lists().len(), 1, "not asked again");
+    }
+
+    #[test]
+    fn servers_a_list_could_not_answer_keep_their_order_and_the_one_that_ran_it_its_place() {
+        // Regression (Windows CI): the job that ran the list went to the back, behind servers that were after it, so
+        // a server on screen could be checked before an earlier one. The list fails slowly; the servers on screen
+        // are named while it runs.
+        let env = Env::new(
+            &servers(5),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"delay_ms":600,"exit_code":1},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let core = env.start();
+        std::thread::sleep(Duration::from_millis(250));
+        core.send(Command::Visible(vec![
+            crate::model::ConnectionId::new(Scope::User, None, "s4"),
+            crate::model::ConnectionId::new(Scope::User, None, "s3"),
+        ]));
+        all_checked(&core, 5);
+        let order: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(order, ["s3", "s4", "s0", "s1", "s2"], "{order:?}");
     }
 
     #[test]

@@ -27,6 +27,9 @@ Branch `claude/mcp-list-checks`, from main `2279dd4` (PR #22 merged in; its `Job
 - One more was a race in the test itself: the F5 test counted the `get`s after only `recent` had answered; `fresh`'s second check may not have started. It now waits for both.
 - After: `cargo test -p klefki-core --lib -- engine::` 4 of 4 runs and `cargo test --workspace` 2 of 2 runs, default threads, no failure.
 
+## CI fix after the first push
+Windows CI failed `background_checks_of_servers_on_screen_go_first` (`["s4","s3",…]`): when a list could not answer, the job that ran it was queued behind the servers that were after it, so a server on screen could be checked before an earlier one. Real bug of this slice, seen only when `Visible` arrives before the first job is taken. Reproducer (failed first: `["s3","s4","s1","s2","s0"]`): `servers_a_list_could_not_answer_keep_their_order_and_the_one_that_ran_it_its_place`. The job now goes first in the re-queue.
+
 ## Checks
 - `cargo fmt --check`: exit 0. `cargo clippy --workspace --all-targets -- -D warnings`: exit 0. `cargo deny check`: advisories, bans, licenses, sources ok.
 - `cargo test --workspace` (default threads, twice): core 622, app 303, cli 20, others, all passed.
