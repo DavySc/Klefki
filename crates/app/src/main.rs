@@ -1,3 +1,7 @@
+// A release build is a GUI program on Windows: no console window opens next to it. Debug builds keep the
+// console so panics and logs stay visible while developing.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod activity;
 mod command;
 mod desktop;

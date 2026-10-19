@@ -3,7 +3,11 @@ name = "klefki"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish.workspace = true
+description = "A fast, native manager for the MCP servers configured in Claude Code"
+homepage = "https://github.com/DavySc/Klefki"
+repository = "https://github.com/DavySc/Klefki"
 
 [dependencies]
 klefki-core = { path = "../core", features = ["wayland"] }
@@ -12,5 +16,33 @@ eframe = { version = "=0.36.1", default-features = false, features = ["glow", "a
 egui_extras = "=0.36.1"
 egui-phosphor = "0.14"
 
+# Only does work when the target is Windows (see build.rs); it never reaches the binary.
+[build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
+
 [dev-dependencies]
 egui_kittest = { version = "=0.36.1", features = ["eframe"] }
+
+# Installers and bundles, built by `.github/workflows/release.yml` with cargo-packager (see docs/RELEASING.md).
+# The release workflow builds both binaries first; packaging only collects them. The NSIS installer installs
+# for the current user (its default), so it needs no administrator prompt.
+[package.metadata.packager]
+product-name = "Klefki"
+identifier = "io.github.davysc.klefki"
+publisher = "Klefki contributors"
+authors = ["Klefki contributors <https://github.com/DavySc/Klefki>"]
+long-description = "Lists every MCP server Claude Code knows about and lets you add, edit, move, enable, disable, sign in to, export, import and delete them, with every change previewed first. Includes the klefki-cli command-line tool."
+copyright = "Copyright (c) 2026 the Klefki contributors. MIT OR Apache-2.0."
+category = "DeveloperTool"
+license-file = "../../LICENSE-MIT"
+binaries = [{ path = "klefki", main = true }, { path = "klefki-cli", main = false }]
+icons = ["assets/icon/klefki.ico", "assets/icon/klefki.icns", "assets/icon/klefki-256.png"]
+
+[package.metadata.packager.deb]
+section = "devel"
+# eframe loads the GL and keyboard libraries at run time, so dpkg cannot see them in the binary.
+depends = ["libgl1 | libegl1", "libxkbcommon0"]
+
+# The release workflow builds with MACOSX_DEPLOYMENT_TARGET set to the same version.
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"

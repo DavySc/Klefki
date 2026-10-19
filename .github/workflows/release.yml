@@ -1,0 +1,136 @@
+name: release
+# Builds the installers for Windows, macOS and Linux. A `v*` tag publishes them as a draft GitHub Release;
+# a manual run only builds them and keeps them as workflow artifacts. Never runs on pull requests (the macOS
+# job is billed at 10x). See docs/RELEASING.md.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: 0.11.8
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            system: windows
+          - os: macos-latest
+            system: macos
+          # The oldest supported runner, so the binaries run on older glibc versions too.
+          - os: ubuntu-22.04
+            system: linux
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libfuse2
+      # Pinned to a commit: this action builds the binaries we publish. The SHA is the `stable` branch on 2026-10-19.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+          targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+      # No build cache: a release is built from scratch, and caches saved under a tag could not be reused.
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked --version "$CARGO_PACKAGER_VERSION"
+
+      - name: Version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "klefki"))')
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build (Windows, Linux)
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked -p klefki -p klefki-cli
+      - name: Build (macOS, Intel and Apple silicon in one binary)
+        if: runner.os == 'macOS'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          for target in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --locked -p klefki -p klefki-cli --target "$target"
+          done
+          mkdir -p target/universal-apple-darwin/release
+          for bin in klefki klefki-cli; do
+            lipo -create -output "target/universal-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin" "target/aarch64-apple-darwin/release/$bin"
+          done
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          base="klefki-$VERSION"
+          case "${{ matrix.system }}" in
+            windows)
+              cargo packager --release -p klefki -f nsis,wix -o "$GITHUB_WORKSPACE/target/packages"
+              cp target/packages/*-setup.exe "dist/$base-windows-x64-setup.exe"
+              cp target/packages/*.msi "dist/$base-windows-x64.msi"
+              mkdir portable
+              cp target/release/klefki.exe target/release/klefki-cli.exe LICENSE-MIT LICENSE-APACHE README.md portable/
+              (cd portable && 7z a -tzip "../dist/$base-windows-x64.zip" .)
+              ;;
+            macos)
+              cargo packager --release -p klefki -f app,dmg --target universal-apple-darwin -o "$GITHUB_WORKSPACE/target/packages"
+              cp target/packages/*.dmg "dist/$base-macos-universal.dmg"
+              ;;
+            linux)
+              cargo packager --release -p klefki -f deb,appimage -o "$GITHUB_WORKSPACE/target/packages"
+              cp target/packages/*.deb "dist/$base-linux-amd64.deb"
+              cp target/packages/*.AppImage "dist/$base-linux-x86_64.AppImage"
+              ;;
+          esac
+          ls -l dist
+
+      - name: Check the packages
+        run: python3 scripts/check-release.py ${{ matrix.system }} dist ${{ steps.version.outputs.version }} ${{ runner.os == 'macOS' && '--app target/packages/Klefki.app' || '' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: klefki-${{ matrix.system }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The notes name each file exactly, so their commands can be pasted as they are.
+          sed "s/{version}/$version/g" docs/release-notes.md > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
+            --title "Klefki $version" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes

@@ -159,6 +159,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
    - Linux: deb and AppImage, with checksums and minisign.
    - Build provenance attestation and an SBOM.
    - Auto-update only from an org-owned, signature-verified source.
+   - Slices, in order: (1) unsigned release builds from a `v*` tag, with checksums and the MIT OR Apache-2.0 licence (`docs/RELEASING.md`); (2) provenance attestation and SBOM; (3) minisign; (4) Authenticode; (5) Developer ID and notarisation; (6) update check. Slices 3 to 5 need the owner's keys or accounts.
 
 ## Nice to have (after M4)
 Ideas from an outside brainstorm, compared with this plan and checked on a real machine in `docs/decisions/003-brainstorm-comparison.md`. None of them blocks M0 to M4, and they are in rough order of value.
