@@ -2242,6 +2242,18 @@ impl ShellApp {
             // Behind the review, as it was, to come Back to.
             return;
         }
+        let focused = form.focus_was;
+        if form.asking_to_discard
+            && ctx.input(|i| {
+                i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Text(_) | egui::Event::Paste(_)))
+            })
+        {
+            // Back to typing: the question no longer fits what is there.
+            form.asking_to_discard = false;
+            form.focus_back = None;
+        }
         form.reread();
         form.refill();
         let checked = form.check(&self.snapshot.servers);
@@ -2254,6 +2266,7 @@ impl ShellApp {
             && checked.iter().all(|c| !matches!(c, Check::Name(_)));
         let mut review = ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
+        let mut discard_now = false;
         // The top stays put, so the tabs and fields do not move as the dialog grows or shrinks; the body scrolls
         // as one, between the tabs and the buttons, which stay in view.
         let screen = ctx.content_rect().height();
@@ -2394,6 +2407,35 @@ impl ShellApp {
                 }
             }
             ui.add_space(8.0);
+            if form.asking_to_discard {
+                // In place of the buttons, where the eye already is: a second dialog over this one would hide what
+                // is about to be thrown away.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::WARNING_CIRCLE).color(pal.danger));
+                    ui.label(RichText::new("Discard what you typed?").strong());
+                    ui.add_space(8.0);
+                    let discard =
+                        egui::Button::new(RichText::new("Discard").strong().color(pal.on_bright))
+                            .fill(pal.danger)
+                            .min_size(egui::vec2(96.0, 34.0));
+                    discard_now = ui.add(discard).clicked();
+                    let keep = ui
+                        .add(egui::Button::new("Keep editing").min_size(egui::vec2(80.0, 34.0)))
+                        .on_hover_text("Esc");
+                    // The least destructive answer has the keyboard, so Enter keeps editing and Shift+Tab
+                    // reaches Discard.
+                    if std::mem::take(&mut form.focus_answer) {
+                        keep.request_focus();
+                    }
+                    if keep.clicked() {
+                        form.asking_to_discard = false;
+                        if let Some(id) = form.focus_back.take() {
+                            ui.memory_mut(|m| m.request_focus(id));
+                        }
+                    }
+                });
+                return (ui.min_rect().height() - body_height, body_height);
+            }
             ui.horizontal(|ui| {
                 // Always pressable: pressed too soon, it says what is missing rather than doing nothing.
                 let confirm =
@@ -2410,6 +2452,7 @@ impl ShellApp {
             (ui.min_rect().height() - body_height, body_height)
         });
         settle(ctx, &modal.response);
+        form.focus_was = ctx.memory(|m| m.focused());
         let (taken, body_height) = modal.inner;
         if (taken - overhead).abs() > 0.5 {
             ctx.data_mut(|d| d.insert_temp(overhead_id, taken));
@@ -2429,6 +2472,19 @@ impl ShellApp {
             let checked = form.check(&self.snapshot.servers);
             form.show_what_stops_review(&checked);
         }
+        // Esc asks first when there is something to lose, and backs out of that question when pressed again.
+        let escaped = closed_on_purpose(&modal) && !review && !cancel && !discard_now;
+        let close = !review
+            && (cancel || discard_now || escaped && !form.asking_to_discard && !form.has_typing());
+        if escaped && !close {
+            form.asking_to_discard = !form.asking_to_discard;
+            if form.asking_to_discard {
+                form.focus_back = focused;
+                form.focus_answer = true;
+            } else if let Some(id) = form.focus_back.take() {
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        }
         if let Some(port) = form.port_wanted.take() {
             form.port_pending = Some(port);
             self.send(Command::CheckCallbackPort(port));
@@ -2439,10 +2495,11 @@ impl ShellApp {
                 self.adding_signs_in = signs_in;
                 if let Some(form) = &mut self.add {
                     form.reviewing = true;
+                    form.asking_to_discard = false;
                     form.failed = None;
                 }
             }
-        } else if (cancel || closed_on_purpose(&modal)) && !review {
+        } else if close {
             self.close_add();
         }
     }
@@ -2917,7 +2974,7 @@ impl ShellApp {
                             egui::Button::new(format!("{} Back", icon::ARROW_LEFT))
                                 .min_size(egui::vec2(80.0, 34.0)),
                         )
-                        .on_hover_text("Change what is added")
+                        .on_hover_text("Change what is added (Esc)")
                         .clicked()
                 {
                     back = true;
@@ -2928,7 +2985,7 @@ impl ShellApp {
                         !applying,
                         egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)),
                     )
-                    .on_hover_text("Esc")
+                    .on_hover_text(if from_add { "Add nothing" } else { "Esc" })
                     .clicked()
                 {
                     cancel = true;
@@ -2963,7 +3020,12 @@ impl ShellApp {
         });
         settle(ctx, &modal.response);
         if closed_on_purpose(&modal) && !applying {
-            cancel = true;
+            // Esc backs out one step: from the review of an Add, to the Add dialog, as it was.
+            if from_add {
+                back = true;
+            } else {
+                cancel = true;
+            }
         }
         if apply {
             self.applying = true;
@@ -4228,6 +4290,14 @@ struct AddForm {
     tried: bool,
     /// Review asked for a plan: the dialog waits behind it, as it was, to come back to.
     reviewing: bool,
+    /// Esc was pressed with something pasted or typed: the dialog asks before throwing it away.
+    asking_to_discard: bool,
+    /// The field that had the keyboard before the question, to give it back once the question is put away.
+    focus_back: Option<egui::Id>,
+    /// What had the keyboard at the end of the last frame: Esc takes it away before the dialog sees the key.
+    focus_was: Option<egui::Id>,
+    /// Give Keep editing the keyboard on the next frame.
+    focus_answer: bool,
     /// Why the last review or add failed, said in the dialog.
     failed: Option<String>,
     /// Bring the OAuth settings into view on the next frame.
@@ -4282,12 +4352,47 @@ impl AddForm {
             left: BTreeSet::new(),
             tried: false,
             reviewing: false,
+            asking_to_discard: false,
+            focus_back: None,
+            focus_was: None,
+            focus_answer: false,
             failed: None,
             reveal_oauth: false,
             port_wanted: None,
             port_pending: None,
             port_checked: None,
         }
+    }
+
+    /// Something was pasted or typed that closing would throw away. How the server connects and where it goes are
+    /// choices, quickly made again, not typing.
+    fn has_typing(&self) -> bool {
+        let empty = |rows: &[(String, String)]| {
+            rows.iter()
+                .all(|(k, v)| k.trim().is_empty() && v.trim().is_empty())
+        };
+        let fields = ServerFields {
+            transport: ServerFields::default().transport,
+            oauth: ServerFields::default().oauth,
+            ..self.fields.clone()
+        };
+        let fields = ServerFields {
+            env: if empty(&fields.env) {
+                Vec::new()
+            } else {
+                fields.env
+            },
+            headers: if empty(&fields.headers) {
+                Vec::new()
+            } else {
+                fields.headers
+            },
+            ..fields
+        };
+        !self.text.trim().is_empty()
+            || (self.name_edited && !self.name.trim().is_empty())
+            || fields != ServerFields::default()
+            || !self.secret.is_empty()
     }
 
     /// Reads the text again if it changed. A name the user changed is kept while the server it names is still read
@@ -9770,6 +9875,8 @@ mod tests {
         h.get_by_label_contains("Adds files for the user.");
         h.key_press(egui::Key::Escape);
         h.run();
+        h.get_by_label("Discard").click();
+        h.run();
         assert!(h.state().add.is_none());
         assert!(duplicate_requested(&engine).is_empty());
     }
@@ -10007,7 +10114,7 @@ mod tests {
     }
 
     #[test]
-    fn add_is_in_the_palette_and_esc_closes_it_without_asking_anything() {
+    fn add_is_in_the_palette_and_esc_closes_it_without_adding_anything() {
         let (mut h, engine) = duplicate_harness();
         ctrl_k(&mut h);
         type_into_palette(&mut h, "add a server");
@@ -10017,8 +10124,181 @@ mod tests {
         paste(&mut h, "claude mcp add x node");
         h.key_press(egui::Key::Escape);
         h.run();
+        h.get_by_label("Discard").click();
+        h.run();
         assert!(h.state().add.is_none());
         assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    // Esc is a reflex, pressed to leave a field or a menu as often as a dialog, so it never throws away what was
+    // pasted or typed without asking. Cancel is clicked on purpose and closes at once.
+    const DISCARD_QUESTION: &str = "Discard what you typed?";
+
+    #[test]
+    fn esc_closes_an_empty_add_dialog_at_once() {
+        for mode in [AddMode::Paste, AddMode::Fill] {
+            let (mut h, _engine) = duplicate_harness();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+            h.run();
+            add_form(&mut h).mode = mode;
+            // Choosing how a server connects, or where it goes, is not typing: there is nothing to lose. Nor is
+            // ticking OAuth, or adding a row and leaving it empty.
+            let f = add_form(&mut h);
+            f.fields.transport = TransportKind::Http;
+            f.fields.oauth = true;
+            f.fields.headers.push((String::new(), " ".into()));
+            f.fields.env.push((String::new(), String::new()));
+            h.run();
+            h.key_press(egui::Key::Escape);
+            h.run();
+            assert!(h.state().add.is_none(), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn esc_asks_before_throwing_away_what_was_pasted_or_typed() {
+        type Typing = fn(&mut AddForm);
+        let typed: [(&str, Typing); 5] = [
+            ("pasted", |f| f.text = "claude mcp add x node".into()),
+            ("name", |f| {
+                f.mode = AddMode::Fill;
+                f.name = "files".into();
+                f.name_edited = true;
+            }),
+            ("command", |f| {
+                f.mode = AddMode::Fill;
+                f.fields.command = "npx -y @x/fs".into();
+            }),
+            ("url", |f| {
+                f.mode = AddMode::Fill;
+                f.fields.transport = TransportKind::Http;
+                f.fields.url = "https://example.com/mcp".into();
+            }),
+            ("secret", |f| {
+                f.mode = AddMode::Fill;
+                *f.secret.edit() = "s3cret".into();
+            }),
+        ];
+        for (what, fill) in typed {
+            let (mut h, engine) = duplicate_harness();
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+            h.run();
+            fill(add_form(&mut h));
+            h.run();
+            assert!(h.query_by_label(DISCARD_QUESTION).is_none(), "{what}");
+            h.key_press(egui::Key::Escape);
+            h.run();
+            assert!(h.state().add.is_some(), "{what}: closed without asking");
+            h.get_by_label(DISCARD_QUESTION);
+            // Esc again backs out of the question, not out of the dialog.
+            h.key_press(egui::Key::Escape);
+            h.run();
+            assert!(h.state().add.is_some(), "{what}");
+            assert!(h.query_by_label(DISCARD_QUESTION).is_none(), "{what}");
+            h.key_press(egui::Key::Escape);
+            h.run();
+            h.get_by_label("Keep editing").click();
+            h.run();
+            assert!(h.state().add.is_some(), "{what}");
+            assert!(h.query_by_label(DISCARD_QUESTION).is_none(), "{what}");
+            h.key_press(egui::Key::Escape);
+            h.run();
+            h.get_by_label("Discard").click();
+            h.run();
+            assert!(h.state().add.is_none(), "{what}");
+            assert!(duplicate_requested(&engine).is_empty(), "{what}");
+        }
+    }
+
+    #[test]
+    fn the_discard_question_works_from_the_keyboard() {
+        // From the review of #13: after Esc nothing had the keyboard, and Tab went into the paste box, which kept
+        // it, so Discard and Keep editing could not be reached without a mouse.
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text = "claude mcp add x node";
+        paste(&mut h, text);
+        h.run();
+        let typing_in = h.ctx.memory(|m| m.focused());
+        assert!(typing_in.is_some(), "the paste box has the keyboard");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.run();
+        // The least destructive answer has the keyboard: Enter keeps editing.
+        assert!(h.get_by_label("Keep editing").is_focused());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.run();
+        assert!(h.query_by_label(DISCARD_QUESTION).is_none());
+        assert_eq!(
+            h.ctx.memory(|m| m.focused()),
+            typing_in,
+            "back where it was"
+        );
+        // One Tab back from Keep editing reaches Discard; Enter on it closes.
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Tab);
+        h.run();
+        assert!(h.get_by_label("Discard").is_focused());
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(h.state().add.is_none());
+        assert!(duplicate_requested(&engine).is_empty());
+    }
+
+    #[test]
+    fn going_back_to_typing_puts_the_discard_question_away() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add x node");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.get_by_label(DISCARD_QUESTION);
+        h.event(egui::Event::Text("y".into()));
+        h.run();
+        assert!(h.query_by_label(DISCARD_QUESTION).is_none());
+        h.get_by_label("Review");
+        assert!(h.state().add.is_some());
+    }
+
+    #[test]
+    fn cancel_closes_a_filled_in_add_dialog_at_once() {
+        let (mut h, _engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        paste(&mut h, "claude mcp add x node");
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(h.state().add.is_none());
+    }
+
+    #[test]
+    fn esc_in_the_review_of_an_add_goes_back_to_the_dialog() {
+        let (mut h, engine) = duplicate_harness();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
+        h.run();
+        let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
+        paste(&mut h, text);
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(waits_behind_review(&h));
+        assert_eq!(duplicate_requested(&engine).len(), 1);
+        let mut plan = plan_view(9, &["+   \"files\""], &[], false);
+        plan.action = "Add".to_owned();
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label(&format!("{} Back", icon::ARROW_LEFT));
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().plan.is_none());
+        assert_eq!(drain(&engine), vec![Command::Discard(9)]);
+        let form = h.state().add.as_ref().expect("the Add dialog is kept");
+        assert!(!form.reviewing);
+        assert_eq!(form.text, text);
     }
 
     fn fill_in(h: &mut Harness<'static, ShellApp>) {
@@ -10166,6 +10446,8 @@ mod tests {
             .unwrap();
         h.run();
         h.key_press(egui::Key::Escape);
+        h.run();
+        h.get_by_label("Discard").click();
         h.run();
         // A secret typed, then OAuth unticked: not sent.
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
