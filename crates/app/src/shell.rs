@@ -3081,6 +3081,8 @@ impl ShellApp {
     fn plan_dialog(&mut self, ctx: &egui::Context) {
         let pal = theme::palette(ctx);
         let Some(plan) = self.plan.clone() else {
+            // What the last plan's diffs needed goes with it.
+            self.diff_tops = DiffTops::default();
             return;
         };
         let applying = self.applying;
@@ -3145,10 +3147,17 @@ impl ShellApp {
                             continue;
                         }
                         ui.add_space(8.0);
+                        // The size is in the heading: only the lines in view are laid out, so a screen reader would
+                        // otherwise not know there are more, and the box below shows few at a time.
+                        let count = file.lines.len();
                         ui.label(
-                            RichText::new(format!("Changes in {}", file.path))
-                                .small()
-                                .color(pal.text_muted),
+                            RichText::new(format!(
+                                "Changes in {} · {count} {}",
+                                file.path,
+                                if count == 1 { "line" } else { "lines" }
+                            ))
+                            .small()
+                            .color(pal.text_muted),
                         );
                         Frame::new()
                             .fill(pal.field)
@@ -3161,6 +3170,10 @@ impl ShellApp {
                                 egui::ScrollArea::vertical()
                                     .id_salt(("plan_diff", plan.id, &file.path))
                                     .max_height(220.0)
+                                    // A long diff looks no longer than the box without a bar that says otherwise.
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                    )
                                     .show_viewport(ui, |ui, viewport| {
                                         let line = |ui: &Ui, line: &str| {
                                             let color = if line.starts_with("+ ") {
@@ -8985,6 +8998,8 @@ mod tests {
             .collect();
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let (mut h, _engine) = with_plan(&refs, &[], false);
+        // Cross-review: with only the lines in view laid out, the heading says how many there are.
+        h.get_by_label("Changes in .claude.json · 500 lines");
         let first = h.get_by_label("+ line 0").rect();
         assert!(
             h.query_by_label("+ line 499").is_none(),
@@ -9025,6 +9040,11 @@ mod tests {
             last.bottom() <= first.top() + 220.0 + 1.0,
             "{first:?} {last:?}"
         );
+        // Where the lines went is let go with the plan.
+        assert!(!h.state().diff_tops.files.is_empty());
+        h.state_mut().plan = None;
+        h.run();
+        assert!(h.state().diff_tops.files.is_empty());
     }
 
     #[test]
@@ -9038,6 +9058,7 @@ mod tests {
             h.get_by_label_contains("Review the change");
             h.get_by_label_contains("disabledMcpServers");
             h.get_by_label("+ alpha");
+            h.get_by_label("Changes in .claude.json · 2 lines");
             h.get_by_label_contains("may need a restart");
             (h, engine)
         };

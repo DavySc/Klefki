@@ -16,3 +16,9 @@ The performance review of 2026-10-19 left items in `engine.rs`, `docstore.rs` an
 
 ## Next
 Cross-review, then CI on all three systems.
+
+## Cross-review round 1 (no blockers; two UX folds and one optional item, all taken)
+- V1: with only the lines in view laid out, a screen reader could not tell there were more. The heading now says the size: "Changes in .claude.json · 500 lines" ("1 line" for one).
+- V2: the diff box's scroll bar was hidden until scrolled (as on main), so a long diff looked short. It is now always shown.
+- `diff_tops` is cleared once no plan is open.
+- Tests: `a_long_diff_lays_out_only_the_lines_in_view_and_scrolls_to_its_end` now also checks the heading and the clearing; the plan dialog test checks "· 2 lines".
