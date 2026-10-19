@@ -6302,20 +6302,29 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label("Claude CLI 2.1.303");
-        // Where the whole of it does not fit, the number alone, which says what it is on hover.
-        let (mut h, engine) = live_harness();
-        h.set_size(egui::vec2(900.0, SMALLEST_SIZE.y));
-        engine
-            .events
-            .send(klefki_core::api::Event::CliVersion(Some(
-                "2.1.303".to_owned(),
-            )))
-            .unwrap();
-        h.run();
-        assert!(h.query_by_label("Claude CLI 2.1.303").is_none());
-        h.get_by_label("2.1.303").hover();
-        h.run();
-        h.get_by_label("Claude CLI 2.1.303");
+        // Where the whole of it does not fit, the number alone, which says what it is on hover. Where that starts
+        // depends on the platform's shortcut labels, so it is looked for across the widths.
+        let mut number_only = 0;
+        for width in (SMALLEST_SIZE.x as usize..=OPENING_SIZE.x as usize).step_by(10) {
+            let (mut h, engine) = live_harness();
+            h.set_size(egui::vec2(width as f32, SMALLEST_SIZE.y));
+            engine
+                .events
+                .send(klefki_core::api::Event::CliVersion(Some(
+                    "2.1.303".to_owned(),
+                )))
+                .unwrap();
+            h.run();
+            if h.query_by_label("Claude CLI 2.1.303").is_none()
+                && h.query_by_label("2.1.303").is_some()
+            {
+                number_only += 1;
+                h.get_by_label("2.1.303").hover();
+                h.run();
+                h.get_by_label("Claude CLI 2.1.303");
+            }
+        }
+        assert!(number_only > 0, "the number alone was never shown");
     }
 
     #[test]
