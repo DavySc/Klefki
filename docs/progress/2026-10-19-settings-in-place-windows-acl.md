@@ -16,8 +16,10 @@ Goal: part 2 of the docstore leftovers from PR #24 (part 1, the lock, is `2026-1
 - CI on 15eb385: green on Windows, macOS and Linux; the Windows log shows `backups_and_their_folder_are_owner_only_on_windows ... ok` (core 635 there).
 - Cross-review (another thread, review on #30): ready, nothing blocking; each `unsafe` block checked. Optional O1 folded in as a comment: unlike Unix, folders made above the private one keep their inherited access.
 
+- Main f0b1d91 (with #26 and #25) merged in: full verify exit 0; core 654, app 314, cli 18 + 25, 0 failed; deny ok. Windows clippy exit 0.
+
 ## Left open
 - Existing backup folders on Windows keep their old access list; new backups in them are owner-only.
 
 ## Next
-- Cross-review, CI on three systems (first run of the Windows-only test), merge.
+- Merge #30 on green CI.
