@@ -13,8 +13,12 @@ Goal: make four tests that failed under load pass reliably, changing tests only.
 
 ## Checks
 - Before (main 2208801): the engine and form tests (`engine::tests form::tests`, `--test-threads=12`) run 400 times, four to eight loops at once. 57 of 400 runs had a failure: callback port review test 41, kept definition 8, callback port engine test 7, form port test 3; no other test failed.
-- After: see the pull request; filled in below once run.
-- `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0.
+- After (87d38be): the same command 400 times, eight loops at once (twice the load). None of the four tests failed. 4 of 400 runs failed on another test, `engine::tests::a_server_claude_checked_recently_is_left_alone_until_f5` (engine.rs:2380, the F5 list of checked names), which this change does not touch; it did not fail in the before runs at lower load. Not looked into.
+- `cargo fmt --check` 0; `cargo clippy --workspace --all-targets -- -D warnings` 0; `cargo test --workspace` 0 (797 passed); `cargo deny check` 0.
+
+## Open
+- `a_server_claude_checked_recently_is_left_alone_until_f5` fails about 1 in 100 runs under heavy load (above). Likely the same kind of race (names read before F5's second check of `fresh` is logged), inferred, not checked.
+- Windows and macOS: covered only by CI.
 
 ## Next
 - Drive the pull request to green CI on all three systems.
