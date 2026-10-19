@@ -19,7 +19,7 @@ Branch `claude/review-performance-hwr3ft`, from main `e169d1b`. Baseline on that
 - `config::entry::tests::a_long_definition_is_diffed_quickly`: 8,000 arguments all replaced, one of them changed, and none changed, within 1 s (debug). Failed: 9.5 s. It also checks two edits far apart: in 1,000 arguments, 4 changed lines and no note; in 3,000, the run between them with the note. Variant `config::entry::tests::the_diff_keeps_as_many_lines_as_can_be_kept`: 2,000 pairs of short texts made of repeating lines, where dropping the added lines gives the old text, dropping the removed ones gives the new, and the kept lines are a longest common subsequence (passed before and after).
 
 ## Checks
-- Verify all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0, 700 tests passed (695 + 5 new), deny "advisories ok, bans ok, licenses ok, sources ok". After merging main (`1f480c7`, with #27): exit 0, 705 tests. After review round 1: exit 0, 707 tests. With the plan diff fix: exit 0, 709 tests. With its review polish: exit 0, 709 tests.
+- Verify all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0, 700 tests passed (695 + 5 new), deny "advisories ok, bans ok, licenses ok, sources ok". After merging main (`1f480c7`, with #27): exit 0, 705 tests. After review round 1: exit 0, 707 tests. With the plan diff fix: exit 0, 709 tests. With its review polish: exit 0, 709 tests. After merging main (`76ff566`, with #30; `from_commands` keeps #30's arm for add commands and this branch's for skipped lines, masked with `shown_text`): exit 0, 732 tests, deny ok.
 - Release timings of `Pasted::parse` before → after (255 KiB): distinct lines 2,294 → 21 ms; distinct variables 1,500 → 20 ms; the same line repeated 11 → 7 ms; 7,493 commands (refused, over 100) 22 → 14 ms.
 
 ## Baseline measured on main (Linux, Xvfb, Mesa llvmpipe, release build)
@@ -28,4 +28,4 @@ Branch `claude/review-performance-hwr3ft`, from main `e169d1b`. Baseline on that
 - With the real `claude` on PATH, background checks run one at a time: the tree peaks at 365 MB summed RSS (289 MB PSS) and the 30 checks end after about 20 s. Each `claude mcp get` takes about 0.5 s and 150 MB PSS.
 
 ## Next
-More PRs from this review follow from this branch once this one is merged; the rest is in the findings file.
+Merge this PR once CI is green on all three systems. Davy asked that the open PRs be the last of the overnight session, so this review opens no more; what is left is in the findings file.
