@@ -16,7 +16,12 @@ pub use crate::secrets::{Secret, SecretError};
 
 /// Whether two project keys name the same folder, as the engine compares them: `c:\Repos\x\` is `C:/Repos/x`.
 pub fn same_project(a: &str, b: &str) -> bool {
-    crate::config::inventory::normalise_project(a) == crate::config::inventory::normalise_project(b)
+    project_key(a) == project_key(b)
+}
+
+/// A project key as [`same_project`] compares it, borrowed when the key is already spelled that way.
+pub fn project_key(path: &str) -> std::borrow::Cow<'_, str> {
+    crate::config::inventory::project_key(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
