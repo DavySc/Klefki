@@ -11,4 +11,5 @@ Goal: PLAN "Nice to have" 6. A user-scope stdio server whose command names a pat
 - Full verify on main `99f3ab3` + this change: exit 0 (app 316, core 675, cli 19 + 25 passed), deny "advisories ok, bans ok, licenses ok, sources ok".
 - Real app (debug, Xvfb 1200x720, the real config above): badges, hover and details as described; screenshots in the project files under `reviews/2026-10-19-relative-path/`. `klefki-cli list` and `--json` as above.
 - Not done: a hint on the Status tab's failure explanation; flagging bare program names (on Windows a bare `server.exe` is also looked for in the current folder first); a live hint in the Add form before Review (the review warns).
-- Next: cross-review, then merge.
+- Main `4b8fb5a` (#34 Secrets page) merged in; its new test row in `secret_uses.rs` gets the field. Full verify after: no failures (app 325, core 691, cli 19 + 25), deny ok.
+- Next: cross-review (Secrets page author), then merge.
