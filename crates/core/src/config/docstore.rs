@@ -25,6 +25,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Claude's own staleness rule for its lock directory.
@@ -255,6 +256,8 @@ pub(crate) struct Docstore {
     pub keep_backups: usize,
     /// How long to wait for the lock before giving up. The decision record proposes about 3 s.
     pub lock_wait: Duration,
+    /// Claude's rule: a lock not refreshed for this long is taken over.
+    pub lock_stale: Duration,
     /// How long after a write to look again for an unlocked overwrite by Claude.
     pub verify_delay: Duration,
     /// Runs just before the validation and rename, so a test can write the file at that moment.
@@ -273,6 +276,7 @@ impl Docstore {
             backup_dir,
             keep_backups: 20,
             lock_wait: Duration::from_secs(3),
+            lock_stale: LOCK_STALE,
             verify_delay: Duration::from_secs(1),
             #[cfg(test)]
             before_replace: None,
@@ -384,7 +388,7 @@ impl Docstore {
         {
             ensure_plain_dir(dir)?;
         }
-        let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
+        let _lock = self.lock()?;
         self.read_edit_write(|current| {
             let (text, changes) = self.edit(current, &plan.ops, Purpose::Change)?;
             if changes != plan.changes && current.hash() != plan.base_hash {
@@ -487,7 +491,7 @@ impl Docstore {
             if round + 1 == MAX_VERIFY_ROUNDS {
                 break;
             }
-            let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
+            let _lock = self.lock()?;
             // A newer change marks itself before it takes the lock, so under the lock this answer is final.
             if superseded() {
                 return Ok(reapplied);
@@ -497,6 +501,18 @@ impl Docstore {
                 .wrote;
         }
         Err(StoreError::Lost)
+    }
+
+    fn lock(&self) -> Result<Lock, StoreError> {
+        let takeover = self
+            .backup_dir
+            .join(format!("{}.takeover", self.backup_label()));
+        Lock::acquire(&LockAt {
+            dir: &self.lock_path(),
+            takeover: &takeover,
+            wait: self.lock_wait,
+            stale: self.lock_stale,
+        })
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -846,42 +862,65 @@ impl Current {
     }
 }
 
-/// Claude's lock: a directory next to the file. Removed when dropped, but only if we made it and it is still ours.
+/// Where Claude's lock is and how it is taken.
+struct LockAt<'a> {
+    /// The lock directory, next to the file.
+    dir: &'a Path,
+    /// Klefki's own marker, in its backup folder, while it takes over a stale lock: of two Klefkis that both find
+    /// the lock stale, only one removes it, and the other then finds the new owner's lock fresh.
+    takeover: &'a Path,
+    wait: Duration,
+    /// Age after which a lock nobody refreshes is taken over. A held lock is refreshed twice as often.
+    stale: Duration,
+}
+
+/// Claude's lock: a directory next to the file. Kept fresh while held, as Claude keeps its own, so a long write is
+/// not taken for a dead one. Removed when dropped, but only if we made it and it is still ours.
 struct Lock {
     dir: PathBuf,
-    /// The directory as we made it. Held past the stale age, it can be taken over: someone else's is left alone.
+    /// The directory as we made it (`None`: it could not be looked at).
     made: Option<watch::Stamp>,
+    /// Refreshes the directory until the sender is dropped, then says whether it is still ours.
+    refresher: Option<(mpsc::Sender<()>, std::thread::JoinHandle<Held>)>,
+}
+
+/// Whose the lock directory is, as far as its holder knows.
+#[derive(Debug)]
+enum Held {
+    /// Ours, as it was when we made or last refreshed it.
+    Ours(Option<watch::Stamp>),
+    /// Someone took it over (ours was held past the stale age); it is theirs to refresh and remove.
+    Lost,
 }
 
 impl Lock {
-    fn acquire(dir: &Path, wait: Duration) -> Result<Self, StoreError> {
-        Self::acquire_with(dir, wait, cfg!(windows), |dir| std::fs::create_dir(dir))
+    fn acquire(at: &LockAt) -> Result<Self, StoreError> {
+        Self::acquire_with(at, cfg!(windows), |dir| std::fs::create_dir(dir), || {})
     }
 
     /// [`acquire`](Self::acquire), with `create` making the directory. `denied_passes`: a refusal to create it may
-    /// be over in a moment (Windows).
+    /// be over in a moment (Windows). `judged_stale` runs when a lock is found stale, before it is taken over.
     fn acquire_with(
-        dir: &Path,
-        wait: Duration,
+        at: &LockAt,
         denied_passes: bool,
         mut create: impl FnMut(&Path) -> io::Result<()>,
+        mut judged_stale: impl FnMut(),
     ) -> Result<Self, StoreError> {
+        let dir = at.dir;
         let started = Instant::now();
         let mut attempt = 0;
         loop {
             let refused = match create(dir) {
-                Ok(()) => {
-                    return Ok(Self {
-                        dir: dir.to_owned(),
-                        made: watch::stamp(dir),
-                    });
-                }
+                Ok(()) => return Ok(Self::held(dir, at.stale / 2)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     // Whoever held it is gone. `remove_dir` only removes an empty directory; anything else at that
                     // path (a file, a folder with contents) is not a lock we can take over, so it is waited out
                     // like a held one rather than retried at once forever.
-                    if is_stale(dir) && std::fs::remove_dir(dir).is_ok() {
-                        continue;
+                    if is_older(dir, at.stale) {
+                        judged_stale();
+                        if take_over(at)? {
+                            continue;
+                        }
                     }
                     None
                 }
@@ -891,31 +930,125 @@ impl Lock {
                 Err(e) if denied_passes && e.kind() == io::ErrorKind::PermissionDenied => Some(e),
                 Err(e) => return Err(e.into()),
             };
-            if started.elapsed() >= wait {
+            if started.elapsed() >= at.wait {
                 return Err(refused.map_or(StoreError::Locked, StoreError::from));
             }
             let pause = Duration::from_millis(BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)]);
             attempt += 1;
-            std::thread::sleep(pause.min(wait.saturating_sub(started.elapsed())));
+            std::thread::sleep(pause.min(at.wait.saturating_sub(started.elapsed())));
+        }
+    }
+
+    /// The lock we just made, refreshed every `every` from now on.
+    fn held(dir: &Path, every: Duration) -> Self {
+        let made = watch::stamp(dir);
+        let (stop, stopped) = mpsc::channel();
+        let (owned, mut held) = (dir.to_owned(), Held::Ours(made.clone()));
+        let refresher = std::thread::Builder::new()
+            .name("klefki-lock".to_owned())
+            // It only waits and sets a time: a small stack is plenty.
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                    held = refresh(&owned, held);
+                }
+                held
+            })
+            .ok()
+            .map(|thread| (stop, thread));
+        Self {
+            dir: dir.to_owned(),
+            made,
+            refresher,
         }
     }
 }
 
+/// One refresh of a held lock: its time is set to now, unless it is no longer the directory we left.
+fn refresh(dir: &Path, held: Held) -> Held {
+    match held {
+        Held::Ours(last) if last.is_none() || watch::stamp(dir) == last => {
+            if touch(dir).is_ok() {
+                Held::Ours(watch::stamp(dir))
+            } else {
+                Held::Ours(last)
+            }
+        }
+        _ => Held::Lost,
+    }
+}
+
+/// Sets a directory's modification time to now.
+#[cfg(not(windows))]
+fn touch(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.set_modified(SystemTime::now())
+}
+
+/// Sets a directory's modification time to now. Windows opens a directory only with backup semantics, and setting
+/// its time needs no more than the right to write its attributes.
+#[cfg(windows)]
+fn touch(dir: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+    };
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .set_modified(SystemTime::now())
+}
+
 impl Drop for Lock {
     fn drop(&mut self) {
+        let held = match self.refresher.take() {
+            Some((stop, thread)) => {
+                drop(stop);
+                thread.join().unwrap_or(Held::Lost)
+            }
+            None => Held::Ours(self.made.clone()),
+        };
         // Not looked at when made: removed as before.
-        if self.made.is_none() || watch::stamp(&self.dir) == self.made {
+        if let Held::Ours(last) = held
+            && (last.is_none() || watch::stamp(&self.dir) == last)
+        {
             let _ = std::fs::remove_dir(&self.dir);
         }
     }
 }
 
-fn is_stale(dir: &Path) -> bool {
-    std::fs::metadata(dir)
+/// Removes a lock found stale, under Klefki's takeover marker: another Klefki that found it stale at the same moment
+/// sees the marker and waits, and then finds the lock we make fresh. Under the marker the lock is looked at again,
+/// so one that was taken over meanwhile is left alone. Says whether it was removed.
+///
+/// A marker older than the stale age was left by a Klefki that ended in the middle (a takeover lasts microseconds):
+/// it is removed, and the next try goes ahead.
+fn take_over(at: &LockAt) -> Result<bool, StoreError> {
+    if let Some(folder) = at.takeover.parent() {
+        create_private_dir(folder)?;
+    }
+    match create_private_file(at.takeover) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if is_older(at.takeover, at.stale) {
+                let _ = std::fs::remove_file(at.takeover);
+            }
+            return Ok(false);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let removed = is_older(at.dir, at.stale) && std::fs::remove_dir(at.dir).is_ok();
+    let _ = std::fs::remove_file(at.takeover);
+    Ok(removed)
+}
+
+/// Whether `path` was last modified more than `age` ago.
+fn is_older(path: &Path, age: Duration) -> bool {
+    std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age > LOCK_STALE)
+        .is_some_and(|elapsed| elapsed > age)
 }
 
 /// Replacements in a file's text: each range (in file order, not overlapping) becomes the string.
@@ -2936,35 +3069,57 @@ mod tests {
         // contender checking its age, Claude Code, a virus scanner), and the lock took that refusal as final.
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".claude.json.lock");
+        let takeover = dir.path().join("takeover");
+        let at = |wait| LockAt {
+            dir: &lock,
+            takeover: &takeover,
+            wait,
+            stale: LOCK_STALE,
+        };
         let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
         let mut calls = 0;
-        let taken = Lock::acquire_with(&lock, Duration::from_secs(5), true, |d| {
-            calls += 1;
-            if calls < 3 {
-                Err(denied())
-            } else {
-                std::fs::create_dir(d)
-            }
-        });
+        let taken = Lock::acquire_with(
+            &at(Duration::from_secs(5)),
+            true,
+            |d| {
+                calls += 1;
+                if calls < 3 {
+                    Err(denied())
+                } else {
+                    std::fs::create_dir(d)
+                }
+            },
+            || {},
+        );
         assert!(taken.is_ok(), "{:?}", taken.err());
         assert_eq!(calls, 3);
         drop(taken);
         assert!(!lock.exists(), "released");
         // A refusal that lasts is returned as it is, not as "locked", once the wait is over.
         let mut calls = 0;
-        let err = Lock::acquire_with(&lock, Duration::from_millis(200), true, |_| {
-            calls += 1;
-            Err(denied())
-        })
+        let err = Lock::acquire_with(
+            &at(Duration::from_millis(200)),
+            true,
+            |_| {
+                calls += 1;
+                Err(denied())
+            },
+            || {},
+        )
         .err();
         assert!(matches!(err, Some(StoreError::Io(_))), "{err:?}");
         assert!(calls > 1, "{calls}");
         // Where a refusal is final (not Windows), it is returned at once.
         let mut calls = 0;
-        let err = Lock::acquire_with(&lock, Duration::from_secs(5), false, |_| {
-            calls += 1;
-            Err(denied())
-        })
+        let err = Lock::acquire_with(
+            &at(Duration::from_secs(5)),
+            false,
+            |_| {
+                calls += 1;
+                Err(denied())
+            },
+            || {},
+        )
         .err();
         assert!(matches!(err, Some(StoreError::Io(_))), "{err:?}");
         assert_eq!(calls, 1);
@@ -3284,7 +3439,7 @@ mod tests {
     fn a_lock_someone_else_took_over_is_left_to_them() {
         // Ours was taken over as stale (held too long) and replaced by theirs: releasing ours must not remove it.
         let f = Fixture::new(&pretty(&sample()));
-        let lock = Lock::acquire(&f.lock(), Duration::ZERO).unwrap();
+        let lock = f.store.lock().unwrap();
         std::fs::remove_dir(f.lock()).unwrap();
         let theirs = f.dir.path().join("theirs");
         std::fs::create_dir(&theirs).unwrap();
@@ -3295,7 +3450,129 @@ mod tests {
         assert!(f.lock().is_dir(), "their lock is still there");
         // Our own is released as before.
         std::fs::remove_dir(f.lock()).unwrap();
-        drop(Lock::acquire(&f.lock(), Duration::ZERO).unwrap());
+        drop(f.store.lock().unwrap());
+        assert!(!f.lock().exists());
+    }
+
+    /// A lock folder and a takeover marker in a fresh folder, with the given rules.
+    struct LockFixture {
+        dir: tempfile::TempDir,
+        stale: Duration,
+    }
+
+    impl LockFixture {
+        fn new(stale: Duration) -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                stale,
+            }
+        }
+
+        fn lock(&self) -> PathBuf {
+            self.dir.path().join(".claude.json.lock")
+        }
+
+        fn takeover(&self) -> PathBuf {
+            self.dir.path().join("backups").join("claude.json.takeover")
+        }
+
+        fn acquire(&self, wait: Duration) -> Result<Lock, StoreError> {
+            self.acquire_judging(wait, || {})
+        }
+
+        fn acquire_judging(
+            &self,
+            wait: Duration,
+            judged_stale: impl FnMut(),
+        ) -> Result<Lock, StoreError> {
+            let (lock, takeover) = (self.lock(), self.takeover());
+            let at = LockAt {
+                dir: &lock,
+                takeover: &takeover,
+                wait,
+                stale: self.stale,
+            };
+            Lock::acquire_with(&at, cfg!(windows), |d| std::fs::create_dir(d), judged_stale)
+        }
+    }
+
+    fn set_age(path: &Path, age: Duration) {
+        let then = SystemTime::now() - age;
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(then)).unwrap();
+    }
+
+    #[test]
+    fn a_lock_held_longer_than_the_stale_age_is_refreshed_and_not_taken_over() {
+        // Claude's rule: a lock not refreshed for 10 s is stale. A write held up longer (a large file, Windows
+        // refusing the rename for a while, a slow disk) must keep it fresh, or Claude takes it over and writes.
+        let f = LockFixture::new(Duration::from_secs(1));
+        let ours = f.acquire(Duration::ZERO).unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            matches!(f.acquire(Duration::ZERO), Err(StoreError::Locked)),
+            "a lock held for 2.5 s with a stale age of 1 s was taken over"
+        );
+        assert!(f.lock().is_dir());
+        drop(ours);
+        assert!(!f.lock().exists(), "released");
+    }
+
+    #[test]
+    fn a_lock_taken_over_while_held_is_neither_refreshed_nor_removed() {
+        let f = LockFixture::new(Duration::from_millis(400));
+        let ours = f.acquire(Duration::ZERO).unwrap();
+        // Someone found ours stale and put theirs in its place; theirs is old by now as well.
+        std::fs::remove_dir(f.lock()).unwrap();
+        let theirs = f.dir.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::rename(&theirs, f.lock()).unwrap();
+        set_age(&f.lock(), Duration::from_secs(60));
+        let before = std::fs::metadata(f.lock()).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        let after = std::fs::metadata(f.lock()).unwrap().modified().unwrap();
+        assert_eq!(after, before, "their lock was refreshed as if it were ours");
+        drop(ours);
+        assert!(f.lock().is_dir(), "their lock was removed");
+    }
+
+    #[test]
+    fn two_waiters_cannot_both_take_over_one_stale_lock() {
+        // Both find the lock stale. The first removes it and makes its own; the second must not then remove that.
+        let f = LockFixture::new(LOCK_STALE);
+        std::fs::create_dir(f.lock()).unwrap();
+        set_age(&f.lock(), Duration::from_secs(60));
+        let mut first = None;
+        let second = f.acquire_judging(Duration::ZERO, || {
+            if first.is_none() {
+                first = Some(f.acquire(Duration::ZERO).expect("the first takes it over"));
+            }
+        });
+        assert!(first.is_some(), "the lock was not judged stale");
+        assert!(
+            matches!(second, Err(StoreError::Locked)),
+            "both waiters hold the lock"
+        );
+        assert!(f.lock().is_dir(), "the first one's lock is gone");
+        drop(first);
+        assert!(!f.lock().exists());
+        assert!(!f.takeover().exists(), "the takeover marker is left behind");
+    }
+
+    #[test]
+    fn a_takeover_marker_left_by_a_klefki_that_ended_is_cleared_once_stale() {
+        let f = LockFixture::new(Duration::from_secs(5));
+        std::fs::create_dir(f.lock()).unwrap();
+        set_age(&f.lock(), Duration::from_secs(60));
+        std::fs::create_dir_all(f.takeover().parent().unwrap()).unwrap();
+        std::fs::write(f.takeover(), "").unwrap();
+        // Fresh: another Klefki is taking over right now, so this one waits.
+        assert!(matches!(f.acquire(Duration::ZERO), Err(StoreError::Locked)));
+        assert!(f.lock().is_dir());
+        // Old: whoever made it ended in the middle. It is cleared and the stale lock taken over.
+        set_age(&f.takeover(), Duration::from_secs(60));
+        let ours = f.acquire(Duration::from_secs(2)).unwrap();
+        assert!(!f.takeover().exists());
+        drop(ours);
         assert!(!f.lock().exists());
     }
 
