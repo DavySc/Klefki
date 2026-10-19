@@ -177,7 +177,9 @@ fn exists(path: &Path) -> bool {
 fn server(name: &str, entry: &Value) -> DesktopServer {
     let (mut transport, mut target) = inventory::classify(entry);
     let url = entry.get("url").and_then(Value::as_str);
-    let remote = url.is_some()
+    let command = entry.get("command").and_then(Value::as_str).is_some();
+    // An entry with a command is started, whatever else it has.
+    let remote = (url.is_some() && !command)
         || matches!(
             transport,
             TransportKind::Http | TransportKind::Sse | TransportKind::Ws
@@ -346,7 +348,8 @@ mod tests {
                 "sse": {"type": "sse", "url": "https://b.example/sse"},
                 "bare": {"url": "https://c.example/mcp?key=secret"},
                 "bad": {"url": "not a url"},
-                "local": {"command": "node", "args": ["s.js"]}
+                "local": {"command": "node", "args": ["s.js"]},
+                "both": {"command": "node", "url": "https://d.example/mcp"}
             }}"#,
         );
         let d = load(&r.roots());
@@ -364,6 +367,9 @@ mod tests {
         assert_eq!(by("bare").target, "https://c.example/mcp?…");
         assert_eq!(by("bad").transport, TransportKind::Invalid);
         assert_eq!(by("local").not_used, None);
+        // Review round 2: a command is started even when a URL is there too.
+        assert_eq!(by("both").not_used, None);
+        assert_eq!(by("both").transport, TransportKind::Stdio);
     }
 
     #[test]
