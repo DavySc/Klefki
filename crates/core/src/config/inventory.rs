@@ -133,8 +133,11 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         .filter_map(|(key, project)| legacy_disabled(key, project, &disabled_by_project[key]))
         .collect();
 
+    // User rows by name as the file spells it, to mark the projects where a closer scope hides them.
+    let mut user_rows: HashMap<&str, usize> = HashMap::new();
     if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
         for (name, entry) in servers {
+            user_rows.insert(name, snap.servers.len());
             let (status, cached) = hints.status_of(name);
             let mut r = row(name, entry, Scope::User, None, true, status);
             r.status_cached = cached;
@@ -160,14 +163,18 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     for (key, project) in &projects {
         let disabled = &disabled_by_project[key];
         let mut seen_local = BTreeSet::new();
-        // This project's local rows are the ones pushed from here on in this iteration.
-        let local_start = snap.servers.len();
+        // The user rows that a local or approved project server of this project replaces. A name that is off here
+        // hides nothing: the toggle goes by name, so nothing of that name runs here at all.
+        let mut hidden = BTreeSet::new();
         for (value, key) in project.values.iter().zip(&project.keys) {
             let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
                 continue;
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
+                    if !disabled.contains(name) {
+                        hidden.extend(user_rows.get(name.as_str()));
+                    }
                     let mut r = row(
                         name,
                         entry,
@@ -194,6 +201,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                 "Skipped the .mcp.json of {}: not a local absolute path.",
                 sanitize(&project.display)
             ));
+            mark_hidden(&mut snap, &hidden, project);
             continue;
         }
         let mcp_json = Path::new(&project.raw).join(".mcp.json");
@@ -233,11 +241,12 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                             definition: fingerprint(&entry),
                         },
                     );
-                    // Claude Code compares names as the file spells them, not as shown.
-                    r.shadowed = snap.servers[local_start..].iter().any(|o| {
-                        o.scope == Scope::Local
-                            && keys.get(&o.connection).is_some_and(|k| k.name == name)
-                    });
+                    // Claude Code compares names as the file spells them, not as shown, and loads a project
+                    // server only once it is approved.
+                    r.shadowed = seen_local.contains(&name);
+                    if approval == Approval::Approved && !disabled.contains(&name) {
+                        hidden.extend(user_rows.get(name.as_str()));
+                    }
                     snap.servers.push(r);
                 }
             }
@@ -245,10 +254,27 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                 .warnings
                 .push(format!("Ignored {}: {e}", display_path(&mcp_json))),
         }
+        mark_hidden(&mut snap, &hidden, project);
+    }
+    // Like the toggle: one row for every project, so hidden only when hidden in all of them.
+    for &i in user_rows.values() {
+        let r = &mut snap.servers[i];
+        r.shadowed = snap.project_count > 0 && r.shadowed_in.len() == snap.project_count;
     }
 
     mark_casing_collisions(&mut snap.servers);
     snap
+}
+
+/// Names `project` on the user rows at `hidden`: there, a server of the same name is loaded instead.
+fn mark_hidden(snap: &mut Snapshot, hidden: &BTreeSet<usize>, project: &Project<'_>) {
+    if hidden.is_empty() {
+        return;
+    }
+    let shown = clip(&sanitize(&project.display));
+    for &i in hidden {
+        snap.servers[i].shadowed_in.push(shown.clone());
+    }
 }
 
 /// The old toggle list of a project, from every spelling of it, when any has one.
@@ -319,6 +345,7 @@ fn row(
         disabled_in: 0,
         approval: None,
         shadowed: false,
+        shadowed_in: Vec::new(),
         casing_collision: false,
         status_cached: false,
         oauth: oauth_info(entry),
@@ -1388,6 +1415,120 @@ mod tests {
     }
 
     #[test]
+    fn a_user_server_is_shadowed_where_a_local_or_approved_project_server_has_its_name() {
+        // Claude Code loads user < approved project < local; a project server waiting for approval or rejected
+        // is not loaded, so it hides nothing. Names compare as the file spells them.
+        let e = Env::new();
+        let (a, b, c) = (e.project("a"), e.project("b"), e.project("c"));
+        std::fs::write(
+            b.join(".mcp.json"),
+            r#"{"mcpServers":{"gh":{"command":"node"},"docs":{"command":"node"},"solo":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {
+                    "gh": {"command": "gh"}, "docs": {"command": "d"},
+                    "solo": {"command": "s"}, "free": {"command": "f"}
+                },
+                "projects": {
+                    a.to_string_lossy(): {"mcpServers": {"gh": {"command": "mine"}}},
+                    b.to_string_lossy(): {
+                        "mcpServers": {"gh": {"command": "mine too"}},
+                        "enabledMcpjsonServers": ["gh"], "disabledMcpjsonServers": ["solo"]
+                    },
+                    c.to_string_lossy(): {"mcpServers": {"GH": {"command": "other case"}}}
+                }
+            }),
+        );
+        let s = e.load();
+        // The projects as their rows show them, in the inventory's order: a, then b.
+        let shown: Vec<String> = s
+            .servers
+            .iter()
+            .filter(|r| r.scope == Scope::Local && r.name == "gh")
+            .filter_map(|r| r.project.clone())
+            .collect();
+        let gh = find(&s, Scope::User, "gh");
+        // In b both a local and an approved project server hide it: one project, listed once.
+        assert_eq!(gh.shadowed_in, shown);
+        assert_eq!(shown.len(), 2);
+        assert!(!gh.shadowed, "still used in c, so not hidden everywhere");
+        for name in ["docs", "solo", "free"] {
+            let r = find(&s, Scope::User, name);
+            assert!(
+                r.shadowed_in.is_empty() && !r.shadowed,
+                "{name}: {:?}",
+                r.shadowed_in
+            );
+        }
+        // Rows of the other scopes keep their own meaning and list nothing.
+        assert!(
+            s.servers
+                .iter()
+                .filter(|r| r.scope != Scope::User)
+                .all(|r| r.shadowed_in.is_empty())
+        );
+    }
+
+    #[test]
+    fn a_project_where_the_name_is_off_hides_nothing() {
+        // The toggle goes by name: where `gh` is off, neither the user server nor the closer one runs, so nothing
+        // is used instead of the user server there (cross-review of #21).
+        let e = Env::new();
+        let (a, b, c) = (e.project("a"), e.project("b"), e.project("c"));
+        std::fs::write(
+            b.join(".mcp.json"),
+            r#"{"mcpServers":{"gh":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"gh": {"command": "gh"}},
+                "projects": {
+                    a.to_string_lossy(): {"mcpServers": {"gh": {"command": "mine"}}, "disabledMcpServers": ["gh"]},
+                    b.to_string_lossy(): {"enableAllProjectMcpServers": true, "disabledMcpServers": ["gh"]},
+                    c.to_string_lossy(): {}
+                }
+            }),
+        );
+        let s = e.load();
+        let gh = find(&s, Scope::User, "gh");
+        assert_eq!(gh.disabled_in, 2);
+        assert!(gh.shadowed_in.is_empty(), "{:?}", gh.shadowed_in);
+        assert!(!gh.shadowed);
+    }
+
+    #[test]
+    fn a_user_server_hidden_in_every_known_project_is_shadowed() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        std::fs::write(
+            b.join(".mcp.json"),
+            r#"{"mcpServers":{"gh":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"gh": {"command": "gh"}},
+                "projects": {
+                    a.to_string_lossy(): {"mcpServers": {"gh": {"command": "mine"}}},
+                    b.to_string_lossy(): {"enableAllProjectMcpServers": true}
+                }
+            }),
+        );
+        let s = e.load();
+        let gh = find(&s, Scope::User, "gh");
+        assert!(gh.shadowed);
+        assert_eq!(gh.shadowed_in.len(), 2);
+        // A project server is still hidden only by a local one, never by the user server it hides.
+        assert!(!find(&s, Scope::Project, "gh").shadowed);
+    }
+
+    #[test]
     fn duplicate_keys_in_mcp_json_are_reported_and_last_wins() {
         let e = Env::new();
         let p = e.project("dup");
@@ -1579,6 +1720,22 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("not a local absolute path"))
         );
+    }
+
+    #[test]
+    fn a_local_server_in_a_project_whose_mcp_json_is_skipped_still_shadows() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"x": {"command": "u"}},
+                "projects": {"\\\\evil\\share\\proj": {"mcpServers": {"x": {"command": "c"}}}}
+            }),
+        );
+        let s = e.load();
+        let x = find(&s, Scope::User, "x");
+        assert_eq!(x.shadowed_in.len(), 1);
+        assert!(x.shadowed, "the only known project");
     }
 
     #[test]

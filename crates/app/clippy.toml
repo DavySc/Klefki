@@ -15,4 +15,5 @@ disallowed-methods = [
   { path = "std::process::Command::new", reason = "UI spawns no processes; use klefki_core::api" },
   { path = "std::net::TcpStream::connect", reason = "UI does no network IO; use klefki_core::api" },
   { path = "std::net::UdpSocket::bind", reason = "UI does no network IO; use klefki_core::api" },
+  { path = "std::net::TcpListener::bind", reason = "UI does no network IO; use klefki_core::api" },
 ]

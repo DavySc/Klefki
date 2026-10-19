@@ -179,7 +179,13 @@ pub struct ServerRow {
     pub disabled_in: usize,
     /// Project (`.mcp.json`) servers only.
     pub approval: Option<Approval>,
+    /// Another server of the same name is loaded in its place. For a project server: a local one in its project.
+    /// For a user server, which is one row for every project: `true` only when it is hidden in every known
+    /// project (see `shadowed_in`).
     pub shadowed: bool,
+    /// User servers only: the projects (as shown) where a local or approved project server of the same name is
+    /// loaded instead, in the inventory's order. Empty for other rows.
+    pub shadowed_in: Vec<String>,
     pub casing_collision: bool,
     /// `status` is what Claude's own cache last said, which can be old, not an answer klefki got itself. Such rows
     /// are checked again in the background; until then the app shows the status as last known.
@@ -374,6 +380,7 @@ mod tests {
             assert!(s.servers.iter().any(|r| r.transport == t), "{t:?}");
         }
         assert!(s.servers.iter().any(|r| r.shadowed));
+        assert!(s.servers.iter().any(|r| !r.shadowed_in.is_empty()));
         assert!(s.servers.iter().any(|r| !r.enabled));
         assert!(s.cli_version.is_some());
     }

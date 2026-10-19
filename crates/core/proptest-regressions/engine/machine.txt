@@ -22,3 +22,4 @@ cc 19dc2de06bef7ec587cd5a85cc1e6632332e463262634257edcf00f7fb9ca9c6 # shrinks to
 cc f857ab3d242d6d4ed2dc7fbc58dd9bf0676912dab34df17970f88fb86b501bd0 # an earlier rename's check failed on a later copy under the old name: "b_r already exists there"
 cc 522e43e24c416f205b71201991ea4b954f1619f8ad452bf16c29ba5915eb0686 # the same on macOS CI: "q_r_r already exists there"
 cc 2bc4448e1134a1d07165aaa68f6c7ffca0364f5915589edde2e12d46ff5a7de9 # Copy p to pa; Move it to pb with [Works, TimesOutBefore, TimesOutBefore], kept; Copy user a to pa with [FailsAfter], SetFails: the kept secret went
+cc e896270edf198b97371c76c63658056af4ee2b0e9680a153608557dfb03f27c2
