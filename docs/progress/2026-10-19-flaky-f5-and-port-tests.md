@@ -9,7 +9,7 @@ Goal: find and fix the cause of the engine tests that still failed now and then:
 
 ## Done
 - F5 test: waits for both servers to answer before counting.
-- New variant `f5_checks_one_at_a_time_still_check_every_one`: the same scenario with `max_checks: 1`, so F5's checks run one after another.
+- New variant `f5_checks_one_at_a_time_still_check_every_one`: the same scenario with `max_checks: 1`. It checks that F5 still checks every server when its checks run one after another. It does not reproduce the race: the cross-review found it also passes with the old wait. The failing evidence is the stress run.
 - No product code changed.
 
 ## Checks
@@ -20,9 +20,12 @@ Goal: find and fix the cause of the engine tests that still failed now and then:
   - The callback port tests did not fail in any of these 520 runs.
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`: exit 0 (app 314, core 655, cli 18 + 25; deny ok).
 
+- Cross-review (#26 author): no objection; the variant's comment was corrected as asked. Main f306c48 merged in (be5627c, 379a3e8, merge 88f4669); the full check line re-run gives exit 0 (app 315, core 657, cli 18 + 25; deny ok).
+- CI on be5627c: green on Linux, macOS and Windows.
+
 ## Open
 - macOS and Windows: covered only by CI.
 - #29 needs the one-hunk fix above before it can be green on Windows.
 
 ## Next
-- Get the pull request cross-reviewed and merged.
+- Merge once CI is green on the merge commit.
