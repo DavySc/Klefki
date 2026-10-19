@@ -6646,7 +6646,24 @@ mod tests {
             "{warning:?}"
         );
         drop(held);
-        assert_eq!(answer(&core), (port, None));
+        assert_eq!(
+            once_let_go(|| answer(&core), |(_, warning)| warning.is_none()),
+            (port, None)
+        );
+    }
+
+    /// What `ask` answers about a port once the test let it go. Until then another holder can have the same number
+    /// for a moment: a child process another test starts keeps a copy of the listener until it runs its program, and
+    /// a listener on 127.0.0.1 leaves `::1` free for another test to take. So it asks again, up to `WAIT`.
+    fn once_let_go<T>(mut ask: impl FnMut() -> T, free: impl Fn(&T) -> bool) -> T {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let answer = ask();
+            if free(&answer) || Instant::now() >= deadline {
+                return answer;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -6684,7 +6701,10 @@ mod tests {
         // A port let go is not warned about, and neither is a server that leaves the port to Claude Code.
         drop(held);
         assert_eq!(
-            said(&plan_for(&core, vec![add(with_port)])),
+            once_let_go(
+                || said(&plan_for(&core, vec![add(with_port.clone())])),
+                Vec::is_empty
+            ),
             Vec::<String>::new()
         );
         let plan = plan_for(
