@@ -198,15 +198,20 @@ struct Outcome {
 /// How long a success message stays.
 const SUCCESS_SECONDS: f64 = 4.0;
 
-/// The outcome message: its text's widest, its narrowest beside the detail panel, the room its frame takes around
-/// the text, and its distance from the window's edges.
+/// The outcome message: its text's widest, its narrowest beside the detail panel, and its distance from the
+/// window's edges.
 const TOAST_WIDTH: f32 = 420.0;
 const TOAST_NARROWEST: f32 = 280.0;
-const TOAST_FRAME: f32 = 26.0;
 const TOAST_MARGIN: f32 = 16.0;
 
-/// The navigation column's width.
-const NAV_WIDTH: f32 = 220.0;
+/// What was chosen on the outcome message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OutcomeChoice {
+    SignIn,
+    Undo,
+    OpenLog,
+    Dismiss,
+}
 
 /// The size Klefki opens at.
 pub const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
@@ -255,9 +260,15 @@ pub struct ShellApp {
     save_bar_wanted: bool,
     /// How tall the save bar was last frame (none: 0), so the scroll area above it leaves that much room.
     save_bar_height: f32,
-    /// Where the save bar was drawn in this frame, and the detail panel's left edge: the outcome message keeps
-    /// clear of it.
-    save_bar_at: Option<(egui::Rect, f32)>,
+    /// The save bar was drawn in this frame: the outcome message keeps clear of it.
+    save_bar_shown: bool,
+    /// The room between the navigation and the detail panel, as last laid out: the outcome message goes there,
+    /// over the list, when it fits.
+    list_room: Option<egui::Rect>,
+    /// The outcome message was drawn in this frame as a strip above the save bar, where there is no room beside
+    /// the detail panel, and what was chosen on it.
+    outcome_inline: bool,
+    outcome_chosen: Option<OutcomeChoice>,
     cli_version: Option<String>,
     cli_problem: Option<String>,
     /// A change the engine has prepared and the user has not yet confirmed.
@@ -340,7 +351,10 @@ impl ShellApp {
             reveal_diagnosis: None,
             save_bar_wanted: false,
             save_bar_height: 0.0,
-            save_bar_at: None,
+            save_bar_shown: false,
+            list_room: None,
+            outcome_inline: false,
+            outcome_chosen: None,
             cli_version: None,
             cli_problem: None,
             plan: None,
@@ -911,13 +925,14 @@ impl ShellApp {
             }
         }
         let pal = theme::palette(ui.ctx());
-        self.save_bar_at = None;
+        self.save_bar_shown = false;
+        self.outcome_inline = false;
         egui::Panel::top("top_bar")
             .frame(bar_frame(pal))
             .show(ui, |ui| self.top_bar(ui));
-        egui::Panel::left("nav")
+        let nav = egui::Panel::left("nav")
             .resizable(false)
-            .exact_size(NAV_WIDTH)
+            .exact_size(220.0)
             .frame(
                 Frame::new()
                     .fill(pal.chrome)
@@ -938,8 +953,20 @@ impl ShellApp {
                     ..Margin::same(12)
                 }))
                 .show(ui, |ui| self.detail(ui));
-            if let Some((_, left)) = &mut self.save_bar_at {
-                *left = panel.response.rect.left();
+            let (nav, panel) = (nav.response.rect, panel.response.rect);
+            self.list_room = Some(egui::Rect::from_x_y_ranges(
+                nav.right()..=panel.left(),
+                panel.y_range(),
+            ));
+            // The panel was laid out with the message in it, or without, by the room last frame; the room it
+            // leaves now decides.
+            if self.save_bar_shown
+                && self.outcome.is_some()
+                && self.outcome_inline == self.outcome_fits_beside(ui.ctx())
+            {
+                ui.ctx().request_discard(
+                    "the outcome message moved beside the detail panel or into it",
+                );
             }
         }
         self.plan_dialog(&ctx);
@@ -2834,98 +2861,155 @@ impl ShellApp {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
         }
         let outcome = outcome.clone();
-        let (color, glyph) = if outcome.ok && outcome.warn {
-            (pal.warn, icon::WARNING)
-        } else if outcome.ok {
-            (pal.success, icon::CHECK_CIRCLE)
-        } else {
-            (pal.danger, icon::WARNING_CIRCLE)
-        };
-        let mut dismiss = false;
-        let mut sign_in = false;
-        let mut undo = false;
-        let mut log = false;
-        // In the window's bottom-right corner, but never over the save bar, whose buttons may be wanted while it
-        // shows: beside the detail panel, over the list, where there is room; otherwise just above the bar.
-        let screen = ctx.content_rect();
-        let mut offset = egui::vec2(-TOAST_MARGIN, -TOAST_MARGIN);
-        let mut width = TOAST_WIDTH;
-        if let Some((bar, panel_left)) = self.save_bar_at {
-            let beside = panel_left - NAV_WIDTH - 2.0 * TOAST_MARGIN - TOAST_FRAME;
-            if beside >= TOAST_NARROWEST {
-                offset.x = panel_left - screen.right() - TOAST_MARGIN;
-                width = beside.min(TOAST_WIDTH);
-            } else {
-                offset.y = bar.top() - screen.bottom() - TOAST_MARGIN / 2.0;
+        let (color, glyph) = outcome_look(pal, &outcome);
+        let mut chosen = self.outcome_chosen.take();
+        if !self.outcome_inline {
+            // In the window's bottom-right corner, but never over the save bar, whose buttons may be wanted while
+            // it shows: beside the detail panel, over the list, where there is room (otherwise the detail panel
+            // has it, above the bar).
+            let screen = ctx.content_rect();
+            let mut offset = egui::vec2(-TOAST_MARGIN, -TOAST_MARGIN);
+            let mut width = TOAST_WIDTH;
+            if self.save_bar_shown
+                && let Some(room) = self.list_room
+            {
+                offset.x = room.right() - screen.right() - TOAST_MARGIN;
+                width = self.outcome_width_beside(ctx).min(TOAST_WIDTH);
             }
-        }
-        egui::Area::new(egui::Id::new("outcome"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, offset)
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                Frame::new()
-                    .fill(pal.panel_raised)
-                    .stroke(egui::Stroke::new(1.0, color))
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(12))
-                    .shadow(egui::Shadow {
-                        offset: [0, 4],
-                        blur: 16,
-                        spread: 0,
-                        color: Color32::from_black_alpha(80),
-                    })
-                    .show(ui, |ui| {
-                        ui.set_max_width(width);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(glyph).size(16.0).color(color));
-                            ui.add(
-                                egui::Label::new(RichText::new(&outcome.text).color(pal.text))
-                                    .wrap(),
-                            );
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                            if ui.small_button("Dismiss").clicked() {
-                                dismiss = true;
-                            }
-                            // The backup's place stays on the Activity log after this card is gone.
-                            if outcome.logged
-                                && self.page != Page::ActivityLog
-                                && ui.small_button("Open activity log").clicked()
+            egui::Area::new(egui::Id::new("outcome"))
+                .anchor(egui::Align2::RIGHT_BOTTOM, offset)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    outcome_frame(pal, color)
+                        .shadow(egui::Shadow {
+                            offset: [0, 4],
+                            blur: 16,
+                            spread: 0,
+                            color: Color32::from_black_alpha(80),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_max_width(width);
+                            if let Some(choice) =
+                                self.outcome_card(ui, &outcome, glyph, color, false)
                             {
-                                log = true;
-                            }
-                            if outcome.undo.is_some() {
-                                undo = ui
-                                    .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
-                                    .on_hover_text("Move it back, after a review")
-                                    .clicked();
-                            }
-                            if outcome.sign_in.is_some() && self.sign_in.is_none() {
-                                let button = egui::Button::new(
-                                    RichText::new("Sign in").strong().color(pal.on_bright),
-                                )
-                                .fill(pal.primary);
-                                sign_in = ui.add(button).clicked();
+                                chosen = Some(choice);
                             }
                         });
-                    });
-            });
-        if sign_in
-            && let Some(row) = outcome
-                .sign_in
-                .and_then(|id| self.snapshot.servers.iter().find(|r| r.is(&id)).cloned())
-        {
-            self.outcome = None;
-            self.start_sign_in(&row);
-        } else if undo && let Some(change) = outcome.undo {
-            self.outcome = None;
-            self.prepare(vec![change]);
-        } else if log {
-            self.outcome = None;
-            self.go(Page::ActivityLog);
-        } else if dismiss {
-            self.outcome = None;
+                });
         }
+        match chosen {
+            Some(OutcomeChoice::SignIn) => {
+                if let Some(row) = outcome
+                    .sign_in
+                    .and_then(|id| self.snapshot.servers.iter().find(|r| r.is(&id)).cloned())
+                {
+                    self.outcome = None;
+                    self.start_sign_in(&row);
+                }
+            }
+            Some(OutcomeChoice::Undo) => {
+                if let Some(change) = outcome.undo {
+                    self.outcome = None;
+                    self.prepare(vec![change]);
+                }
+            }
+            Some(OutcomeChoice::OpenLog) => {
+                self.outcome = None;
+                self.go(Page::ActivityLog);
+            }
+            Some(OutcomeChoice::Dismiss) => self.outcome = None,
+            None => {}
+        }
+    }
+
+    /// How wide the outcome message's text can be beside the detail panel, over the list.
+    fn outcome_width_beside(&self, ctx: &egui::Context) -> f32 {
+        let frame = outcome_frame(theme::palette(ctx), Color32::TRANSPARENT);
+        self.list_room.map_or(0.0, |room| {
+            room.width() - 2.0 * TOAST_MARGIN - frame.total_margin().sum().x
+        })
+    }
+
+    /// The outcome message fits beside the detail panel, so its save bar stays clear.
+    fn outcome_fits_beside(&self, ctx: &egui::Context) -> bool {
+        self.outcome_width_beside(ctx) >= TOAST_NARROWEST
+    }
+
+    /// The outcome message as a strip above the save bar, when it does not fit beside the detail panel: in the
+    /// layout, so it covers nothing and the form above still scrolls.
+    fn outcome_strip(&mut self, ui: &mut Ui) {
+        let Some(outcome) = self.outcome.clone() else {
+            return;
+        };
+        let pal = theme::palette(ui.ctx());
+        let (color, glyph) = outcome_look(pal, &outcome);
+        outcome_frame(pal, color).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            self.outcome_chosen = self.outcome_card(ui, &outcome, glyph, color, true);
+        });
+        self.outcome_inline = true;
+    }
+
+    /// The outcome message's text and buttons, and which of them was used.
+    /// In a strip (`strip`), a long text scrolls past two and a half lines, the half line showing there is more,
+    /// and the buttons wrap, so it leaves the form room and does not widen the panel.
+    fn outcome_card(
+        &self,
+        ui: &mut Ui,
+        outcome: &Outcome,
+        glyph: &str,
+        color: Color32,
+        strip: bool,
+    ) -> Option<OutcomeChoice> {
+        let pal = theme::palette(ui.ctx());
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(glyph).size(16.0).color(color));
+            let text = egui::Label::new(RichText::new(&outcome.text).color(pal.text)).wrap();
+            if strip {
+                // Wrapped lines follow each other with no spacing between them.
+                let line = ui.text_style_height(&egui::TextStyle::Body);
+                egui::ScrollArea::vertical()
+                    .id_salt("outcome_text")
+                    .max_height(2.5 * line)
+                    .min_scrolled_height(2.5 * line)
+                    .show(ui, |ui| ui.add(text));
+            } else {
+                ui.add(text);
+            }
+        });
+        ui.with_layout(
+            Layout::right_to_left(Align::Min).with_main_wrap(strip),
+            |ui| {
+                if ui.small_button("Dismiss").clicked() {
+                    chosen = Some(OutcomeChoice::Dismiss);
+                }
+                // The backup's place stays on the Activity log after this card is gone.
+                if outcome.logged
+                    && self.page != Page::ActivityLog
+                    && ui.small_button("Open activity log").clicked()
+                {
+                    chosen = Some(OutcomeChoice::OpenLog);
+                }
+                if outcome.undo.is_some()
+                    && ui
+                        .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
+                        .on_hover_text("Move it back, after a review")
+                        .clicked()
+                {
+                    chosen = Some(OutcomeChoice::Undo);
+                }
+                if outcome.sign_in.is_some() && self.sign_in.is_none() {
+                    let button =
+                        egui::Button::new(RichText::new("Sign in").strong().color(pal.on_bright))
+                            .fill(pal.primary);
+                    if ui.add(button).clicked() {
+                        chosen = Some(OutcomeChoice::SignIn);
+                    }
+                }
+            },
+        );
+        chosen
     }
 
     /// The confirmation step: shows exactly what would change, then applies or drops it.
@@ -3334,10 +3418,13 @@ impl ShellApp {
         // form, so Tab reaches it last. A change in its height is laid out again before the frame is shown.
         let height = if self.save_bar_wanted {
             let bar = Frame::new().inner_margin(gutter).show(ui, |ui| {
+                if !self.outcome_fits_beside(ui.ctx()) {
+                    self.outcome_strip(ui);
+                }
                 ui.separator();
                 self.save_bar(ui, s);
             });
-            self.save_bar_at = Some((bar.response.rect, bar.response.rect.left()));
+            self.save_bar_shown = true;
             bar.response.rect.height() + ui.spacing().item_spacing.y
         } else {
             0.0
@@ -4224,6 +4311,26 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
     {
         ui.ctx().copy_text(diagnosis_report(row, d));
     }
+}
+
+/// The outcome message's color and glyph: a problem, a warning or a success.
+fn outcome_look(pal: &Palette, outcome: &Outcome) -> (Color32, &'static str) {
+    if outcome.ok && outcome.warn {
+        (pal.warn, icon::WARNING)
+    } else if outcome.ok {
+        (pal.success, icon::CHECK_CIRCLE)
+    } else {
+        (pal.danger, icon::WARNING_CIRCLE)
+    }
+}
+
+/// The outcome message's card, edged in its color.
+fn outcome_frame(pal: &Palette, color: Color32) -> Frame {
+    Frame::new()
+        .fill(pal.panel_raised)
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(8)
+        .inner_margin(Margin::same(12))
 }
 
 fn bar_frame(pal: &Palette) -> Frame {
@@ -7614,12 +7721,23 @@ mod tests {
         }
     }
 
+    /// Where the outcome message saying `text` is: from the start of its text to its Dismiss button, the last thing
+    /// on it. (The text's own rect runs on below what is shown when it scrolls.)
+    fn outcome_rect(h: &Harness<'static, ShellApp>, text: &str) -> egui::Rect {
+        egui::Rect::from_min_max(
+            h.get_by_label(text).rect().min,
+            h.get_by_label("Dismiss").rect().max,
+        )
+    }
+
     #[test]
     fn the_outcome_message_never_covers_the_save_bar() {
         // Found in the UI review: for four seconds after a change was applied, its message sat over Review and
         // save… and Revert; one that offers Undo or warns stays until dismissed, and covered them all that time.
+        // As long as one seen in the app, whose backup folder was deep in a temporary home.
         let long = "Moved files to webapp. The previous file is kept in \
-            /home/me/.local/share/klefki/backups/claude.json.0001792408049204-0.bak";
+            /home/someone/work/clients/acme/sandboxes/2026-10-19/home/.local/share/klefki/backups/\
+            claude.json.0001792408049204-0.bak";
         let outcomes = [
             ("success", "Saved.", false, None),
             ("warning", long, true, None),
@@ -7638,6 +7756,7 @@ mod tests {
                 let mut h = long_form(size);
                 form(&mut h).command = "node22".into();
                 h.run();
+                let save = h.get_by_label("Review and save…").rect();
                 h.state_mut().outcome = Some(Outcome {
                     text: text.into(),
                     ok: true,
@@ -7649,11 +7768,14 @@ mod tests {
                     undo,
                 });
                 h.run();
-                let toast = h
-                    .ctx
-                    .memory(|m| m.area_rect(egui::Id::new("outcome")))
-                    .expect("the message is shown");
+                let toast = outcome_rect(&h, text);
                 let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                // The bar, and the panel's width, stay put.
+                assert_eq!(
+                    h.get_by_label("Review and save…").rect(),
+                    save,
+                    "{size:?} {kind}"
+                );
                 assert!(window.contains_rect(toast), "{size:?} {kind}: {toast:?}");
                 for label in ["Review and save…", "Revert", "Unsaved"] {
                     let rect = h.get_by_label(label).rect();
@@ -7661,6 +7783,23 @@ mod tests {
                         !toast.intersects(rect),
                         "{size:?} {kind}: the message at {toast:?} covers {label} at {rect:?}"
                     );
+                }
+                // Nor the form: its last field can still be scrolled to, and is not under the message. A success
+                // fades while the panel is wheeled, so only the ones that stay are tried.
+                if kind != "success" {
+                    let (_, rect) = wheel_the_detail_panel_to(&mut h, size, "Add argument");
+                    let toast = outcome_rect(&h, text);
+                    assert!(
+                        detail_view(&h, size).contains_rect(rect),
+                        "{size:?} {kind}: Add argument can't be scrolled to while the message shows: {rect:?}"
+                    );
+                    assert!(
+                        !toast.intersects(rect),
+                        "{size:?} {kind}: the message at {toast:?} covers Add argument at {rect:?}"
+                    );
+                    h.get_by_label("Dismiss").click();
+                    h.run();
+                    assert_eq!(h.state().outcome, None, "{size:?} {kind}: Dismiss works");
                 }
                 h.get_by_label("Revert").click();
                 h.run();
