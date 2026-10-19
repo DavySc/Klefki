@@ -38,8 +38,9 @@ pub(crate) fn build(debug_text: &str, server: &str, extra: &str) -> Report {
         .filter(|l| l.contains(&plain) || l.contains(&escaped))
         .collect();
     let selected: Vec<&str> = if about_server.is_empty() {
-        let all: Vec<&str> = clean.lines().collect();
-        all[all.len().saturating_sub(FALLBACK_LINES)..].to_vec()
+        let mut tail: Vec<&str> = clean.lines().rev().take(FALLBACK_LINES).collect();
+        tail.reverse();
+        tail
     } else {
         about_server
     };
@@ -82,8 +83,10 @@ fn server_output(lines: &[&str]) -> Vec<String> {
             .map(str::trim)
             .filter(|l| !l.is_empty())
         {
-            if !out.iter().any(|seen| seen == said) {
-                out.push(clip(said, MAX_LINE_CHARS));
+            // A repeat is judged on what is shown: a long line is kept cut.
+            let said = clip(said, MAX_LINE_CHARS);
+            if !out.contains(&said) {
+                out.push(said);
             }
             if out.len() >= MAX_SERVER_LINES {
                 return out;
@@ -141,6 +144,27 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("Connection failed after 246ms (CONNECTION_CLOSED)"))
         );
+    }
+
+    #[test]
+    fn a_long_line_the_server_printed_twice_is_shown_once() {
+        // Core review 3: a repeat was compared with the line as cut for showing, so a line over the limit was never
+        // found again and showed twice. The client logs a stdio server's stderr twice.
+        for len in [
+            MAX_LINE_CHARS - 1,
+            MAX_LINE_CHARS,
+            MAX_LINE_CHARS + 1,
+            2 * MAX_LINE_CHARS + 1,
+        ] {
+            let said: String = "abcdefg ".chars().cycle().take(len).collect();
+            assert!(!said.ends_with(' '), "{len}");
+            let log = format!(
+                "T [DEBUG] \"MCP server \\\"x\\\": stderr of the stdio server before restarting it: {said}\"\n\
+                 T [ERROR] \"MCP server \\\"x\\\" Server stderr: {said}\"\n"
+            );
+            let r = build(&log, "x", "");
+            assert_eq!(r.server_said, vec![clip(&said, MAX_LINE_CHARS)], "{len}");
+        }
     }
 
     #[test]
