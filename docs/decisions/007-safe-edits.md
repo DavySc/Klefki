@@ -46,6 +46,14 @@ and local scope, and PLAN's model-based test as the acceptance bar.
 - **A change that got through is not offered back:** a recovery file also records where the server was going; on
   listing, one whose server arrived there (and left where it was) is discarded. Covers Klefki stopping between the
   add and tidying up.
+  It also covers a later change that brings the same about, such as a copy of the same definition to where a
+  failed move was going: the server is where the user sent it, and Put back would bring it back where it was moved
+  from. Only with its client secret (2026-10-19, found by model seed `19dc2de0`): when Klefki holds a copy where the
+  server was, the file is discarded only once the same copy is where it went, and the one left behind is deleted
+  first (a server put there later would claim it). Otherwise it stays listed: a copy from a server without a Klefki
+  secret leaves Claude Code without one, and Put back is the only way left to hand it over. Klefki never reads
+  Claude Code's credentials, so it cannot tell that case from stopping between the add and moving its own copy;
+  that window (milliseconds) now leaves the definition offered too, which is safe: Put back or Forget.
 - **Klefki's keyring copy** is moved (or a stale copy at the new place deleted) before the recovery file is
   discarded; a keyring failure after Claude Code succeeded is a note, not a failure.
 - **Progress:** each of Claude Code's commands is announced (`Event::Applying`), and the dialog asks to keep Klefki
