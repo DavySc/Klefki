@@ -81,8 +81,7 @@ impl Pasted {
         };
         if pasted.servers.len() > MAX_SERVERS {
             return Err(format!(
-                "That holds {} servers; Klefki adds at most {MAX_SERVERS} at a time.",
-                pasted.servers.len()
+                "That holds more than {MAX_SERVERS} servers. Paste up to {MAX_SERVERS} at a time."
             ));
         }
         let mut seen = HashSet::new();
@@ -267,10 +266,15 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
     let lexed = lex_with(text, true);
     let mut notes = Vec::new();
     let mut servers = Vec::new();
-    // Each skipped line once, in order, and whether it starts with claude: most likely a mistyped command.
-    let mut skipped: Vec<(bool, String)> = Vec::new();
+    // Each skipped line that names claude once, in order: most likely a mistyped command. Other text is counted.
+    let mut skipped: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
+    let mut other = 0;
     for command in &lexed.commands {
+        if servers.len() > MAX_SERVERS {
+            // Refused as too many: the rest need not be read.
+            break;
+        }
         let words: Vec<&str> = command.words.iter().map(String::as_str).collect();
         let adds = match words.as_slice() {
             [claude, "mcp", verb @ ("add" | "add-json"), rest @ ..] if is_claude(claude) => {
@@ -279,8 +283,8 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
             _ => None,
         };
         match (adds, command.shell) {
-            (Some(_), Some(what)) => servers.push(PastedServer::refused(
-                "",
+            (Some((verb, rest)), Some(what)) => servers.push(PastedServer::refused(
+                &shell_named(verb, rest),
                 format!(
                     "This command uses the shell ({what}), and Klefki never runs pasted text. Paste the claude mcp add command on its own."
                 ),
@@ -298,19 +302,17 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
                 }
                 servers.push(server);
             }
-            (None, _) => {
+            (None, _) if names_claude(&command.words) => {
                 let line = clip(&shown_text(&command.words.join(" ")), 60);
                 if seen.insert(line.clone()) {
-                    let claude = command.words.first().is_some_and(|w| is_claude(w));
-                    skipped.push((claude, line));
+                    skipped.push(line);
                 }
             }
+            (None, _) => other += 1,
         }
     }
-    // Lines that start with claude are named first; the sort keeps the order within each kind.
-    skipped.sort_by_key(|(claude, _)| !claude);
     let shown = named(skipped.len(), MAX_SKIPPED_SHOWN);
-    for (_, line) in &skipped[..shown] {
+    for line in &skipped[..shown] {
         notes.push(format!(
             "Skipped a line that is not a claude mcp add command: {line}"
         ));
@@ -320,6 +322,11 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
             "Skipped {} more lines that are not claude mcp add commands.",
             skipped.len() - shown
         ));
+    }
+    match other {
+        0 => {}
+        1 => notes.push("Skipped a line of other text.".to_owned()),
+        n => notes.push(format!("Skipped {n} lines of other text.")),
     }
     if servers.is_empty() {
         // A line that names claude is most likely the command meant, mistyped: quoted, it says why nothing was added.
@@ -349,6 +356,18 @@ fn from_commands(text: &str) -> Result<Pasted, String> {
     Ok(Pasted { servers, notes })
 }
 
+/// The name a command refused for using the shell gives, so the list says which command it is. Read as any other
+/// command is, so a word that may be a secret is left out of it too.
+fn shell_named(verb: &str, rest: &[&str]) -> String {
+    let mut notes = Vec::new();
+    let server = if verb == "add" {
+        add(rest, &mut notes)
+    } else {
+        add_json(rest, &mut notes)
+    };
+    server.name
+}
+
 /// `names`, each written by `show`, for a note: a long list names the first few and counts the rest.
 pub(crate) fn listed(names: &[String], show: impl Fn(&str) -> String) -> String {
     let shown = named(names.len(), MAX_NAMES_SHOWN);
@@ -361,6 +380,23 @@ pub(crate) fn listed(names: &[String], show: impl Fn(&str) -> String) -> String 
         text.push_str(&format!(" and {} more", names.len() - shown));
     }
     text
+}
+
+/// Whether a skipped command starts with claude, or has `claude mcp` in it (`sudo claude mcp add …`): most likely a
+/// command that was meant, so it is named. A guide's sentences ("Then run this in Claude Code:") are not.
+fn names_claude(words: &[String]) -> bool {
+    let mut words = words.iter().flat_map(|w| w.split_whitespace());
+    let Some(mut previous) = words.next() else {
+        return false;
+    };
+    if is_claude(previous) {
+        return true;
+    }
+    words.any(|word| {
+        let found = word == "mcp" && is_claude(previous);
+        previous = word;
+        found
+    })
 }
 
 fn is_claude(word: &str) -> bool {
@@ -982,6 +1018,9 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
     // no command has started on it yet.
     let mut line_end = 0;
     let mut fresh = true;
+    // Where the Markdown inline code or table cell holding the command being read ends (`` `claude mcp add …` ``,
+    // `| claude mcp add … |`), and whether it is in a table.
+    let mut code_end: Option<(usize, bool)> = None;
     let end_word = |current: &mut Words, word: &mut String, in_word: &mut bool| {
         if *in_word {
             current.words.push(std::mem::take(word));
@@ -994,6 +1033,24 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
         }
     };
     while let Some(c) = chars.next() {
+        if let Some((end, table)) = code_end
+            && end == text.len() - chars.rest.len() - c.len_utf8()
+        {
+            // The command ends with its code or cell. The rest of the line is read for another one (a table's next
+            // cell starts at this pipe); the prose around them is not.
+            code_end = None;
+            end_word(&mut current, &mut word, &mut in_word);
+            end_command(&mut commands, &mut current);
+            let from = if table { end } else { end + c.len_utf8() };
+            chars.rest = match chained_claude(&text[from..line_end], table) {
+                Some((_, start, Chained::Enclosed(end))) => {
+                    code_end = Some((from + end, table));
+                    &text[from + start..]
+                }
+                _ => &text[line_end..],
+            };
+            continue;
+        }
         if pasted && !in_word && current.words.is_empty() && !c.is_whitespace() {
             // Slices of the text, never copies: a line is looked at once per command in it.
             let at = text.len() - chars.rest.len() - c.len_utf8();
@@ -1013,10 +1070,35 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
                 }
                 fresh = false;
             }
+            if c == '`'
+                && let Some(end) = inline_claude(&line[1..])
+            {
+                code_end = Some((at + 1 + end, false));
+                continue;
+            }
             if !"$#'\"\\`^".contains(c) && !is_claude(first_word(line)) {
+                if let Some(start) = run_by_package(line) {
+                    // `npx @anthropic-ai/claude-code mcp add …` is `claude mcp add …`.
+                    current.words.push("claude".to_owned());
+                    chars.rest = &text[at + start..];
+                    continue;
+                }
                 // Up to a claude command chained after it (`cd app && claude mcp add …`), which is read.
-                let (skipped, next) = match chained_claude(line) {
-                    Some((end, start)) => (&line[..end], at + start),
+                let table = c == '|';
+                let (skipped, next) = match chained_claude(line, table) {
+                    Some((end, start, Chained::Then)) => (&line[..end], at + start),
+                    Some((_, start, Chained::Shell(what))) => {
+                        // Read, so that it is refused saying why.
+                        current.shell = Some(what);
+                        chars.rest = &text[at + start..];
+                        continue;
+                    }
+                    Some((_, start, Chained::Enclosed(end))) => {
+                        // The text around it explains it: not a line of its own.
+                        code_end = Some((at + end, table));
+                        chars.rest = &text[at + start..];
+                        continue;
+                    }
                     None => (line, line_end),
                 };
                 chars.rest = &text[next..];
@@ -1175,14 +1257,78 @@ fn marker_len(line: &str) -> Option<usize> {
     None
 }
 
-/// Where a claude command chained after other text starts (`cd app && claude mcp add …`): the end of the text
-/// before the `&&` or `;`, and the start of what follows it, in bytes.
-fn chained_claude(line: &str) -> Option<(usize, usize)> {
+/// How a claude command follows other text on a line.
+enum Chained {
+    /// After `&&` or `;`: it runs on its own, so it is read.
+    Then,
+    /// After `||`, a pipe or `&`: what it does depends on the shell.
+    Shell(&'static str),
+    /// In Markdown inline code or a table cell, which ends at this byte of the line.
+    Enclosed(usize),
+}
+
+/// Where a claude command after other text starts (`cd app && claude mcp add …`, ``Run `claude mcp add …` ``): the
+/// end of the text before it, the start of the command, in bytes, and how it follows. In a Markdown `table` row a
+/// pipe is the edge of a cell, which can hold a command.
+fn chained_claude(line: &str, table: bool) -> Option<(usize, usize, Chained)> {
     line.char_indices().find_map(|(i, _)| {
         let rest = &line[i..];
-        let after = rest.strip_prefix("&&").or_else(|| rest.strip_prefix(';'))?;
-        is_claude(first_word(after)).then(|| (i, line.len() - after.len()))
+        let enclosed = |after: &str, end: usize| Chained::Enclosed(line.len() - after.len() + end);
+        let (after, how) = if let Some(after) = rest.strip_prefix('|').filter(|_| table) {
+            let end = after.find('|').unwrap_or(after.len());
+            (after, enclosed(after, end))
+        } else if let Some(after) = rest.strip_prefix("&&") {
+            (after, Chained::Then)
+        } else if let Some(after) = rest.strip_prefix("||") {
+            (after, Chained::Shell("||"))
+        } else if let Some(after) = rest.strip_prefix(';') {
+            (after, Chained::Then)
+        } else if let Some(after) = rest.strip_prefix('|') {
+            (after, Chained::Shell("a pipe, |"))
+        } else if let Some(after) = rest.strip_prefix('&') {
+            (after, Chained::Shell("&"))
+        } else {
+            let after = rest.strip_prefix('`')?;
+            let end = inline_claude(after)?;
+            (after, enclosed(after, end))
+        };
+        is_claude(first_word(after)).then(|| (i, line.len() - after.len(), how))
     })
+}
+
+/// Where the inline code ends, when `code` (the text after an opening backtick) is a claude command closed by a
+/// backtick on the same line.
+fn inline_claude(code: &str) -> Option<usize> {
+    if !is_claude(first_word(code)) {
+        return None;
+    }
+    code.find('`')
+}
+
+/// Where `mcp` starts when a package runner runs Claude Code: `npx [-y] @anthropic-ai/claude-code[@version] mcp …`,
+/// also with `bunx`, `pnpm dlx` and `yarn dlx`.
+fn run_by_package(line: &str) -> Option<usize> {
+    const PACKAGE: &str = "@anthropic-ai/claude-code";
+    let mut rest = ["npx", "bunx", "pnpx", "pnpm dlx", "yarn dlx"]
+        .into_iter()
+        .find_map(|runner| line.strip_prefix(runner))
+        .filter(|rest| rest.starts_with([' ', '\t']))?;
+    loop {
+        let word = first_word(rest);
+        if word.is_empty() {
+            return None;
+        }
+        let after = &rest[rest.find(word)? + word.len()..];
+        if word == "-y" || word == "--yes" {
+            rest = after;
+            continue;
+        }
+        let version = word.strip_prefix(PACKAGE)?;
+        if !version.is_empty() && (!version.starts_with('@') || version.len() == 1) {
+            return None;
+        }
+        return Some(line.len() - after.len());
+    }
 }
 
 /// The first word of `text`: up to a space or the end of a command, so each word is looked at once.
@@ -1439,22 +1585,24 @@ mod tests {
     fn many_skipped_lines_are_counted_not_all_listed() {
         // Found reviewing performance: one note per skipped line, so a long text pasted around a command gave
         // thousands of notes, each laid out every frame.
-        let lines: String = (0..40).map(|i| format!("not a command {i}\n")).collect();
-        let pasted = Pasted::parse(&format!("claude mcp add s -- node\n{lines}")).unwrap();
+        let lines: String = (0..40).map(|i| format!("claude mcp get {i}\n")).collect();
+        let prose: String = (0..40).map(|i| format!("not a command {i}\n")).collect();
+        let pasted = Pasted::parse(&format!("claude mcp add s -- node\n{lines}{prose}")).unwrap();
         let skipped: Vec<&String> = pasted
             .notes
             .iter()
             .filter(|n| n.starts_with("Skipped"))
             .collect();
-        assert_eq!(skipped.len(), 6, "{pasted:?}");
-        assert!(skipped[0].ends_with("not a command 0"), "{skipped:?}");
-        assert!(skipped[4].ends_with("not a command 4"), "{skipped:?}");
+        assert_eq!(skipped.len(), 7, "{pasted:?}");
+        assert!(skipped[0].ends_with("claude mcp get 0"), "{skipped:?}");
+        assert!(skipped[4].ends_with("claude mcp get 4"), "{skipped:?}");
         assert_eq!(
             skipped[5],
             "Skipped 35 more lines that are not claude mcp add commands."
         );
+        assert_eq!(skipped[6], "Skipped 40 lines of other text.");
         // The same line many times is one line, as before.
-        let same = "npm install thing\n".repeat(40);
+        let same = "claude mcp install thing\n".repeat(40);
         let pasted = Pasted::parse(&format!("{same}claude mcp add s -- node\n")).unwrap();
         assert_eq!(pasted.notes.len(), 1, "{pasted:?}");
     }
@@ -1485,10 +1633,9 @@ mod tests {
                 skipped[0].ends_with(": claude mcp ad foo -- npx foo"),
                 "{skipped:?}"
             );
-            assert_eq!(skipped.len(), 6, "{skipped:?}");
+            assert_eq!(skipped.len(), 2, "{skipped:?}");
             assert!(
-                skipped[5].starts_with("Skipped ")
-                    && skipped[5].ends_with(" more lines that are not claude mcp add commands."),
+                skipped[1].starts_with("Skipped ") && skipped[1].ends_with(" lines of other text."),
                 "{skipped:?}"
             );
         }
@@ -1497,7 +1644,7 @@ mod tests {
     #[test]
     fn one_more_is_named_not_counted() {
         // Review of #29: "1 more" takes the room of the line it hides.
-        let lines: String = (0..6).map(|i| format!("not a command {i}\n")).collect();
+        let lines: String = (0..6).map(|i| format!("claude mcp get {i}\n")).collect();
         let pasted = Pasted::parse(&format!("claude mcp add s -- node\n{lines}")).unwrap();
         assert_eq!(pasted.notes.len(), 6, "{pasted:?}");
         assert!(
@@ -1564,7 +1711,7 @@ mod tests {
             pasted
                 .notes
                 .iter()
-                .any(|n| n.contains("not a claude mcp add command") && n.contains("npm install")),
+                .any(|n| n == "Skipped a line of other text."),
             "{pasted:?}"
         );
         assert_eq!(json_of(&pasted.servers[3])["args"], json!([]));
@@ -1836,15 +1983,7 @@ mod tests {
         assert_eq!(pasted.servers.len(), 1, "{pasted:?}");
         assert_eq!(pasted.servers[0].name, "fs");
         assert_eq!(pasted.servers[0].problem, None);
-        assert_eq!(
-            pasted
-                .notes
-                .iter()
-                .filter(|n| n.starts_with("Skipped"))
-                .count(),
-            2,
-            "{pasted:?}"
-        );
+        assert_eq!(pasted.notes, ["Skipped 2 lines of other text."]);
     }
 
     #[test]
@@ -1937,7 +2076,7 @@ mod tests {
             let names: Vec<_> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
             assert_eq!(names, ["a", "b"], "{text}");
             assert!(
-                pasted.notes.iter().any(|n| n.starts_with("Skipped a line")),
+                pasted.notes.iter().any(|n| n.ends_with(" of other text.")),
                 "{:?}",
                 pasted.notes
             );
@@ -2113,14 +2252,17 @@ mod tests {
         let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c", "d", "e", "f", "g", "h"]);
         assert_eq!(pasted.notes, Vec::<String>::new());
-        // A line of other text is still named, as written, and a line that starts with shell is named too.
-        let pasted =
-            Pasted::parse("- npm install -g foo\n| grep x\nclaude mcp add a -- npx a").unwrap();
+        // A line of other text is still counted, and a line that starts with shell too; a claude line is named
+        // without its marker.
+        let pasted = Pasted::parse(
+            "- npm install -g foo\n| grep x\n- claude mcp list\nclaude mcp add a -- npx a",
+        )
+        .unwrap();
         assert_eq!(
             pasted.notes,
             [
-                "Skipped a line that is not a claude mcp add command: npm install -g foo",
-                "Skipped a line that is not a claude mcp add command: | grep x",
+                "Skipped a line that is not a claude mcp add command: claude mcp list",
+                "Skipped 2 lines of other text.",
             ]
         );
     }
@@ -2153,6 +2295,148 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_command_after_a_pipe_or_an_or_says_it_uses_the_shell() {
+        // Review round 2 (#30): these were refused as "does not start with claude mcp add", which hides the reason.
+        for (text, why) in [
+            ("false || claude mcp add a -- npx a", "(||)"),
+            ("echo y | claude mcp add a -- npx a", "(a pipe, |)"),
+            ("sleep 1 & claude mcp add a -- npx a", "(&)"),
+        ] {
+            let pasted = Pasted::parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(pasted.servers.len(), 1, "{text}: {pasted:?}");
+            let s = &pasted.servers[0];
+            assert!(s.json.is_empty(), "{text}: {s:?}");
+            let problem = s.problem.as_deref().unwrap_or_default();
+            assert!(
+                problem.contains(&format!("uses the shell {why}")),
+                "{text}: {problem}"
+            );
+        }
+        // The refused server is named, so it is clear which command is meant.
+        let pasted =
+            Pasted::parse("claude mcp add a -- npx a\nfalse || claude mcp add web -- npx web")
+                .unwrap();
+        assert_eq!(pasted.servers[1].name, "web", "{pasted:?}");
+        assert!(pasted.servers[1].problem.is_some(), "{pasted:?}");
+        // Nearby: the name never shows a word that may be a secret.
+        let s = one("false || claude mcp add --client-secret sk_live_ABCDEFGH1234 x -- npx x");
+        assert!(!format!("{s:?}").contains("ABCDEFGH"), "{s:?}");
+    }
+
+    #[test]
+    fn a_command_in_a_markdown_table_is_read_from_its_cell() {
+        // Review of #32: the pipes between a table's cells were taken for a pipe into claude.
+        let pasted = Pasted::parse(
+            "| Server | Command |\n|---|---|\n| github | claude mcp add github -- npx gh |\n| claude mcp add a -- npx a | first cell |\n| docs | `claude mcp add docs -- npx docs` | more |\n| two | claude mcp add b -- npx b | claude mcp add c -- npx c |\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["github", "a", "docs", "b", "c"], "{pasted:?}");
+        assert!(
+            pasted.servers.iter().all(|s| s.problem.is_none()),
+            "{pasted:?}"
+        );
+        assert_eq!(json_of(&pasted.servers[0])["args"], json!(["gh"]));
+        assert_eq!(pasted.notes, ["Skipped 2 lines of other text."]);
+    }
+
+    #[test]
+    fn a_command_in_markdown_inline_code_is_read() {
+        // Review round 2 (#30): a raw README writes the command as `claude mcp add …`; that gave only "Nothing here
+        // adds a server".
+        let pasted = Pasted::parse(
+            "`claude mcp add a -- npx a`\n- `claude mcp add b -s user -- npx b`  \nRun `claude mcp add c -- npx \"c d\"` in a terminal, then it's there.\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"], "{pasted:?}");
+        assert!(
+            pasted.servers.iter().all(|s| s.problem.is_none()),
+            "{pasted:?}"
+        );
+        assert_eq!(json_of(&pasted.servers[2])["args"], json!(["c d"]));
+        assert_eq!(pasted.servers[1].scope, Some(Scope::User));
+        // Every command on a line is read, and a mistyped one is named.
+        let pasted = Pasted::parse(
+            "Run `claude mcp add a -- npx a` then `claude mcp add b -- npx b`, or `claude mcp ad c -- npx c`.",
+        )
+        .unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "{pasted:?}");
+        assert_eq!(
+            pasted.notes,
+            ["Skipped a line that is not a claude mcp add command: claude mcp ad c -- npx c"]
+        );
+        // Shell inside the code is still the shell, and other code is other text.
+        let s = one("`claude mcp add x -- node a.js | tee log`");
+        assert!(s.problem.is_some_and(|p| p.contains("|")) && s.json.is_empty());
+        let pasted = Pasted::parse("`npm install -g x`\nclaude mcp add y -- npx y").unwrap();
+        assert_eq!(pasted.notes, ["Skipped a line of other text."]);
+    }
+
+    #[test]
+    fn claude_code_run_through_a_package_runner_is_read_as_claude() {
+        // Review round 2 (#30): `npx @anthropic-ai/claude-code mcp add …` gave only "Nothing here adds a server".
+        for text in [
+            "npx @anthropic-ai/claude-code mcp add a -- npx a",
+            "npx -y @anthropic-ai/claude-code@latest mcp add a -- npx a",
+            "npx --yes @anthropic-ai/claude-code@2.1.0 mcp add a -- npx a",
+            "bunx @anthropic-ai/claude-code mcp add a -- npx a",
+            "pnpm dlx @anthropic-ai/claude-code mcp add a -- npx a",
+            "$ npx @anthropic-ai/claude-code mcp add a -- npx a",
+        ] {
+            let s = one(text);
+            assert_eq!(s.name, "a", "{text}");
+            assert_eq!(s.problem, None, "{text}");
+            assert_eq!(json_of(&s)["args"], json!(["a"]), "{text}");
+        }
+        // Nearby: another package is another program.
+        for text in [
+            "npx @anthropic-ai/claude-code-router mcp add a -- npx a",
+            "npx @someone/claude-code mcp add a -- npx a",
+            "npxx @anthropic-ai/claude-code mcp add a -- npx a",
+            "npx @anthropic-ai/claude-code@ mcp add a -- npx a",
+        ] {
+            assert!(Pasted::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn other_text_is_counted_in_one_note_and_claude_lines_are_named() {
+        // Owed from the performance review: a pasted guide named each of its sentences; only a line that starts
+        // with claude is likely a mistyped command worth reading.
+        let pasted = Pasted::parse(
+            "# Setup\nInstall Node first.\nThen run this in Claude Code:\nclaude mcp list\nsudo claude mcp add z -- npx z\nclaude mcp add a -- npx a\nThat's all.\n",
+        )
+        .unwrap();
+        assert_eq!(
+            pasted.notes,
+            [
+                "Skipped a line that is not a claude mcp add command: claude mcp list",
+                "Skipped a line that is not a claude mcp add command: sudo claude mcp add z -- npx z",
+                "Skipped 3 lines of other text.",
+            ]
+        );
+        // Each line counts, also when it repeats.
+        let pasted = Pasted::parse("npm i x\nnpm i x\nclaude mcp add a -- npx a").unwrap();
+        assert_eq!(pasted.notes, ["Skipped 2 lines of other text."]);
+    }
+
+    #[test]
+    fn a_paste_of_many_commands_is_refused_without_reading_them_all() {
+        // Not-on-main list: thousands of commands were each read in full, then refused for being over 100.
+        let many: String = (0..7_000)
+            .map(|i| format!("claude mcp add s{i} -- npx p{i}\n"))
+            .collect();
+        assert!(many.len() < MAX_PASTE_BYTES);
+        let error = Pasted::parse(&many).unwrap_err();
+        assert_eq!(
+            error,
+            "That holds more than 100 servers. Paste up to 100 at a time."
+        );
+    }
+
+    #[test]
     fn a_full_paste_of_one_long_line_is_read_quickly() {
         // Review round 2 (#30): each command start copied the rest of its line, so one 256 KiB line of prompts,
         // markers or commands took up to 37 s, and the dialog reads the paste again after every key.
@@ -2170,6 +2454,10 @@ mod tests {
             ";",
             "claude;",
             "\u{1b}[0m && claude mcp add s -- x; ",
+            "| claude mcp add s -- x ",
+            "| a ",
+            "`claude mcp add s -- x` ",
+            "`claude ",
         ] {
             let text = unit.repeat((MAX_PASTE_BYTES - tail.len()) / unit.len()) + tail;
             let started = std::time::Instant::now();
@@ -2215,6 +2503,12 @@ mod tests {
         // Review round 1 (#30), nearby: the note quoted a skipped line as it was.
         let pasted = Pasted::parse(
             "export OPENAI_API_KEY=sk-proj-ABCDEFGHIJKLMNOP1234\nclaude mcp add a -- npx a",
+        )
+        .unwrap();
+        assert_eq!(pasted.notes, ["Skipped a line of other text."]);
+        // A named line is masked.
+        let pasted = Pasted::parse(
+            "claude mcp ad b -e OPENAI_API_KEY=sk-proj-ABCDEFGHIJKLMNOP1234 -- npx b\nclaude mcp add a -- npx a",
         )
         .unwrap();
         assert_eq!(pasted.notes.len(), 1, "{:?}", pasted.notes);
