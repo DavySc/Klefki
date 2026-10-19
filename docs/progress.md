@@ -147,12 +147,12 @@ Checks after the fixes: `cargo fmt --check` 0; `cargo clippy --workspace --all-t
 Open, for the owner (not changed):
 - `crates/fake-claude/` and `deny.toml` changed in #1; progress records approval of both. `unmaintained = "workspace"` accepts every unmaintained transitive crate, and `[licenses.private] ignore = true` works like an ignore list: confirm both are intended.
 - ~~Writes use the sanitised, clipped row name and project.~~ Fixed: see "Writes use the keys as the file spells them".
-- Lock: never refreshed while held (Claude's rule is stale after 10 s); `Drop` removes the folder without checking it is still ours; two waiters can both take over one stale lock; on Windows a delete-pending lock folder gives `PermissionDenied`, treated as fatal.
+- Lock: never refreshed while held (Claude's rule is stale after 10 s); ~~`Drop` removes the folder without checking it is still ours~~ (fixed, see `docs/progress/2026-10-19-save-retry-overwrite.md`); two waiters can both take over one stale lock; ~~on Windows a delete-pending lock folder gives `PermissionDenied`, treated as fatal~~ (waited out, `a_lock_folder_still_being_removed_is_waited_for`).
 - ~~A Claude write without the lock, landing between our read and our rename, is overwritten.~~ Narrowed to the moment between the stamp check and the rename (see "Write path" above).
 - Windows: backups get no owner-only ACL (they rely on the profile folder's ACL). (The rename is now retried on a transient sharing violation: `a7b9cf9`.)
 - A bare command (`node`) in an approval review could, on Windows, resolve to a file in the repository (lookup in the current folder first); not verified against Claude Code.
 - Selection: Enable/Disable also act on selected rows the search hides (the dialog lists them).
-- Backup names: within one millisecond `-10` sorts before `-2`; a clock going backwards can rotate a new backup out at once.
+- ~~Backup names: within one millisecond `-10` sorts before `-2`; a clock going backwards can rotate a new backup out at once.~~ Fixed, see `docs/progress/2026-10-19-save-retry-overwrite.md`.
 - `settings.local.json` is rewritten whole: duplicate keys collapse and huge integers become floats.
 - Timing-sensitive test `a_change_claude_overwrites_a_moment_later_is_put_back` (800 ms window, non-atomic write) could flake on a slow runner; passed every run here.
 
