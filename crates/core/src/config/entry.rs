@@ -217,8 +217,8 @@ fn no_line_breaks(what: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Most cells the table of [`diff_lines`] may have (4 MiB). A longer run of changed lines is shown as all removed and
-/// all added: still right, only not the shortest diff.
+/// Most old × new changed lines [`diff_lines`] compares one by one, with a table of about 4 MiB. A longer run is shown
+/// as all removed and all added, after a note saying so: still right, only not the shortest diff.
 const MAX_DIFF_CELLS: usize = 1 << 20;
 
 /// The lines of `old` and `new` (pretty JSON) as a diff: `- ` removed, `+ ` added, two spaces unchanged. Made from a
@@ -236,6 +236,7 @@ pub(crate) fn diff_lines(old: &str, new: &str) -> Vec<String> {
     let (a, b) = (&old[start..old.len() - end], &new[start..new.len() - end]);
     let mut out: Vec<String> = old[..start].iter().map(|l| format!("  {l}")).collect();
     if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
+        out.push("~ (too many changed lines to compare one by one, so all of them show as removed and added)".to_owned());
         // In the order the table gives when no line is shared.
         out.extend(b.iter().map(|l| format!("+ {l}")));
         out.extend(a.iter().map(|l| format!("- {l}")));
@@ -482,12 +483,28 @@ mod tests {
         let started = std::time::Instant::now();
         let count =
             |diff: &[String], mark: &str| diff.iter().filter(|l| l.starts_with(mark)).count();
-        // Every argument changes: each old one out, each new one in, the rest kept.
+        // Every argument changes: each old one out, each new one in, the rest kept, and a note that says why the
+        // lines are not matched up.
         let diff = diff_lines(&old, &new);
         assert_eq!(
             (count(&diff, "- "), count(&diff, "+ "), count(&diff, "  ")),
             (8_000, 8_000, 5)
         );
+        assert_eq!(count(&diff, "~ "), 1);
+        // Two edits far apart, in 1,000 arguments: matched up, two lines out and two in. Past the cap (3,000), every
+        // line from the first edit to the second shows as changed, with the note.
+        for (args, changed, note) in [(1_000, 4, 0), (3_000, 2 * 2_998, 1)] {
+            let old = serde_json::to_string_pretty(&json!({"args": (0..args).collect::<Vec<_>>()}))
+                .unwrap();
+            let edited = old.replacen("    1,", "    x,", 1).replacen(
+                &format!("    {},", args - 2),
+                "    y,",
+                1,
+            );
+            let diff = diff_lines(&old, &edited);
+            assert_eq!(count(&diff, "+ ") + count(&diff, "- "), changed, "{args}");
+            assert_eq!(count(&diff, "~ "), note, "{args}");
+        }
         // One argument among 8,000 changes: one line out, one in.
         let edited = old.replace("\"a4000\",", "\"z\",");
         let diff = diff_lines(&old, &edited);
