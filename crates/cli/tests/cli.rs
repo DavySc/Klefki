@@ -607,6 +607,7 @@ fn secrets_in_a_stdio_servers_arguments_are_never_printed() {
         &["list", "--json"],
         &["status", "alpha", "--claude", &claude],
         &["status", "--json", "--claude", &claude],
+        &["export"],
     ] {
         let out = env.run(args);
         let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
@@ -698,5 +699,75 @@ fn a_mistyped_command_gets_a_suggestion_and_no_command_gets_the_help() {
     assert!(
         err.contains("Examples:") && err.contains("--claude"),
         "{err}"
+    );
+}
+
+#[test]
+fn export_prints_every_server_as_one_block_with_secrets_as_references_and_runs_nothing() {
+    let env = Env::new();
+    let out = env.run(&["export"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is only the block");
+    let servers = block["mcpServers"]
+        .as_object()
+        .expect("an mcpServers block");
+    let mut names: Vec<&str> = servers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["alpha", "beta", "delta", "docs", "gamma", "remote"]);
+    assert_eq!(
+        servers["alpha"]["args"],
+        serde_json::json!([
+            "-y",
+            "alpha-mcp",
+            "--api-key",
+            "${API_KEY}",
+            "--token=${TOKEN}",
+            "${SECRET}"
+        ])
+    );
+    assert_eq!(
+        servers["docs"]["args"],
+        serde_json::json!(["tools/docs-mcp.js"])
+    );
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("Set these variables"), "{stderr}");
+    assert!(
+        stderr.contains("API_KEY  (alpha: argument --api-key)"),
+        "{stderr}"
+    );
+    assert!(!env.any_run(), "export starts no program");
+}
+
+#[test]
+fn export_with_names_holds_only_those_and_an_unknown_name_is_a_usage_error() {
+    let env = Env::new();
+    let out = env.run(&["export", "gamma", "docs"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut names: Vec<&String> = block["mcpServers"].as_object().unwrap().keys().collect();
+    names.sort_unstable();
+    assert_eq!(names, ["docs", "gamma"]);
+    // Nothing to set: no variable list.
+    assert!(
+        !text(&out.stderr).contains("Set these"),
+        "{}",
+        text(&out.stderr)
+    );
+
+    let out = env.run(&["export", "alpah"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert!(
+        text(&out.stderr).contains("did you mean \"alpha\""),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = env.run(&["export", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr).contains("export always prints JSON"),
+        "{}",
+        text(&out.stderr)
     );
 }
