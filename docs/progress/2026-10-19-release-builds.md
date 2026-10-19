@@ -33,8 +33,14 @@ for the three systems and publishes them, with checksums, as a draft GitHub Rele
   (wrong subsystem twice, no icon), exit 1.
 - macOS check exercised on synthetic Mach-O headers only (thin arm64 reported as not universal; wrong version reported).
 
+- Trial run on CI (commit 83633be, a temporary branch trigger reverted in 757ed36): run 39327893536, all three
+  builds green; `check-release.py` passed on each system, so NSIS, MSI, zip, universal `.app`/`.dmg`, `.deb` and
+  AppImage were built and checked. Artifacts: Windows 22.4 MB, Linux 21.7 MB, macOS 14.5 MB (zipped). It took
+  about 12 minutes; macOS ~9 minutes of build. Afterwards the Rust cache was dropped from the workflow (139e6e8):
+  a tag run saved ~470 MB per system that no later run could restore.
+
 ## Not verified / open
-- NSIS, MSI, `.app` and `.dmg` are only built on CI: run once on this branch before merging (see the PR).
+- No one has installed the Windows or macOS packages yet: needs a person on those systems.
 - The publish job runs only on a real tag, so it first runs on the first release.
 - Unsigned: SmartScreen and Gatekeeper warn. Next slices: provenance + SBOM, then minisign, Authenticode,
   notarisation (owner's keys), then the update check.
