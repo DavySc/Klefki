@@ -32,7 +32,7 @@ On macOS 11 to 14 you can instead right-click Klefki in Applications, choose **O
 To use the command-line tool from a terminal:
 
 ```
-sudo ln -s /Applications/Klefki.app/Contents/MacOS/klefki-cli /usr/local/bin/klefki-cli
+sudo mkdir -p /usr/local/bin && sudo ln -s /Applications/Klefki.app/Contents/MacOS/klefki-cli /usr/local/bin/klefki-cli
 ```
 
 ### Linux (x86_64)
