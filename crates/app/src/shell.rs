@@ -13701,6 +13701,15 @@ mod tests {
         );
     }
 
+    /// A whole path on this system: `/home/me/x` here, `C:\home\me\x` on Windows, where a path from `/` is not.
+    fn whole(path: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{}", path.replace('/', "\\"))
+        } else {
+            path.to_owned()
+        }
+    }
+
     #[test]
     fn after_the_dialog_closes_without_a_file_a_path_can_still_be_typed() {
         // Found in review: a desktop portal without a file chooser fails slowly, which looks like a cancel; without
@@ -13713,7 +13722,7 @@ mod tests {
         engine
             .events
             .send(Event::ExportFileChosen(FileChoice::Cancelled {
-                suggested: "/home/me/Documents/a-mcp.json".into(),
+                suggested: whole("/home/me/Documents/a-mcp.json").into(),
             }))
             .unwrap();
         h.run();
@@ -13728,7 +13737,7 @@ mod tests {
         let field = h.get_by_label("Save to");
         assert_eq!(
             field.accesskit_node().value().as_deref(),
-            Some("/home/me/Documents/a-mcp.json")
+            Some(whole("/home/me/Documents/a-mcp.json").as_str())
         );
         assert!(
             h.query_by_label_contains("No save dialog could be opened")
@@ -13743,7 +13752,7 @@ mod tests {
         assert_eq!(
             drain(&engine),
             vec![Command::SaveExport {
-                path: "/home/me/Documents/servers.json".into(),
+                path: whole("/home/me/Documents/servers.json").into(),
                 text: "{}".into(),
                 replace: false
             }]
@@ -13875,7 +13884,7 @@ mod tests {
             .click();
         h.run();
         drain(&engine);
-        let suggested = std::path::PathBuf::from("/home/me/Documents/mcp-servers.json");
+        let suggested = std::path::PathBuf::from(whole("/home/me/Documents/mcp-servers.json"));
         engine
             .events
             .send(Event::ExportFileChosen(FileChoice::NoDialog {
@@ -13887,7 +13896,7 @@ mod tests {
         let field = h.get_by_label("Save to");
         assert_eq!(
             field.accesskit_node().value().as_deref(),
-            Some("/home/me/Documents/mcp-servers.json")
+            Some(whole("/home/me/Documents/mcp-servers.json").as_str())
         );
         // The field has the keyboard, so Enter saves (and does not copy).
         h.key_press(egui::Key::Enter);
@@ -13905,7 +13914,7 @@ mod tests {
             .events
             .send(Event::ExportSaved {
                 path: suggested.clone(),
-                shown: "/home/me/Documents/mcp-servers.json".into(),
+                shown: whole("/home/me/Documents/mcp-servers.json"),
                 result: Err(SaveError::Exists),
             })
             .unwrap();
@@ -13925,7 +13934,7 @@ mod tests {
             .events
             .send(Event::ExportSaved {
                 path: suggested.clone(),
-                shown: "/home/me/Documents/mcp-servers.json".into(),
+                shown: whole("/home/me/Documents/mcp-servers.json"),
                 result: Err(SaveError::Exists),
             })
             .unwrap();
@@ -13945,12 +13954,15 @@ mod tests {
             .events
             .send(Event::ExportSaved {
                 path: suggested,
-                shown: "/home/me/Documents/mcp-servers.json".into(),
+                shown: whole("/home/me/Documents/mcp-servers.json"),
                 result: Ok(()),
             })
             .unwrap();
         h.run();
-        h.get_by_label("Saved to /home/me/Documents/mcp-servers.json");
+        h.get_by_label(&format!(
+            "Saved to {}",
+            whole("/home/me/Documents/mcp-servers.json")
+        ));
         assert!(
             h.query_by_label("Save to").is_none(),
             "the path field is done"
