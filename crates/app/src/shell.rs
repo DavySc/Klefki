@@ -3167,10 +3167,19 @@ impl ShellApp {
                                 ui.set_width(ui.available_width());
                                 // Its own scroll position per plan and file: each review opens at the top.
                                 // Only the lines in view are laid out: a diff can have thousands.
+                                // A bar that is always drawn, beside the lines: the default one is invisible until
+                                // pointed at, so a long diff would look no longer than the box.
+                                ui.spacing_mut().scroll = egui::style::ScrollStyle {
+                                    // In the text's colour, on a track that stands out from the box.
+                                    foreground_color: true,
+                                    ..egui::style::ScrollStyle::solid()
+                                };
+                                ui.visuals_mut().extreme_bg_color = pal.border;
                                 egui::ScrollArea::vertical()
                                     .id_salt(("plan_diff", plan.id, &file.path))
                                     .max_height(220.0)
-                                    // A long diff looks no longer than the box without a bar that says otherwise.
+                                    // As wide as the box, so the bar is at its edge, not after the widest line in view.
+                                    .auto_shrink([false, true])
                                     .scroll_bar_visibility(
                                         egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
                                     )
