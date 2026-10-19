@@ -1,3 +1,5 @@
+<p align="center"><img src="crates/app/assets/icon/klefki-256.png" width="128" height="128" alt="Klefki icon: a hub with a keyhole, wired to four servers"></p>
+
 # Klefki
 
 A fast, native, cross-platform manager for the MCP servers configured in Claude Code. It replaces the earlier Electron-based MCP manager.
