@@ -4041,6 +4041,21 @@ impl ShellApp {
                         self.open_casing();
                     }
                 }
+                if s.scope == Scope::User && !s.relative_paths.is_empty() {
+                    ui.add_space(8.0);
+                    // What to do first, with the paths as values; why under it, quieter.
+                    ui.add(egui::Label::new(relative_job(ui, &s.relative_paths, pal.warn)).wrap());
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(
+                                "Claude Code starts user servers in each session's folder. Klefki checks them \
+                                 from your home folder, so the check can pass here.",
+                            )
+                            .color(pal.text_muted),
+                        )
+                        .wrap(),
+                    );
+                }
                 if s.scope == Scope::Project
                     && s.approval.is_some_and(|a| a != Approval::Approved)
                     && self.core.is_some()
@@ -6751,6 +6766,16 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     if s.casing_collision {
         badges.push(loud("casing", pal.warn, None));
     }
+    if s.scope == Scope::User && !s.relative_paths.is_empty() {
+        badges.push(loud(
+            "relative path",
+            pal.warn,
+            Some(
+                "Claude Code starts user servers in each session's folder, so sessions in other folders can't \
+                 find a file its command names. The details say which.",
+            ),
+        ));
+    }
     // The toggle is per project: a user server can be off in some and on in others.
     if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
         badges.push(loud(
@@ -6944,6 +6969,31 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32, color: Color32) -> egui::Respon
             ui.label(RichText::new(text).small().color(color));
         })
         .response
+}
+
+/// "Use full paths: sessions in other folders can't find `a` or `b`.", the paths in the code font, for the detail
+/// panel of a user server whose command names `paths` relative to where it starts.
+fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::text::LayoutJob {
+    let text = |style: egui::TextStyle| egui::TextFormat {
+        font_id: style.resolve(ui.style()),
+        color,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        "Use full paths: sessions in other folders can't find ",
+        0.0,
+        text(egui::TextStyle::Body),
+    );
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            let between = if i + 1 == paths.len() { " or " } else { ", " };
+            job.append(between, 0.0, text(egui::TextStyle::Body));
+        }
+        job.append(path, 0.0, text(egui::TextStyle::Monospace));
+    }
+    job.append(".", 0.0, text(egui::TextStyle::Body));
+    job
 }
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
@@ -7254,6 +7304,7 @@ mod tests {
             shadowed: false,
             shadowed_in: Vec::new(),
             casing_collision: false,
+            relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
         };
@@ -7380,6 +7431,7 @@ mod tests {
             shadowed: false,
             shadowed_in: Vec::new(),
             casing_collision: false,
+            relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
         }
@@ -8217,6 +8269,38 @@ mod tests {
         h.get_by_label("in 2 of 17 projects: WebApp, Api").hover();
         h.run();
         h.get_by_label_contains("C:/Repos/WebApp\nC:/Repos/Api");
+    }
+
+    #[test]
+    fn a_user_server_with_a_relative_path_is_marked_and_its_details_name_the_paths() {
+        let (mut h, engine) = live_harness();
+        let mut user = live_row("docs", Scope::User, None);
+        user.relative_paths = vec!["build/index.js".into(), "./c.json (in CFG)".into()];
+        // In its own project's folder a relative path is what it should be.
+        let mut local = live_row("tools", Scope::Local, Some("C:/Repos/WebApp"));
+        local.relative_paths = vec!["server.py".into()];
+        engine
+            .events
+            .send(snapshot_with_projects(3, vec![user, local]))
+            .unwrap();
+        h.run();
+        let badges: Vec<_> = h.query_all_by_label("relative path").collect();
+        assert_eq!(badges.len(), 1, "only the user server");
+        h.get_by_label("relative path").hover();
+        h.run();
+        h.get_by_label_contains(
+            "sessions in other folders can't \
+             find a file its command names",
+        );
+        h.get_by_label("docs").click();
+        h.run();
+        h.get_by_label(
+            "Use full paths: sessions in other folders can't find build/index.js or ./c.json (in CFG).",
+        );
+        h.get_by_label_contains("so the check can pass here");
+        h.get_by_label("tools").click();
+        h.run();
+        assert!(h.query_by_label_contains("Use full paths").is_none());
     }
 
     #[test]
