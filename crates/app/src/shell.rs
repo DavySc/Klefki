@@ -933,10 +933,12 @@ impl ShellApp {
                         ))
                         .desired_width(220.0),
                 );
+                // Not while Claude Code cannot be found: the version would be of a program that is gone.
                 if let Some(version) = self
                     .cli_version
                     .as_deref()
                     .or(self.snapshot.cli_version.as_deref())
+                    .filter(|_| self.cli_problem.is_none())
                 {
                     ui.label(RichText::new(format!("Claude CLI {version}")).color(pal.text_muted));
                 }
@@ -6254,6 +6256,37 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label_contains("Live status is unavailable");
+    }
+
+    #[test]
+    fn a_version_is_not_shown_once_claude_code_is_no_longer_found() {
+        // From the review of the warning fix: the reverse case. Claude Code removed and F5 pressed, and the top bar
+        // still named the version beside "not found".
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(klefki_core::api::Event::CliVersion(Some(
+                "2.1.303".to_owned(),
+            )))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Claude CLI 2.1.303");
+        engine
+            .events
+            .send(klefki_core::api::Event::CliProblem(
+                "Live status is unavailable: the Claude CLI was not found.".to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Claude CLI 2.1.303").is_none());
+        engine
+            .events
+            .send(klefki_core::api::Event::CliVersion(Some(
+                "2.1.304".to_owned(),
+            )))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Claude CLI 2.1.304");
     }
 
     #[test]
