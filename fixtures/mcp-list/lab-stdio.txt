@@ -1,0 +1,35 @@
+Checking MCP server health…
+
+ok: python C:\lab\srv.py ok - ✔ Connected
+exit: python C:\lab\srv.py exit - ✘ Failed to connect — CONNECTION_CLOSED: Connection closed
+noise: python C:\lab\srv.py noise - ✔ Connected
+badinit: python C:\lab\srv.py badinit - ✘ Failed to connect — -32603: nope
+oldproto: python C:\lab\srv.py oldproto - ✘ Failed to connect — Server's protocol version is not supported: 1999-01-01
+toolsfail: python C:\lab\srv.py toolsfail - ! Connected · tools fetch failed — no tools
+exitunknown: python C:\lab\srv.py exitunknown - ✔ Connected
+silentunknown: python C:\lab\srv.py silentunknown - ✔ Connected
+discoverok: python C:\lab\srv.py discoverok - ✔ Connected
+discoverjunk: python C:\lab\srv.py discoverjunk - ✔ Connected
+notools: python C:\lab\srv.py notools - ✔ Connected
+pages: python C:\lab\srv.py pages - ✔ Connected
+exitafterinit: python C:\lab\srv.py exitafterinit - ! Connected · tools fetch failed — Connection closed
+crashtools: python C:\lab\srv.py crashtools - ! Connected · tools fetch failed — Connection closed
+badtools: python C:\lab\srv.py badtools - ! Connected · tools fetch failed — Invalid result for tools/list: tools: Invalid input: expected array, received string
+ver2025-03-26: python C:\lab\srv.py ver2025-03-26 - ✔ Connected
+missing: no-such-binary-xyz  - ✘ Failed to connect — CONNECTION_CLOSED: Connection closed
+argvar: python C:\lab\srv.py ${LABMODE} - ✔ Connected
+defvar: python C:\lab\srv.py ${NOPE} - ✔ Connected
+undefvar: python C:\lab\srv.py ${NOPE_UNDEF} - ✔ Connected
+cmdshim: lab  - ✘ Failed to connect — CONNECTION_CLOSED: Connection closed
+relcmd: python C:\lab\srv.py ok - ✔ Connected
+envcfg: python C:\lab\srv.py ok - ✔ Connected
+
+MCP config diagnostics ⚠
+
+For help configuring MCP servers, see: https://code.claude.com/docs/en/mcp
+
+[Contains warnings] User config (available in all your projects)
+Location: C:\lab\cfgp\.claude.json
+ ├ [Warning] [argvar] mcpServers.argvar: Missing environment variables: LABMODE
+ └ [Warning] [undefvar] mcpServers.undefvar: Missing environment variables: NOPE_UNDEF
+

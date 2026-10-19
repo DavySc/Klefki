@@ -22,6 +22,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
@@ -507,6 +508,7 @@ enum JobKind {
     Diagnose,
 }
 
+#[derive(Clone)]
 struct Job {
     id: ServerId,
     /// Already validated; it is passed to the CLI as its own argument.
@@ -519,6 +521,8 @@ struct Job {
     background: bool,
     /// Asked for on its own ([`Queue::push_now`]): ahead of every other job, after earlier such asks.
     now: bool,
+    /// A `claude mcp list` had no clear answer for it: it is checked on its own, not through another list.
+    alone: bool,
 }
 
 #[derive(Default)]
@@ -563,6 +567,21 @@ impl Queue {
             .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
         let at = self.jobs.iter().take_while(|q| q.now).count();
         self.jobs.insert(at, Job { now: true, ..job });
+    }
+
+    /// Takes the other background checks waiting to run in `cwd`, to be answered by one `claude mcp list`. None when
+    /// there are too few for a list to pay off: it starts every server of the folder, those not asked about too.
+    fn take_mates(&mut self, cwd: &Path) -> Vec<Job> {
+        let is_mate =
+            |j: &Job| j.background && j.kind == JobKind::Check && !j.alone && j.cwd == cwd;
+        if self.jobs.iter().filter(|j| is_mate(j)).count() + 1 < MIN_LIST_BATCH {
+            return Vec::new();
+        }
+        let (mates, rest): (Vec<Job>, Vec<Job>) = std::mem::take(&mut self.jobs)
+            .into_iter()
+            .partition(|j| is_mate(j));
+        self.jobs = rest.into();
+        mates
     }
 
     fn take(&mut self) -> Option<Job> {
@@ -653,6 +672,33 @@ impl Drop for Announced<'_> {
 /// klefki from 123 MB to about 700 MB at startup. One keeps it near 300 MB.
 const BACKGROUND_CHECKS: usize = 1;
 
+/// Background checks of one folder that are answered by one `claude mcp list` instead of one `mcp get` each: the
+/// list costs one Claude start and checks all servers at once (30 servers: 2.6 s against 28.5 s), but it starts
+/// every server of the folder, so for a few separate checks are as quick and touch only those.
+const MIN_LIST_BATCH: usize = 4;
+
+/// A list holds a line for every server of the folder, with its command.
+const MAX_LIST_OUTPUT: usize = 4 * 1024 * 1024;
+
+/// What a list is run with, besides the usual environment.
+/// - No claude.ai connectors: a list also checks those over the network (21 of them took 19-32 s where the servers in
+///   the files took 7 s), and they are not servers of these files.
+/// - A connection timeout of 3 s (Claude's own is 30 s) and 10 servers connected at once (Claude's is 3): a list
+///   prints only when the last server is done, so one that hangs would hold back the answers of all the others for
+///   30 s. Now that is about 8 s (the 3 s probe Claude starts with, the timeout and its own start); 6 hanging servers
+///   took 13.5 s with 3 at once, 8.4 s with 10. A server that needs longer than 3 s is not given a failure for it:
+///   see `parse::parse_list`, and it is checked with `get`.
+const LIST_ENV: [(&str, &str); 3] = [
+    ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+    ("MCP_TIMEOUT", "3000"),
+    ("MCP_SERVER_CONNECTION_BATCH_SIZE", "10"),
+];
+
+fn list_env<'a>(mut base: Vec<(&'a str, &'a OsStr)>) -> Vec<(&'a str, &'a OsStr)> {
+    base.extend(LIST_ENV.iter().map(|&(k, v)| (k, OsStr::new(v))));
+    base
+}
+
 struct Shared {
     config: EngineConfig,
     queue: Mutex<Queue>,
@@ -666,6 +712,9 @@ struct Shared {
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     /// The secret store once opened. Not kept when opening failed, so a store unlocked later is found.
     secret_store: Mutex<Option<Arc<dyn SecretStore>>>,
+    /// Cleared when a `claude mcp list` gave no answer at all (it failed, or its output is not what is read): every
+    /// check is then a `get`, as before, until klefki is started again.
+    list_works: AtomicBool,
     /// Per file, the redo log of klefki's changes whose check is still due.
     journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
@@ -728,6 +777,7 @@ fn engine_main(
         version: Mutex::new(None),
         journals: Arc::default(),
         secret_store: Mutex::new(None),
+        list_works: AtomicBool::new(true),
         emitter,
         input: input_tx.clone(),
     });
@@ -2061,6 +2111,7 @@ fn build_job(
         announce,
         background: false,
         now: false,
+        alone: false,
     })
 }
 
@@ -2134,7 +2185,9 @@ fn worker(shared: &Shared) {
     }
 }
 
-fn run(shared: &Shared, job: &Job) {
+/// Says a job is checking, when it should, and notes the change count its answer is compared with. Taken after the
+/// announcement: an edit noted before this is one the check will see.
+fn begin<'a>(shared: &'a Shared, job: &Job) -> (Option<Announced<'a>>, u64) {
     let announced = job
         .announce
         .then(|| Announced::new(&shared.queue, &job.id.connection));
@@ -2143,16 +2196,30 @@ fn run(shared: &Shared, job: &Job) {
             .emitter
             .status(job.id.clone(), Status::Checking, None);
     }
-    // Taken after the announcement: an edit noted before this is one the check will see.
     let started = lock(&shared.changes).count;
     if let Some(a) = &announced {
         a.started(started);
     }
+    (announced, started)
+}
+
+fn run(shared: &Shared, job: &Job) {
+    let (_announced, started) = begin(shared, job);
     // An answer about a server edited or removed while this ran is about a definition that is gone.
     let current = || !lock(&shared.changes).since(&job.id.connection, started);
     match job.kind {
         JobKind::Check => {
-            let (status, detail) = execute(shared, job);
+            let listed = if job.background {
+                check_listed(shared, job)
+            } else {
+                ListedCheck::Not
+            };
+            let (status, detail) = match listed {
+                ListedCheck::Answer(answer) => answer,
+                ListedCheck::Not => execute(shared, job),
+                // Its `get` goes in the queue behind those of the servers that were only slow.
+                ListedCheck::Later => return,
+            };
             if current() {
                 shared.emitter.status(job.id.clone(), status, detail);
             }
@@ -2233,6 +2300,122 @@ fn claude_program(shared: &Shared) -> Option<PathBuf> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
+}
+
+/// What `check_listed` made of the job it was given.
+enum ListedCheck {
+    /// The list answered for it.
+    Answer((Status, Option<String>)),
+    /// No list was run for it: check it with `get` now.
+    Not,
+    /// The list had no answer for it, and it is queued again, to be checked with `get` in its turn.
+    Later,
+}
+
+/// Answers the other background checks waiting in the job's folder from one `claude mcp list`, and returns the answer
+/// for the job itself when the list had a clear one. A server the list did not answer clearly goes back to the queue
+/// to be checked on its own, so what is shown is always what `claude mcp get` says. A list that answered nothing
+/// ends listing for the rest of the run, and the job is checked as usual.
+fn check_listed(shared: &Shared, job: &Job) -> ListedCheck {
+    if job.alone || !shared.list_works.load(Ordering::Relaxed) {
+        return ListedCheck::Not;
+    }
+    let Some(program) = claude_program(shared) else {
+        return ListedCheck::Not;
+    };
+    let mates = lock(&shared.queue).take_mates(&job.cwd);
+    if mates.is_empty() {
+        return ListedCheck::Not;
+    }
+    let begun: Vec<_> = mates
+        .into_iter()
+        .map(|mate| {
+            let started = begin(shared, &mate);
+            (mate, started)
+        })
+        .collect();
+    let names: Vec<&str> = std::iter::once(job.name.as_str())
+        .chain(begun.iter().map(|(mate, _)| mate.name.as_str()))
+        .collect();
+    let env = list_env(cli_env(shared));
+    let result = runner::run(&RunSpec {
+        program: &program,
+        args: &["mcp", "list"],
+        cwd: Some(&job.cwd),
+        env: &env,
+        timeout: shared.config.check_timeout,
+        max_output: MAX_LIST_OUTPUT,
+    });
+    let answers = match result {
+        Ok(out) if !out.timed_out && out.exit_code == Some(0) => {
+            // Cut off in the middle of a line: that line is not read.
+            let text = match (out.truncated, out.stdout.rfind('\n')) {
+                (true, Some(end)) => &out.stdout[..end],
+                (true, None) => "",
+                (false, _) => out.stdout.as_str(),
+            };
+            parse::parse_list(text, &names)
+        }
+        _ => HashMap::new(),
+    };
+    if answers.is_empty() {
+        shared.list_works.store(false, Ordering::Relaxed);
+    }
+    // The servers the list did not answer, with whether each never answered the connection.
+    let mut again: Vec<(Job, bool)> = Vec::new();
+    for (mate, (_announced, started)) in begun {
+        match answers.get(mate.name.as_str()) {
+            Some(parse::Listed::Settled(checked)) => {
+                // Edited or removed while the list ran: the answer is about a definition that is gone.
+                if !lock(&shared.changes).since(&mate.id.connection, started) {
+                    shared
+                        .emitter
+                        .status(mate.id.clone(), checked.status, checked.detail.clone());
+                }
+            }
+            other => again.push((
+                Job {
+                    alone: true,
+                    ..mate
+                },
+                never_connected(other),
+            )),
+        }
+    }
+    let own = answers.get(job.name.as_str());
+    if let Some(parse::Listed::Settled(checked)) = own {
+        let answer = (checked.status, checked.detail.clone());
+        return queue_again(shared, again, ListedCheck::Answer(answer));
+    }
+    // The job has no answer either: it waits for its turn like the others, so that a server that hangs does not
+    // hold the rest back with its 30 s.
+    again.push((
+        Job {
+            alone: true,
+            ..job.clone()
+        },
+        never_connected(own),
+    ));
+    queue_again(shared, again, ListedCheck::Later)
+}
+
+fn never_connected(listed: Option<&parse::Listed>) -> bool {
+    matches!(
+        listed,
+        Some(parse::Listed::Open {
+            never_connected: true
+        })
+    )
+}
+
+/// Queues the servers a list did not answer, those that answered the connection too slowly first and those that never
+/// did last (the order within each stays), and returns `then`.
+fn queue_again(shared: &Shared, mut again: Vec<(Job, bool)>, then: ListedCheck) -> ListedCheck {
+    again.sort_by_key(|(_, never_connected)| *never_connected);
+    if !again.is_empty() {
+        lock(&shared.queue).add(again.into_iter().map(|(job, _)| job).collect());
+    }
+    then
 }
 
 fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
@@ -2400,7 +2583,8 @@ mod tests {
     use crate::model::Target;
     use std::time::Instant;
 
-    const WAIT: Duration = Duration::from_secs(15);
+    /// Long enough for a slow machine: starting a process took 1-3 s while a whole run of these tests started them at once.
+    const WAIT: Duration = Duration::from_secs(60);
 
     struct Env {
         dir: tempfile::TempDir,
@@ -2492,6 +2676,19 @@ mod tests {
                 }
             }
             out
+        }
+
+        /// The folder of every `mcp list` the fake CLI was asked to run, in order.
+        fn lists(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(|l| {
+                    l["event"] == "start" && l["argv"] == serde_json::json!(["mcp", "list"])
+                })
+                .map(|l| l["cwd"].as_str().unwrap_or_default().to_owned())
+                .collect()
         }
     }
 
@@ -2721,7 +2918,10 @@ mod tests {
         );
 
         core.send(Command::Refresh { live_all: true });
-        let events = collect(&core, |e| final_status(e, "recent").is_some());
+        // Both answer again: counting the gets after only one has, the other may not have started yet.
+        let events = collect(&core, |e| {
+            final_status(e, "recent").is_some() && final_status(e, "fresh").is_some()
+        });
         assert_eq!(final_status(&events, "recent"), Some(Status::Connected));
         let mut names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
         names.sort();
@@ -2757,6 +2957,353 @@ mod tests {
         let gets = env.gets();
         assert_eq!(gets.len(), 4);
         assert_eq!(max_overlap(&gets), 1, "{gets:?}");
+    }
+
+    /// What `claude mcp list` prints for `lines` (name, command, status as Claude words it).
+    fn list_output(lines: &[(&str, &str)]) -> Vec<u8> {
+        let mut text = String::from("Checking MCP server health…\n\n");
+        for (name, status) in lines {
+            text.push_str(&format!("{name}: x - {status}\n"));
+        }
+        text.into_bytes()
+    }
+
+    fn servers(n: usize) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> = (0..n)
+            .map(|i| (format!("s{i}"), serde_json::json!({"command": "x"})))
+            .collect();
+        serde_json::json!({ "mcpServers": map })
+    }
+
+    const LIST_AND_GET: &str = r#"{"rules":[{"args":["--version"]},
+        {"args":["mcp","list"],"stdout_file":"list.txt"},
+        {"args":["mcp","get","s2"],"stdout_file":"failed.txt"},
+        {"args":["mcp","get","s5"],"stdout_file":"failed.txt"},
+        {"args":["mcp","get"],"stdout_file":"c.txt"}]}"#;
+
+    fn all_checked(core: &Core, n: usize) -> Vec<Event> {
+        collect(core, |e| {
+            (0..n).all(|i| final_status(e, &format!("s{i}")).is_some())
+        })
+    }
+
+    #[test]
+    fn background_checks_in_one_folder_share_one_claude_list() {
+        let list = list_output(&[
+            ("s0", "✔ Connected"),
+            (
+                "s1",
+                "✘ Failed to connect — CONNECTION_CLOSED: Connection closed",
+            ),
+            ("s2", "! Connected · tools fetch failed — no tools"),
+            ("s3", "! Needs authentication"),
+            ("s4", "✔ Connected"),
+            ("s5", "✔ Connected"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        let said = |n: &str| status_of(&events, n);
+        assert_eq!(said("s0"), Some((Status::Connected, None)));
+        assert_eq!(
+            said("s1"),
+            Some((
+                Status::Failed,
+                Some("CONNECTION_CLOSED: Connection closed".to_owned())
+            ))
+        );
+        assert_eq!(
+            said("s2"),
+            Some((Status::Degraded, Some("no tools".to_owned())))
+        );
+        assert_eq!(said("s3").map(|s| s.0), Some(Status::NeedsAuth));
+        assert_eq!(said("s5"), Some((Status::Connected, None)));
+        assert_eq!(env.lists().len(), 1, "one list for the folder");
+        assert!(env.gets().is_empty(), "no get: {:?}", env.gets());
+    }
+
+    #[test]
+    fn a_server_the_list_does_not_answer_clearly_is_checked_on_its_own() {
+        // s2 is on two lines and s5 on none: Claude is asked about each of them, and the list is not asked again.
+        let list = list_output(&[
+            ("s0", "✔ Connected"),
+            ("s1", "✔ Connected"),
+            ("s2", "✔ Connected"),
+            ("s2", "✔ Connected"),
+            ("s3", "✔ Connected"),
+            ("s4", "✔ Connected"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        assert_eq!(final_status(&events, "s0"), Some(Status::Connected));
+        assert_eq!(
+            final_status(&events, "s2"),
+            Some(Status::Failed),
+            "its own get"
+        );
+        assert_eq!(
+            final_status(&events, "s5"),
+            Some(Status::Failed),
+            "its own get"
+        );
+        let mut asked: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        asked.sort();
+        assert_eq!(asked, ["s2", "s5"]);
+        assert_eq!(env.lists().len(), 1);
+    }
+
+    #[test]
+    fn when_the_list_fails_every_server_is_checked_with_get() {
+        // Variant: a list that exits 1, and one that exits 0 with nothing usable, both leave the servers to `get`.
+        for scenario in [
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"exit_code":1},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"stdout_file":"nonsense.txt"},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+        ] {
+            let env = Env::new(
+                &servers(6),
+                scenario,
+                &[("c.txt", CONNECTED), ("nonsense.txt", b"something else\n")],
+            );
+            let core = env.start();
+            let events = all_checked(&core, 6);
+            assert_eq!(final_status(&events, "s3"), Some(Status::Connected));
+            assert_eq!(env.gets().len(), 6, "{scenario}");
+            assert_eq!(env.lists().len(), 1, "not asked again: {scenario}");
+        }
+    }
+
+    #[test]
+    fn a_list_answer_a_timeout_may_have_caused_is_checked_with_get() {
+        // The list runs with a short timeout so a hanging server cannot hold the others back; what it says
+        // about a server that ran out of time is not Claude's answer, which `get` gives with the full time.
+        let list = list_output(&[
+            ("s0", "✔ Connected"),
+            ("s1", "✘ Failed to connect — Request timed out"),
+            (
+                "s2",
+                "✘ Failed to connect — MCP server \"[redacted]\" connection timed out after 3000ms",
+            ),
+            ("s3", "! Connected · tools fetch failed — Request timed out"),
+            ("s4", "✔ Connected"),
+            ("s5", "✘ Failed to connect"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        assert_eq!(
+            final_status(&events, "s1"),
+            Some(Status::Connected),
+            "its get"
+        );
+        assert_eq!(final_status(&events, "s2"), Some(Status::Failed), "its get");
+        assert_eq!(
+            final_status(&events, "s3"),
+            Some(Status::Connected),
+            "its get"
+        );
+        assert_eq!(final_status(&events, "s5"), Some(Status::Failed), "its get");
+        let mut asked: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        asked.sort();
+        assert_eq!(asked, ["s1", "s2", "s3", "s5"]);
+        assert_eq!(env.lists().len(), 1);
+    }
+
+    #[test]
+    fn a_server_that_never_connected_in_the_list_is_checked_after_one_that_was_only_slow() {
+        // A hanging server's own `get` takes 30 s, so the others come first, though it is first in the queue and
+        // is the job that ran the list.
+        let list = list_output(&[
+            (
+                "s0",
+                "✘ Failed to connect — MCP server \"s0\" connection timed out after 3000ms",
+            ),
+            ("s1", "✘ Failed to connect — Request timed out"),
+            ("s2", "✔ Connected"),
+            ("s3", "✔ Connected"),
+            ("s4", "✔ Connected"),
+            ("s5", "✔ Connected"),
+        ]);
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        let events = all_checked(&core, 6);
+        assert_eq!(
+            final_status(&events, "s2"),
+            Some(Status::Connected),
+            "from the list"
+        );
+        assert_eq!(
+            final_status(&events, "s0"),
+            Some(Status::Connected),
+            "its own get"
+        );
+        let asked: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        assert_eq!(asked, ["s1", "s0"], "the slow one first");
+        assert_eq!(env.lists().len(), 1);
+    }
+
+    #[test]
+    fn the_list_is_asked_for_a_short_timeout_and_a_wide_batch_without_the_connectors() {
+        let base = [("FAKE", OsStr::new("1"))];
+        let env = list_env(base.to_vec());
+        assert!(
+            env.contains(&("FAKE", OsStr::new("1"))),
+            "the usual environment stays"
+        );
+        for (key, value) in [
+            ("ENABLE_CLAUDEAI_MCP_SERVERS", "false"),
+            ("MCP_TIMEOUT", "3000"),
+            ("MCP_SERVER_CONNECTION_BATCH_SIZE", "10"),
+        ] {
+            assert!(env.contains(&(key, OsStr::new(value))), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_list_that_hangs_is_ended_and_the_servers_are_checked_with_get() {
+        let env = Env::new(
+            &servers(6),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"hang":true},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let mut config = env.config();
+        config.check_timeout = Duration::from_millis(400);
+        let core = start_with(config, || {});
+        let events = all_checked(&core, 6);
+        assert_eq!(final_status(&events, "s4"), Some(Status::Connected));
+        assert_eq!(env.gets().len(), 6);
+        assert_eq!(env.lists().len(), 1, "not asked again");
+    }
+
+    #[test]
+    fn a_few_servers_are_checked_one_by_one() {
+        // A list starts every server of the folder; for a few, separate gets are not slower and start only those.
+        let env = Env::new(
+            &servers(3),
+            LIST_AND_GET,
+            &[
+                ("list.txt", b""),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        all_checked(&core, 3);
+        assert_eq!(env.gets().len(), 3);
+        assert!(env.lists().is_empty());
+    }
+
+    #[test]
+    fn a_check_the_user_asks_for_is_always_a_get() {
+        let list = list_output(
+            &(0..6)
+                .map(|i| (["s0", "s1", "s2", "s3", "s4", "s5"][i], "✔ Connected"))
+                .collect::<Vec<_>>(),
+        );
+        let env = Env::new(
+            &servers(6),
+            LIST_AND_GET,
+            &[
+                ("list.txt", &list),
+                ("c.txt", CONNECTED),
+                ("failed.txt", FAILED),
+            ],
+        );
+        let core = env.start();
+        all_checked(&core, 6);
+        core.send(Command::Check(user_id("s5")));
+        let events = collect(&core, |e| final_status(e, "s5").is_some());
+        assert_eq!(
+            final_status(&events, "s5"),
+            Some(Status::Failed),
+            "its get answered"
+        );
+        assert_eq!(env.lists().len(), 1);
+        assert_eq!(env.gets().len(), 1);
+    }
+
+    #[test]
+    fn each_folder_gets_its_own_list() {
+        let env = Env::new(
+            &serde_json::json!({}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","list"],"stdout_file":"list.txt"},{"args":["mcp","get"],"stdout_file":"failed.txt"}]}"#,
+            &[
+                (
+                    "list.txt",
+                    &list_output(&[
+                        ("a0", "✔ Connected"),
+                        ("a1", "✔ Connected"),
+                        ("a2", "✔ Connected"),
+                        ("a3", "✔ Connected"),
+                    ]),
+                ),
+                ("failed.txt", FAILED),
+            ],
+        );
+        // Two projects, four local servers each, named alike so the one list text answers both.
+        let (p1, p2) = (env.dir.path().join("p1"), env.dir.path().join("p2"));
+        std::fs::create_dir_all(&p1).unwrap();
+        std::fs::create_dir_all(&p2).unwrap();
+        let local: serde_json::Map<String, serde_json::Value> = (0..4)
+            .map(|i| (format!("a{i}"), serde_json::json!({"command": "x"})))
+            .collect();
+        std::fs::write(
+            env.dir.path().join("cfg").join(".claude.json"),
+            serde_json::json!({"projects": {
+                p1.to_str().unwrap(): {"mcpServers": local},
+                p2.to_str().unwrap(): {"mcpServers": local}}})
+            .to_string(),
+        )
+        .unwrap();
+        let core = env.start();
+        collect(&core, |e| {
+            e.iter()
+                .filter(
+                    |x| matches!(x, Event::Status { status, .. } if *status != Status::Checking),
+                )
+                .count()
+                >= 8
+        });
+        let mut folders = env.lists();
+        folders.sort();
+        assert_eq!(folders.len(), 2, "{folders:?}");
+        assert!(
+            folders[0].ends_with("p1") && folders[1].ends_with("p2"),
+            "{folders:?}"
+        );
+        assert!(env.gets().is_empty(), "{:?}", env.gets());
     }
 
     #[test]
