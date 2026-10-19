@@ -2633,13 +2633,19 @@ mod tests {
     #[test]
     fn a_plugin_server_is_compared_with_its_root_variable_expanded() {
         let e = Env::new();
-        let root = e.dir.path().join("plugins/cache/mkt/p1");
-        // Claude Code puts the folder in as text, as `installed_plugins.json` spells it, before the `/s.js`.
-        let script = format!("{}/s.js", root.to_string_lossy());
         e.plugin(
             "p1",
             json!({"rooted": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/s.js"]}}),
         );
+        // Claude Code puts the folder in as text, as `installed_plugins.json` spells it, before the `/s.js`.
+        let installed: Value = serde_json::from_str(
+            &std::fs::read_to_string(e.dir.path().join("plugins/installed_plugins.json")).unwrap(),
+        )
+        .unwrap();
+        let root = installed["plugins"]["p1@mkt"][0]["installPath"]
+            .as_str()
+            .unwrap();
+        let script = format!("{root}/s.js");
         // A second plugin writes the same, but its root is another folder.
         e.plugin(
             "p2",

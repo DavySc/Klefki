@@ -79,7 +79,9 @@ Checks for this round:
 - CI on `66e015f`: Windows failed `a_plugin_server_is_compared_with_its_root_variable_expanded`. The test built the
   hand-written path with `Path::join` (`…\p1\s.js`), while Claude Code puts the folder in as text before `/s.js`
   (`…\p1/s.js`). Test fixed to write what Claude Code expands; whether Claude Code on Windows treats the two spellings
-  as the same is added to 008's Not verified.
+  as the same is added to 008's Not verified. The second try (`b5980fa`) still joined `plugins/cache/mkt/p1` in one piece while
+  the helper joins `plugins/cache/mkt` then `p1` (different separators on Windows); the test now takes the folder from
+  `installed_plugins.json` as written.
 
 ## Open
 - Plugins on or off only in a project's settings files are not read yet (decision 008, finding 3).
