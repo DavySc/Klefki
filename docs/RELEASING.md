@@ -14,7 +14,18 @@ Each package holds both `klefki` and `klefki-cli`. The Linux job also writes a C
 
 Before upload, `scripts/check-release.py` looks inside each package: the Windows app is a GUI program with its icon embedded and the CLI a console program, the macOS binaries hold both architectures and `Info.plist` carries the version, and the `.deb` installs both programs, a menu entry and an icon.
 
-The builds are not signed yet; signing comes in later M4 slices (`docs/PLAN.md`).
+The installers are not code-signed yet; Windows and macOS signing come in later M4 slices (`docs/PLAN.md`).
+
+## Checksum signature (minisign)
+
+`scripts/sign-checksums.sh` signs `SHA256SUMS` with minisign, on tags and on manual runs from main only, and checks the signature against `minisign.pub` before anything is published. Committing `minisign.pub` at the repository root switches it on; until then the step prints a notice and skips. Once it is committed, a missing secret or a signature that does not verify fails the release. The release notes then gain a "Check the signature" section (`docs/release-notes-minisign.md`, with the public key filled in).
+
+To set it up (once, by the owner):
+
+1. `minisign -G -p minisign.pub -s klefki.key`, with a strong password. Keep `klefki.key` and the password backed up offline: losing them means users must move to a new key.
+2. Add the repository secrets `MINISIGN_SECRET_KEY` (the whole content of `klefki.key`) and `MINISIGN_PASSWORD`.
+3. Commit `minisign.pub` through a pull request.
+4. Start the release workflow by hand on main: the publish job should print `Signature and comment signature verified`.
 
 ## Cutting a release
 
