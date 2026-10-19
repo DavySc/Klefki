@@ -179,14 +179,9 @@ impl ServerFields {
             }
         };
         if !lexed.variables.is_empty() {
-            let names: Vec<String> = lexed
-                .variables
-                .iter()
-                .map(|v| format!("${{{v}}}"))
-                .collect();
             notes.push(format!(
                 "Claude Code fills in {} from its own environment when it starts the server.",
-                names.join(", ")
+                paste::listed(&lexed.variables, |v| format!("${{{v}}}"))
             ));
         }
         Ok(words)
@@ -596,6 +591,17 @@ mod tests {
                 .any(|h| h.contains("${HOME}") && h.contains("${API_TOKEN}")),
             "{:?}",
             s.hints
+        );
+        // Many names are counted, not all listed (the note is laid out every frame); every argument is kept.
+        let names: String = (0..20).map(|i| format!(" $V{i}")).collect();
+        let s = stdio(&format!("node{names}")).read("n");
+        assert_eq!(definition(&s)["args"][19], json!("${V19}"));
+        let [note] = s.hints.as_slice() else {
+            panic!("{:?}", s.hints)
+        };
+        assert!(
+            note.contains("${V7} and 12 more from") && !note.contains("${V8}"),
+            "{note}"
         );
     }
 
