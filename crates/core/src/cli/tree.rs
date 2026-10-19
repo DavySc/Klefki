@@ -1,19 +1,28 @@
 //! Ends a process together with everything it started, such as the server that `claude mcp get` runs through npx
 //! and node. On Unix the process leads a process group of its own; on Windows it is put in a job object.
 //!
-//! Only a timeout or a cancel ends a tree. When the process ends by itself, whatever it left running is left alone:
-//! Claude may start something on purpose that outlives it, such as an update.
+//! A timeout or a cancel ends a tree. When the process ends by itself, whatever it left running is left alone
+//! (Claude may start something on purpose that outlives it, such as an update), unless the tree was started with
+//! `end_leftovers`: such a tree is ended by its caller then too, and whenever Klefki itself ends while it runs.
+//! On Unix that is when Klefki returns or exits, or is ended by SIGINT (Ctrl+C), SIGTERM or SIGHUP (its terminal
+//! closed); SIGKILL cannot be caught. On Windows the job ends with Klefki however Klefki ends.
 use std::io;
 use std::process::{Child, Command};
 
 /// Starts `cmd` so that it can be ended with everything it starts. On Windows it also gets no console window.
-pub(crate) fn spawn(cmd: &mut Command) -> io::Result<(Child, Tree)> {
+pub(crate) fn spawn(cmd: &mut Command, end_leftovers: bool) -> io::Result<(Child, Tree)> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+        if end_leftovers {
+            live::watch();
+        }
         let child = cmd.spawn()?;
-        let tree = Tree::led_by(child.id());
+        let mut tree = Tree::led_by(child.id());
+        if end_leftovers && let Some(group) = tree.group {
+            tree.listed = live::add(group);
+        }
         Ok((child, tree))
     }
     #[cfg(windows)]
@@ -26,7 +35,7 @@ pub(crate) fn spawn(cmd: &mut Command) -> io::Result<(Child, Tree)> {
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let mut child = cmd.spawn()?;
         let tree = Tree {
-            job: sys::job_with(child.as_raw_handle()),
+            job: sys::job_with(child.as_raw_handle(), end_leftovers),
         };
         if let Err(e) = sys::resume(child.id()) {
             let _ = child.kill();
@@ -41,6 +50,9 @@ pub(crate) fn spawn(cmd: &mut Command) -> io::Result<(Child, Tree)> {
 pub(crate) struct Tree {
     #[cfg(unix)]
     group: Option<libc::pid_t>,
+    /// The group is on the list of those ended when Klefki ends.
+    #[cfg(unix)]
+    listed: bool,
     #[cfg(windows)]
     job: Option<std::os::windows::io::OwnedHandle>,
 }
@@ -52,14 +64,20 @@ impl Tree {
     pub(crate) fn of_pty(child: &dyn portable_pty::Child) -> Self {
         #[cfg(unix)]
         {
-            child
-                .process_id()
-                .map_or(Self { group: None }, Self::led_by)
+            child.process_id().map_or(
+                Self {
+                    group: None,
+                    listed: false,
+                },
+                Self::led_by,
+            )
         }
         #[cfg(windows)]
         {
             Self {
-                job: child.as_raw_handle().and_then(sys::job_with),
+                job: child
+                    .as_raw_handle()
+                    .and_then(|process| sys::job_with(process, false)),
             }
         }
     }
@@ -68,6 +86,7 @@ impl Tree {
     fn led_by(pid: u32) -> Self {
         Self {
             group: libc::pid_t::try_from(pid).ok().filter(|&p| p > 1),
+            listed: false,
         }
     }
 
@@ -82,10 +101,152 @@ impl Tree {
                 libc::kill(-group, libc::SIGKILL);
             }
         }
+        #[cfg(unix)]
+        self.unlist();
         #[cfg(windows)]
         if let Some(job) = &self.job {
             sys::terminate(job);
         }
+    }
+
+    /// Takes the group off the list before its leader is waited for, after which its id may be another's.
+    #[cfg(unix)]
+    fn unlist(&self) {
+        if self.listed
+            && let Some(group) = self.group
+        {
+            live::remove(group);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Tree {
+    fn drop(&mut self) {
+        self.unlist();
+    }
+}
+
+/// Has the process ended? Unlike [`Child::try_wait`] it is not waited for yet, so on Unix its id still names its
+/// group: call [`Tree::kill`], then wait for it.
+pub(crate) fn has_ended(child: &mut Child) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let pid: libc::id_t = child.id();
+        loop {
+            // SAFETY: all zeros is a valid `siginfo_t`; zeroed, it says "nothing ended" if the call leaves it alone.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is a valid, writable `siginfo_t`. `WNOWAIT` leaves the process to be waited for.
+            let r = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid,
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if r == 0 {
+                // SAFETY: filled in by `waitid` for a process that changed state, all zeros otherwise.
+                let changed = unsafe { info.si_pid() } != 0;
+                // macOS also reports a stopped process here, despite `WEXITED` (golang/go#19314): only an end counts.
+                let ended = matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                );
+                return Ok(changed && ended);
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // A job keeps its own handle: nothing can take its place, waited for or not.
+        Ok(child.try_wait()?.is_some())
+    }
+}
+
+/// The process groups to end when Klefki ends. A signal handler reads them, so they are plain atomics: no lock, no
+/// allocation. A group that finds no free slot is still ended by its caller, only not when Klefki ends.
+#[cfg(unix)]
+mod live {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    const SLOTS: usize = 64;
+    static GROUPS: [AtomicI32; SLOTS] = [const { AtomicI32::new(0) }; SLOTS];
+    const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    pub(super) fn add(group: libc::pid_t) -> bool {
+        GROUPS.iter().any(|slot| {
+            slot.compare_exchange(0, group, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        })
+    }
+
+    pub(super) fn remove(group: libc::pid_t) {
+        for slot in &GROUPS {
+            let _ = slot.compare_exchange(group, 0, Ordering::SeqCst, Ordering::SeqCst);
+        }
+    }
+
+    /// Only calls that are safe in a signal handler.
+    fn end_all() {
+        for slot in &GROUPS {
+            let group = slot.load(Ordering::SeqCst);
+            if group > 1 {
+                // SAFETY: a plain system call. A group on the list has a leader that was not waited for yet. Another
+                // thread may take it off the list and wait for its leader just after this load; its id would then
+                // have to be reused by a new group within that instant, while Klefki is ending.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    extern "C" fn at_exit() {
+        end_all();
+    }
+
+    extern "C" fn on_signal(signal: libc::c_int) {
+        end_all();
+        // Then end as the signal would have: the shell sees that Klefki was interrupted.
+        // SAFETY: both calls are safe in a signal handler; the signal stays blocked until the handler returns.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    /// Once per process: ends the listed groups when it exits, and on the signals that would end it by default. A
+    /// signal that is ignored (`nohup`) or already handled is left as it is.
+    pub(super) fn watch() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // SAFETY: registers a function that takes no arguments and only makes system calls.
+            unsafe {
+                libc::atexit(at_exit);
+            }
+            for signal in SIGNALS {
+                // SAFETY: all zeros is a valid `sigaction`; the first call only reads the current action into it.
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(signal, std::ptr::null(), &mut old) != 0
+                        || old.sa_sigaction != libc::SIG_DFL
+                    {
+                        continue;
+                    }
+                    let mut new: libc::sigaction = std::mem::zeroed();
+                    new.sa_sigaction =
+                        on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                    libc::sigemptyset(&mut new.sa_mask);
+                    libc::sigaction(signal, &new, std::ptr::null_mut());
+                }
+            }
+        });
     }
 }
 
@@ -99,13 +260,14 @@ mod sys {
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
-    /// A new job holding `process`, or `None` if the system refuses (then only the process itself is ended).
-    pub(super) fn job_with(process: RawHandle) -> Option<OwnedHandle> {
+    /// A new job holding `process`, or `None` if the system refuses (then only the process itself is ended). With
+    /// `end_leftovers`, the job ends when its last handle closes: Klefki's, however Klefki ends.
+    pub(super) fn job_with(process: RawHandle, end_leftovers: bool) -> Option<OwnedHandle> {
         // SAFETY: no name and no security attributes; a handle returned is owned from here on.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
@@ -116,7 +278,12 @@ mod sys {
         // A process that asks to leave the job on purpose may (it is then not ended with it); without this its start
         // would fail. If the system refuses, the job is used as it is.
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            | if end_leftovers {
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            } else {
+                0
+            };
         // SAFETY: the handle is open and `limits` is the structure this information class takes, with its size.
         unsafe {
             SetInformationJobObject(

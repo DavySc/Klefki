@@ -68,6 +68,7 @@ impl Claude for Program {
             env: &env,
             timeout: self.timeout,
             max_output: MAX_OUTPUT,
+            end_leftovers: false,
         })
     }
 }

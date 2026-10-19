@@ -55,6 +55,16 @@ pub enum Command {
     /// The definitions of these servers as one `{"mcpServers": {…}}` block, values that may be secrets replaced by
     /// `${VAR}` references (see [`Event::Exported`]). Writes nothing.
     Export(Vec<ServerId>),
+    /// Ask the user, in the system's save dialog, where to save an export; `name` is the file name to start from
+    /// (see [`Event::ExportFileChosen`]).
+    ChooseExportFile { name: String },
+    /// Write an exported block to `path` (see [`Event::ExportSaved`]). An existing file is replaced only with
+    /// `replace`; Claude Code's own files and `.mcp.json` files are never written.
+    SaveExport {
+        path: PathBuf,
+        text: String,
+        replace: bool,
+    },
     /// Whether a client secret is stored for this OAuth server (see [`Event::SecretStatus`]).
     SecretStatus(ServerId),
     /// Keep this client secret for the OAuth server, in the system's secret store.
@@ -357,6 +367,14 @@ pub enum Event {
     },
     /// The block [`Command::Export`] asked for.
     Exported(crate::export::Exported),
+    /// Where the user chose to save an export, after [`Command::ChooseExportFile`].
+    ExportFileChosen(crate::export_file::FileChoice),
+    /// Whether [`Command::SaveExport`] wrote the file. `shown` is the path as it can be shown (sanitised).
+    ExportSaved {
+        path: PathBuf,
+        shown: String,
+        result: Result<(), crate::export_file::SaveError>,
+    },
     /// Why a sign-in could not come back to `port` now, or `None` when it could ([`Command::CheckCallbackPort`]).
     CallbackPort {
         port: u16,
@@ -427,6 +445,8 @@ pub(crate) struct EngineConfig {
     pub secrets: Option<Arc<dyn SecretStore>>,
     /// Opens a checked sign-in page in the browser. Tests record the link instead.
     pub open_url: OpenUrl,
+    /// Shows the system's save dialog. Tests answer for the user instead.
+    pub choose_file: crate::export_file::ChooseFile,
     /// How long a sign-in may wait for the user before it is stopped.
     pub sign_in_timeout: Duration,
     /// Runs Claude Code's own commands that change servers (`mcp add-json`, `mcp remove`) instead of the CLI found
@@ -788,6 +808,30 @@ fn engine_main(
                 shared
                     .emitter
                     .emit(Event::Exported(crate::export::export(sources)));
+            }
+            Command::ChooseExportFile { name } => {
+                // The dialog waits for the user, so it runs on a thread of its own: the engine keeps going.
+                let choose = Arc::clone(&shared.config.choose_file);
+                let home = shared.config.home.clone();
+                let emitter = shared.emitter.clone();
+                std::thread::spawn(move || {
+                    let choice = crate::export_file::choose(&choose, &name, home.as_deref());
+                    emitter.emit(Event::ExportFileChosen(choice));
+                });
+            }
+            Command::SaveExport {
+                path,
+                text,
+                replace,
+            } => {
+                let result =
+                    crate::export_file::save(shared.config.paths.as_ref(), &path, &text, replace);
+                let shown = crate::sanitize::shown(&path.to_string_lossy());
+                shared.emitter.emit(Event::ExportSaved {
+                    path,
+                    shown,
+                    result,
+                });
             }
             Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
             Command::StoreSecret { id, secret: value } => {
@@ -2240,6 +2284,14 @@ fn cli_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
         .collect()
 }
 
+/// The environment of a run that checks a server. A check ends whatever Claude leaves running
+/// (`RunSpec::end_leftovers`), so it must not start an update of Claude that would be ended with it.
+fn check_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
+    let mut env = cli_env(shared);
+    env.push(("DISABLE_AUTOUPDATER", OsStr::new("1")));
+    env
+}
+
 fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
     let stamp = ProgramStamp::of(program);
     if let (Some(stamp), Some((known, version))) = (&stamp, &*lock(&shared.version))
@@ -2263,6 +2315,7 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
         env: &cli_env(shared),
         timeout: VERSION_TIMEOUT,
         max_output: 1024,
+        end_leftovers: false,
     })
     .ok()?;
     let token = out.stdout.split_whitespace().next()?;
@@ -2290,9 +2343,10 @@ fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
         program: &program,
         args: &["mcp", "get", job.name.as_str()],
         cwd: Some(&job.cwd),
-        env: &cli_env(shared),
+        env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     interpret(result, timeout)
 }
@@ -2381,9 +2435,10 @@ fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
             job.name.as_str(),
         ],
         cwd: Some(&job.cwd),
-        env: &cli_env(shared),
+        env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     let stderr = result
         .as_ref()
@@ -2450,6 +2505,8 @@ mod tests {
         log: PathBuf,
         /// Links the engine asked to open in a browser. Tests never open one.
         opened: Arc<Mutex<Vec<String>>>,
+        /// What the save dialog answers. Tests never show one.
+        chosen: Arc<Mutex<Option<PathBuf>>>,
     }
 
     impl Env {
@@ -2468,6 +2525,7 @@ mod tests {
                 dir,
                 log,
                 opened: Arc::default(),
+                chosen: Arc::default(),
             }
         }
 
@@ -2499,6 +2557,10 @@ mod tests {
                         lock(&opened).push(link.to_owned());
                         Ok(())
                     })
+                },
+                choose_file: {
+                    let chosen = Arc::clone(&self.chosen);
+                    Arc::new(move |_: &str| lock(&chosen).clone())
                 },
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
@@ -5588,6 +5650,75 @@ mod tests {
             std::fs::read(env.dir.path().join("cfg").join(".claude.json")).unwrap(),
             claude_json_before
         );
+    }
+
+    fn first_event<T>(core: &Core, pick: impl Fn(&Event) -> Option<T>) -> T {
+        collect(core, |e| e.iter().any(|x| pick(x).is_some()))
+            .iter()
+            .find_map(pick)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_export_is_saved_where_the_user_chose_and_never_over_claudes_own_file() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let core = env.start();
+        let chosen = |core: &Core| {
+            first_event(core, |e| match e {
+                Event::ExportFileChosen(choice) => Some(choice.clone()),
+                _ => None,
+            })
+        };
+        let saved = |core: &Core| {
+            first_event(core, |e| match e {
+                Event::ExportSaved { shown, result, .. } => Some((shown.clone(), result.clone())),
+                _ => None,
+            })
+        };
+        // No dialog could be shown: a path to start from instead.
+        core.send(Command::ChooseExportFile {
+            name: "mcp-servers.json".into(),
+        });
+        assert!(matches!(
+            chosen(&core),
+            crate::export_file::FileChoice::NoDialog { suggested } if suggested.ends_with("mcp-servers.json")
+        ));
+        let file = env.dir.path().join("home").join("servers.json");
+        *lock(&env.chosen) = Some(file.clone());
+        core.send(Command::ChooseExportFile {
+            name: "servers.json".into(),
+        });
+        assert_eq!(
+            chosen(&core),
+            crate::export_file::FileChoice::Chosen(file.clone())
+        );
+        core.send(Command::SaveExport {
+            path: file.clone(),
+            text: "{}".into(),
+            replace: false,
+        });
+        assert_eq!(saved(&core), (file.to_string_lossy().into_owned(), Ok(())));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}\n");
+        core.send(Command::SaveExport {
+            path: file.clone(),
+            text: "{\"again\": 1}".into(),
+            replace: false,
+        });
+        assert_eq!(saved(&core).1, Err(crate::export_file::SaveError::Exists));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}\n");
+
+        let claude_json = env.dir.path().join("cfg").join(".claude.json");
+        let before = std::fs::read(&claude_json).unwrap();
+        core.send(Command::SaveExport {
+            path: claude_json.clone(),
+            text: "{}".into(),
+            replace: true,
+        });
+        assert!(matches!(
+            saved(&core).1,
+            Err(crate::export_file::SaveError::Refused(_))
+        ));
+        assert_eq!(std::fs::read(&claude_json).unwrap(), before);
     }
 
     #[test]

@@ -36,6 +36,7 @@ Written for people first, with `--json` for scripts (clig.dev: "Human-readable o
 | 1 | `status` found a checked server that is not connected (failed, needs auth, tools failed, pending approval, could not be checked). |
 | 2 | Usage error: unknown command or option, a name that matches no server, no command at all. |
 | 3 | Claude Code could not be used: not found, refused (a script shim), or no check got an answer (all timed out or gave output Klefki does not understand). A broken tool, not a broken server, so monitoring can tell them apart (clig.dev: map exit codes to the main failure modes). |
+| 4 | `export --output` wrote nothing: the file is there and replacing it was not confirmed, or Klefki does not write there (see below). |
 
 ## `export` (2026-10-19)
 - Prints the servers (all, or those named) as one `{"mcpServers": {…}}` block on stdout: the shape a `.mcp.json` has, and what the app's Add reads back when pasted. It is the same block the app's Export dialog shows, made by core (`export.rs`). It reads the configuration only: no process, no write.
@@ -43,6 +44,7 @@ Written for people first, with `--json` for scripts (clig.dev: "Human-readable o
 - A value made entirely of references stays; one that mixes a reference with text is replaced, with a note. Secret-looking URL path segments, and a `command` or `headersHelper` holding a known key shape, are replaced too (the latter two whole). An environment value that is a plain setting (short number, word, path, or URL without credentials, under a name that does not sound secret) becomes `${NAME:-value}`, so the block works with nothing set; stderr lists those apart from the variables that must be set.
 - The variables to set, and notes (a server left out, two servers with one name: the second is `NAME_2`; the same definition in two places is in the block once), go to stderr, so `> servers.json` holds only the block. No `--json`: the output is JSON already.
 - Exit 0 when every server is in the block, 1 when one could not be read (the note says why), 2 for a name that matches no server.
+- **`--output FILE` / `-o FILE`** (2026-10-19) writes the block to `FILE` instead of stdout (stdout stays empty), and stderr says `Saved <name or N servers> to FILE.` before the variables. The file is written whole (a temporary file beside it, then moved into place). An existing file is kept: at a terminal the CLI asks `Replace it? [y/N]`; otherwise it names `--force`, which replaces it (clig.dev: "Confirm before doing anything dangerous", with a flag for scripts). Claude Code's own files (`.claude.json`, anything in its configuration folder or a `.claude` folder) and `.mcp.json` files are refused even with `--force`: they change only through a reviewed plan, and a project's servers belong to its repository. A link is never followed. Exit **4** when the file was not written, so a script can tell it from a server left out (1).
 
 ## Not done here
 Filtering by project or scope, colour. Ctrl+C does not yet stop running checks and the servers they started (follow-up, with #24's process-tree kill).

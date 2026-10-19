@@ -71,8 +71,21 @@ pub(crate) fn gone_soon(pid: u32) -> bool {
     false
 }
 
+/// Ends a process the test left running on purpose.
+pub(crate) fn end_pid(pid: u32) {
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .output();
+}
+
 const TREE_FILE: &str = "KLEFKI_TEST_TREE_FILE";
 const TREE_DEPTH: &str = "KLEFKI_TEST_TREE_DEPTH";
+const TREE_LEADER_ENDS: &str = "KLEFKI_TEST_TREE_LEADER_ENDS";
 
 /// A stand-in for `claude` starting a server (`npx`, then node) that it never ends: this test binary, run as
 /// [`tree_helper`], starts `depth` more levels of itself below it, and every level waits forever. Each appends its
@@ -94,6 +107,17 @@ pub(crate) fn process_tree(
         (TREE_FILE.to_owned(), pids.as_os_str().to_owned()),
         (TREE_DEPTH.to_owned(), depth.to_string().into()),
     ];
+    (program, args, env)
+}
+
+/// Like [`process_tree`], but its first process ends by itself once every level below it has started, as `claude`
+/// does when its own wait for a server runs out: it ends the server it started, not what that started.
+pub(crate) fn process_tree_left_behind(
+    pids: &Path,
+    depth: u32,
+) -> (PathBuf, Vec<String>, Vec<(String, OsString)>) {
+    let (program, args, mut env) = process_tree(pids, depth);
+    env.push((TREE_LEADER_ENDS.to_owned(), "1".into()));
     (program, args, env)
 }
 
@@ -126,6 +150,7 @@ fn tree_helper() {
         return;
     };
     let depth: u32 = std::env::var(TREE_DEPTH).unwrap().parse().unwrap();
+    let leader_ends = std::env::var_os(TREE_LEADER_ENDS).is_some();
     // Like a server that outlives a hang-up: closing a terminal must not be what ends it.
     #[cfg(unix)]
     // SAFETY: setting a signal to be ignored has no handler to run and no memory to share.
@@ -137,6 +162,7 @@ fn tree_helper() {
         Command::new(program)
             .args(args)
             .envs(env)
+            .env_remove(TREE_LEADER_ENDS)
             .stdin(Stdio::null())
             .spawn()
             .unwrap()
@@ -148,6 +174,10 @@ fn tree_helper() {
         .unwrap()
         .write_all(format!("{}\n", std::process::id()).as_bytes())
         .unwrap();
+    if leader_ends {
+        tree_pids(Path::new(&file), depth as usize + 1);
+        return;
+    }
     loop {
         std::thread::sleep(Duration::from_secs(60));
     }
