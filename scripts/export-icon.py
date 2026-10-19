@@ -12,11 +12,15 @@ def img(f,s): return Image.open(io.BytesIO(cairosvg.svg2png(url=f"{D}/{f}",outpu
 def art(s): return img('klefki-small.svg' if s<=24 else 'klefki.svg', s)
 def pngb(im):
     b=io.BytesIO(); im.save(b,'PNG',optimize=True); return b.getvalue()
-for s in (128,256): art(s).save(f"{D}/klefki-{s}.png",optimize=True)
-sizes=[16,24,32,48,64,128,256]
+art(256).save(f"{D}/klefki-256.png",optimize=True)
+# Windows asks for 16, 20, 24, 30, 32, 36, 40, 48, 64 and 256 px depending on display scaling.
+sizes=[16,20,24,30,32,36,40,48,64,128,256]
 blobs=[pngb(art(s)) for s in sizes]
 out=struct.pack('<HHH',0,1,len(sizes)); off=6+16*len(sizes)
 for s,b in zip(sizes,blobs):
     out+=struct.pack('<BBBBHHII',s%256,s%256,0,0,1,32,len(b),off); off+=len(b)
 open(f"{D}/klefki.ico",'wb').write(out+b''.join(blobs))
-big=art(1024); big.save(f"{D}/klefki.icns",append_images=[art(s) for s in (16,32,64,128,256,512)])
+# icns by hand: Pillow leaves out the 16 and 32 px (@1x) entries. Each entry is a type, a length and a PNG.
+icns=[("icp4",16),("ic11",32),("icp5",32),("ic12",64),("icp6",64),("ic07",128),("ic13",256),("ic08",256),("ic14",512),("ic09",512),("ic10",1024)]
+body=b"".join(t.encode()+struct.pack(">I",8+len(b))+b for t,b in ((t,pngb(art(s))) for t,s in icns))
+open(f"{D}/klefki.icns","wb").write(b"icns"+struct.pack(">I",8+len(body))+body)

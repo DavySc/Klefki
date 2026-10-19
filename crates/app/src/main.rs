@@ -37,9 +37,10 @@ fn main() -> eframe::Result {
     )
 }
 
-/// The window and taskbar icon (`assets/icon/klefki.svg`), baked in as a small PNG. eframe already links the
-/// PNG decoder, so this adds no dependency; decoding it takes well under a millisecond.
-const ICON_PNG: &[u8] = include_bytes!("../assets/icon/klefki-128.png");
+/// The window, taskbar and Dock icon (`assets/icon/klefki.svg`), baked in as a 13 KB PNG. 256 px keeps the
+/// macOS Dock sharp on a Retina screen; Windows scales it down to its title bar and taskbar sizes. eframe
+/// already links the PNG decoder, so this adds no dependency; decoding it takes well under a millisecond.
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon/klefki-256.png");
 
 fn viewport() -> egui::ViewportBuilder {
     let builder = egui::ViewportBuilder::default()
@@ -72,8 +73,8 @@ mod tests {
     #[test]
     fn the_window_has_the_app_icon() {
         let icon = viewport().icon.expect("the window sets an icon");
-        assert_eq!((icon.width, icon.height), (128, 128));
-        assert_eq!(icon.rgba.len(), 128 * 128 * 4);
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 
     #[test]
@@ -85,7 +86,7 @@ mod tests {
         for (x, y) in [(0, 0), (last, 0), (0, last), (last, last)] {
             assert_eq!(alpha(x, y), 0, "corner ({x}, {y}) is transparent");
         }
-        assert_eq!(alpha(64, 64), 255);
-        assert_eq!(alpha(64, 3), 255, "the tile reaches the top edge");
+        assert_eq!(alpha(128, 128), 255);
+        assert_eq!(alpha(128, 6), 255, "the tile reaches the top edge");
     }
 }
