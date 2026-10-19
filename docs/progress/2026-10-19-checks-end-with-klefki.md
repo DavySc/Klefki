@@ -30,4 +30,4 @@ Goal: two open items from `2026-10-18-kill-process-tree.md` and `2026-10-18-cli-
 - Polish: check and Diagnose runs get `DISABLE_AUTOUPDATER=1`, so a check never starts an update that it would then end; one name (`end_leftovers`) in tree.rs too; the `end_all` SAFETY note names the remaining instant between a handler's load and the runner's wait.
 
 ## Next
-CI was green on all three systems on 93efcd6. Main (efe73f2, #24) merged in; verify-all exit 0 (core 616, app 303, cli 17 + 23; deny ok). CI on the merge, then merge.
+CI was green on all three systems on 93efcd6 and c720288. Main 5fc9dc1 (#26) merged in (one conflict: both added tests at the end of crates/cli/tests/cli.rs; both kept); verify-all exit 0 (core 651, app 314, cli 18 + 25; deny ok). CI on the merge, then merge.
