@@ -141,6 +141,12 @@ impl EditorState {
         state
     }
 
+    /// The draft differs from the definition it was read from.
+    fn edited(&mut self) -> bool {
+        self.sync();
+        matches!(self, Self::Ready { text, original, .. } if text != original)
+    }
+
     /// Brings the form and the JSON in line after either was edited: an edited JSON text is read into the form,
     /// an edited form is written out as JSON. Comparisons only, unless something changed.
     fn sync(&mut self) {
@@ -245,6 +251,10 @@ pub struct ShellApp {
     preparing: bool,
     /// The definition being viewed or edited, in the form or as JSON.
     editor: Option<Editor>,
+    /// The editor's draft was sent for review, and no plan or failure has come back yet.
+    draft_asked: bool,
+    /// The plan that saves the editor's draft. Any other change applied leaves a draft's edits as they are.
+    draft_plan: Option<u64>,
     /// Ctrl+K / ⌘K.
     command: CommandPalette,
     /// The Duplicate dialog, while open.
@@ -310,6 +320,8 @@ impl ShellApp {
             applying: false,
             preparing: false,
             editor: None,
+            draft_asked: false,
+            draft_plan: None,
             command: CommandPalette::default(),
             duplicate: None,
             add: None,
@@ -429,15 +441,18 @@ impl ShellApp {
             }
             Event::PlanReady(plan) => {
                 self.preparing = false;
+                let saves_draft = std::mem::take(&mut self.draft_asked);
                 if self.plan.is_some() {
                     // Only one dialog at a time; the one open (perhaps being saved) keeps it.
                     self.send(Command::Discard(plan.id));
                 } else {
+                    self.draft_plan = saves_draft.then_some(plan.id);
                     self.plan = Some(plan);
                 }
             }
             Event::PlanFailed(why) => {
                 self.preparing = false;
+                self.draft_asked = false;
                 self.adding.clear();
                 match self.add.as_mut().filter(|f| f.reviewing) {
                     // Said in the Add dialog, which comes back as it was, so nothing typed is lost.
@@ -465,18 +480,23 @@ impl ShellApp {
             } => {
                 if changed {
                     // Read again what was saved, for the server still being edited; drop it for any other.
+                    let saved_draft = self.draft_plan.take() == Some(plan);
                     let open = self
                         .editor
                         .take()
-                        .map(|e| e.id)
-                        .filter(|id| self.single_selected().is_some_and(|s| s.is(id)));
-                    if let Some(id) = open {
-                        self.editor = Some(Editor {
-                            id: id.clone(),
-                            state: EditorState::Loading,
-                            reveal: false,
-                        });
-                        self.send(Command::Inspect(id));
+                        .filter(|e| self.single_selected().is_some_and(|s| s.is(&e.id)));
+                    if let Some(mut e) = open {
+                        if !saved_draft && e.state.edited() {
+                            // Edits not saved yet stay: what was applied was another change.
+                            self.editor = Some(e);
+                        } else {
+                            self.editor = Some(Editor {
+                                id: e.id.clone(),
+                                state: EditorState::Loading,
+                                reveal: false,
+                            });
+                            self.send(Command::Inspect(e.id));
+                        }
                     }
                 }
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
@@ -3547,9 +3567,20 @@ impl ShellApp {
             {
                 *text = original.clone();
             }
+            // A draft outlives other changes, so it does not pass for what the file holds.
+            if text != original {
+                ui.add(
+                    egui::Label::new(RichText::new("Unsaved").small().color(pal.text_muted))
+                        .extend(),
+                )
+                .on_hover_text("This edit is not saved yet: Review and save… writes it");
+            }
         });
-        if let Some(json) = review {
+        if let Some(json) = review
+            && self.can_prepare()
+        {
             self.prepare(vec![Change::Replace { id: s.id(), json }]);
+            self.draft_asked = true;
         }
     }
 }
@@ -8612,6 +8643,123 @@ mod tests {
             .unwrap();
         h.run();
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+    }
+
+    /// Another change, prepared and applied while the form is open: Turn off from the toolbar, say.
+    fn apply_another_change(
+        h: &mut Harness<'static, ShellApp>,
+        engine: &klefki_core::api::Detached,
+        plan: u64,
+    ) {
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(plan, &["+ alpha"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label("Apply").click();
+        h.run();
+        assert_eq!(drain(engine), vec![Command::Apply(plan)]);
+        engine
+            .events
+            .send(Event::Applied {
+                plan,
+                changed: true,
+                backup: None,
+                notes: Vec::new(),
+            })
+            .unwrap();
+        h.run();
+    }
+
+    #[test]
+    fn a_draft_not_yet_saved_survives_another_change_being_applied() {
+        // Found in the UI review: a command edited in the form, then the same server turned off, and the edit was
+        // replaced by what was saved before.
+        let (mut h, engine, _) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        apply_another_change(&mut h, &engine, 3);
+        assert!(
+            drain(&engine).is_empty(),
+            "the definition is not asked for again"
+        );
+        assert_eq!(form(&mut h).command, "node22");
+        assert!(
+            !h.get_by_label("Review and save…")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
+    fn the_save_bar_says_while_a_draft_is_not_saved() {
+        // A draft is kept through other changes, so it says it is not saved yet rather than passing for what the
+        // file holds.
+        let (mut h, engine, _) = form_harness(FORM_ORIGINAL, true);
+        assert!(h.query_by_label("Unsaved").is_none());
+        form(&mut h).command = "node22".into();
+        h.run();
+        apply_another_change(&mut h, &engine, 3);
+        h.get_by_label("Unsaved");
+        // Once the message about the other change has faded: it sits over the save bar until then.
+        h.state_mut().outcome.as_mut().unwrap().shown_at = Some(-1000.0);
+        h.run();
+        h.get_by_label("Revert").click();
+        h.run();
+        assert_eq!(form(&mut h).command, "node");
+        assert!(h.query_by_label("Unsaved").is_none());
+    }
+
+    #[test]
+    fn a_draft_edited_as_json_survives_another_change_being_applied() {
+        let (mut h, engine, _) = form_harness(FORM_ORIGINAL, true);
+        set_json_text(&mut h, |t| t.replace("a.js", "b.js"));
+        h.run();
+        apply_another_change(&mut h, &engine, 3);
+        assert!(drain(&engine).is_empty());
+        assert!(json_text(&h).contains("b.js"));
+    }
+
+    #[test]
+    fn a_saved_draft_is_read_again_once_applied() {
+        // What was written is read back: the draft's typed values are dropped and the form starts from the file.
+        let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        h.get_by_label("Review and save…").click();
+        h.run();
+        assert!(matches!(drain(&engine).as_slice(), [Command::Prepare(_)]));
+        apply_another_change(&mut h, &engine, 5);
+        assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+    }
+
+    #[test]
+    fn a_draft_whose_review_was_cancelled_or_failed_survives_a_later_change() {
+        let (mut h, engine, _) = form_harness(FORM_ORIGINAL, true);
+        form(&mut h).command = "node22".into();
+        h.run();
+        // Reviewed, then cancelled.
+        h.get_by_label("Review and save…").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(5, &["+ node22"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label("Cancel").click();
+        h.run();
+        // Reviewed, and the engine could not prepare it.
+        h.get_by_label("Review and save…").click();
+        h.run();
+        engine
+            .events
+            .send(Event::PlanFailed("the file changed".into()))
+            .unwrap();
+        h.run();
+        drain(&engine);
+        apply_another_change(&mut h, &engine, 6);
+        assert!(drain(&engine).is_empty());
+        assert_eq!(form(&mut h).command, "node22");
     }
 
     #[test]
