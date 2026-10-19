@@ -2826,7 +2826,40 @@ mod tests {
         );
 
         core.send(Command::Refresh { live_all: true });
-        let events = collect(&core, |e| final_status(e, "recent").is_some());
+        // Both answer again: counting the gets after only one has, the other may not have started yet.
+        let events = collect(&core, |e| {
+            final_status(e, "recent").is_some() && final_status(e, "fresh").is_some()
+        });
+        assert_eq!(final_status(&events, "recent"), Some(Status::Connected));
+        let mut names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        names.sort();
+        assert_eq!(names, ["fresh", "fresh", "recent"], "F5 checks every one");
+    }
+
+    #[test]
+    fn f5_checks_one_at_a_time_still_check_every_one() {
+        // The test above with F5's checks one after another instead of side by side: the second has not started
+        // when the first answers, so the test waits for both before counting.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "recent": http("https://a.example.com"),
+                "fresh": {"type": "stdio", "command": "x"}}}),
+            r#"{"rules":[{"args":["mcp","get"],"stdout_file":"c.txt"},{"args":["--version"]}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["recent".to_owned()]);
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| final_status(e, "fresh").is_some());
+        core.send(Command::Refresh { live_all: true });
+        let events = collect(&core, |e| {
+            final_status(e, "recent").is_some() && final_status(e, "fresh").is_some()
+        });
         assert_eq!(final_status(&events, "recent"), Some(Status::Connected));
         let mut names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
         names.sort();
