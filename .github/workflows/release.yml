@@ -39,9 +39,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release
+      # No build cache: a release is built from scratch, and caches saved under a tag could not be reused.
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version "$CARGO_PACKAGER_VERSION"
 
