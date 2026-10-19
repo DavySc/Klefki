@@ -14,6 +14,10 @@ pub enum Cmd {
         json: bool,
         claude: Option<PathBuf>,
     },
+    /// The definitions, as one `{"mcpServers": {…}}` block with secrets replaced by `${VAR}` references.
+    Export {
+        names: Vec<String>,
+    },
     Help,
     Version,
 }
@@ -32,16 +36,18 @@ fn bad(why: String) -> Usage {
 }
 
 pub const HELP: &str = "\
-klefki-cli: list Claude Code's MCP servers and check whether they connect.
+klefki-cli: list Claude Code's MCP servers, check whether they connect, export them.
 
 Examples:
   klefki-cli status                 check every server that is on
   klefki-cli status docs            check one server, a project server too
   klefki-cli status --json | jq '.servers[] | select(.status == \"failed\") | .name'
+  klefki-cli export github > servers.json
 
 Usage:
   klefki-cli list   [NAME...] [--json]
   klefki-cli status [NAME...] [--json] [--claude PATH]
+  klefki-cli export [NAME...]
   klefki-cli help
   klefki-cli --version
 
@@ -51,10 +57,15 @@ Commands:
   status   Ask Claude Code whether each server connects. Checks the user and local
            servers that are on. Project (.mcp.json) servers run the repository's own
            command, so they are checked only when named.
+  export   Print the servers' definitions as one {\"mcpServers\": {...}} block, the
+           shape a .mcp.json has and Klefki's Add reads. Every environment and
+           header value, and anything else that looks like a secret, is written
+           as a ${VAR} reference; stderr lists the variables to set. Reads the
+           configuration only; runs nothing, writes nothing.
 
 Options:
   NAME           Only these servers (by name, in every scope).
-  --json         Print JSON for scripts instead of the table.
+  --json         Print JSON for scripts instead of the table (list, status).
   --claude PATH  The Claude CLI to use (default: found like the Klefki app does).
   -h, --help     Show this help.
   -V, --version  Show the version.
@@ -62,8 +73,9 @@ Options:
   Servers that are off, or rejected for their project, are never checked.
 
 Exit status:
-  0  Done; for status, every server checked is connected.
-  1  status found a server that is not connected.
+  0  Done; for status, every server checked is connected; for export, every
+     server named is in the block.
+  1  status found a server that is not connected; export left one out.
   2  The command line was wrong, or a NAME matches no server.
   3  Claude Code could not be used: not found, or no check got an answer.
 
@@ -76,21 +88,23 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
         None => return Err(Usage::NoCommand),
         Some(c) => text(c)?,
     };
-    let status = match command.as_str() {
-        "list" => false,
-        "status" => true,
+    let kind = match command.as_str() {
+        "list" => Kind::List,
+        "status" => Kind::Status,
+        "export" => Kind::Export,
         "help" | "-h" | "--help" => return Ok(Cmd::Help),
         "-V" | "--version" => return Ok(Cmd::Version),
         other if other.starts_with('-') => return Err(bad(format!("unknown option {other}"))),
         other => {
             return Err(bad(
-                match crate::suggest::closest(other, ["list", "status", "help"]) {
+                match crate::suggest::closest(other, ["list", "status", "export", "help"]) {
                     Some(meant) => format!("unknown command {other:?}; did you mean {meant:?}?"),
                     None => format!("unknown command {other:?}"),
                 },
             ));
         }
     };
+    let status = kind == Kind::Status;
     let mut names = Vec::new();
     let mut json = false;
     let mut claude = None;
@@ -108,13 +122,16 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
         match arg.as_str() {
             _ if only_names => names.push(arg),
             "--" => only_names = true,
+            "--json" if kind == Kind::Export => {
+                return Err(bad("export always prints JSON; leave out --json".to_owned()));
+            }
             "--json" => json = true,
             "-h" | "--help" => return Ok(Cmd::Help),
             "--claude" if status => claude = Some(claude_path(args.next())?),
             "--claude" => {
-                return Err(bad(
-                    "--claude is only for status: list starts no program".to_owned()
-                ));
+                return Err(bad(format!(
+                    "--claude is only for status: {command} starts no program"
+                )));
             }
             option if option.starts_with('-') && option.len() > 1 => {
                 return Err(bad(format!("unknown option {option}")));
@@ -122,15 +139,22 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             _ => names.push(arg),
         }
     }
-    Ok(if status {
-        Cmd::Status {
+    Ok(match kind {
+        Kind::Status => Cmd::Status {
             names,
             json,
             claude,
-        }
-    } else {
-        Cmd::List { names, json }
+        },
+        Kind::List => Cmd::List { names, json },
+        Kind::Export => Cmd::Export { names },
     })
+}
+
+#[derive(PartialEq, Eq)]
+enum Kind {
+    List,
+    Status,
+    Export,
 }
 
 fn claude_path(value: Option<OsString>) -> Result<PathBuf, Usage> {
@@ -189,6 +213,24 @@ mod tests {
             assert_eq!(p(help), Ok(Cmd::Help), "{help:?}");
         }
         assert_eq!(p(&["-V"]), Ok(Cmd::Version));
+    }
+
+    #[test]
+    fn export_takes_names_only() {
+        assert_eq!(
+            p(&["export", "a", "b"]),
+            Ok(Cmd::Export {
+                names: vec!["a".into(), "b".into()]
+            })
+        );
+        assert_eq!(p(&["export"]), Ok(Cmd::Export { names: vec![] }));
+        let refused = |args: &[&str]| match p(args) {
+            Err(Usage::Bad(why)) => why,
+            other => panic!("{args:?} gave {other:?}"),
+        };
+        assert!(refused(&["export", "--json"]).contains("always prints JSON"));
+        assert!(refused(&["export", "--claude", "/x"]).contains("export starts no program"));
+        assert!(refused(&["exprot"]).contains("did you mean \"export\""));
     }
 
     #[test]

@@ -18,8 +18,7 @@ const USAGE: u8 = 2;
 /// Claude Code could not be used, so nothing is known about the servers: a broken tool, not a broken server.
 const UNAVAILABLE: u8 = 3;
 
-const SHORT_USAGE: &str =
-    "Usage: klefki-cli list|status [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
+const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 
 fn main() -> ExitCode {
     let code = match args::parse(std::env::args_os().skip(1)) {
@@ -31,6 +30,7 @@ fn main() -> ExitCode {
             json,
             claude,
         }) => status(&names, json, claude),
+        Ok(Cmd::Export { names }) => export(&names),
         Err(Usage::NoCommand) => {
             eprint!("{}", args::HELP);
             USAGE
@@ -58,6 +58,43 @@ fn list(names: &[String], json: bool) -> u8 {
         render::list_text(&snapshot, &rows, home().as_deref())
     };
     out(&text)
+}
+
+/// The block goes to stdout, so `> servers.json` holds only the block; what to know about it goes to stderr.
+fn export(names: &[String]) -> u8 {
+    let snapshot = api::load_snapshot();
+    warn(&snapshot);
+    let ids: Vec<_> = match select(&snapshot, names) {
+        Ok(rows) => rows.into_iter().map(ServerRow::id).collect(),
+        Err(why) => return usage(&why),
+    };
+    let exported = api::export(&ids);
+    for note in &exported.notes {
+        eprintln!("note: {note}");
+    }
+    let (to_set, defaults): (Vec<_>, Vec<_>) =
+        exported.variables.iter().partition(|v| v.default.is_none());
+    if !to_set.is_empty() {
+        eprintln!("Set these variables where the servers are added:");
+        for variable in to_set {
+            eprintln!("  {}  ({})", variable.name, variable.replaces.join("; "));
+        }
+    }
+    if !defaults.is_empty() {
+        eprintln!("Plain settings kept as defaults (set the variable to change one):");
+        for variable in defaults {
+            let default = variable.default.as_deref().unwrap_or_default();
+            eprintln!(
+                "  {}={default}  ({})",
+                variable.name,
+                variable.replaces.join("; ")
+            );
+        }
+    }
+    match out(&format!("{}\n", exported.text)) {
+        OK if exported.left_out > 0 => PROBLEM,
+        code => code,
+    }
 }
 
 fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u8 {

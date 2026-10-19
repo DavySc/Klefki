@@ -4,6 +4,7 @@ mod cli;
 mod config;
 mod diagnose;
 mod engine;
+mod export;
 mod fixtures;
 mod form;
 mod model;
