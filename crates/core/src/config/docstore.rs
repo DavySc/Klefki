@@ -758,10 +758,21 @@ struct Lock {
 
 impl Lock {
     fn acquire(dir: &Path, wait: Duration) -> Result<Self, StoreError> {
+        Self::acquire_with(dir, wait, cfg!(windows), |dir| std::fs::create_dir(dir))
+    }
+
+    /// [`acquire`](Self::acquire), with `create` making the directory. `denied_passes`: a refusal to create it may
+    /// be over in a moment (Windows).
+    fn acquire_with(
+        dir: &Path,
+        wait: Duration,
+        denied_passes: bool,
+        mut create: impl FnMut(&Path) -> io::Result<()>,
+    ) -> Result<Self, StoreError> {
         let started = Instant::now();
         let mut attempt = 0;
         loop {
-            match std::fs::create_dir(dir) {
+            let refused = match create(dir) {
                 Ok(()) => {
                     return Ok(Self {
                         dir: dir.to_owned(),
@@ -774,11 +785,16 @@ impl Lock {
                     if is_stale(dir) && std::fs::remove_dir(dir).is_ok() {
                         continue;
                     }
+                    None
                 }
+                // A lock just removed while something still had it open (a contender checking its age, Claude
+                // Code, a virus scanner) stays on Windows for a moment, and creating it again is refused as access
+                // denied: waited out like a held lock. A refusal that lasts is what is returned.
+                Err(e) if denied_passes && e.kind() == io::ErrorKind::PermissionDenied => Some(e),
                 Err(e) => return Err(e.into()),
-            }
+            };
             if started.elapsed() >= wait {
-                return Err(StoreError::Locked);
+                return Err(refused.map_or(StoreError::Locked, StoreError::from));
             }
             let pause = Duration::from_millis(BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)]);
             attempt += 1;
@@ -2538,6 +2554,47 @@ mod tests {
         assert_eq!(f.text(), text);
         assert!(f.backups().is_empty(), "{:?}", f.backups());
         assert!(f.leftovers().is_empty(), "{:?}", f.leftovers());
+    }
+
+    #[test]
+    fn a_lock_folder_still_being_removed_is_waited_for() {
+        // Main's Windows CI (run 39178339976): `two_writers_at_once_both_get_their_change_in` failed with "Access is
+        // denied". Windows refuses to create a folder that was just removed while something still had it open (a
+        // contender checking its age, Claude Code, a virus scanner), and the lock took that refusal as final.
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".claude.json.lock");
+        let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+        let mut calls = 0;
+        let taken = Lock::acquire_with(&lock, Duration::from_secs(5), true, |d| {
+            calls += 1;
+            if calls < 3 {
+                Err(denied())
+            } else {
+                std::fs::create_dir(d)
+            }
+        });
+        assert!(taken.is_ok(), "{:?}", taken.err());
+        assert_eq!(calls, 3);
+        drop(taken);
+        assert!(!lock.exists(), "released");
+        // A refusal that lasts is returned as it is, not as "locked", once the wait is over.
+        let mut calls = 0;
+        let err = Lock::acquire_with(&lock, Duration::from_millis(200), true, |_| {
+            calls += 1;
+            Err(denied())
+        })
+        .err();
+        assert!(matches!(err, Some(StoreError::Io(_))), "{err:?}");
+        assert!(calls > 1, "{calls}");
+        // Where a refusal is final (not Windows), it is returned at once.
+        let mut calls = 0;
+        let err = Lock::acquire_with(&lock, Duration::from_secs(5), false, |_| {
+            calls += 1;
+            Err(denied())
+        })
+        .err();
+        assert!(matches!(err, Some(StoreError::Io(_))), "{err:?}");
+        assert_eq!(calls, 1);
     }
 
     #[test]
