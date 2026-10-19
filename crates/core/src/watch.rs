@@ -8,6 +8,7 @@
 //! burst of saves (Claude saves several times per command) causes one reload.
 use crate::api::Snapshot;
 use crate::config::{ConfigPaths, inventory};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -104,8 +105,9 @@ impl Watch {
     /// Also watches those of `files` not watched yet, as they are now. Files already watched keep their baseline.
     pub(crate) fn extend(&self, files: Vec<PathBuf>) {
         let mut b = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
+        let mut known: HashSet<PathBuf> = b.files.iter().map(|(f, _)| f.clone()).collect();
         for f in files {
-            if !b.files.iter().any(|(known, _)| *known == f) {
+            if known.insert(f.clone()) {
                 let s = stamp(&f);
                 b.files.push((f, s));
             }
@@ -273,6 +275,51 @@ mod tests {
                 .any(|f| f.to_string_lossy().contains("relative"))
         );
         assert_eq!(files.len(), 3 + 2);
+    }
+
+    #[test]
+    fn many_new_files_are_watched_at_once() {
+        // Found reviewing performance: each new file was looked for among all the files added before it, so the
+        // first load with 300 projects (603 files) spent 15 to 20 ms here before the list was sent. The bound is
+        // loose, for debug builds on slow machines; the quadratic version took far longer.
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<PathBuf> = (0..10_000)
+            .map(|i| dir.path().join(format!("p{i}")).join(".mcp.json"))
+            .collect();
+        let w = Watch::start(Duration::from_secs(3600), SETTLE, || {});
+        w.rebase(files[..1].to_vec());
+        let started = Instant::now();
+        w.extend(files.clone());
+        w.extend(files.clone());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        let b = w.baseline.lock().unwrap();
+        assert_eq!(b.files.len(), files.len(), "each file once");
+        assert!(
+            b.files.iter().zip(&files).all(|((f, _), g)| f == g),
+            "in order"
+        );
+    }
+
+    #[test]
+    fn a_file_named_twice_is_watched_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.json"), dir.path().join("b.json"));
+        let w = Watch::start(Duration::from_secs(3600), SETTLE, || {});
+        w.rebase(vec![a.clone()]);
+        w.extend(vec![b.clone(), a.clone(), b.clone()]);
+        let files: Vec<PathBuf> = w
+            .baseline
+            .lock()
+            .unwrap()
+            .files
+            .iter()
+            .map(|(f, _)| f.clone())
+            .collect();
+        assert_eq!(files, [a, b]);
     }
 
     #[test]
