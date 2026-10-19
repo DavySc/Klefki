@@ -217,11 +217,37 @@ fn no_line_breaks(what: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Most cells the table of [`diff_lines`] may have (4 MiB). A longer run of changed lines is shown as all removed and
+/// all added: still right, only not the shortest diff.
+const MAX_DIFF_CELLS: usize = 1 << 20;
+
 /// The lines of `old` and `new` (pretty JSON) as a diff: `- ` removed, `+ ` added, two spaces unchanged. Made from a
-/// longest common subsequence, which is plenty for definitions of a few dozen lines.
+/// longest common subsequence of the lines between those both start and end with.
 pub(crate) fn diff_lines(old: &str, new: &str) -> Vec<String> {
-    let a: Vec<&str> = old.lines().collect();
-    let b: Vec<&str> = new.lines().collect();
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let end = old[start..]
+        .iter()
+        .rev()
+        .zip(new[start..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (a, b) = (&old[start..old.len() - end], &new[start..new.len() - end]);
+    let mut out: Vec<String> = old[..start].iter().map(|l| format!("  {l}")).collect();
+    if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
+        // In the order the table gives when no line is shared.
+        out.extend(b.iter().map(|l| format!("+ {l}")));
+        out.extend(a.iter().map(|l| format!("- {l}")));
+    } else {
+        changed_lines(a, b, &mut out);
+    }
+    out.extend(old[old.len() - end..].iter().map(|l| format!("  {l}")));
+    out
+}
+
+/// The diff of `a` and `b` from a longest common subsequence, onto `out`.
+fn changed_lines(a: &[&str], b: &[&str], out: &mut Vec<String>) {
     // lcs[i][j]: length of the longest common subsequence of a[i..] and b[j..].
     let mut lcs = vec![vec![0u32; b.len() + 1]; a.len() + 1];
     for i in (0..a.len()).rev() {
@@ -234,7 +260,6 @@ pub(crate) fn diff_lines(old: &str, new: &str) -> Vec<String> {
         }
     }
     let (mut i, mut j) = (0, 0);
-    let mut out = Vec::new();
     while i < a.len() || j < b.len() {
         if i < a.len() && j < b.len() && a[i] == b[j] {
             out.push(format!("  {}", a[i]));
@@ -248,7 +273,6 @@ pub(crate) fn diff_lines(old: &str, new: &str) -> Vec<String> {
             i += 1;
         }
     }
-    out
 }
 
 #[cfg(test)]
@@ -443,5 +467,78 @@ mod tests {
         assert!(diff_lines(old, old).iter().all(|l| l.starts_with("  ")));
         assert_eq!(diff_lines("", "x"), ["+ x"]);
         assert_eq!(diff_lines("x", ""), ["- x"]);
+    }
+
+    #[test]
+    fn a_long_definition_is_diffed_quickly() {
+        // Found reviewing main: the diff built a table of every old line by every new line, before the plan noticed
+        // that nothing changes. Replacing 8,000 arguments took 256 MB, and a definition read from the file has no
+        // size limit.
+        let definition = |tag: &str| {
+            let args: Vec<String> = (0..8_000).map(|i| format!("{tag}{i}")).collect();
+            serde_json::to_string_pretty(&json!({"command": "node", "args": args})).unwrap()
+        };
+        let (old, new) = (definition("a"), definition("b"));
+        let started = std::time::Instant::now();
+        let count =
+            |diff: &[String], mark: &str| diff.iter().filter(|l| l.starts_with(mark)).count();
+        // Every argument changes: each old one out, each new one in, the rest kept.
+        let diff = diff_lines(&old, &new);
+        assert_eq!(
+            (count(&diff, "- "), count(&diff, "+ "), count(&diff, "  ")),
+            (8_000, 8_000, 5)
+        );
+        // One argument among 8,000 changes: one line out, one in.
+        let edited = old.replace("\"a4000\",", "\"z\",");
+        let diff = diff_lines(&old, &edited);
+        let changed: Vec<_> = diff.iter().filter(|l| !l.starts_with("  ")).collect();
+        assert_eq!(changed, ["+     \"z\",", "-     \"a4000\","]);
+        assert_eq!(diff.len(), 8_006);
+        assert_eq!(count(&diff_lines(&old, &old), "  "), 8_005);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+    }
+
+    #[test]
+    fn the_diff_keeps_as_many_lines_as_can_be_kept() {
+        // Texts of a few lines that repeat, as `{`, `}` and `]` do in JSON: dropping the added lines gives the old
+        // text, dropping the removed ones the new, and the kept lines are a longest common subsequence.
+        fn longest_common(a: &[&str], b: &[&str]) -> usize {
+            let mut table = vec![vec![0; b.len() + 1]; a.len() + 1];
+            for i in 0..a.len() {
+                for j in 0..b.len() {
+                    table[i + 1][j + 1] = if a[i] == b[j] {
+                        table[i][j] + 1
+                    } else {
+                        table[i][j + 1].max(table[i + 1][j])
+                    };
+                }
+            }
+            table[a.len()][b.len()]
+        }
+        let words = ["{", "}", "  ]", "a", "b"];
+        let mut seed = 7u64;
+        let mut text = |lines: usize| {
+            (0..lines)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    words[(seed >> 33) as usize % words.len()]
+                })
+                .collect::<Vec<_>>()
+        };
+        for round in 0..2_000 {
+            let (a, b) = (text(round % 9), text(round % 7));
+            let diff = diff_lines(&a.join("\n"), &b.join("\n"));
+            let side = |drop: &str| -> Vec<&str> {
+                diff.iter()
+                    .filter(|l| !l.starts_with(drop))
+                    .map(|l| &l[2..])
+                    .collect()
+            };
+            assert_eq!(side("+ "), a, "{a:?} {b:?} {diff:?}");
+            assert_eq!(side("- "), b, "{a:?} {b:?} {diff:?}");
+            let kept = diff.iter().filter(|l| l.starts_with("  ")).count();
+            assert_eq!(kept, longest_common(&a, &b), "{a:?} {b:?} {diff:?}");
+        }
     }
 }
