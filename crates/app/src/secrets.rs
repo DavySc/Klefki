@@ -106,12 +106,13 @@ impl SecretsPage {
                                 store_name()
                             ))
                             .color(pal.warn),
-                        )
-                        .on_hover_text(problem.as_str());
+                        );
                         if ui.small_button("Try again").clicked() {
                             asked = Some(Asked::Reload);
                         }
                     });
+                    // In the open, not in a tooltip: it says what to fix, and hover is out of the keyboard's reach.
+                    muted(ui, problem);
                     ui.add_space(8.0);
                 }
                 let written = report.written();
@@ -125,7 +126,8 @@ impl SecretsPage {
                         egui::Label::new(
                             RichText::new(format!(
                                 "{} {count} typed into a configuration file, readable by anyone who can read \
-                                 the file. Open the server to put a ${{VARIABLE}} in its place.",
+                                 the file. Open the server to put a ${{VARIABLE}} in its place, and set that \
+                                 variable where Claude Code starts, or the server loses it.",
                                 icon::WARNING
                             ))
                             .color(pal.warn),
@@ -182,15 +184,17 @@ impl SecretsPage {
                     muted(
                         ui,
                         &format!(
-                            "Kept in the {} for servers no longer in the configuration (removed or renamed \
-                             outside Klefki). A server added back with the same name and place uses its secret \
-                             again.",
-                            store_name()
+                            "Kept in the {} for servers that are not in {} (removed or renamed outside \
+                             Klefki). If you use another Claude Code configuration on this computer, a server \
+                             there may still need one of these. A server added back with the same name and place \
+                             uses its secret again.",
+                            store_name(),
+                            report.config
                         ),
                     );
                     ui.add_space(6.0);
                     for u in unused {
-                        if let Some(a) = unused_line(ui, u, confirm) {
+                        if let Some(a) = unused_line(ui, u, &report.config, confirm) {
                             asked = Some(a);
                         }
                     }
@@ -209,7 +213,12 @@ fn muted(ui: &mut Ui, text: &str) {
 }
 
 /// One unused secret, with Forget, which asks first (`confirm`): a secret forgotten cannot be brought back.
-fn unused_line(ui: &mut Ui, u: &UnusedSecret, confirm: &mut Option<ConnectionId>) -> Option<Asked> {
+fn unused_line(
+    ui: &mut Ui,
+    u: &UnusedSecret,
+    config: &str,
+    confirm: &mut Option<ConnectionId>,
+) -> Option<Asked> {
     let pal = theme::palette(ui.ctx());
     let mut asked = None;
     let asking = confirm.as_ref() == Some(&u.connection);
@@ -233,8 +242,9 @@ fn unused_line(ui: &mut Ui, u: &UnusedSecret, confirm: &mut Option<ConnectionId>
             ui.add(
                 egui::Label::new(
                     RichText::new(format!(
-                        "Delete the client secret kept for {}? It cannot be brought back: adding the server \
-                         again means typing it in again.",
+                        "Delete the client secret kept for {}? No server in {config} uses it, but a server in \
+                         another Claude Code configuration on this computer may: its sign-in would stop working. \
+                         It cannot be brought back; you would type it in again.",
                         u.name
                     ))
                     .color(pal.warn),
@@ -242,7 +252,13 @@ fn unused_line(ui: &mut Ui, u: &UnusedSecret, confirm: &mut Option<ConnectionId>
                 .wrap(),
             );
             ui.horizontal(|ui| {
-                if ui.button("Forget secret").clicked() {
+                let forget = egui::Button::new(
+                    RichText::new("Forget secret")
+                        .strong()
+                        .color(pal.on_bright),
+                )
+                .fill(pal.danger);
+                if ui.add(forget).clicked() {
                     asked = Some(Asked::Forget(u.connection.clone()));
                 }
                 if ui.button("Keep").clicked() {
@@ -321,7 +337,8 @@ fn where_it_lives(ui: &mut Ui, u: &SecretUse, file: &str) {
             if let Some(instead) = instead {
                 text.push_str(&format!(" · use {instead} instead"));
             }
-            line(ui, text, pal.warn).on_hover_text(format!(
+            // Muted: the banner above says it once in the warning colour; a page of orange rows would not.
+            line(ui, text, pal.text_muted).on_hover_text(format!(
                 "{file}\nAnyone who can read this file can read the secret."
             ));
         }
@@ -502,6 +519,7 @@ mod tests {
             unused: vec![gone()],
             store_problem: None,
             notes: Vec::new(),
+            config: "~/.claude.json".to_owned(),
         }
     }
 
@@ -596,6 +614,9 @@ mod tests {
         drain(&engine);
         h.get_by_label("Forget…").click();
         h.run();
+        // Cross-review B1: what was checked, and who else may need it.
+        h.get_by_label_contains("No server in ~/.claude.json uses it");
+        h.get_by_label_contains("another Claude Code configuration on this computer may");
         h.get_by_label_contains("It cannot be brought back");
         h.get_by_label("Keep").click();
         h.run();
@@ -636,7 +657,8 @@ mod tests {
             .send(Event::Snapshot(fixture_snapshot()))
             .unwrap();
         h.run();
-        assert_eq!(asked_for_secrets(&engine), 1);
+        // Cross-review N1: the definitions again, not the system's store, which can ask to be unlocked.
+        assert_eq!(drain(&engine), [Command::SecretsAfterFileChange]);
         // What was shown stays until the answer comes.
         h.get_by_label("Header Authorization");
     }
@@ -652,6 +674,8 @@ mod tests {
         h.run();
         drain(&engine);
         h.get_by_label_contains("could not look in the");
+        // Cross-review N4: the reason in the open, not only on hover.
+        h.get_by_label("locked");
         h.get_by_label("Try again").click();
         h.run();
         assert_eq!(asked_for_secrets(&engine), 1);

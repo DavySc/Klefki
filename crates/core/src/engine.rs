@@ -94,6 +94,9 @@ pub enum Command {
     /// Which servers use secrets and where each lives, and the client secrets nothing uses (see [`Event::Secrets`]).
     /// Read only when asked: the Secrets page asks each time it is opened. No secret is read.
     Secrets,
+    /// [`Command::Secrets`] again after the files changed: the definitions are read again, and the system's store is
+    /// not asked again (asking can prompt to unlock it, and Claude Code saves often); its last listing is used.
+    SecretsAfterFileChange,
     /// Delete a client secret from the system's store that no server uses ([`crate::api::UnusedSecret`]). Refused
     /// when a server, or a definition Klefki keeps to put back, uses it by now. Answers with
     /// [`Event::UnusedSecretForgotten`], then [`Event::Secrets`].
@@ -705,6 +708,8 @@ struct Shared {
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     /// The secret store once opened. Not kept when opening failed, so a store unlocked later is found.
     secret_store: Mutex<Option<Arc<dyn SecretStore>>>,
+    /// What the system's store last listed for the Secrets page, or why it could not.
+    secrets_listed: Mutex<Option<Result<Vec<crate::model::ConnectionId>, String>>>,
     /// Per file, the redo log of klefki's changes whose check is still due.
     journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
@@ -767,6 +772,7 @@ fn engine_main(
         version: Mutex::new(None),
         journals: Arc::default(),
         secret_store: Mutex::new(None),
+        secrets_listed: Mutex::new(None),
         emitter,
         input: input_tx.clone(),
     });
@@ -870,8 +876,11 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
-            Command::Secrets => secrets(&shared, &state, None),
-            Command::ForgetUnusedSecret(connection) => secrets(&shared, &state, Some(connection)),
+            Command::Secrets => secrets(&shared, &state, SecretsAsk::List),
+            Command::SecretsAfterFileChange => secrets(&shared, &state, SecretsAsk::Reuse),
+            Command::ForgetUnusedSecret(connection) => {
+                secrets(&shared, &state, SecretsAsk::Forget(connection));
+            }
         }
     }
     // The UI is gone: a sign-in still running is stopped, so no `claude` keeps listening after Klefki closes.
@@ -930,9 +939,19 @@ fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
     });
 }
 
+/// How the Secrets page asks about the system's store.
+enum SecretsAsk {
+    /// List it again.
+    List,
+    /// Use its last listing, if there is one.
+    Reuse,
+    /// Delete this unused client secret, if nothing uses it, then list the store again.
+    Forget(crate::model::ConnectionId),
+}
+
 /// The Secrets page: the definitions are read here, the system's store is listed on a thread of its own (it may be
-/// slow, or ask the user to unlock it). With `forget`, that unused client secret is deleted first, if nothing uses it.
-fn secrets(shared: &Arc<Shared>, state: &State, forget: Option<crate::model::ConnectionId>) {
+/// slow, or ask the user to unlock it).
+fn secrets(shared: &Arc<Shared>, state: &State, ask: SecretsAsk) {
     let report = crate::secret_uses::read(
         shared.config.paths.as_ref(),
         shared.config.home.as_deref(),
@@ -952,37 +971,13 @@ fn secrets(shared: &Arc<Shared>, state: &State, forget: Option<crate::model::Con
             .iter()
             .flat_map(swap::Recovery::connections)
             .collect();
-        let store = secret_store(&shared);
-        if let Some(connection) = forget {
-            let used = snapshot
-                .servers
-                .iter()
-                .any(|r| r.connection == connection && r.oauth.is_some())
-                || kept.contains(&connection);
-            let result = if used {
-                Err("A server uses this client secret now, so it was kept.".to_owned())
-            } else {
-                match &store {
-                    Ok(store) => store
-                        .delete(&connection)
-                        .map(|_| ())
-                        .map_err(|e| sanitize(&e.to_string())),
-                    Err(e) => Err(sanitize(&e.to_string())),
-                }
-            };
-            shared
-                .emitter
-                .emit(Event::UnusedSecretForgotten { connection, result });
-        }
-        let listed = match &store {
-            Ok(store) => store.list().map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
+        let reused = match ask {
+            SecretsAsk::Reuse => lock(&shared.secrets_listed).clone(),
+            _ => None,
         };
-        // A store that cannot be opened matters only when a server signs in with OAuth.
-        let signs_in = snapshot.servers.iter().any(|r| r.oauth.is_some());
-        let listed = match listed {
-            Err(_) if !signs_in => Ok(Vec::new()),
-            listed => listed,
+        let listed = match reused {
+            Some(listed) => listed,
+            None => list_secrets(&shared, &snapshot, &kept, ask),
         };
         shared
             .emitter
@@ -990,6 +985,50 @@ fn secrets(shared: &Arc<Shared>, state: &State, forget: Option<crate::model::Con
                 report, &snapshot, listed, &kept,
             )));
     });
+}
+
+/// The connections the system's store keeps a client secret for, or why it could not say; after deleting `ask`'s
+/// unused secret. Remembered for [`SecretsAsk::Reuse`].
+fn list_secrets(
+    shared: &Shared,
+    snapshot: &Snapshot,
+    kept: &[crate::model::ConnectionId],
+    ask: SecretsAsk,
+) -> Result<Vec<crate::model::ConnectionId>, String> {
+    let store = secret_store(shared);
+    if let SecretsAsk::Forget(connection) = ask {
+        let used = snapshot
+            .servers
+            .iter()
+            .any(|r| r.connection == connection && r.oauth.is_some())
+            || kept.contains(&connection);
+        let result = if used {
+            Err("A server uses this client secret now, so it was kept.".to_owned())
+        } else {
+            match &store {
+                Ok(store) => store
+                    .delete(&connection)
+                    .map(|_| ())
+                    .map_err(|e| sanitize(&e.to_string())),
+                Err(e) => Err(sanitize(&e.to_string())),
+            }
+        };
+        shared
+            .emitter
+            .emit(Event::UnusedSecretForgotten { connection, result });
+    }
+    let listed = match &store {
+        Ok(store) => store.list().map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    // A store that cannot be opened matters only when a server signs in with OAuth.
+    let signs_in = snapshot.servers.iter().any(|r| r.oauth.is_some());
+    let listed = match listed {
+        Err(_) if !signs_in => Ok(Vec::new()),
+        listed => listed,
+    };
+    *lock(&shared.secrets_listed) = Some(listed.clone());
+    listed
 }
 
 /// The store client secrets are kept in: the one tests give, else the system's own, opened the first time it is
@@ -5021,12 +5060,6 @@ mod tests {
                     "Authorization".into(),
                     Place::Environment(vec!["REF_TOKEN".into()])
                 ),
-                (
-                    "sso2".into(),
-                    SecretKind::ClientSecret,
-                    "".into(),
-                    Place::Store(Some(false))
-                ),
             ]
         );
         assert!(
@@ -5042,6 +5075,61 @@ mod tests {
         for value in ["s3cret", "ghp_0123"] {
             assert!(!everything.contains(value), "{everything}");
         }
+    }
+
+    #[test]
+    fn unused_means_unused_in_this_configuration_and_the_report_names_it() {
+        // Cross-review B1: one store, two Claude Code configurations (CLAUDE_CONFIG_DIR). The second one cannot
+        // see the first's servers, so the page must say which configuration it looked at.
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let sso = user_id("sso").connection;
+        store
+            .set(&sso, &crate::secrets::Secret::new("s3cret".into()))
+            .unwrap();
+        let second = quiet_env(&serde_json::json!({"mcpServers": {"plain": {"command": "node"}}}));
+        let core = with_store(&second, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        let unused: Vec<&str> = report.unused.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(unused, ["sso"]);
+        let config = second.dir.path().join("cfg").join(".claude.json");
+        assert_eq!(
+            report.config,
+            crate::sanitize::shown(&config.display().to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_change_reads_the_definitions_again_but_not_the_store() {
+        // Cross-review N1/N2: listing the store can ask to unlock it, and Claude Code saves often.
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        assert_eq!(secrets_report(&core).store_problem, None);
+        *store.fail.lock().unwrap() =
+            Some(crate::secrets::SecretError::Unavailable("locked".into()));
+        let mut config = config_json(&env);
+        config["mcpServers"]["new"] =
+            serde_json::json!({"command": "x", "env": {"API_TOKEN": "${API_TOKEN}"}});
+        write_config(&env, &config);
+        core.send(Command::Refresh { live_all: false });
+        collect(&core, |e| !snapshots(e).is_empty());
+        core.send(Command::SecretsAfterFileChange);
+        let again = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Secrets(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(again.store_problem, None, "the store was not asked again");
+        assert!(
+            again.servers.iter().any(|s| s.id.name == "new"),
+            "{again:?}"
+        );
+        // Asked on purpose (opening the page, Try again), it is.
+        assert!(secrets_report(&core).store_problem.is_some());
     }
 
     #[test]

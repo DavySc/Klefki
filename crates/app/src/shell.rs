@@ -488,16 +488,15 @@ impl ShellApp {
         }
         // Anything that can change where secrets are, while the Secrets page is shown: read it again. What is shown
         // stays until the answer arrives.
-        if self.secrets.is_some()
-            && matches!(
-                event,
-                Event::Snapshot(_)
-                    | Event::Applied { changed: true, .. }
-                    | Event::ApplyFailed { .. }
-                    | Event::SecretStatus { .. }
-            )
-        {
-            self.send(Command::Secrets);
+        // A file change (Claude Code saves often) does not ask the system's store again: that can prompt to unlock it.
+        if self.secrets.is_some() {
+            match event {
+                Event::Snapshot(_) => self.send(Command::SecretsAfterFileChange),
+                Event::Applied { changed: true, .. }
+                | Event::ApplyFailed { .. }
+                | Event::SecretStatus { .. } => self.send(Command::Secrets),
+                _ => {}
+            }
         }
         match event {
             Event::Secrets(report) => {

@@ -30,6 +30,10 @@ pub struct Secrets {
     pub store_problem: Option<String>,
     /// Servers whose definition could not be read, and why.
     pub notes: Vec<String>,
+    /// The configuration file whose servers were looked at, as it can be shown (`~/.claude.json`). A client secret is
+    /// "unused" when no server there uses it: another Claude Code configuration on this computer
+    /// (`CLAUDE_CONFIG_DIR`) shares the same store and may still need it.
+    pub config: String,
 }
 
 impl Secrets {
@@ -130,7 +134,13 @@ pub(crate) fn read(
 ) -> Secrets {
     let ids: Vec<ServerId> = snapshot.servers.iter().map(|r| r.id()).collect();
     let sources = crate::export::sources(paths, snapshot, keys, &ids);
-    let mut secrets = Secrets::default();
+    let mut secrets = Secrets {
+        config: paths.map_or_else(
+            || ".claude.json".to_owned(),
+            |p| short(&p.claude_json, home),
+        ),
+        ..Secrets::default()
+    };
     for (row, source) in snapshot.servers.iter().zip(sources) {
         let definition = match source.definition {
             Ok(Value::Object(definition)) => definition,
@@ -148,10 +158,7 @@ pub(crate) fn read(
         }
         let file = match (row.scope, &row.project) {
             (Scope::Project, Some(project)) => format!("{project}/.mcp.json"),
-            _ => paths.map_or_else(
-                || ".claude.json".to_owned(),
-                |p| short(&p.claude_json, home),
-            ),
+            _ => secrets.config.clone(),
         };
         secrets.servers.push(ServerSecrets {
             id: row.id(),
@@ -195,12 +202,16 @@ pub(crate) fn with_store(
     };
     let held: Option<HashSet<&ConnectionId>> = stored.as_ref().map(|s| s.iter().collect());
     for server in &mut secrets.servers {
-        for u in &mut server.uses {
+        let stored = held.as_ref().map(|h| h.contains(&server.id.connection));
+        // No client secret stored is the usual case (a public client, or one that registers itself): nothing to say.
+        server.uses.retain_mut(|u| {
             if u.kind == SecretKind::ClientSecret {
-                u.place = Place::Store(held.as_ref().map(|h| h.contains(&server.id.connection)));
+                u.place = Place::Store(stored);
             }
-        }
+            u.place != Place::Store(Some(false))
+        });
     }
+    secrets.servers.retain(|s| !s.uses.is_empty());
     let used: HashSet<&ConnectionId> = snapshot
         .servers
         .iter()
@@ -628,7 +639,11 @@ mod tests {
             std::slice::from_ref(&kept),
         );
         assert_eq!(out.servers[0].uses[0].place, Place::Store(Some(true)));
-        assert_eq!(out.servers[1].uses[0].place, Place::Store(Some(false)));
+        assert_eq!(
+            out.servers.len(),
+            1,
+            "a server whose only secret would be a client secret it does not have is left out"
+        );
         // A kept definition's secret is in use; a server that no longer signs in does not use its old one.
         let unused: Vec<(&str, Option<&str>)> = out
             .unused
@@ -640,6 +655,7 @@ mod tests {
 
         let failed = with_store(secrets, &snapshot, Err("locked".into()), &[]);
         assert_eq!(failed.servers[0].uses[0].place, Place::Store(None));
+        assert_eq!(failed.servers.len(), 2, "not known is said");
         assert!(failed.unused.is_empty());
         assert_eq!(failed.store_problem.as_deref(), Some("locked"));
     }

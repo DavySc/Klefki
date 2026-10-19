@@ -30,4 +30,21 @@ are only listed, deleting one is an explicit user action) plus a read-only map o
 - **Checks** (Linux): `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test
   --workspace && cargo deny check` exit 0 (668 core, 323 app, 18 + 25 cli); `cargo clippy -p klefki -- -D warnings`
   exit 0. Ran the app under Xvfb on a sample config; screenshots at 1200 and 800×480 in the project's reviews folder.
-- **Next:** pull request, cross-review, merge.
+- **PR #34.** Cross-review (another thread) at 485acb9: one blocking point, eight non-blocking, folded in once:
+  - **B1** Forget could delete a secret another Claude Code configuration (`CLAUDE_CONFIG_DIR`) still uses: one
+    store, ids not per configuration. Fixed with the reviewer's smallest option: the report names the file it
+    checked (`Secrets::config`), and the section and the confirmation say no server *there* uses it and that a
+    server in another configuration may. The safer option (a per-configuration record of the secrets Klefki
+    stored) is left as a follow-up; it would hide secrets stored before the record existed.
+  - **N1/N2** A file change reads the definitions again (`Command::SecretsAfterFileChange`) and reuses the store's
+    last listing: listing can ask to unlock the Linux keyring, and Claude Code saves often. Opening the page,
+    Try again, Forget and an applied change list it again.
+  - **N3** Typed-in rows muted (icon kept); the banner alone in the warning colour. **N4** the store problem's
+    reason shown under it, not only on hover. **N5** Forget secret is a danger button. **N6** the banner says to
+    set the variable where Claude Code starts. **N7** a client secret that is not stored is left out (public
+    clients have none). **N8** the page names the store one way throughout (`store_name`).
+  - Tests: engine `unused_means_unused_in_this_configuration_and_the_report_names_it` (the reviewer's probe),
+    `a_file_change_reads_the_definitions_again_but_not_the_store`; app tests assert the B1 wording, the reason
+    line and `SecretsAfterFileChange` on a snapshot.
+  - Checks after the fold-in (Linux): full verify + `cargo clippy -p klefki` exit 0 (670 core, 323 app, 18 + 25 cli).
+- **Next:** merge main in, re-verify, reviewer re-checks B1, merge.
