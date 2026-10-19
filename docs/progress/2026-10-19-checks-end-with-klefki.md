@@ -18,11 +18,16 @@ Goal: two open items from `2026-10-18-kill-process-tree.md` and `2026-10-18-cli-
   - Kept behaviour: `runner::tests::other_runs_leave_what_claude_started_alone`.
 - Mutation checks: no `atexit` fails the exit case; no signal handlers fail SIGINT in both tests; no kill on a normal end fails the first test.
 - Cross-checked with clippy `-D warnings` for `x86_64-pc-windows-gnu` (core, cli) and `aarch64-apple-darwin` (core): clean. Windows and macOS tests run only in CI.
-- Verify-all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0; core 607, app 303, cli 17 + 23 passed; deny "advisories ok, bans ok, licenses ok, sources ok". No helper or fake-claude process left after a run.
+- Verify-all (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`): exit 0; core 607 (608 after review), app 303, cli 17 + 23 passed; deny "advisories ok, bans ok, licenses ok, sources ok". No helper or fake-claude process left after a run.
 
 ## Open
 - Diagnose passes `end_leftovers: true` but has no test of its own; the check path is covered end to end by the klefki-cli test.
 - Unchanged from before: a process that leaves the group (`setsid`, a daemon) or the job (breakaway) is not ended.
 
+## Cross-review (on cad5973): one fix, polish folded in once
+- Reviewer ran real Claude Code 2.1.302 with `klefki-cli status` and a hanging stdio server that starts a child: with Claude's own timeout (`MCP_TIMEOUT=3000`) and with SIGINT mid-check, main leaves processes behind and this branch leaves none (exit 130 on SIGINT).
+- Fixed: on macOS `waitid(WEXITED)` also reports a stopped process (golang/go#19314), so a stopped `claude` would have been taken for ended, its group killed and its leader waited for without a timeout. `has_ended` now counts only `CLD_EXITED`, `CLD_KILLED` and `CLD_DUMPED`. Reproducer `runner::tests::a_check_that_is_stopped_for_a_while_is_not_taken_for_ended` (SIGSTOP, then SIGCONT): with Linux made to report stops too (`WSTOPPED`) and no `si_code` check it fails ("exit_code: None"), with the check it passes.
+- Polish: check and Diagnose runs get `DISABLE_AUTOUPDATER=1`, so a check never starts an update that it would then end; one name (`end_leftovers`) in tree.rs too; the `end_all` SAFETY note names the remaining instant between a handler's load and the runner's wait.
+
 ## Next
-Cross-review, CI green on all three systems, merge.
+CI green on all three systems, merge.

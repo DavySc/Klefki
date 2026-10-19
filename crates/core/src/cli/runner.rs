@@ -370,6 +370,62 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_check_that_is_stopped_for_a_while_is_not_taken_for_ended() {
+        // Found in review: on macOS `waitid(WEXITED)` also reports a stopped process, which ended the check's group
+        // while Claude still ran and then waited for it without a timeout.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid.txt");
+        let json = format!(
+            r#"{{"rules":[{{"args":[],"delay_ms":1500,"stdout_file":"out.txt","write_pid_to":{}}}]}}"#,
+            serde_json::to_string(&pid_file.display().to_string()).unwrap()
+        );
+        let f = fixture(&json, &[("out.txt", b"answered\n")]);
+        let pauser = std::thread::spawn(move || {
+            let until = Instant::now() + SECS;
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                assert!(Instant::now() < until, "the check never started");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let signal = |name: &str| {
+                Command::new("kill")
+                    .args([name, &pid.to_string()])
+                    .status()
+                    .unwrap()
+            };
+            signal("-STOP");
+            std::thread::sleep(Duration::from_millis(500));
+            signal("-CONT");
+        });
+        let env: Vec<(&str, &OsStr)> = vec![
+            ("FAKE_CLAUDE_SCENARIO", f.scenario.as_os_str()),
+            ("FAKE_CLAUDE_LOG", f.log.as_os_str()),
+        ];
+        let out = run(&RunSpec {
+            program: fake_claude(),
+            args: &["mcp", "get", "x"],
+            cwd: None,
+            env: &env,
+            timeout: SECS,
+            max_output: 1000,
+            end_leftovers: true,
+        })
+        .unwrap();
+        pauser.join().unwrap();
+        assert_eq!(
+            (out.exit_code, out.stdout.as_str()),
+            (Some(0), "answered\n"),
+            "{out:?}"
+        );
+    }
+
     #[test]
     fn other_runs_leave_what_claude_started_alone() {
         // Claude may start something on purpose that outlives it, such as an update.

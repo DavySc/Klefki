@@ -3,24 +3,24 @@
 //!
 //! A timeout or a cancel ends a tree. When the process ends by itself, whatever it left running is left alone
 //! (Claude may start something on purpose that outlives it, such as an update), unless the tree was started with
-//! `ends_with_klefki`: such a tree is ended by its caller then too, and whenever Klefki itself ends while it runs.
+//! `end_leftovers`: such a tree is ended by its caller then too, and whenever Klefki itself ends while it runs.
 //! On Unix that is when Klefki returns or exits, or is ended by SIGINT (Ctrl+C), SIGTERM or SIGHUP (its terminal
 //! closed); SIGKILL cannot be caught. On Windows the job ends with Klefki however Klefki ends.
 use std::io;
 use std::process::{Child, Command};
 
 /// Starts `cmd` so that it can be ended with everything it starts. On Windows it also gets no console window.
-pub(crate) fn spawn(cmd: &mut Command, ends_with_klefki: bool) -> io::Result<(Child, Tree)> {
+pub(crate) fn spawn(cmd: &mut Command, end_leftovers: bool) -> io::Result<(Child, Tree)> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
-        if ends_with_klefki {
+        if end_leftovers {
             live::watch();
         }
         let child = cmd.spawn()?;
         let mut tree = Tree::led_by(child.id());
-        if ends_with_klefki && let Some(group) = tree.group {
+        if end_leftovers && let Some(group) = tree.group {
             tree.listed = live::add(group);
         }
         Ok((child, tree))
@@ -35,7 +35,7 @@ pub(crate) fn spawn(cmd: &mut Command, ends_with_klefki: bool) -> io::Result<(Ch
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         let mut child = cmd.spawn()?;
         let tree = Tree {
-            job: sys::job_with(child.as_raw_handle(), ends_with_klefki),
+            job: sys::job_with(child.as_raw_handle(), end_leftovers),
         };
         if let Err(e) = sys::resume(child.id()) {
             let _ = child.kill();
@@ -146,8 +146,14 @@ pub(crate) fn has_ended(child: &mut Child) -> io::Result<bool> {
                 )
             };
             if r == 0 {
-                // SAFETY: filled in by `waitid` for a process that ended, all zeros otherwise.
-                return Ok(unsafe { info.si_pid() } != 0);
+                // SAFETY: filled in by `waitid` for a process that changed state, all zeros otherwise.
+                let changed = unsafe { info.si_pid() } != 0;
+                // macOS also reports a stopped process here, despite `WEXITED` (golang/go#19314): only an end counts.
+                let ended = matches!(
+                    info.si_code,
+                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+                );
+                return Ok(changed && ended);
             }
             let e = io::Error::last_os_error();
             if e.kind() != io::ErrorKind::Interrupted {
@@ -191,7 +197,9 @@ mod live {
         for slot in &GROUPS {
             let group = slot.load(Ordering::SeqCst);
             if group > 1 {
-                // SAFETY: a plain system call. A group on the list has a leader that was not waited for yet.
+                // SAFETY: a plain system call. A group on the list has a leader that was not waited for yet. Another
+                // thread may take it off the list and wait for its leader just after this load; its id would then
+                // have to be reused by a new group within that instant, while Klefki is ending.
                 unsafe {
                     libc::kill(-group, libc::SIGKILL);
                 }
@@ -258,8 +266,8 @@ mod sys {
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
     /// A new job holding `process`, or `None` if the system refuses (then only the process itself is ended). With
-    /// `ends_with_klefki`, the job ends when its last handle closes: Klefki's, however Klefki ends.
-    pub(super) fn job_with(process: RawHandle, ends_with_klefki: bool) -> Option<OwnedHandle> {
+    /// `end_leftovers`, the job ends when its last handle closes: Klefki's, however Klefki ends.
+    pub(super) fn job_with(process: RawHandle, end_leftovers: bool) -> Option<OwnedHandle> {
         // SAFETY: no name and no security attributes; a handle returned is owned from here on.
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
@@ -271,7 +279,7 @@ mod sys {
         // would fail. If the system refuses, the job is used as it is.
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK
-            | if ends_with_klefki {
+            | if end_leftovers {
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             } else {
                 0
