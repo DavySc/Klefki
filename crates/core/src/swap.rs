@@ -807,9 +807,46 @@ pub(crate) fn free_of_kept(backup_dir: &Path, spot: &Spot) -> Result<(), String>
 }
 
 /// Deletes a recovery file the user no longer needs.
-pub(crate) fn forget(backup_dir: &Path, id: &str) -> Result<(), String> {
-    Recovery::load(&recovery_dir(backup_dir), id)?.discard();
+pub(crate) fn forget(backup_dir: &Path, claude_json: &Path, id: &str) -> Result<(), String> {
+    let kept = Recovery::load(&recovery_dir(backup_dir), id)?;
+    if let Some(why) = forget_problem(claude_json, &kept) {
+        return Err(why);
+    }
+    kept.discard();
     Ok(())
+}
+
+/// Why `kept` must not be forgotten now, if so: a server elsewhere shares its sign-in (same name, address and
+/// headers), and Claude Code's remove of the kept one took that server's client secret too. Only putting it back
+/// hands the secret to Claude Code again; forgetting it would leave the other server without one. Not once the kept
+/// server is back where it was: that add handed the secret over already.
+pub(crate) fn forget_problem(claude_json: &Path, kept: &Recovery) -> Option<String> {
+    if !signs_in(&kept.entry) {
+        return None;
+    }
+    let root = match read_root(claude_json) {
+        Ok(root) => root,
+        Err(e) => {
+            return Some(format!(
+                "Klefki cannot read the configuration to check what shares its sign-in: {e}."
+            ));
+        }
+    };
+    let spot = Spot {
+        project: kept.project.clone(),
+        name: kept.name.clone(),
+    };
+    if entry_in(&root, &spot).is_some() {
+        return None;
+    }
+    let others = sharing(&root, &spot, &kept.entry);
+    (!others.is_empty()).then(|| {
+        format!(
+            "{} {} shares this definition's sign-in, so removing this one may also have removed that server's client secret in Claude Code. Put this one back instead: that gives both their client secret again.",
+            sanitize(&kept.name),
+            others.join(" and ")
+        )
+    })
 }
 
 pub(crate) fn signs_in(entry: &Value) -> bool {
