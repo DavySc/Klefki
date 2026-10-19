@@ -1091,13 +1091,7 @@ impl ShellApp {
                         .hint_text(hint)
                         .desired_width(220.0),
                 );
-                // Not while Claude Code cannot be found: the version would be of a program that is gone.
-                if let Some(version) = self
-                    .cli_version
-                    .as_deref()
-                    .or(self.snapshot.cli_version.as_deref())
-                    .filter(|_| self.cli_problem.is_none())
-                {
+                if let Some(version) = self.shown_cli_version() {
                     // Only where it fits: in a narrow window it would be drawn over the title. Where the whole
                     // of it does not, the number alone, named in full on hover.
                     let full = format!("Claude CLI {version}");
@@ -1118,6 +1112,15 @@ impl ShellApp {
                 }
             });
         });
+    }
+
+    /// Claude Code's version, when it is known. Not while Claude Code cannot be found: the version would be of a
+    /// program that is gone.
+    fn shown_cli_version(&self) -> Option<&str> {
+        self.cli_version
+            .as_deref()
+            .or(self.snapshot.cli_version.as_deref())
+            .filter(|_| self.cli_problem.is_none())
     }
 
     fn nav(&mut self, ui: &mut Ui) {
@@ -2663,6 +2666,36 @@ impl ShellApp {
                 .small()
                 .color(pal.text_muted),
         );
+        // The top bar names the version only where it fits; here it always has room.
+        ui.add_space(24.0);
+        ui.label(RichText::new("Programs").strong());
+        ui.add_space(6.0);
+        egui::Grid::new("programs")
+            .num_columns(2)
+            .spacing([24.0, 14.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Claude Code").color(pal.text_muted));
+                match (self.shown_cli_version(), &self.cli_problem) {
+                    (Some(version), _) => {
+                        ui.label(version);
+                    }
+                    (None, Some(problem)) => {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Not found").color(pal.warn));
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(problem).small().color(pal.text_muted),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+                    (None, None) => {
+                        ui.label(RichText::new("Not known yet").color(pal.text_muted));
+                    }
+                }
+                ui.end_row();
+            });
     }
 
     /// Moves the selection `step` rows through the list as shown, starting at the top when nothing is selected.
@@ -7065,6 +7098,61 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label_contains("Live status is unavailable");
+    }
+
+    /// Whether the Settings page's "Claude Code" row says `text`, beside its name.
+    fn settings_cli_row_says(h: &Harness<'static, ShellApp>, size: egui::Vec2, text: &str) -> bool {
+        let page = egui::Rect::from_min_max(egui::pos2(220.0, 60.0), size.to_pos2());
+        let row = h.get_by_label("Claude Code").rect();
+        assert!(page.contains_rect(row), "{size:?}: Claude Code at {row:?}");
+        h.query_all_by_label_contains(text).any(|n| {
+            let r = n.rect();
+            page.contains_rect(r) && r.bottom() > row.top() && r.left() > row.right()
+        })
+    }
+
+    #[test]
+    fn settings_names_the_claude_code_version_at_any_width() {
+        // From the review of the top bar fix: in a narrow window the version showed nowhere.
+        for size in [SMALLEST_SIZE, egui::vec2(900.0, 600.0), OPENING_SIZE] {
+            let (mut h, engine) = live_harness();
+            h.set_size(size);
+            engine
+                .events
+                .send(klefki_core::api::Event::CliVersion(Some(
+                    "2.1.303".to_owned(),
+                )))
+                .unwrap();
+            h.run();
+            h.get_by_label("Settings").click();
+            h.run();
+            assert!(settings_cli_row_says(&h, size, "2.1.303"), "{size:?}");
+        }
+    }
+
+    #[test]
+    fn settings_says_when_claude_code_is_not_found_or_not_known_yet() {
+        let (mut h, engine) = live_harness();
+        h.set_size(OPENING_SIZE);
+        h.get_by_label("Settings").click();
+        h.run();
+        assert!(settings_cli_row_says(&h, OPENING_SIZE, "Not known yet"));
+        engine
+            .events
+            .send(klefki_core::api::Event::CliVersion(Some(
+                "2.1.303".to_owned(),
+            )))
+            .unwrap();
+        engine
+            .events
+            .send(klefki_core::api::Event::CliProblem(
+                "Claude Code was not found on PATH.".to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        assert!(settings_cli_row_says(&h, OPENING_SIZE, "Not found"));
+        assert!(settings_cli_row_says(&h, OPENING_SIZE, "not found on PATH"));
+        assert!(!settings_cli_row_says(&h, OPENING_SIZE, "2.1.303"));
     }
 
     #[test]
