@@ -10,6 +10,7 @@ Branch `claude/review-core-y2uzla`, restarted from main `5c27260` after part 1 (
 - **Masking gaps** (`config/secretlike.rs`, 85f7195). Shown in full before: a token as a URL's user name, a secret in a later query parameter or the fragment, `--oauth2Bearer`, `--header=Authorization: …` as one word, a neutral header name with a scheme or a credential's shape. Over-masked before: `--token-file x/y`, `--auth-type oauth`, `--token-url https://…`.
 - **Paste preview** (`paste.rs`, e876b3c). The summary used no masking, and problems quoted back `-k=SECRET`, `-e SECRET`, `-H "Bearer SECRET"`. It now uses the list's rules (and `display_url` for addresses) and cleans each word on its own.
 - **Diagnose, from #27's round 2** (`diagnose/redact.rs`, bf21f22). A plain-quoted value with an escaped quote in it (`"x\"y horse battery"`) was hidden only up to that quote; it is now read as a JSON string.
+- **Paste reading** (`paste.rs`, see the commit "Paste: prose, web typography, missing values and Git Bash switches"). An apostrophe in a README line (`Don't run as root.`) opened a quote that swallowed every command after it; when pasting, a line not starting with `claude` is now skipped whole, unread (not in the form). Non-breaking spaces separate words outside quotes; a curly quote or long dash starting a word is the problem, saying what to type instead. `-e`, `-H`, `-t`, `--client-id` and add-json's `-s` without a value are a problem, as in Claude Code. Every `X:/` switch Git Bash made right after `cmd` is put back (`cmd /s /c`).
 - **Duplicate-key flood** (`config/inventory.rs`, 83b82c3). One warning per repeat (174,750 for a 1 MiB file) buried every other warning; now one per name.
 
 ## Tests (each failed first; the later assertions in each were confirmed by temporarily reverting one rule at a time)
@@ -19,10 +20,11 @@ Branch `claude/review-core-y2uzla`, restarted from main `5c27260` after part 1 (
 - `sanitize::tests::a_csi_ends_where_its_text_starts`, `one_line_text_keeps_no_line_breaks`.
 - `config::secretlike::tests::secrets_the_first_rules_missed_are_hidden_too`, `a_setting_named_after_a_secret_stays_readable`, `a_token_in_an_address_gets_a_reference`.
 - `diagnose::redact::tests::a_quoted_value_is_hidden_to_its_closing_quote` gained the escaped-quote case.
+- `paste::tests::prose_with_an_apostrophe_hides_none_of_the_commands_after_it` (main: "Nothing here adds a server"), `every_switch_git_bash_turned_into_a_drive_is_undone`, `an_option_without_its_value_is_a_problem`, `typography_from_a_web_page_is_read_or_named`.
 - `paste::tests::the_summary_hides_what_the_list_hides`, `a_problem_never_repeats_a_secret`.
 
 ## Checks
-See the pull request: the full verify is run on the final head, after main is brought in.
+See the pull request (#30): the full verify is run on the final head, after main is brought in. CI could not run from about 23:55Z (no runners assigned); Windows and macOS are unverified until it does.
 
 ## Not done here (findings for Davy, in `reviews/2026-10-19-core/findings.md` in the project folder)
-Anything in files #26 changes (docstore, engine, api, ops), behaviour changes users would notice, and the paste-reading fixes, which come in part 3.
+Anything in files #26 changes (docstore, engine, api, ops), behaviour changes users would notice (Windows-style paste lexing, invisible characters), and decisions such as running `cargo deny` in CI.
