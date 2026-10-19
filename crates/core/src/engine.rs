@@ -56,6 +56,20 @@ pub enum Command {
     /// The definitions of these servers as one `{"mcpServers": {…}}` block, values that may be secrets replaced by
     /// `${VAR}` references (see [`Event::Exported`]). Writes nothing.
     Export(Vec<ServerId>),
+    /// Ask the user, in the system's save dialog, where to save an export; `name` is the file name to start from
+    /// (see [`Event::ExportFileChosen`]). `shown` is the dialog when the UI already opened it over its window
+    /// ([`Core::choose_export_file`]); without it no dialog is opened, and a path is asked for instead.
+    ChooseExportFile {
+        name: String,
+        shown: Option<crate::export_file::ShownDialog>,
+    },
+    /// Write an exported block to `path` (see [`Event::ExportSaved`]). An existing file is replaced only with
+    /// `replace`; Claude Code's own files and `.mcp.json` files are never written.
+    SaveExport {
+        path: PathBuf,
+        text: String,
+        replace: bool,
+    },
     /// Whether a client secret is stored for this OAuth server (see [`Event::SecretStatus`]).
     SecretStatus(ServerId),
     /// Keep this client secret for the OAuth server, in the system's secret store.
@@ -175,6 +189,11 @@ pub enum Change {
         targets: Vec<crate::model::Target>,
         secret: Option<Secret>,
     },
+    /// Put Claude Code's user and local servers, and which are switched off in each project, back the way the backup
+    /// `backup` of `.claude.json` has them (an [`crate::api::Backup::path`] from the activity log). Servers added
+    /// since are left as they are, and the rest of the file (Claude Code's own settings and history) too. Reviewed
+    /// on its own, not with other changes.
+    Restore { backup: String },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -353,6 +372,14 @@ pub enum Event {
     },
     /// The block [`Command::Export`] asked for.
     Exported(crate::export::Exported),
+    /// Where the user chose to save an export, after [`Command::ChooseExportFile`].
+    ExportFileChosen(crate::export_file::FileChoice),
+    /// Whether [`Command::SaveExport`] wrote the file. `shown` is the path as it can be shown (sanitised).
+    ExportSaved {
+        path: PathBuf,
+        shown: String,
+        result: Result<(), crate::export_file::SaveError>,
+    },
     /// Why a sign-in could not come back to `port` now, or `None` when it could ([`Command::CheckCallbackPort`]).
     CallbackPort {
         port: u16,
@@ -366,11 +393,25 @@ pub enum Event {
 pub struct Core {
     tx: Sender<Command>,
     rx: Receiver<Event>,
+    /// Opens the system's save dialog; `None` for a detached `Core` that opens none.
+    open_dialog: Option<crate::export_file::OpenDialog>,
 }
 
 impl Core {
     pub fn send(&self, command: Command) {
         let _ = self.tx.send(command);
+    }
+
+    /// [`Command::ChooseExportFile`] with the system's save dialog opened here, over `owner` (Klefki's window), so it
+    /// belongs to that window: a click on the window cannot send it behind, and on macOS it is the window's sheet.
+    /// Call it on the thread that owns the window. It returns once the dialog is open; the engine waits for the
+    /// answer.
+    pub fn choose_export_file(&self, name: String, owner: Option<&dyn crate::export_file::Owner>) {
+        let shown = self
+            .open_dialog
+            .as_ref()
+            .map(|open| crate::export_file::ShownDialog::open(open, &name, owner));
+        self.send(Command::ChooseExportFile { name, shown });
     }
 
     /// The next event, if one is ready. Never blocks.
@@ -384,7 +425,25 @@ impl Core {
     pub fn detached() -> (Core, Detached) {
         let (tx, commands) = mpsc::channel();
         let (events, rx) = mpsc::channel();
-        (Core { tx, rx }, Detached { commands, events })
+        let core = Core {
+            tx,
+            rx,
+            open_dialog: None,
+        };
+        (core, Detached { commands, events })
+    }
+
+    /// [`Core::detached`], with `open` showing the save dialog instead of the system: it is told the file name and
+    /// whether the dialog has an owner window.
+    #[doc(hidden)]
+    pub fn detached_with_dialog(
+        open: impl Fn(&str, bool) -> Option<PathBuf> + Send + Sync + 'static,
+    ) -> (Core, Detached) {
+        let (mut core, engine) = Core::detached();
+        core.open_dialog = Some(Arc::new(move |name, owner| {
+            Box::pin(std::future::ready(open(name, owner.is_some())))
+        }));
+        (core, engine)
     }
 }
 
@@ -423,6 +482,8 @@ pub(crate) struct EngineConfig {
     pub secrets: Option<Arc<dyn SecretStore>>,
     /// Opens a checked sign-in page in the browser. Tests record the link instead.
     pub open_url: OpenUrl,
+    /// Opens the system's save dialog. Tests answer for the user instead.
+    pub open_dialog: crate::export_file::OpenDialog,
     /// How long a sign-in may wait for the user before it is stopped.
     pub sign_in_timeout: Duration,
     /// Runs Claude Code's own commands that change servers (`mcp add-json`, `mcp remove`) instead of the CLI found
@@ -461,8 +522,13 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
             let _ = ui.send(Input::Closed);
         })
         .expect("start the command relay");
+    let open_dialog = Some(Arc::clone(&config.open_dialog));
     std::thread::spawn(move || engine_main(config, input_rx, input_tx, emitter));
-    Core { tx, rx }
+    Core {
+        tx,
+        rx,
+        open_dialog,
+    }
 }
 
 /// What the engine thread reacts to.
@@ -834,6 +900,46 @@ fn engine_main(
                     .emitter
                     .emit(Event::Exported(crate::export::export(sources)));
             }
+            Command::ChooseExportFile { name, shown } => {
+                let home = shared.config.home.clone();
+                // Only the UI's thread may open a dialog (on macOS, AppKit is main-thread only), so without one
+                // opened there, a path is asked for instead.
+                match shown.and_then(|s| s.take()) {
+                    None => {
+                        let choice = crate::export_file::not_shown(&name, home.as_deref());
+                        shared.emitter.emit(Event::ExportFileChosen(choice));
+                    }
+                    // The dialog waits for the user, so its answer is waited for on a thread of its own: the engine
+                    // keeps going.
+                    Some((opened, answer)) => {
+                        let emitter = shared.emitter.clone();
+                        std::thread::spawn(move || {
+                            let picked = pollster::block_on(answer);
+                            let choice = crate::export_file::answered(
+                                opened,
+                                picked,
+                                &name,
+                                home.as_deref(),
+                            );
+                            emitter.emit(Event::ExportFileChosen(choice));
+                        });
+                    }
+                }
+            }
+            Command::SaveExport {
+                path,
+                text,
+                replace,
+            } => {
+                let result =
+                    crate::export_file::save(shared.config.paths.as_ref(), &path, &text, replace);
+                let shown = crate::sanitize::shown(&path.to_string_lossy());
+                shared.emitter.emit(Event::ExportSaved {
+                    path,
+                    shown,
+                    result,
+                });
+            }
             Command::SecretStatus(id) => secret(&shared, &state.snapshot, id, SecretOp::Status),
             Command::StoreSecret { id, secret: value } => {
                 secret(&shared, &state.snapshot, id, SecretOp::Store(value));
@@ -1091,7 +1197,21 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         );
         let mut fresh = fresh;
         fresh.snapshot.kept = kept_list(shared);
-        let mut resolved = ops::resolve(changes, &fresh.snapshot, &fresh.keys)?;
+        let mut resolved = match changes {
+            [Change::Restore { backup }] => {
+                let now = match &read {
+                    Ok(Some((text, _))) => text.as_str(),
+                    Ok(None) => "",
+                    Err(e) => {
+                        return Err(format!(
+                            "The configuration could not be read, so nothing is restored: {e}"
+                        ));
+                    }
+                };
+                crate::restore::resolve(&backup_dir(shared)?, backup, now)?
+            }
+            _ => ops::resolve(changes, &fresh.snapshot, &fresh.keys)?,
+        };
         // A kept definition whose removal also took another server's client secret is put back, not forgotten.
         for id in &resolved.forget {
             let kept = swap::Recovery::find(&backup_dir(shared)?, id)?;
@@ -1158,6 +1278,30 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 let (op, warning) = swap::preview_put_back(&kept);
                 resolved.preview.push(op);
                 resolved.warnings.extend(warning);
+            }
+            // A server a restore puts back gets the client secret Klefki kept for it.
+            if resolved.cli.iter().any(|a| a.stored) {
+                let store = secret_store(shared).map_err(store_problem)?;
+                let mut without = Vec::new();
+                for add in resolved.cli.iter_mut().filter(|a| a.stored) {
+                    let scope = if add.project.is_some() {
+                        Scope::Local
+                    } else {
+                        Scope::User
+                    };
+                    let id =
+                        crate::model::ConnectionId::new(scope, add.project.as_deref(), &add.name);
+                    add.secret = store.get(&id).map_err(store_problem)?;
+                    if add.secret.is_none() {
+                        without.push(sanitize(&add.name));
+                    }
+                }
+                if !without.is_empty() {
+                    resolved.notes.push(format!(
+                        "Klefki has no copy of the client secret of {}, so Claude Code keeps none. If a server needs one, enter it on its Auth tab once it is back.",
+                        ops::and_list(&without)
+                    ));
+                }
             }
             let involves_secrets = !resolved.swaps.is_empty() || !resolved.put_back.is_empty();
             // Asked now, so a store that is missing or locked stops the change before anything runs.
@@ -2264,6 +2408,14 @@ fn cli_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
         .collect()
 }
 
+/// The environment of a run that checks a server. A check ends whatever Claude leaves running
+/// (`RunSpec::end_leftovers`), so it must not start an update of Claude that would be ended with it.
+fn check_env(shared: &Shared) -> Vec<(&str, &OsStr)> {
+    let mut env = cli_env(shared);
+    env.push(("DISABLE_AUTOUPDATER", OsStr::new("1")));
+    env
+}
+
 fn cached_cli_version(shared: &Shared, program: &Path) -> Option<String> {
     let stamp = ProgramStamp::of(program);
     if let (Some(stamp), Some((known, version))) = (&stamp, &*lock(&shared.version))
@@ -2287,6 +2439,7 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
         env: &cli_env(shared),
         timeout: VERSION_TIMEOUT,
         max_output: 1024,
+        end_leftovers: false,
     })
     .ok()?;
     let token = out.stdout.split_whitespace().next()?;
@@ -2345,6 +2498,8 @@ fn check_listed(shared: &Shared, job: &Job) -> ListedCheck {
         env: &env,
         timeout: shared.config.check_timeout,
         max_output: MAX_LIST_OUTPUT,
+        // It starts the servers, as `mcp get` does: none may outlive it.
+        end_leftovers: true,
     });
     let answers = match result {
         Ok(out) if !out.timed_out && out.exit_code == Some(0) => {
@@ -2433,9 +2588,10 @@ fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
         program: &program,
         args: &["mcp", "get", job.name.as_str()],
         cwd: Some(&job.cwd),
-        env: &cli_env(shared),
+        env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     interpret(result, timeout)
 }
@@ -2524,9 +2680,10 @@ fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
             job.name.as_str(),
         ],
         cwd: Some(&job.cwd),
-        env: &cli_env(shared),
+        env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
+        end_leftovers: true,
     });
     let stderr = result
         .as_ref()
@@ -2594,6 +2751,8 @@ mod tests {
         log: PathBuf,
         /// Links the engine asked to open in a browser. Tests never open one.
         opened: Arc<Mutex<Vec<String>>>,
+        /// What the save dialog answers. Tests never show one.
+        chosen: Arc<Mutex<Option<PathBuf>>>,
     }
 
     impl Env {
@@ -2612,6 +2771,7 @@ mod tests {
                 dir,
                 log,
                 opened: Arc::default(),
+                chosen: Arc::default(),
             }
         }
 
@@ -2643,6 +2803,10 @@ mod tests {
                         lock(&opened).push(link.to_owned());
                         Ok(())
                     })
+                },
+                open_dialog: {
+                    let chosen = Arc::clone(&self.chosen);
+                    Arc::new(move |_, _| Box::pin(std::future::ready(lock(&chosen).clone())))
                 },
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
@@ -2922,6 +3086,35 @@ mod tests {
 
         core.send(Command::Refresh { live_all: true });
         // Both answer again: counting the gets after only one has, the other may not have started yet.
+        let events = collect(&core, |e| {
+            final_status(e, "recent").is_some() && final_status(e, "fresh").is_some()
+        });
+        assert_eq!(final_status(&events, "recent"), Some(Status::Connected));
+        let mut names: Vec<String> = env.gets().into_iter().map(|g| g.0).collect();
+        names.sort();
+        assert_eq!(names, ["fresh", "fresh", "recent"], "F5 checks every one");
+    }
+
+    #[test]
+    fn f5_checks_one_at_a_time_still_check_every_one() {
+        // F5 with one check at a time still checks every one.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {
+                "recent": http("https://a.example.com"),
+                "fresh": {"type": "stdio", "command": "x"}}}),
+            r#"{"rules":[{"args":["mcp","get"],"stdout_file":"c.txt"},{"args":["--version"]}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        recently_needing_auth(&env, &["recent".to_owned()]);
+        let core = start_with(
+            EngineConfig {
+                max_checks: 1,
+                ..env.config()
+            },
+            || {},
+        );
+        collect(&core, |e| final_status(e, "fresh").is_some());
+        core.send(Command::Refresh { live_all: true });
         let events = collect(&core, |e| {
             final_status(e, "recent").is_some() && final_status(e, "fresh").is_some()
         });
@@ -6118,6 +6311,169 @@ mod tests {
         );
     }
 
+    fn first_event<T>(core: &Core, pick: impl Fn(&Event) -> Option<T>) -> T {
+        collect(core, |e| e.iter().any(|x| pick(x).is_some()))
+            .iter()
+            .find_map(pick)
+            .unwrap()
+    }
+
+    /// A window as the UI hands it over. Its handles are not there (as for a window not shown yet), which is all a
+    /// test can give without one.
+    struct Window;
+
+    impl raw_window_handle::HasWindowHandle for Window {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    impl raw_window_handle::HasDisplayHandle for Window {
+        fn display_handle(
+            &self,
+        ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn the_save_dialog_opens_over_the_window_where_it_lives_and_its_answer_is_awaited_elsewhere() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let opened: Arc<Mutex<Vec<(String, bool, std::thread::ThreadId)>>> = Arc::default();
+        let (answer, user) = mpsc::channel::<Option<PathBuf>>();
+        let user = Arc::new(Mutex::new(user));
+        let mut config = env.config();
+        config.open_dialog = {
+            let opened = Arc::clone(&opened);
+            Arc::new(move |name, owner| {
+                lock(&opened).push((
+                    name.to_owned(),
+                    owner.is_some(),
+                    std::thread::current().id(),
+                ));
+                let user = Arc::clone(&user);
+                // The user answers when the test says so.
+                Box::pin(async move { lock(&user).recv().ok().flatten() })
+            })
+        };
+        let core = start_with(config, || {});
+        core.choose_export_file("github-mcp.json".into(), Some(&Window));
+        // Opened here, on the thread that has the window, over it; and this thread did not wait for the user.
+        assert_eq!(
+            *lock(&opened),
+            vec![(
+                "github-mcp.json".to_owned(),
+                true,
+                std::thread::current().id()
+            )]
+        );
+        let file = env.dir.path().join("home").join("github-mcp.json");
+        answer.send(Some(file.clone())).unwrap();
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert_eq!(chosen, crate::export_file::FileChoice::Chosen(file));
+
+        // Nearby: a dialog with no window to belong to opens all the same, and closing it offers a path to type.
+        core.choose_export_file("x.json".into(), None);
+        assert_eq!(lock(&opened).last().map(|o| o.1), Some(false));
+        answer.send(None).unwrap();
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(
+                &chosen,
+                crate::export_file::FileChoice::NoDialog { suggested }
+                    | crate::export_file::FileChoice::Cancelled { suggested }
+                    if suggested.ends_with("x.json")
+            ),
+            "{chosen:?}"
+        );
+
+        // A command with no dialog opened by the UI opens none here, off the UI's thread (on macOS, AppKit is
+        // main-thread only): a path is asked for instead.
+        let before = lock(&opened).len();
+        core.send(Command::ChooseExportFile {
+            name: "y.json".into(),
+            shown: None,
+        });
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(&chosen, crate::export_file::FileChoice::NoDialog { suggested } if suggested.ends_with("y.json")),
+            "{chosen:?}"
+        );
+        assert_eq!(lock(&opened).len(), before);
+    }
+
+    #[test]
+    fn an_export_is_saved_where_the_user_chose_and_never_over_claudes_own_file() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let core = env.start();
+        let chosen = |core: &Core| {
+            first_event(core, |e| match e {
+                Event::ExportFileChosen(choice) => Some(choice.clone()),
+                _ => None,
+            })
+        };
+        let saved = |core: &Core| {
+            first_event(core, |e| match e {
+                Event::ExportSaved { shown, result, .. } => Some((shown.clone(), result.clone())),
+                _ => None,
+            })
+        };
+        // No dialog opened by the UI: a path to start from instead, and no dialog is opened here.
+        core.send(Command::ChooseExportFile {
+            name: "mcp-servers.json".into(),
+            shown: None,
+        });
+        assert!(matches!(
+            chosen(&core),
+            crate::export_file::FileChoice::NoDialog { suggested } if suggested.ends_with("mcp-servers.json")
+        ));
+        let file = env.dir.path().join("home").join("servers.json");
+        *lock(&env.chosen) = Some(file.clone());
+        core.choose_export_file("servers.json".into(), None);
+        assert_eq!(
+            chosen(&core),
+            crate::export_file::FileChoice::Chosen(file.clone())
+        );
+        core.send(Command::SaveExport {
+            path: file.clone(),
+            text: "{}".into(),
+            replace: false,
+        });
+        assert_eq!(saved(&core), (file.to_string_lossy().into_owned(), Ok(())));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}\n");
+        core.send(Command::SaveExport {
+            path: file.clone(),
+            text: "{\"again\": 1}".into(),
+            replace: false,
+        });
+        assert_eq!(saved(&core).1, Err(crate::export_file::SaveError::Exists));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "{}\n");
+
+        let claude_json = env.dir.path().join("cfg").join(".claude.json");
+        let before = std::fs::read(&claude_json).unwrap();
+        core.send(Command::SaveExport {
+            path: claude_json.clone(),
+            text: "{}".into(),
+            replace: true,
+        });
+        assert!(matches!(
+            saved(&core).1,
+            Err(crate::export_file::SaveError::Refused(_))
+        ));
+        assert_eq!(std::fs::read(&claude_json).unwrap(), before);
+    }
+
     #[test]
     fn a_project_server_is_shown_but_not_editable() {
         let (env, key, _repo) = repo_env(serde_json::json!({}));
@@ -8933,5 +9289,250 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    // ---- restoring from a backup in the activity log
+
+    fn applied(core: &Core, plan: &PlanView) -> Vec<Event> {
+        core.send(Command::Apply(plan.id));
+        let events = collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        events
+    }
+
+    /// The `.claude.json` backup of the newest change in the activity log, as the page lists it.
+    fn newest_backup(core: &Core) -> String {
+        let log = activity(core);
+        log.entries[0].backups[0].path.clone()
+    }
+
+    #[test]
+    fn a_restore_puts_back_a_deleted_server_and_leaves_the_rest_of_the_file_alone() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(&core, vec![Change::Delete { id: user_id("gw") }]);
+        applied(&core, &plan);
+        let backup = newest_backup(&core);
+        // Since then Claude Code went on: it counted a start, and a server was added.
+        let mut config = config_json(&env);
+        config["numStartups"] = serde_json::json!(9);
+        config["mcpServers"]["newer"] = serde_json::json!({"type": "stdio", "command": "n"});
+        write_config(&env, &config);
+        let plan = plan_for(&core, vec![Change::Restore { backup }]);
+        assert_eq!(plan.action, "Restore");
+        assert!(!plan.nothing_to_do);
+        assert!(
+            plan.summary
+                .contains(&"Put back gw for the user".to_owned()),
+            "{plan:#?}"
+        );
+        assert!(
+            plan.summary.iter().any(|s| s.contains("newer")),
+            "what was added since is named: {plan:#?}"
+        );
+        // The review never shows a server's settings.
+        assert!(!format!("{plan:?}").contains("s3cret-value"));
+        let events = applied(&core, &plan);
+        let config = config_json(&env);
+        assert_eq!(
+            config["mcpServers"]["gw"],
+            two_projects("end")["mcpServers"]["gw"],
+            "back, secret and all"
+        );
+        assert_eq!(
+            config["mcpServers"]["newer"]["command"], "n",
+            "a restore removes nothing"
+        );
+        assert_eq!(config["numStartups"], 9, "Claude Code's own settings stay");
+        assert!(
+            snapshots(&events)
+                .last()
+                .unwrap()
+                .servers
+                .iter()
+                .any(|r| r.name == "gw")
+        );
+        // The restore is logged with the backup it took first, so it can be undone the same way.
+        let log = activity(&core);
+        assert_eq!(log.entries.len(), 2, "{log:#?}");
+        assert_eq!(log.entries[0].summary, plan.summary);
+        let before = &log.entries[0].backups[0];
+        assert!(before.kept);
+        let undo = plan_for(
+            &core,
+            vec![Change::Restore {
+                backup: before.path.clone(),
+            }],
+        );
+        assert!(undo.summary.iter().any(|s| s.contains("gw")), "{undo:#?}");
+    }
+
+    #[test]
+    fn a_restore_puts_back_one_server_and_changes_another_back_in_the_same_list() {
+        // Found trying it in the real app: the save refused to add a server and change another in one list.
+        let mut config = two_projects("end");
+        config["mcpServers"]["tool"] = serde_json::json!({"type": "stdio", "command": "t1"});
+        config["projects"]["/work/a"]["mcpServers"]["second"] =
+            serde_json::json!({"type": "stdio", "command": "s1"});
+        let env = quiet_env(&config);
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        applied(&core, &plan);
+        let backup = newest_backup(&core);
+        let mut now = config_json(&env);
+        now["mcpServers"].as_object_mut().unwrap().remove("gw");
+        now["mcpServers"]["tool"]["command"] = serde_json::json!("t2");
+        now["projects"]["/work/a"]["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("loc");
+        now["projects"]["/work/a"]["mcpServers"]["second"]["command"] = serde_json::json!("s2");
+        write_config(&env, &now);
+        let plan = plan_for(&core, vec![Change::Restore { backup }]);
+        applied(&core, &plan);
+        let after = config_json(&env);
+        assert_eq!(after["mcpServers"], config["mcpServers"]);
+        assert_eq!(
+            after["projects"]["/work/a"]["mcpServers"]["loc"],
+            config["projects"]["/work/a"]["mcpServers"]["loc"]
+        );
+        assert_eq!(
+            after["projects"]["/work/a"]["mcpServers"]["second"]["command"],
+            "s1"
+        );
+    }
+
+    #[test]
+    fn restoring_what_is_already_there_writes_nothing() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled: false,
+            }],
+        );
+        applied(&core, &plan);
+        let backup = newest_backup(&core);
+        let plan = plan_for(&core, vec![Change::Restore { backup }]);
+        assert_eq!(
+            plan.summary[1..],
+            ["Turn on loc in a".to_owned()],
+            "{plan:#?}"
+        );
+        applied(&core, &plan);
+        assert_eq!(disabled_list(&env, "/work/a"), serde_json::json!([]));
+        // The backup taken before the restore matches the file before it: restoring it again is the undo; restoring
+        // the first one again does nothing.
+        let first = activity(&core).entries[1].backups[0].path.clone();
+        let again = plan_for(&core, vec![Change::Restore { backup: first }]);
+        assert!(again.nothing_to_do, "{again:#?}");
+    }
+
+    #[test]
+    fn a_restore_is_refused_for_anything_but_a_kept_backup_of_claude_json() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        for backup in [
+            "../cfg/.claude.json".to_owned(),
+            env.dir
+                .path()
+                .join("cfg")
+                .join(".claude.json")
+                .display()
+                .to_string(),
+            "claude.json.0001760000000000-0.bak".to_owned(),
+        ] {
+            let why = plan_failure(&core, vec![Change::Restore { backup }]);
+            assert!(!why.is_empty());
+        }
+        let why = plan_failure(
+            &core,
+            vec![
+                Change::Restore {
+                    backup: "claude.json.0001760000000000-0.bak".to_owned(),
+                },
+                Change::Delete { id: user_id("gw") },
+            ],
+        );
+        assert!(why.contains("on its own"), "{why}");
+        assert!(config_json(&env)["mcpServers"].get("gw").is_some());
+    }
+
+    #[test]
+    fn a_restore_puts_back_a_server_that_signs_in_with_its_kept_client_secret() {
+        let (env, store, _key, _repo) = oauth_move_env(
+            r#"{"rules":[{"args":["mcp","add-json"],"delay_ms":600,"stdout_file":"added.txt"}]}"#,
+        );
+        std::fs::write(
+            env.dir.path().join("added.txt"),
+            "Added http MCP server sso to user config\n",
+        )
+        .unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        // A plain change, for a backup that has sso; then sso is removed (by Claude Code, say).
+        let mut config = config_json(&env);
+        config["mcpServers"]["plain"] = serde_json::json!({"type": "stdio", "command": "p"});
+        write_config(&env, &config);
+        let plan = plan_for(
+            &core,
+            vec![Change::Delete {
+                id: user_id("plain"),
+            }],
+        );
+        applied(&core, &plan);
+        let backup = newest_backup(&core);
+        let mut config = config_json(&env);
+        config["mcpServers"].as_object_mut().unwrap().remove("sso");
+        write_config(&env, &config);
+        let plan = plan_for(&core, vec![Change::Restore { backup }]);
+        assert!(
+            plan.summary
+                .contains(&"Put back sso for the user".to_owned()),
+            "{plan:#?}"
+        );
+        let runs = env.changes_run().len();
+        core.send(Command::Apply(plan.id));
+        env.wait_for_run(runs + 1);
+        let mut config = config_json(&env);
+        config["mcpServers"]["sso"] = serde_json::from_str(SSO_ENTRY).unwrap();
+        write_config(&env, &config);
+        let events = collect(&core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        let run = &env.changes_run()[runs];
+        assert_eq!(
+            run.0[..5],
+            ["mcp", "add-json", "-s", "user", "--client-secret"]
+        );
+        assert!(!run.0.iter().any(|a| a.contains(CLIENT_SECRET)));
+        assert_eq!(run.2.as_deref(), Some(sha256(CLIENT_SECRET).as_str()));
+        assert!(
+            config_json(&env)["mcpServers"].get("plain").is_some(),
+            "plain is back too"
+        );
     }
 }

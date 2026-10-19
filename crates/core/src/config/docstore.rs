@@ -25,6 +25,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 /// Claude's own staleness rule for its lock directory.
@@ -255,6 +256,8 @@ pub(crate) struct Docstore {
     pub keep_backups: usize,
     /// How long to wait for the lock before giving up. The decision record proposes about 3 s.
     pub lock_wait: Duration,
+    /// Claude's rule: a lock not refreshed for this long is taken over.
+    pub lock_stale: Duration,
     /// How long after a write to look again for an unlocked overwrite by Claude.
     pub verify_delay: Duration,
     /// Runs just before the validation and rename, so a test can write the file at that moment.
@@ -273,6 +276,7 @@ impl Docstore {
             backup_dir,
             keep_backups: 20,
             lock_wait: Duration::from_secs(3),
+            lock_stale: LOCK_STALE,
             verify_delay: Duration::from_secs(1),
             #[cfg(test)]
             before_replace: None,
@@ -349,22 +353,19 @@ impl Docstore {
         let (text, lines) = match self.kind {
             // Possibly tens of megabytes: only the bytes of the changed lists are replaced.
             Kind::ClaudeJson => edit_claude_json(&current.text, ops, purpose)?,
-            // A small file: parse, change, write it out whole.
+            // A small file, but Claude Code's and the user's: only the bytes of the changed lists are replaced.
             Kind::ProjectSettings => {
-                let mut doc = current.parse()?;
+                current.parse()?;
+                let names = ops
+                    .iter()
+                    .map(|op| match op {
+                        Op::Approve { name } => Ok(name.as_str()),
+                        _ => Err(wrong_file()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut lines = Vec::new();
-                for op in ops {
-                    match op {
-                        Op::Approve { name } => approve(&mut doc, name, &mut lines)?,
-                        _ => return Err(wrong_file()),
-                    }
-                }
-                let text = if lines.is_empty() {
-                    None
-                } else {
-                    Some(vec![(0..current.text.len(), current.render(&doc)?)])
-                };
-                (text, lines)
+                let splices = approve(&current.text, &names, current.missing, &mut lines)?;
+                (splices, lines)
             }
         };
         let path = match self.kind {
@@ -384,7 +385,7 @@ impl Docstore {
         {
             ensure_plain_dir(dir)?;
         }
-        let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
+        let _lock = self.lock()?;
         self.read_edit_write(|current| {
             let (text, changes) = self.edit(current, &plan.ops, Purpose::Change)?;
             if changes != plan.changes && current.hash() != plan.base_hash {
@@ -487,7 +488,7 @@ impl Docstore {
             if round + 1 == MAX_VERIFY_ROUNDS {
                 break;
             }
-            let _lock = Lock::acquire(&self.lock_path(), self.lock_wait)?;
+            let _lock = self.lock()?;
             // A newer change marks itself before it takes the lock, so under the lock this answer is final.
             if superseded() {
                 return Ok(reapplied);
@@ -497,6 +498,18 @@ impl Docstore {
                 .wrote;
         }
         Err(StoreError::Lost)
+    }
+
+    fn lock(&self) -> Result<Lock, StoreError> {
+        let takeover = self
+            .backup_dir
+            .join(format!("{}.takeover", self.backup_label()));
+        Lock::acquire(&LockAt {
+            dir: &self.lock_path(),
+            takeover: &takeover,
+            wait: self.lock_wait,
+            stale: self.lock_stale,
+        })
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -759,7 +772,13 @@ fn make_private(path: &Path) {
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 
-#[cfg(not(unix))]
+/// Best effort, as on Unix: a file system without access lists (a FAT drive) keeps what it has.
+#[cfg(windows)]
+fn make_private(path: &Path) {
+    let _ = super::owner_only::restrict(path, false);
+}
+
+#[cfg(not(any(unix, windows)))]
 fn make_private(_path: &Path) {}
 
 #[cfg(unix)]
@@ -771,7 +790,20 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
         .create(path)
 }
 
-#[cfg(not(unix))]
+/// The folder is made owner-only when this makes it; what is made in it inherits that. A folder that was already
+/// there is left as it is, as on Unix. Unlike Unix, folders made above it on the way keep their inherited access:
+/// nothing private lives in them.
+#[cfg(windows)]
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(path)?;
+    let _ = super::owner_only::restrict(path, true);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
@@ -786,7 +818,18 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
+/// Owner-only even in a folder that was made before Klefki restricted its folders.
+#[cfg(windows)]
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let _ = super::owner_only::restrict(path, false);
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
@@ -830,58 +873,67 @@ impl Current {
         hasher.update(self.text.as_bytes());
         format!("{:x}", hasher.finalize())
     }
-
-    /// Claude writes 2-space JSON with LF and no trailing newline; a file that has CRLF or a final newline keeps
-    /// them (and a byte-order mark, which `write` adds back).
-    fn render(&self, doc: &Value) -> Result<String, StoreError> {
-        let mut out = serde_json::to_string_pretty(doc)
-            .map_err(|e| StoreError::Invalid(sanitize(&e.to_string())))?;
-        if self.text.ends_with('\n') || self.missing {
-            out.push('\n');
-        }
-        if self.text.contains("\r\n") {
-            out = out.replace('\n', "\r\n");
-        }
-        Ok(out)
-    }
 }
 
-/// Claude's lock: a directory next to the file. Removed when dropped, but only if we made it and it is still ours.
+/// Where Claude's lock is and how it is taken.
+struct LockAt<'a> {
+    /// The lock directory, next to the file.
+    dir: &'a Path,
+    /// Klefki's own marker, in its backup folder, while it takes over a stale lock: of two Klefkis that both find
+    /// the lock stale, only one removes it, and the other then finds the new owner's lock fresh.
+    takeover: &'a Path,
+    wait: Duration,
+    /// Age after which a lock nobody refreshes is taken over. A held lock is refreshed twice as often.
+    stale: Duration,
+}
+
+/// Claude's lock: a directory next to the file. Kept fresh while held, as Claude keeps its own, so a long write is
+/// not taken for a dead one. Removed when dropped, but only if we made it and it is still ours.
 struct Lock {
     dir: PathBuf,
-    /// The directory as we made it. Held past the stale age, it can be taken over: someone else's is left alone.
+    /// The directory as we made it (`None`: it could not be looked at).
     made: Option<watch::Stamp>,
+    /// Refreshes the directory until the sender is dropped, then says whether it is still ours.
+    refresher: Option<(mpsc::Sender<()>, std::thread::JoinHandle<Held>)>,
+}
+
+/// Whose the lock directory is, as far as its holder knows.
+#[derive(Debug)]
+enum Held {
+    /// Ours, as it was when we made or last refreshed it.
+    Ours(Option<watch::Stamp>),
+    /// Someone took it over (ours was held past the stale age); it is theirs to refresh and remove.
+    Lost,
 }
 
 impl Lock {
-    fn acquire(dir: &Path, wait: Duration) -> Result<Self, StoreError> {
-        Self::acquire_with(dir, wait, cfg!(windows), |dir| std::fs::create_dir(dir))
+    fn acquire(at: &LockAt) -> Result<Self, StoreError> {
+        Self::acquire_with(at, cfg!(windows), |dir| std::fs::create_dir(dir), || {})
     }
 
     /// [`acquire`](Self::acquire), with `create` making the directory. `denied_passes`: a refusal to create it may
-    /// be over in a moment (Windows).
+    /// be over in a moment (Windows). `judged_stale` runs when a lock is found stale, before it is taken over.
     fn acquire_with(
-        dir: &Path,
-        wait: Duration,
+        at: &LockAt,
         denied_passes: bool,
         mut create: impl FnMut(&Path) -> io::Result<()>,
+        mut judged_stale: impl FnMut(),
     ) -> Result<Self, StoreError> {
+        let dir = at.dir;
         let started = Instant::now();
         let mut attempt = 0;
         loop {
             let refused = match create(dir) {
-                Ok(()) => {
-                    return Ok(Self {
-                        dir: dir.to_owned(),
-                        made: watch::stamp(dir),
-                    });
-                }
+                Ok(()) => return Ok(Self::held(dir, at.stale / 2)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     // Whoever held it is gone. `remove_dir` only removes an empty directory; anything else at that
                     // path (a file, a folder with contents) is not a lock we can take over, so it is waited out
                     // like a held one rather than retried at once forever.
-                    if is_stale(dir) && std::fs::remove_dir(dir).is_ok() {
-                        continue;
+                    if is_older(dir, at.stale) {
+                        judged_stale();
+                        if take_over(at)? {
+                            continue;
+                        }
                     }
                     None
                 }
@@ -891,31 +943,125 @@ impl Lock {
                 Err(e) if denied_passes && e.kind() == io::ErrorKind::PermissionDenied => Some(e),
                 Err(e) => return Err(e.into()),
             };
-            if started.elapsed() >= wait {
+            if started.elapsed() >= at.wait {
                 return Err(refused.map_or(StoreError::Locked, StoreError::from));
             }
             let pause = Duration::from_millis(BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)]);
             attempt += 1;
-            std::thread::sleep(pause.min(wait.saturating_sub(started.elapsed())));
+            std::thread::sleep(pause.min(at.wait.saturating_sub(started.elapsed())));
+        }
+    }
+
+    /// The lock we just made, refreshed every `every` from now on.
+    fn held(dir: &Path, every: Duration) -> Self {
+        let made = watch::stamp(dir);
+        let (stop, stopped) = mpsc::channel();
+        let (owned, mut held) = (dir.to_owned(), Held::Ours(made.clone()));
+        let refresher = std::thread::Builder::new()
+            .name("klefki-lock".to_owned())
+            // It only waits and sets a time: a small stack is plenty.
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
+                    held = refresh(&owned, held);
+                }
+                held
+            })
+            .ok()
+            .map(|thread| (stop, thread));
+        Self {
+            dir: dir.to_owned(),
+            made,
+            refresher,
         }
     }
 }
 
+/// One refresh of a held lock: its time is set to now, unless it is no longer the directory we left.
+fn refresh(dir: &Path, held: Held) -> Held {
+    match held {
+        Held::Ours(last) if last.is_none() || watch::stamp(dir) == last => {
+            if touch(dir).is_ok() {
+                Held::Ours(watch::stamp(dir))
+            } else {
+                Held::Ours(last)
+            }
+        }
+        _ => Held::Lost,
+    }
+}
+
+/// Sets a directory's modification time to now.
+#[cfg(not(windows))]
+fn touch(dir: &Path) -> io::Result<()> {
+    std::fs::File::open(dir)?.set_modified(SystemTime::now())
+}
+
+/// Sets a directory's modification time to now. Windows opens a directory only with backup semantics, and setting
+/// its time needs no more than the right to write its attributes.
+#[cfg(windows)]
+fn touch(dir: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+    };
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .set_modified(SystemTime::now())
+}
+
 impl Drop for Lock {
     fn drop(&mut self) {
+        let held = match self.refresher.take() {
+            Some((stop, thread)) => {
+                drop(stop);
+                thread.join().unwrap_or(Held::Lost)
+            }
+            None => Held::Ours(self.made.clone()),
+        };
         // Not looked at when made: removed as before.
-        if self.made.is_none() || watch::stamp(&self.dir) == self.made {
+        if let Held::Ours(last) = held
+            && (last.is_none() || watch::stamp(&self.dir) == last)
+        {
             let _ = std::fs::remove_dir(&self.dir);
         }
     }
 }
 
-fn is_stale(dir: &Path) -> bool {
-    std::fs::metadata(dir)
+/// Removes a lock found stale, under Klefki's takeover marker: another Klefki that found it stale at the same moment
+/// sees the marker and waits, and then finds the lock we make fresh. Under the marker the lock is looked at again,
+/// so one that was taken over meanwhile is left alone. Says whether it was removed.
+///
+/// A marker older than the stale age was left by a Klefki that ended in the middle (a takeover lasts microseconds):
+/// it is removed, and the next try goes ahead.
+fn take_over(at: &LockAt) -> Result<bool, StoreError> {
+    if let Some(folder) = at.takeover.parent() {
+        create_private_dir(folder)?;
+    }
+    match create_private_file(at.takeover) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if is_older(at.takeover, at.stale) {
+                let _ = std::fs::remove_file(at.takeover);
+            }
+            return Ok(false);
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let removed = is_older(at.dir, at.stale) && std::fs::remove_dir(at.dir).is_ok();
+    let _ = std::fs::remove_file(at.takeover);
+    Ok(removed)
+}
+
+/// Whether `path` was last modified more than `age` ago.
+fn is_older(path: &Path, age: Duration) -> bool {
+    std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age > LOCK_STALE)
+        .is_some_and(|elapsed| elapsed > age)
 }
 
 /// Replacements in a file's text: each range (in file order, not overlapping) becomes the string.
@@ -1631,7 +1777,6 @@ fn edit_servers<'o>(
     let mut removed = Vec::new();
     let mut renamed: Vec<(usize, &str)> = Vec::new();
     let mut added: Vec<(&str, Value)> = Vec::new();
-    let mut changed_existing = false;
     for op in ops {
         let name = op.server_name();
         let index = object.and_then(|o| {
@@ -1659,6 +1804,10 @@ fn edit_servers<'o>(
                     "{} is added twice in one place",
                     sanitize(name)
                 )));
+            }
+            // A server renamed to this name earlier in the plan takes it too.
+            if renamed.iter().any(|(_, n)| *n == name) {
+                return Err(invalid(format!("{} already exists there", sanitize(name))));
             }
             // A new definition has no earlier values, so `<hidden>` in it is refused.
             let new = entry::unmasked(new, &Value::Null).map_err(invalid)?;
@@ -1709,7 +1858,6 @@ fn edit_servers<'o>(
             )));
         }
         found.push(*op);
-        changed_existing = true;
         lines.push(header.clone());
         match op {
             Op::RemoveServer { .. } => {
@@ -1768,12 +1916,10 @@ fn edit_servers<'o>(
     if let (Some(object), false) = (object, removed.is_empty()) {
         splices.extend(remove_members(object, &removed));
     }
+    // Added after the last member, whatever is done to it: its replacement or removal ends where the addition
+    // starts, so the edits meet without overlapping. When every member goes, they would overlap, and `finish`
+    // refuses the plan.
     if !added.is_empty() {
-        if changed_existing {
-            return Err(invalid(
-                "adding a server and changing another in the same list is not supported in one plan".to_owned(),
-            ));
-        }
         let keyed = |(name, value): (&str, Value)| -> Result<(String, Value), StoreError> {
             Ok((
                 serde_json::to_string(name).map_err(|e| invalid(e.to_string()))?,
@@ -2075,45 +2221,94 @@ fn insert_members(
     }
 }
 
-fn approve(doc: &mut Value, name: &str, lines: &mut Vec<String>) -> Result<(), StoreError> {
-    let root = doc
-        .as_object_mut()
-        .ok_or_else(|| StoreError::Invalid("the settings file is not a JSON object".to_owned()))?;
-    let wrong_shape = |key: &str| {
-        StoreError::Invalid(format!(
-            "{key} in the settings file is not a list; refusing to change it"
-        ))
-    };
-    // Check both lists before changing either, so a refusal leaves the document alone.
-    for key in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
-        if root.get(key).is_some_and(|v| !v.is_array()) {
-            return Err(wrong_shape(key));
+/// Approves `names` in a project's settings: each is added to `enabledMcpjsonServers` and taken out of
+/// `disabledMcpjsonServers`. Only the bytes of the lists that change are replaced, so everything else in the file
+/// (duplicate keys, huge integers, its layout) stays exactly as it was. `None` when nothing changes. A file just
+/// created (`missing`) ends with a line break, as Claude Code writes it.
+fn approve(
+    text: &str,
+    names: &[&str],
+    missing: bool,
+    lines: &mut Vec<String>,
+) -> Result<Option<Splices>, StoreError> {
+    const ENABLED: &str = "enabledMcpjsonServers";
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let root = jsonspan::object_with(text, jsonspan::skip_ws(text.as_bytes(), 0), &mut |_, _| {
+        false
+    })
+    .map_err(|e| StoreError::Invalid(sanitize(&e)))?;
+    // Both lists are checked before either is changed, so a refusal leaves the file alone.
+    let list = |key: &str| -> Result<Option<(&jsonspan::Member, Vec<Value>)>, StoreError> {
+        let Some(member) = single(&root, key, "the settings file")? else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&text[member.value.clone()]) {
+            Ok(Value::Array(items)) => Ok(Some((member, items))),
+            _ => Err(StoreError::Invalid(format!(
+                "{key} in the settings file is not a list; refusing to change it"
+            ))),
         }
-    }
-    let is_name = |v: &Value| v.as_str() == Some(name);
-    let enabled = root
-        .entry("enabledMcpjsonServers")
-        .or_insert_with(|| Value::Array(Vec::new()));
-    let enabled = enabled
-        .as_array_mut()
-        .ok_or_else(|| wrong_shape("enabledMcpjsonServers"))?;
-    if !enabled.iter().any(is_name) {
-        enabled.push(Value::String(name.to_owned()));
-        lines.push("  enabledMcpjsonServers".to_owned());
-        lines.push(format!("+ {}", sanitize(name)));
-    }
-    if let Some(rejected) = root
-        .get_mut("disabledMcpjsonServers")
-        .and_then(Value::as_array_mut)
-    {
-        let before = rejected.len();
-        rejected.retain(|v| !is_name(v));
-        if rejected.len() != before {
-            lines.push("  disabledMcpjsonServers".to_owned());
+    };
+    let (enabled, rejected) = (list(ENABLED)?, list(REJECTED)?);
+    let mut enabled_items = enabled.as_ref().map_or_else(Vec::new, |(_, i)| i.clone());
+    let mut rejected_items = rejected.as_ref().map_or_else(Vec::new, |(_, i)| i.clone());
+    let (mut enabled_changed, mut rejected_changed) = (false, false);
+    for &name in names {
+        let is_name = |v: &Value| v.as_str() == Some(name);
+        if !enabled_items.iter().any(is_name) {
+            enabled_items.push(Value::String(name.to_owned()));
+            enabled_changed = true;
+            lines.push(format!("  {ENABLED}"));
+            lines.push(format!("+ {}", sanitize(name)));
+        }
+        let before = rejected_items.len();
+        rejected_items.retain(|v| !is_name(v));
+        if rejected_items.len() != before {
+            rejected_changed = true;
+            lines.push(format!("  {REJECTED}"));
             lines.push(format!("- {}", sanitize(name)));
         }
     }
-    Ok(())
+    let replaced = |member: &jsonspan::Member, items: &[Value]| {
+        let indent = jsonspan::line_indent(text, member.key_start);
+        Ok::<_, StoreError>((member.value.clone(), render_list(items, indent, nl)?))
+    };
+    let mut splices = Splices::new();
+    if enabled_changed {
+        splices.push(match &enabled {
+            Some((member, _)) => replaced(member, &enabled_items)?,
+            None => {
+                let key = serde_json::to_string(ENABLED)
+                    .map_err(|e| StoreError::Invalid(e.to_string()))?;
+                // An empty file object is written out like Claude would, on lines of its own.
+                let first_line = &text[..root.open];
+                let outer = jsonspan::line_indent(text, root.open).or_else(|| {
+                    first_line
+                        .bytes()
+                        .all(|c| matches!(c, b' ' | b'\t'))
+                        .then_some(first_line)
+                });
+                insert_members(
+                    text,
+                    &root,
+                    outer,
+                    &[(key, Value::Array(enabled_items))],
+                    nl,
+                )?
+            }
+        });
+    }
+    if rejected_changed && let Some((member, _)) = &rejected {
+        splices.push(replaced(member, &rejected_items)?);
+    }
+    if splices.is_empty() {
+        return Ok(None);
+    }
+    if missing {
+        splices.push((text.len()..text.len(), nl.to_owned()));
+    }
+    splices.sort_by_key(|(range, _)| (range.start, range.end));
+    Ok(Some(splices))
 }
 
 #[cfg(test)]
@@ -2463,6 +2658,89 @@ mod tests {
         assert_eq!(f.store.still_applies(&preview), Ok(()));
     }
 
+    #[test]
+    fn servers_can_be_added_and_others_changed_in_one_list_in_one_plan() {
+        // A restore puts back a server and changes another one back, in the same list: the added one goes after the
+        // last member, whatever happens to that member.
+        let entry = |c: &str| json!({"command": c});
+        let doc = |servers: Value| {
+            let mut d = sample();
+            d["mcpServers"] = servers;
+            d
+        };
+        let replace = |name: &str, c: &str| Op::ReplaceServer {
+            project: None,
+            name: name.into(),
+            entry: entry(c),
+        };
+        let remove = |name: &str| Op::RemoveServer {
+            project: None,
+            name: name.into(),
+        };
+        let add = |name: &str, c: &str| Op::AddServer {
+            project: None,
+            name: name.into(),
+            entry: entry(c),
+        };
+        let three = json!({"a": entry("a"), "b": entry("b"), "c": entry("c")});
+        let cases = [
+            (
+                vec![replace("c", "c2"), add("d", "d")],
+                json!({"a": entry("a"), "b": entry("b"), "c": entry("c2"), "d": entry("d")}),
+            ),
+            (
+                vec![add("d", "d"), remove("b"), replace("a", "a2")],
+                json!({"a": entry("a2"), "c": entry("c"), "d": entry("d")}),
+            ),
+            (
+                vec![remove("c"), add("d", "d"), replace("b", "b2")],
+                json!({"a": entry("a"), "b": entry("b2"), "d": entry("d")}),
+            ),
+        ];
+        for (ops, servers) in cases {
+            for text in [pretty(&doc(three.clone())), doc(three.clone()).to_string()] {
+                let f = Fixture::new(&text);
+                let plan = f.store.prepare(ops.clone()).unwrap();
+                f.store.apply(&plan).unwrap();
+                assert_eq!(f.json(), doc(servers.clone()), "{ops:?}");
+                let keys: Vec<_> = f.json()["mcpServers"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
+                let expected: Vec<_> = servers.as_object().unwrap().keys().cloned().collect();
+                assert_eq!(keys, expected, "{ops:?}");
+                if text.contains('\n') {
+                    assert_eq!(f.text(), pretty(&doc(servers.clone())), "layout kept");
+                }
+                // Checked again after the write, it is all in place: nothing to redo.
+                assert_eq!(
+                    f.store.prepare(ops.clone()).map(|p| p.is_empty()).ok(),
+                    None,
+                    "the add is refused, the name is taken"
+                );
+            }
+        }
+        // A rename and an add to the same new name, in either order: refused, never two keys of one name.
+        let rename = Op::RenameServer {
+            project: None,
+            name: "a".into(),
+            new_name: "d".into(),
+        };
+        for ops in [
+            vec![rename.clone(), add("d", "d")],
+            vec![add("d", "d"), rename.clone()],
+        ] {
+            let f = Fixture::new(&pretty(&doc(three.clone())));
+            assert!(f.store.prepare(ops.clone()).is_err(), "{ops:?}");
+            assert_eq!(f.text(), pretty(&doc(three.clone())));
+        }
+        // Every member removed and one added, the edits would overlap: refused, the file left as it is.
+        let f = Fixture::new(&pretty(&doc(json!({"a": entry("a")}))));
+        assert!(f.store.prepare(vec![remove("a"), add("d", "d")]).is_err());
+    }
+
     fn rename_disabled(project: &str, name: &str, new_name: &str) -> Op {
         Op::RenameDisabled {
             project: project.to_owned(),
@@ -2722,6 +3000,31 @@ mod tests {
         assert_eq!(mode(&f.store.backup_dir), 0o700);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn backups_and_their_folder_are_owner_only_on_windows() {
+        use crate::config::owner_only::tests::is_owner_only;
+        let f = Fixture::new(&pretty(&sample()));
+        let plan = f
+            .store
+            .prepare(vec![disable("C:/work/app", "gateway")])
+            .unwrap();
+        // A link to the configuration itself, which keeps the access list of the profile until made private.
+        let backup = f.store.apply(&plan).unwrap().backup.unwrap();
+        assert!(is_owner_only(&backup), "the backup");
+        assert!(is_owner_only(&f.store.backup_dir), "the backup folder");
+        // A copy kept before Claude Code's own commands.
+        let copy = f.store.keep_copy().unwrap();
+        assert!(is_owner_only(&copy), "the kept copy");
+        // A file made in a folder from before this change, which other accounts can read.
+        let old = f.dir.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        assert!(!is_owner_only(&old));
+        let file = old.join("x");
+        drop(create_private_file(&file).unwrap());
+        assert!(is_owner_only(&file), "a private file in an open folder");
+    }
+
     #[test]
     fn only_the_newest_backups_are_kept() {
         let f = Fixture::new(&pretty(&sample()));
@@ -2853,35 +3156,57 @@ mod tests {
         // contender checking its age, Claude Code, a virus scanner), and the lock took that refusal as final.
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".claude.json.lock");
+        let takeover = dir.path().join("takeover");
+        let at = |wait| LockAt {
+            dir: &lock,
+            takeover: &takeover,
+            wait,
+            stale: LOCK_STALE,
+        };
         let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
         let mut calls = 0;
-        let taken = Lock::acquire_with(&lock, Duration::from_secs(5), true, |d| {
-            calls += 1;
-            if calls < 3 {
-                Err(denied())
-            } else {
-                std::fs::create_dir(d)
-            }
-        });
+        let taken = Lock::acquire_with(
+            &at(Duration::from_secs(5)),
+            true,
+            |d| {
+                calls += 1;
+                if calls < 3 {
+                    Err(denied())
+                } else {
+                    std::fs::create_dir(d)
+                }
+            },
+            || {},
+        );
         assert!(taken.is_ok(), "{:?}", taken.err());
         assert_eq!(calls, 3);
         drop(taken);
         assert!(!lock.exists(), "released");
         // A refusal that lasts is returned as it is, not as "locked", once the wait is over.
         let mut calls = 0;
-        let err = Lock::acquire_with(&lock, Duration::from_millis(200), true, |_| {
-            calls += 1;
-            Err(denied())
-        })
+        let err = Lock::acquire_with(
+            &at(Duration::from_millis(200)),
+            true,
+            |_| {
+                calls += 1;
+                Err(denied())
+            },
+            || {},
+        )
         .err();
         assert!(matches!(err, Some(StoreError::Io(_))), "{err:?}");
         assert!(calls > 1, "{calls}");
         // Where a refusal is final (not Windows), it is returned at once.
         let mut calls = 0;
-        let err = Lock::acquire_with(&lock, Duration::from_secs(5), false, |_| {
-            calls += 1;
-            Err(denied())
-        })
+        let err = Lock::acquire_with(
+            &at(Duration::from_secs(5)),
+            false,
+            |_| {
+                calls += 1;
+                Err(denied())
+            },
+            || {},
+        )
         .err();
         assert!(matches!(err, Some(StoreError::Io(_))), "{err:?}");
         assert_eq!(calls, 1);
@@ -3201,7 +3526,7 @@ mod tests {
     fn a_lock_someone_else_took_over_is_left_to_them() {
         // Ours was taken over as stale (held too long) and replaced by theirs: releasing ours must not remove it.
         let f = Fixture::new(&pretty(&sample()));
-        let lock = Lock::acquire(&f.lock(), Duration::ZERO).unwrap();
+        let lock = f.store.lock().unwrap();
         std::fs::remove_dir(f.lock()).unwrap();
         let theirs = f.dir.path().join("theirs");
         std::fs::create_dir(&theirs).unwrap();
@@ -3212,7 +3537,129 @@ mod tests {
         assert!(f.lock().is_dir(), "their lock is still there");
         // Our own is released as before.
         std::fs::remove_dir(f.lock()).unwrap();
-        drop(Lock::acquire(&f.lock(), Duration::ZERO).unwrap());
+        drop(f.store.lock().unwrap());
+        assert!(!f.lock().exists());
+    }
+
+    /// A lock folder and a takeover marker in a fresh folder, with the given rules.
+    struct LockFixture {
+        dir: tempfile::TempDir,
+        stale: Duration,
+    }
+
+    impl LockFixture {
+        fn new(stale: Duration) -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                stale,
+            }
+        }
+
+        fn lock(&self) -> PathBuf {
+            self.dir.path().join(".claude.json.lock")
+        }
+
+        fn takeover(&self) -> PathBuf {
+            self.dir.path().join("backups").join("claude.json.takeover")
+        }
+
+        fn acquire(&self, wait: Duration) -> Result<Lock, StoreError> {
+            self.acquire_judging(wait, || {})
+        }
+
+        fn acquire_judging(
+            &self,
+            wait: Duration,
+            judged_stale: impl FnMut(),
+        ) -> Result<Lock, StoreError> {
+            let (lock, takeover) = (self.lock(), self.takeover());
+            let at = LockAt {
+                dir: &lock,
+                takeover: &takeover,
+                wait,
+                stale: self.stale,
+            };
+            Lock::acquire_with(&at, cfg!(windows), |d| std::fs::create_dir(d), judged_stale)
+        }
+    }
+
+    fn set_age(path: &Path, age: Duration) {
+        let then = SystemTime::now() - age;
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(then)).unwrap();
+    }
+
+    #[test]
+    fn a_lock_held_longer_than_the_stale_age_is_refreshed_and_not_taken_over() {
+        // Claude's rule: a lock not refreshed for 10 s is stale. A write held up longer (a large file, Windows
+        // refusing the rename for a while, a slow disk) must keep it fresh, or Claude takes it over and writes.
+        let f = LockFixture::new(Duration::from_secs(1));
+        let ours = f.acquire(Duration::ZERO).unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            matches!(f.acquire(Duration::ZERO), Err(StoreError::Locked)),
+            "a lock held for 2.5 s with a stale age of 1 s was taken over"
+        );
+        assert!(f.lock().is_dir());
+        drop(ours);
+        assert!(!f.lock().exists(), "released");
+    }
+
+    #[test]
+    fn a_lock_taken_over_while_held_is_neither_refreshed_nor_removed() {
+        let f = LockFixture::new(Duration::from_millis(400));
+        let ours = f.acquire(Duration::ZERO).unwrap();
+        // Someone found ours stale and put theirs in its place; theirs is old by now as well.
+        std::fs::remove_dir(f.lock()).unwrap();
+        let theirs = f.dir.path().join("theirs");
+        std::fs::create_dir(&theirs).unwrap();
+        std::fs::rename(&theirs, f.lock()).unwrap();
+        set_age(&f.lock(), Duration::from_secs(60));
+        let before = std::fs::metadata(f.lock()).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        let after = std::fs::metadata(f.lock()).unwrap().modified().unwrap();
+        assert_eq!(after, before, "their lock was refreshed as if it were ours");
+        drop(ours);
+        assert!(f.lock().is_dir(), "their lock was removed");
+    }
+
+    #[test]
+    fn two_waiters_cannot_both_take_over_one_stale_lock() {
+        // Both find the lock stale. The first removes it and makes its own; the second must not then remove that.
+        let f = LockFixture::new(LOCK_STALE);
+        std::fs::create_dir(f.lock()).unwrap();
+        set_age(&f.lock(), Duration::from_secs(60));
+        let mut first = None;
+        let second = f.acquire_judging(Duration::ZERO, || {
+            if first.is_none() {
+                first = Some(f.acquire(Duration::ZERO).expect("the first takes it over"));
+            }
+        });
+        assert!(first.is_some(), "the lock was not judged stale");
+        assert!(
+            matches!(second, Err(StoreError::Locked)),
+            "both waiters hold the lock"
+        );
+        assert!(f.lock().is_dir(), "the first one's lock is gone");
+        drop(first);
+        assert!(!f.lock().exists());
+        assert!(!f.takeover().exists(), "the takeover marker is left behind");
+    }
+
+    #[test]
+    fn a_takeover_marker_left_by_a_klefki_that_ended_is_cleared_once_stale() {
+        let f = LockFixture::new(Duration::from_secs(5));
+        std::fs::create_dir(f.lock()).unwrap();
+        set_age(&f.lock(), Duration::from_secs(60));
+        std::fs::create_dir_all(f.takeover().parent().unwrap()).unwrap();
+        std::fs::write(f.takeover(), "").unwrap();
+        // Fresh: another Klefki is taking over right now, so this one waits.
+        assert!(matches!(f.acquire(Duration::ZERO), Err(StoreError::Locked)));
+        assert!(f.lock().is_dir());
+        // Old: whoever made it ended in the middle. It is cleared and the stale lock taken over.
+        set_age(&f.takeover(), Duration::from_secs(60));
+        let ours = f.acquire(Duration::from_secs(2)).unwrap();
+        assert!(!f.takeover().exists());
+        drop(ours);
         assert!(!f.lock().exists());
     }
 
@@ -3589,6 +4036,64 @@ mod tests {
         let store = settings_store(dir.path());
         std::fs::write(&store.path, "[]").unwrap();
         assert!(store.prepare(vec![approve_op("ps")]).is_err());
+    }
+
+    #[test]
+    fn approving_changes_only_the_two_lists_and_keeps_every_other_byte() {
+        // A rewrite of the whole file collapsed duplicate keys, turned huge integers into floats and restyled
+        // everything; Claude Code and the user may rely on any of it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let store = settings_store(dir.path());
+        let head = "{\n    \"permissions\": {\"allow\": [\"Bash(ls)\"], \"deny\": []},\n    \"n\": 123456789012345678901234567890,\n    \"f\": 1.0e2,\n    \"dup\": 1,\n    \"dup\": 2,\n    \"enabledMcpjsonServers\": ";
+        let middle = ",\n    \"disabledMcpjsonServers\": ";
+        let tail = ",\n    \"after\": \"x\"\n}";
+        let original =
+            format!("{head}[\"a\"]{middle}[\n        \"ps\",\n        \"z\"\n    ]{tail}");
+        std::fs::write(&store.path, &original).unwrap();
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        store.apply(&plan).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&store.path).unwrap(),
+            format!(
+                "{head}[\n      \"a\",\n      \"ps\"\n    ]{middle}[\n      \"z\"\n    ]{tail}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_list_added_to_a_one_line_settings_file_keeps_the_rest_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".claude")).unwrap();
+        let store = settings_store(dir.path());
+        let original = "{\"permissions\":{\"allow\":[]},\"n\":123456789012345678901234567890}\n";
+        std::fs::write(&store.path, original).unwrap();
+        let plan = store.prepare(vec![approve_op("ps")]).unwrap();
+        store.apply(&plan).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&store.path).unwrap(),
+            "{\"permissions\":{\"allow\":[]},\"n\":123456789012345678901234567890,\"enabledMcpjsonServers\":[\"ps\"]}\n"
+        );
+    }
+
+    #[test]
+    fn a_settings_file_with_a_list_twice_is_refused_untouched() {
+        // Which one Claude Code reads is a guess; collapsing them would drop one.
+        for key in ["enabledMcpjsonServers", "disabledMcpjsonServers"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".claude")).unwrap();
+            let store = settings_store(dir.path());
+            let original = format!("{{\n  \"{key}\": [\"a\"],\n  \"{key}\": [\"ps\"]\n}}");
+            std::fs::write(&store.path, &original).unwrap();
+            assert!(
+                matches!(
+                    store.prepare(vec![approve_op("ps")]),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{key}"
+            );
+            assert_eq!(std::fs::read_to_string(&store.path).unwrap(), original);
+        }
     }
 
     #[cfg(unix)]

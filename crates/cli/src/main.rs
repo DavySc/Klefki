@@ -17,6 +17,8 @@ const PROBLEM: u8 = 1;
 const USAGE: u8 = 2;
 /// Claude Code could not be used, so nothing is known about the servers: a broken tool, not a broken server.
 const UNAVAILABLE: u8 = 3;
+/// `export --output` wrote nothing: the file is there, or Klefki does not write there.
+const NOT_WRITTEN: u8 = 4;
 
 const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 
@@ -30,7 +32,11 @@ fn main() -> ExitCode {
             json,
             claude,
         }) => status(&names, json, claude),
-        Ok(Cmd::Export { names }) => export(&names),
+        Ok(Cmd::Export {
+            names,
+            output,
+            force,
+        }) => export(&names, output.as_deref(), force),
         Err(Usage::NoCommand) => {
             eprint!("{}", args::HELP);
             USAGE
@@ -60,8 +66,9 @@ fn list(names: &[String], json: bool) -> u8 {
     out(&text)
 }
 
-/// The block goes to stdout, so `> servers.json` holds only the block; what to know about it goes to stderr.
-fn export(names: &[String]) -> u8 {
+/// The block goes to stdout, so `> servers.json` holds only the block, or to the `--output` file; what to know about
+/// it goes to stderr.
+fn export(names: &[String], output: Option<&std::path::Path>, force: bool) -> u8 {
     let snapshot = api::load_snapshot();
     warn(&snapshot);
     let ids: Vec<_> = match select(&snapshot, names) {
@@ -69,6 +76,17 @@ fn export(names: &[String]) -> u8 {
         Err(why) => return usage(&why),
     };
     let exported = api::export(&ids);
+    if let Some(path) = output {
+        if let Err(why) = save(path, &exported.text, force) {
+            eprintln!("klefki-cli: {} was not written. {why}", path.display());
+            return NOT_WRITTEN;
+        }
+        let what = match &ids[..] {
+            [one] if exported.servers == 1 => one.name.clone(),
+            _ => format!("{} servers", exported.servers),
+        };
+        eprintln!("Saved {what} to {}.", path.display());
+    }
     for note in &exported.notes {
         eprintln!("note: {note}");
     }
@@ -91,10 +109,38 @@ fn export(names: &[String]) -> u8 {
             );
         }
     }
-    match out(&format!("{}\n", exported.text)) {
+    let code = match output {
+        Some(_) => OK,
+        None => out(&format!("{}\n", exported.text)),
+    };
+    match code {
         OK if exported.left_out > 0 => PROBLEM,
         code => code,
     }
+}
+
+/// Writes the block to `path`. A file there is replaced with `force`, or when the user, at a terminal, says so.
+fn save(path: &std::path::Path, text: &str, force: bool) -> Result<(), String> {
+    match api::save_export(path, text, force) {
+        Err(api::SaveError::Exists) if asked_to_replace(path) => {
+            api::save_export(path, text, true).map_err(|e| e.to_string())
+        }
+        Err(api::SaveError::Exists) => {
+            Err("A file with that name is there already; add --force to replace it.".to_owned())
+        }
+        other => other.map_err(|e| e.to_string()),
+    }
+}
+
+/// Asks on the terminal whether to replace `path`; no when nobody is there to answer.
+fn asked_to_replace(path: &std::path::Path) -> bool {
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    eprint!("{} is there already. Replace it? [y/N] ", path.display());
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok()
+        && matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u8 {

@@ -9,6 +9,9 @@ pub use crate::engine::{
     SignInFailure, SignInStep,
 };
 pub use crate::export::{Exported, Variable};
+pub use crate::export_file::{
+    FileChoice, Owner as DialogOwner, SaveError, ShownDialog, file_name as export_file_name,
+};
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
@@ -304,9 +307,29 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         watch_settle: std::time::Duration::from_millis(300),
         secrets: None,
         open_url: std::sync::Arc::new(open_https),
+        open_dialog: std::sync::Arc::new(open_save_dialog),
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
     }
+}
+
+/// Opens the system's own save dialog, starting at `name` in the folder it last used, over `owner` when given: a
+/// sheet on macOS, a dialog owned by the window on Windows, and on Linux the portal is told which window it is for.
+/// It asks before replacing a file. On macOS the dialog must be opened on the main thread, where the window lives;
+/// the answer can be waited for anywhere.
+fn open_save_dialog(
+    name: &str,
+    owner: Option<&dyn crate::export_file::Owner>,
+) -> crate::export_file::Answer {
+    let mut dialog = rfd::AsyncFileDialog::new()
+        .set_title("Save the export")
+        .set_file_name(name)
+        .add_filter("JSON", &["json"]);
+    if let Some(owner) = owner {
+        dialog = dialog.set_parent(owner);
+    }
+    let answer = dialog.save_file();
+    Box::pin(async move { answer.await.map(|file| file.path().to_path_buf()) })
 }
 
 /// Opens `link` in the user's browser, if it is https (CLAUDE.md: URLs opened are https only). No shell is involved.
@@ -350,6 +373,12 @@ pub fn export(ids: &[ServerId]) -> Exported {
         .unwrap_or_default();
     let sources = crate::export::sources(paths.as_ref(), &inventory.snapshot, &inventory.keys, ids);
     crate::export::export(sources)
+}
+
+/// Writes an exported block to `path` for a command-line run, as [`Command::SaveExport`] does: never over an existing
+/// file unless `replace`, and never into Claude Code's own configuration or a `.mcp.json`.
+pub fn save_export(path: &std::path::Path, text: &str, replace: bool) -> Result<(), SaveError> {
+    crate::export_file::save(ConfigPaths::discover().as_ref(), path, text, replace)
 }
 
 pub fn load_snapshot_from(paths: &ConfigPaths) -> Arc<Snapshot> {
