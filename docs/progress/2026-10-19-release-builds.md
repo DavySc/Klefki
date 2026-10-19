@@ -39,6 +39,14 @@ for the three systems and publishes them, with checksums, as a draft GitHub Rele
   about 12 minutes; macOS ~9 minutes of build. Afterwards the Rust cache was dropped from the workflow (139e6e8):
   a tag run saved ~470 MB per system that no later run could restore.
 
+- Cross-review (review 5578196901 on 36934c3): two blockers in the install notes, fixed in the next commit:
+  macOS 15+ steps (System Settings, Privacy & Security, Open Anyway) are now the main path; `{version}` in
+  `docs/release-notes.md` is filled in by the publish job, so commands paste as they are (checked with the same
+  `sed`: no placeholder left, file names match the workflow's). Polish folded in: Windows setup marked
+  Recommended, unsigned warning first, FUSE 2 for the AppImage, PowerShell `Get-FileHash`, where `klefki-cli`
+  lives and how to run it (NSIS per-user: `%LOCALAPPDATA%\Klefki`, from cargo-packager's installer.nsi; MSI:
+  Program Files; not on PATH), `dtolnay/rust-toolchain` pinned to a commit, Claude Code docs link updated.
+
 ## Not verified / open
 - No one has installed the Windows or macOS packages yet: needs a person on those systems.
 - The publish job runs only on a real tag, so it first runs on the first release.

@@ -15,7 +15,7 @@ A fast, native, cross-platform manager for the MCP servers configured in Claude 
 
 ## Install
 
-Download the installer for your system from [Releases](https://github.com/DavySc/Klefki/releases): Windows (installer, MSI or portable zip), macOS (universal `.dmg`) or Linux (`.deb` or AppImage). Each one also contains the `klefki-cli` command-line tool. Klefki needs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed. The builds are not code-signed yet; the release notes say how to open them. Maintainers: see [docs/RELEASING.md](docs/RELEASING.md).
+Download the installer for your system from [Releases](https://github.com/DavySc/Klefki/releases): Windows (installer, MSI or portable zip), macOS (universal `.dmg`) or Linux (`.deb` or AppImage). Each one also contains the `klefki-cli` command-line tool. Klefki needs [Claude Code](https://code.claude.com/docs) installed. The builds are not code-signed yet; the release notes say how to open them. Maintainers: see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Status
 

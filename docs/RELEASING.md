@@ -10,7 +10,7 @@ Releases are built by `.github/workflows/release.yml` with [cargo-packager](http
 | macOS 11+ | universal (Intel + Apple silicon) `.app` in a `.dmg` | `macos-latest` |
 | Linux x86_64 | `.deb`, AppImage | `ubuntu-22.04`, for older glibc |
 
-Each package holds both `klefki` and `klefki-cli`. The publish job adds `SHA256SUMS`. Install instructions for users are in `docs/release-notes.md`, which becomes the top of the release notes; GitHub appends the list of merged pull requests.
+Each package holds both `klefki` and `klefki-cli`. The publish job adds `SHA256SUMS`. Install instructions for users are in `docs/release-notes.md`, which becomes the top of the release notes with every `{version}` replaced by the release's version (so each command and file name can be pasted as is); GitHub appends the list of merged pull requests. Keep its file names in step with the `Package` step of the workflow.
 
 Before upload, `scripts/check-release.py` looks inside each package: the Windows app is a GUI program with its icon embedded and the CLI a console program, the macOS binaries hold both architectures and `Info.plist` carries the version, and the `.deb` installs both programs, a menu entry and an icon.
 

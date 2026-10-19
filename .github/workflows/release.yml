@@ -36,8 +36,10 @@ jobs:
       - name: Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libfuse2
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to a commit: this action builds the binaries we publish. The SHA is the `stable` branch on 2026-10-19.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
         with:
+          toolchain: stable
           targets: ${{ runner.os == 'macOS' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
       # No build cache: a release is built from scratch, and caches saved under a tag could not be reused.
       - name: Install cargo-packager
@@ -127,5 +129,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The notes name each file exactly, so their commands can be pasted as they are.
+          sed "s/{version}/$version/g" docs/release-notes.md > "$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag \
-            --title "Klefki ${GITHUB_REF_NAME#v}" --notes-file docs/release-notes.md --generate-notes
+            --title "Klefki $version" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
