@@ -1107,11 +1107,17 @@ impl Recovery {
     }
 
     /// Every kept definition, oldest first, as far as it can be read. One whose change got through after all (its
-    /// new definition is in `claude_json` and its old one is not) is deleted instead: Klefki stopped between the add
-    /// and deleting the file.
+    /// new definition is in `claude_json` and its old one is not) is deleted instead, with Klefki's copy of its
+    /// client secret where it was, once that copy is also where the server went: Klefki stopped between the add and
+    /// deleting the file, or a later change put the same server there. Without that copy there, the definition is
+    /// still listed: putting it back is then the only way to hand its secret to Claude Code again.
     /// With each, whether its server is back where it was, without the settings Claude Code does not keep: the file
     /// then only holds the rest of the definition, until the user forgets it.
-    pub(crate) fn list(backup_dir: &Path, claude_json: &Path) -> Vec<(Self, bool)> {
+    pub(crate) fn list(
+        backup_dir: &Path,
+        claude_json: &Path,
+        store: Option<&dyn SecretStore>,
+    ) -> Vec<(Self, bool)> {
         let root: Option<Value> = fsx::read_limited(claude_json, inventory::MAX_CLAUDE_JSON)
             .ok()
             .flatten()
@@ -1119,7 +1125,8 @@ impl Recovery {
         Self::files(backup_dir)
             .into_iter()
             .filter(|r| {
-                let done = root.as_ref().is_some_and(|root| r.got_through(root));
+                let done = root.as_ref().is_some_and(|root| r.got_through(root))
+                    && r.secret_went_along(store);
                 if done {
                     r.discard();
                 }
@@ -1175,6 +1182,28 @@ impl Recovery {
         let arrived = entry_in(root, to).is_some_and(|there| same_settings(&there, new));
         let in_place = from.same_place(to) && from.name == to.name;
         arrived && (in_place || entry_in(root, &from).is_none())
+    }
+
+    /// Whether Klefki's copy of the client secret, if it holds one where the server was, is also where the server
+    /// went (the one left behind is then deleted). Unsure counts as no.
+    fn secret_went_along(&self, store: Option<&dyn SecretStore>) -> bool {
+        let (Some((to, _)), Some(store)) = (&self.next, store) else {
+            return true;
+        };
+        let from = Spot {
+            project: self.project.clone(),
+            name: self.name.clone(),
+        }
+        .connection();
+        let to = to.connection();
+        if from == to {
+            return true;
+        }
+        match (store.get(&from), store.get(&to)) {
+            (Ok(None), _) => true,
+            (Ok(Some(kept)), Ok(Some(there))) if kept == there => store.delete(&from).is_ok(),
+            _ => false,
+        }
     }
 
     fn discard(&self) {

@@ -524,6 +524,17 @@ impl Rig {
         }
     }
 
+    /// Where each kept definition's server was going, and as what, by id.
+    fn going(&self) -> BTreeMap<String, (Key, Value)> {
+        swap::Recovery::files(&self.dir.path().join("data").join("backups"))
+            .into_iter()
+            .filter_map(|r| {
+                let (to, new) = r.next?;
+                Some((r.id, ((to.project, to.name), new)))
+            })
+            .collect()
+    }
+
     fn id(&self, (project, name): &(Option<String>, String)) -> ServerId {
         match project {
             None => ServerId::new(Scope::User, None, name),
@@ -793,6 +804,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 }
             }
         };
+        let going = rig.going();
         let outcome = rig.run(changes);
         let after = rig.world();
 
@@ -851,6 +863,51 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
         }
         match &outcome {
             Outcome::Done => {
+                // A kept definition whose change got through after all is no longer offered: its server is where it
+                // was going, as it was going to be, and gone from where it was (decision 007). A later step can
+                // bring that about too, such as a copy of the same definition to where a failed move was going.
+                // The server is then where the user sent it, and putting it back would bring it back where they
+                // moved it from. Only with its client secret, though: when Klefki's copy of it is not also where
+                // the server went, the definition stays, as putting it back is the only way to hand the secret
+                // to Claude Code again. Once it is there, the copy left where the server was goes, and until it
+                // could be deleted the definition stays too.
+                let gone: Vec<String> = expected
+                    .kept
+                    .iter()
+                    .filter(|(id, (project, name, _))| {
+                        let Some(((to_project, to_name), new)) = going.get(*id) else {
+                            return false;
+                        };
+                        let arrived = expected.servers.iter().any(|((p, n), e)| {
+                            same_place(p, to_project) && n == to_name && e == new
+                        });
+                        let from = (project.clone(), name.clone());
+                        let to = (to_project.clone(), to_name.clone());
+                        let in_place = same_place(project, to_project) && name == to_name;
+                        let left = !expected
+                            .servers
+                            .keys()
+                            .any(|(p, n)| same_place(p, project) && n == name);
+                        let secret = match expected.klefki.get(&connection(&from)) {
+                            None => true,
+                            Some(_) if in_place => true,
+                            Some(secret) => {
+                                expected.klefki.get(&connection(&to)) == Some(secret)
+                                    && *store_fault != StoreFault::DeleteFails
+                            }
+                        };
+                        arrived && (in_place || left) && secret
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in gone {
+                    let (project, name, _) = expected.kept.remove(&id).unwrap();
+                    let ((to_project, to_name), _) = &going[&id];
+                    let from = connection(&(project, name));
+                    if from != connection(&(to_project.clone(), to_name.clone())) {
+                        expected.klefki.remove(&from);
+                    }
+                }
                 prop_assert_eq!(&after.servers, &expected.servers, "{}", said);
                 prop_assert_eq!(&after.kept, &expected.kept, "{}", said);
                 prop_assert_eq!(&after.klefki, &expected.klefki, "{}", said);
@@ -1059,6 +1116,122 @@ fn a_kept_definition_says_which_server_lost_its_shared_sign_in_and_putting_it_ba
     let world = rig.world();
     assert_eq!(world.creds.get(&shared).map(String::as_str), Some("sec-a"));
     assert!(world.kept.is_empty());
+}
+
+/// `a` copied into pb, then a move of that copy to pa that fails three times, so its definition is kept.
+fn a_failed_move_to_pa(rig: &Rig) -> (Key, Key) {
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let (pa, pb) = (rig.projects[0].clone(), rig.projects[1].clone());
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&(None, "a".to_owned())),
+        name: "a".into(),
+        targets: vec![Target::Local(pb.clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let (from, to) = (
+        (Some(pb), "a".to_owned()),
+        (Some(pa.clone()), "a".to_owned()),
+    );
+    *lock(&rig.sim.faults) = [Fault::FailsAfter, Fault::FailsBefore, Fault::FailsBefore].into();
+    let outcome = rig.run(vec![Change::Move {
+        id: rig.id(&from),
+        to: Target::Local(pa),
+    }]);
+    assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+    assert_eq!(rig.world().kept.len(), 1);
+    (from, to)
+}
+
+#[test]
+fn a_kept_definition_is_not_offered_once_a_copy_puts_it_where_its_move_was_going() {
+    // Found by the model-based test (seed 19dc2de0): a copy then puts the same definition where the failed move was
+    // going. That is what the move asked, so the kept definition is no longer offered: putting it back would bring
+    // the server back where it was moved from.
+    let rig = start();
+    let (from, to) = a_failed_move_to_pa(&rig);
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&(None, "a".to_owned())),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert!(world.kept.is_empty(), "{:?}", world.kept);
+    assert_eq!(world.servers.get(&to), Some(&definition(true, 0, 0)));
+    assert!(!world.servers.contains_key(&from));
+    // With its client secret, in Claude Code and in Klefki's store.
+    let secret = Some("sec-a");
+    assert_eq!(
+        world
+            .creds
+            .get(&sign_in_key("a", &world.servers[&to]))
+            .map(String::as_str),
+        secret
+    );
+    assert_eq!(
+        world.klefki.get(&connection(&to)).map(String::as_str),
+        secret
+    );
+    // And none is left where it was, for a server put there later to claim.
+    assert!(!world.klefki.contains_key(&connection(&from)));
+}
+
+#[test]
+fn a_kept_definition_stays_offered_when_a_copy_without_its_secret_puts_it_where_its_move_was_going()
+{
+    // Found while checking the seed above: the copy came from a server Klefki holds no client secret for, so Claude
+    // Code has none for it. Dropping the kept definition would leave its secret only in Klefki's store, under a
+    // server that is gone. It stays, and putting it back hands the secret to Claude Code again, for the copy too.
+    let rig = start();
+    let a = (None, "a".to_owned());
+    let (from, to) = a_failed_move_to_pa(&rig);
+    lock(&rig.store.inner.values).remove(&connection(&a));
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert_eq!(world.servers.get(&to), Some(&definition(true, 0, 0)));
+    let kept = world.kept.into_keys().next().expect("still kept");
+    let outcome = rig.run(vec![Change::PutBack { kept }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert!(world.kept.is_empty());
+    assert_eq!(world.servers.get(&from), Some(&definition(true, 0, 0)));
+    assert_eq!(
+        world
+            .creds
+            .get(&sign_in_key("a", &world.servers[&to]))
+            .map(String::as_str),
+        Some("sec-a")
+    );
+}
+
+#[test]
+fn a_kept_definition_stays_offered_when_a_copy_puts_another_definition_where_its_move_was_going() {
+    // The variant: the copy at the move's place is not the kept definition, so it stays, and can be put back.
+    let rig = start();
+    let (from, _) = a_failed_move_to_pa(&rig);
+    let a = (None, "a".to_owned());
+    let outcome = rig.run(vec![Change::Replace {
+        id: rig.id(&a),
+        json: definition(true, 1, 0).to_string(),
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let outcome = rig.run(vec![Change::Duplicate {
+        id: rig.id(&a),
+        name: "a".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let kept = rig.world().kept.into_keys().next().expect("still kept");
+    let outcome = rig.run(vec![Change::PutBack { kept }]);
+    assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    let world = rig.world();
+    assert!(world.kept.is_empty());
+    assert_eq!(world.servers.get(&from), Some(&definition(true, 0, 0)));
 }
 
 #[test]

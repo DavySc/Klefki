@@ -1574,7 +1574,7 @@ fn kept_list(shared: &Shared) -> Vec<crate::api::Kept> {
     let (Some(dir), Some(paths)) = (&shared.config.backup_dir, &shared.config.paths) else {
         return Vec::new();
     };
-    swap::Recovery::list(dir, &paths.claude_json)
+    swap::Recovery::list(dir, &paths.claude_json, shared.config.secrets.as_deref())
         .into_iter()
         .map(|(r, back)| crate::api::Kept {
             id: r.id,
@@ -6196,12 +6196,21 @@ mod tests {
         let core = with_store(&env, Arc::clone(&store));
         collect(&core, |e| !snapshots(e).is_empty());
         keep_sso(&env, &core, &key);
-        // The move landed after all (as if Klefki stopped before it could tidy up).
+        // The move landed after all, and Klefki's copy of the client secret went along (as if Klefki stopped
+        // before it could tidy up).
         let mut config = config_json(&env);
         config["projects"][&key]["mcpServers"] = serde_json::json!({"sso": serde_json::from_str::<serde_json::Value>(SSO_ENTRY).unwrap()});
         write_config(&env, &config);
+        let (from, to) = (
+            crate::model::ConnectionId::new(Scope::User, None, "sso"),
+            crate::model::ConnectionId::new(Scope::Local, Some(&key), "sso"),
+        );
+        store
+            .set(&to, &crate::secrets::Secret::new(CLIENT_SECRET.to_owned()))
+            .unwrap();
         core.send(Command::Refresh { live_all: false });
-        let events = collect(&core, |e| !snapshots(e).is_empty());
+        // A refresh the watcher started before the write above can still come first, and rightly lists it as kept.
+        let events = collect(&core, |e| snapshots(e).iter().any(|s| s.kept.is_empty()));
         assert!(snapshots(&events).last().unwrap().kept.is_empty());
         assert_eq!(
             std::fs::read_dir(env.dir.path().join("recovery"))
@@ -6209,6 +6218,29 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+        // The copy left where it was is deleted, for a server put there later not to claim it.
+        assert!(store.get(&from).unwrap().is_none());
+        assert!(store.get(&to).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_kept_definition_whose_change_got_through_without_its_client_secret_is_still_offered() {
+        // The variant: the server is where it was going, but Klefki's copy of its client secret is not, so nothing
+        // shows Claude Code has it. Putting it back is the only way left to hand it over, so it is still offered.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let kept = keep_sso(&env, &core, &key);
+        let mut config = config_json(&env);
+        config["projects"][&key]["mcpServers"] = serde_json::json!({"sso": serde_json::from_str::<serde_json::Value>(SSO_ENTRY).unwrap()});
+        write_config(&env, &config);
+        core.send(Command::Refresh { live_all: false });
+        let events = collect(&core, |e| !snapshots(e).is_empty());
+        let listed = &snapshots(&events).last().unwrap().kept;
+        assert_eq!(listed.iter().map(|k| &k.id).collect::<Vec<_>>(), [&kept]);
+        let from = crate::model::ConnectionId::new(Scope::User, None, "sso");
+        assert!(store.get(&from).unwrap().is_some());
     }
 
     #[test]
