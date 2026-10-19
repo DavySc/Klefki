@@ -356,7 +356,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
         o.insert("shadowed_in".into(), json!(row.shadowed_in));
         o.insert(
             "plugin".into(),
-            json!({"name": plugin.plugin, "marketplace": plugin.marketplace, "same_as": plugin.same_as}),
+            json!({"name": plugin.plugin, "marketplace": plugin.marketplace, "same_as": plugin.same_as, "written_target": plugin.written_target}),
         );
     }
     o.insert("casing_collision".into(), json!(row.casing_collision));
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(row["scope"], "plugin");
         assert_eq!(
             row["plugin"],
-            json!({"name": "docs-search", "marketplace": "team-plugins", "same_as": null})
+            json!({"name": "docs-search", "marketplace": "team-plugins", "same_as": null, "written_target": null})
         );
         assert_eq!(row["disabled_in"], 0);
     }

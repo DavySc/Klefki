@@ -224,6 +224,9 @@ pub struct PluginInfo {
     /// address: that server's name. A user server, or an earlier plugin's, hides it in every project; a local or
     /// approved project server only in its project (see [`ServerRow::shadowed_in`]).
     pub same_as: Option<String>,
+    /// The target as the plugin's files write it, when Claude Code runs it otherwise (`${CLAUDE_PLUGIN_ROOT}` in it).
+    /// [`ServerRow::target`] is the target as run.
+    pub written_target: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

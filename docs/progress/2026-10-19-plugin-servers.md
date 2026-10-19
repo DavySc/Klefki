@@ -45,6 +45,38 @@ and the later slices.
 - Full verify on main `a3d3b38` + this change: exit 0; 347 + 20 + 25 + 750 passed, 0 failed; deny "advisories ok, bans ok, licenses ok, sources ok".
 - Screenshots: `reviews/2026-10-19-plugin-servers/` in the project files.
 
+## Review of #43 (round 1)
+Four places where "left out" differed from real Claude Code, each with a reproducer and a variant:
+- `${CLAUDE_PLUGIN_ROOT}` is expanded before comparing (and in the target shown; what the plugin writes is on hover):
+  inventory `a_plugin_server_is_compared_with_its_root_variable_expanded` (variant: two plugins writing the same text
+  under different roots are not the same), plugins `the_plugin_root_variable_is_expanded_as_claude_code_runs_the_server`.
+  Found along the way: a local marketplace's root kept a `./` (`mkt/./p1`), which Claude Code does not write; the
+  root is now built from plain components (asserted in the local-marketplace test).
+- The manifest's definition wins over `.mcp.json`'s: `the_manifest_wins_over_mcp_json_for_a_name_both_define`
+  (variant: through a file the manifest names).
+- Per project between plugins: `an_earlier_plugins_server_hides_a_later_one_only_where_it_is_loaded`, four cases
+  (earlier one off in a, off in both, a local server plus the earlier plugin's, and that with the earlier one off in b).
+  `add_plugin_servers` now walks each place (outside every project, then each project) with what is loaded there.
+Polish: a selection mixing plugin and other servers turns on/off, deletes and exports the others and says how many
+plugin servers it left out; with only plugin servers, the buttons' hint names the server and Del says why nothing
+happens (`a_selection_with_a_plugins_server_acts_on_the_others_and_says_what_it_left_out`); `settings.json`,
+`plugins/installed_plugins.json` and `known_marketplaces.json` are watched
+(`the_files_that_say_which_plugins_are_on_are_watched`); the status reads "See /mcp"; the read-only note is first on
+General; "Left out: in every project: … has the same command or address". `klefki-cli list --json` gives
+`plugin.written_target`. Decision 008: findings 5 and 6 extended, known gaps added.
+
+Checks for this round:
+- New tests seen failing before the fix (core: 2 in `plugins.rs`, 2 in `inventory.rs`, 1 in `watch.rs`). App tests
+  checked by mutation: status label back to "Not checked", no note on a mixed toggle, hint for mixed selections, each
+  failing `a_plugins_server_is_shown_…` or `a_selection_with_a_plugins_server_…`.
+- Real Claude Code 2.1.304 against `klefki-cli list`, temp `HOME`/`CLAUDE_CONFIG_DIR`, local marketplace: (1) `rooted`
+  with `${CLAUDE_PLUGIN_ROOT}` and a user `manual` with the expanded path: both leave `rooted` out; `plugin:p1:dup`
+  is `echo manifest` in both; `plugin:p2:dup2` loaded in both. (2) Two projects, local `local-echo` in the first and
+  `plugin:p1:dup` off in the second: `dup2` left out in the first only, in both; with `p1:dup` on in the second, left
+  out in both, in both.
+- Full verify on this round: fmt, clippy `-D warnings` and deny ok; tests 348 + 20 + 25 + 755 passed, 0 failed. Then
+  main (`f516b5e`, release files only) merged in.
+
 ## Open
 - Plugins on or off only in a project's settings files are not read yet (decision 008, finding 3).
 - No `.claude.json`: the list stops before plugins, as it does for everything else.

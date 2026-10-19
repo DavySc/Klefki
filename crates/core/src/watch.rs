@@ -41,6 +41,16 @@ pub(crate) fn watched_files(paths: &ConfigPaths, snapshot: &Snapshot) -> Vec<Pat
         paths.claude_json.clone(),
         paths.claude_dir.join("mcp-health-cache.json"),
         paths.claude_dir.join("mcp-needs-auth-cache.json"),
+        // Which plugins are on, and where their files are (decision 008).
+        paths.claude_dir.join("settings.json"),
+        paths
+            .claude_dir
+            .join("plugins")
+            .join("installed_plugins.json"),
+        paths
+            .claude_dir
+            .join("plugins")
+            .join("known_marketplaces.json"),
     ];
     for project in &snapshot.projects {
         // Like the inventory: a path that is not local and absolute is never touched, not even looked at.
@@ -274,7 +284,23 @@ mod tests {
                 .iter()
                 .any(|f| f.to_string_lossy().contains("relative"))
         );
-        assert_eq!(files.len(), 3 + 2);
+        assert_eq!(files.len(), 6 + 2);
+    }
+
+    #[test]
+    fn the_files_that_say_which_plugins_are_on_are_watched() {
+        let paths = ConfigPaths::in_dir(Path::new("/c"));
+        let files = watched_files(&paths, &Snapshot::default());
+        for file in [
+            "settings.json",
+            "plugins/installed_plugins.json",
+            "plugins/known_marketplaces.json",
+        ] {
+            assert!(
+                files.contains(&paths.claude_dir.join(file)),
+                "{file}: {files:?}"
+            );
+        }
     }
 
     #[test]

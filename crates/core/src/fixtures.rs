@@ -36,6 +36,8 @@ struct RawServer {
     /// Plugin servers: `"<plugin>@<marketplace>"`.
     plugin: Option<String>,
     same_as: Option<String>,
+    #[serde(default)]
+    written_target: Option<String>,
 }
 
 pub(crate) fn load() -> Snapshot {
@@ -95,6 +97,7 @@ pub(crate) fn load() -> Snapshot {
                         plugin: sanitize(plugin),
                         marketplace: sanitize(marketplace),
                         same_as: s.same_as.as_deref().map(sanitize),
+                        written_target: s.written_target.as_deref().map(sanitize),
                     }
                 }),
             })

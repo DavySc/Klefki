@@ -313,6 +313,15 @@ struct ByHand {
 }
 
 impl ByHand {
+    /// Whether Claude Code loads this server in `project` (`None`: outside every project).
+    fn loaded_in(&self, project: Option<&str>) -> bool {
+        match (&self.project, project) {
+            (None, None) => true,
+            (None, Some(p)) => !self.off_in.contains(p),
+            (Some(own), p) => p == Some(own.as_str()),
+        }
+    }
+
     fn in_project(key: String, name: &str, project: &Project<'_>) -> Self {
         Self {
             key,
@@ -337,19 +346,20 @@ fn add_plugin_servers(
     let servers = plugins::load(paths, &mut warnings);
     snap.warnings
         .extend(warnings.iter().map(|w| sanitize::sanitize_line(w)));
-    // The first plugin server with each definition, by its full name.
-    let mut first: HashMap<String, String> = HashMap::new();
+    // Where a server is loaded or left out: outside every project (where nothing is off), then each project.
+    let off: Vec<Option<&BTreeSet<String>>> = std::iter::once(None)
+        .chain(disabled_by_project.values().map(Some))
+        .collect();
+    let places: Vec<Option<&str>> = std::iter::once(None)
+        .chain(shown_projects.iter().map(|p| Some(p.as_str())))
+        .collect();
+    // In each place, the plugin servers loaded there so far, by definition: the first one stays.
+    let mut loaded: Vec<HashMap<String, String>> = vec![HashMap::new(); places.len()];
     for server in servers {
         let name = server.full_name();
+        let run = server.expanded();
         // Claude Code puts every plugin server in its needs-auth cache, whatever the server is: no status from it.
-        let mut r = row(
-            &name,
-            &server.entry,
-            Scope::Plugin,
-            None,
-            true,
-            Status::Unknown,
-        );
+        let mut r = row(&name, &run, Scope::Plugin, None, true, Status::Unknown);
         // A plugin's command runs from the plugin's own folder (`${CLAUDE_PLUGIN_ROOT}`), not a project's.
         r.relative_paths.clear();
         r.disabled_in = disabled_by_project
@@ -357,58 +367,48 @@ fn add_plugin_servers(
             .filter(|d| d.contains(&name))
             .count();
         r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
-        let mut same_as: Option<&str> = None;
-        let mut everywhere = false;
-        let mut hidden_in: BTreeSet<&str> = BTreeSet::new();
-        if let Some(key) = plugins::same_as_key(&server.entry) {
-            for m in by_hand.iter().filter(|m| m.key == key) {
-                match &m.project {
-                    None => {
-                        everywhere |= m.off_in.is_empty();
-                        hidden_in.extend(
-                            shown_projects
-                                .iter()
-                                .filter(|p| !m.off_in.contains(*p))
-                                .map(String::as_str),
-                        );
-                    }
-                    Some(p) => {
-                        hidden_in.insert(p);
-                    }
-                }
-                same_as.get_or_insert(&m.name);
+        let key = plugins::same_as_key(&run);
+        let plugin_key = plugins::same_as_plugin_key(&run);
+        let (mut by_hand_name, mut by_plugin): (Option<&str>, Option<String>) = (None, None);
+        let mut hidden = vec![false; places.len()];
+        for (i, place) in places.iter().enumerate() {
+            let hand = key.as_ref().and_then(|key| {
+                by_hand
+                    .iter()
+                    .find(|m| m.key == *key && m.loaded_in(*place))
+            });
+            let earlier = plugin_key.as_ref().and_then(|k| loaded[i].get(k));
+            if let Some(m) = hand {
+                by_hand_name.get_or_insert(&m.name);
+                hidden[i] = true;
+            } else if let Some(earlier) = earlier {
+                by_plugin.get_or_insert_with(|| earlier.clone());
+                hidden[i] = true;
+            } else if let Some(k) = &plugin_key
+                && !off[i].is_some_and(|d| d.contains(&name))
+            {
+                loaded[i].insert(k.clone(), name.clone());
             }
         }
-        let earlier =
-            plugins::same_as_plugin_key(&server.entry).and_then(|key| match first.entry(key) {
-                std::collections::hash_map::Entry::Occupied(o) => Some(o.get().clone()),
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    if !everywhere {
-                        v.insert(name.clone());
-                    }
-                    None
-                }
-            });
-        if same_as.is_none()
-            && let Some(earlier) = &earlier
-        {
-            same_as = Some(earlier);
-            everywhere = true;
-        }
-        if everywhere {
-            hidden_in.extend(shown_projects.iter().map(String::as_str));
-        }
-        r.shadowed =
-            everywhere || (snap.project_count > 0 && hidden_in.len() == snap.project_count);
+        let same_as = by_hand_name.map(str::to_owned).or(by_plugin);
+        r.shadowed = if snap.project_count == 0 {
+            hidden[0]
+        } else {
+            hidden[1..].iter().all(|h| *h)
+        };
         r.shadowed_in = shown_projects
             .iter()
-            .filter(|p| hidden_in.contains(p.as_str()))
-            .cloned()
+            .zip(&hidden[1..])
+            .filter(|(_, h)| **h)
+            .map(|(p, _)| p.clone())
             .collect();
+        let written = classify(&server.entry).1;
+        let written_target = (written != r.target).then_some(written);
         r.plugin = Some(PluginInfo {
             plugin: clip(&sanitize::sanitize_line(&server.plugin)),
             marketplace: clip(&sanitize::sanitize_line(&server.marketplace)),
-            same_as: same_as.map(|n| clip(&sanitize::sanitize_line(n))),
+            same_as: same_as.map(|n| clip(&sanitize::sanitize_line(&n))),
+            written_target,
         });
         snap.servers.push(r);
     }
@@ -2550,7 +2550,8 @@ mod tests {
             &crate::api::PluginInfo {
                 plugin: "p1".into(),
                 marketplace: "mkt".into(),
-                same_as: None
+                same_as: None,
+                written_target: None
             }
         );
         let beta = find(s, Scope::Plugin, "plugin:p1:beta");
@@ -2627,6 +2628,102 @@ mod tests {
         let cmd = find(&s, Scope::Plugin, "plugin:p1:cmd");
         assert!(!cmd.shadowed);
         assert_eq!(cmd.shadowed_in, [b.to_string_lossy().replace('\\', "/")]);
+    }
+
+    #[test]
+    fn a_plugin_server_is_compared_with_its_root_variable_expanded() {
+        let e = Env::new();
+        let root = e.dir.path().join("plugins/cache/mkt/p1");
+        let script = root.join("s.js").to_string_lossy().into_owned();
+        e.plugin(
+            "p1",
+            json!({"rooted": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/s.js"]}}),
+        );
+        // A second plugin writes the same, but its root is another folder.
+        e.plugin(
+            "p2",
+            json!({"also": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/s.js"]}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"mcpServers": {"manual": {"command": "node", "args": [&script]}}}),
+        );
+        let s = e.load();
+        let rooted = find(&s, Scope::Plugin, "plugin:p1:rooted");
+        assert!(rooted.shadowed, "{rooted:#?}");
+        assert_eq!(plugin_info(rooted).same_as.as_deref(), Some("manual"));
+        // Shown as Claude Code runs it, with what the plugin writes beside it.
+        assert_eq!(rooted.target, format!("node {script}"));
+        assert_eq!(
+            plugin_info(rooted).written_target.as_deref(),
+            Some("node ${CLAUDE_PLUGIN_ROOT}/s.js")
+        );
+        let also = find(&s, Scope::Plugin, "plugin:p2:also");
+        assert!(!also.shadowed, "{also:#?}");
+        assert_eq!(plugin_info(also).same_as, None);
+    }
+
+    #[test]
+    fn an_earlier_plugins_server_hides_a_later_one_only_where_it_is_loaded() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        let (sa, sb) = (
+            a.to_string_lossy().replace('\\', "/"),
+            b.to_string_lossy().replace('\\', "/"),
+        );
+        e.plugin("p1", json!({"dup": {"command": "echo", "args": ["dup"]}}));
+        e.plugin("p2", json!({"dup2": {"command": "echo", "args": ["dup"]}}));
+        // Off in a: there the later one is loaded.
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"disabledMcpServers": ["plugin:p1:dup"]},
+                b.to_string_lossy(): {}
+            }}),
+        );
+        let s = e.load();
+        let dup2 = find(&s, Scope::Plugin, "plugin:p2:dup2");
+        assert!(!dup2.shadowed, "{dup2:#?}");
+        assert_eq!(dup2.shadowed_in, std::slice::from_ref(&sb));
+        assert_eq!(plugin_info(dup2).same_as.as_deref(), Some("plugin:p1:dup"));
+
+        // Off in both: loaded in both.
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"disabledMcpServers": ["plugin:p1:dup"]},
+                b.to_string_lossy(): {"disabledMcpServers": ["plugin:p1:dup"]}
+            }}),
+        );
+        let dup2 = find(&e.load(), Scope::Plugin, "plugin:p2:dup2").clone();
+        assert!(!dup2.shadowed && dup2.shadowed_in.is_empty(), "{dup2:#?}");
+
+        // A local server and the earlier plugin's together: left out where either is loaded.
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"mcpServers": {"local-echo": {"command": "echo", "args": ["dup"]}}},
+                b.to_string_lossy(): {}
+            }}),
+        );
+        let s = e.load();
+        let dup2 = find(&s, Scope::Plugin, "plugin:p2:dup2");
+        assert!(dup2.shadowed, "{dup2:#?}");
+        assert_eq!(dup2.shadowed_in, [sa.clone(), sb.clone()]);
+        // The local server is named: it is configured by hand.
+        assert_eq!(plugin_info(dup2).same_as.as_deref(), Some("local-echo"));
+
+        // And with the earlier one off in b: only the local server's project.
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"mcpServers": {"local-echo": {"command": "echo", "args": ["dup"]}}},
+                b.to_string_lossy(): {"disabledMcpServers": ["plugin:p1:dup"]}
+            }}),
+        );
+        let dup2 = find(&e.load(), Scope::Plugin, "plugin:p2:dup2").clone();
+        assert!(!dup2.shadowed, "{dup2:#?}");
+        assert_eq!(dup2.shadowed_in, [sa]);
     }
 
     #[test]

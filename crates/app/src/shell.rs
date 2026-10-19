@@ -1600,7 +1600,8 @@ impl ShellApp {
 
     fn toolbar(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        let read_only = self.plugin_selected();
+        let read_only_hint = self.read_only_hint();
+        let read_only = read_only_hint.is_some();
         let can_toggle =
             self.core.is_some() && !self.selected.is_empty() && self.can_prepare() && !read_only;
         let can_edit = self.core.is_some() && self.selected.len() == 1 && !read_only;
@@ -1632,7 +1633,7 @@ impl ShellApp {
                     .min_size(egui::vec2(44.0, 38.0));
                 let (enabled, needs) = match glyph {
                     _ if read_only && glyph != icon::PLUS && glyph != icon::TRAY_ARROW_DOWN => {
-                        (false, READ_ONLY_PLUGIN)
+                        (false, read_only_hint.as_deref().unwrap_or_default())
                     }
                     g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
                         (can_toggle, "select a server first")
@@ -1703,11 +1704,6 @@ impl ShellApp {
             .iter()
             .filter_map(|&i| self.snapshot.servers.get(i))
             .collect();
-        let names = selected
-            .iter()
-            .map(|r| r.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
         let live = self.core.is_some();
         let mut add = |icon: &'static str,
                        title: String,
@@ -1722,12 +1718,13 @@ impl ShellApp {
                 action,
             });
         };
-        // A plugin's servers are read-only: nothing here changes, checks or exports them.
-        if live && !selected.is_empty() && !selected.iter().any(|r| r.scope == Scope::Plugin) {
-            let what = if selected.len() == 1 {
-                names.clone()
-            } else {
-                format!("{} servers", selected.len())
+        // A plugin's servers are read-only: nothing here changes, checks or exports them. With others selected, the
+        // actions on the selection take those.
+        let (changeable, _) = self.changeable_selected();
+        if live && !changeable.is_empty() {
+            let what = match changeable[..] {
+                [one] => one.name.clone(),
+                _ => format!("{} servers", changeable.len()),
             };
             add(
                 icon::TOGGLE_RIGHT,
@@ -2013,14 +2010,61 @@ impl ShellApp {
             .filter(|s| matches!(s.scope, Scope::User | Scope::Local))
     }
 
-    /// Whether the selection holds a plugin's server, which Klefki only shows (decision 008).
-    fn plugin_selected(&self) -> bool {
-        self.selected.iter().any(|&i| {
-            self.snapshot
-                .servers
-                .get(i)
-                .is_some_and(|s| s.scope == Scope::Plugin)
+    /// The selected rows, without plugin servers, which Klefki only shows (decision 008); and how many those were.
+    fn changeable_selected(&self) -> (Vec<&ServerRow>, usize) {
+        let rows: Vec<&ServerRow> = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .collect();
+        let all = rows.len();
+        let rows: Vec<&ServerRow> = rows
+            .into_iter()
+            .filter(|s| s.scope != Scope::Plugin)
+            .collect();
+        let left_out = all - rows.len();
+        (rows, left_out)
+    }
+
+    /// Why the buttons that change servers are off: everything selected comes from a plugin. `None` otherwise.
+    pub(crate) fn read_only_hint(&self) -> Option<String> {
+        let (rows, plugins) = self.changeable_selected();
+        if !rows.is_empty() || plugins == 0 {
+            return None;
+        }
+        Some(match self.single_selected() {
+            Some(s) => format!("{} comes from a plugin and is changed there", s.name),
+            None => "the selected servers come from plugins and are changed there".to_owned(),
         })
+    }
+
+    /// Says what a change to the selection left out: the plugin servers in it. With none left to change, names the
+    /// one selected and where it can be changed.
+    fn note_plugins_left_out(&mut self, changed: usize, left_out: usize) {
+        if left_out == 0 {
+            return;
+        }
+        let text = if changed > 0 {
+            match left_out {
+                1 => "Left out 1 plugin server: a plugin's server is changed in its plugin."
+                    .to_owned(),
+                n => format!(
+                    "Left out {n} plugin servers: a plugin's server is changed in its plugin."
+                ),
+            }
+        } else if let Some(s) = self.single_selected() {
+            let plugin = s.plugin.as_ref().map_or("", |p| p.plugin.as_str());
+            format!(
+                "{} comes from the plugin {plugin}. Change it in the plugin, or turn the plugin off in Claude Code \
+                 (/plugin).",
+                s.name
+            )
+        } else {
+            "The selected servers come from plugins. Change them in their plugins, or turn the plugins off in \
+             Claude Code (/plugin)."
+                .to_owned()
+        };
+        self.note(text, false);
     }
 
     /// Opens the Duplicate dialog for the selected server: named `<name>_copy`, in the place it is now.
@@ -2115,7 +2159,7 @@ impl ShellApp {
                     .iter()
                     .any(|s| s.scope != Scope::Plugin && matches_search(s, &q))
             } else {
-                !self.plugin_selected()
+                !self.changeable_selected().0.is_empty()
             }
     }
 
@@ -2146,6 +2190,18 @@ impl ShellApp {
                 1 => Some("Includes 1 selected server the search hides.".to_owned()),
                 n => Some(format!("Includes {n} selected servers the search hides.")),
             }
+        };
+        // A plugin's servers come with the plugin: said, not dropped silently.
+        let plugins = match self.changeable_selected().1 {
+            0 => None,
+            1 => Some("Leaves out 1 selected plugin server: it comes with its plugin.".to_owned()),
+            n => Some(format!(
+                "Leaves out {n} selected plugin servers: they come with their plugins."
+            )),
+        };
+        let scope = match (scope, plugins) {
+            (Some(a), Some(b)) => Some(format!("{a} {b}")),
+            (a, b) => a.or(b),
         };
         self.exporting = Some(ExportView {
             file_name: klefki_core::api::export_file_name(&names),
@@ -3414,37 +3470,35 @@ impl ShellApp {
 
     /// Asks the engine what deleting the selected servers would change. Nothing is written yet.
     fn prepare_delete(&mut self) {
-        if self.plugin_selected() {
-            return;
-        }
-        let changes: Vec<Change> = self
-            .selected
-            .iter()
-            .filter_map(|&i| self.snapshot.servers.get(i))
+        let (rows, left_out) = self.changeable_selected();
+        let changes: Vec<Change> = rows
+            .into_iter()
             .map(|row| Change::Delete { id: row.id() })
             .collect();
+        let changed = changes.len();
         if !changes.is_empty() {
             self.outcome = None;
             self.send(Command::Prepare(changes));
         }
+        self.note_plugins_left_out(changed, left_out);
     }
 
     /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
     fn prepare_toggle(&mut self, enabled: bool) {
-        if self.plugin_selected() {
-            return;
-        }
-        let changes: Vec<Change> = self
-            .selected
-            .iter()
-            .filter_map(|&i| self.snapshot.servers.get(i))
+        let (rows, left_out) = self.changeable_selected();
+        let changes: Vec<Change> = rows
+            .into_iter()
             .map(|row| Change::SetEnabled {
                 id: row.id(),
                 enabled,
             })
             .collect();
-        if !changes.is_empty() {
+        let changed = changes.len();
+        if !changes.is_empty() && self.can_prepare() {
             self.prepare(changes);
+            self.note_plugins_left_out(changed, left_out);
+        } else if changes.is_empty() {
+            self.note_plugins_left_out(0, left_out);
         }
     }
 
@@ -4268,6 +4322,14 @@ impl ShellApp {
         };
         match tab {
             DetailTab::General => {
+                // First, before anyone looks for a way to edit it.
+                if let Some(p) = &s.plugin {
+                    ui.add(
+                        egui::Label::new(RichText::new(plugin_read_only(p)).color(pal.text_muted))
+                            .wrap(),
+                    );
+                    ui.add_space(8.0);
+                }
                 // A local or project server that runs where a user server of its name is hidden.
                 let replaces = s.scope != Scope::User
                     && !s.shadowed
@@ -4295,7 +4357,13 @@ impl ShellApp {
                             None => kv("Project", s.project.clone().unwrap_or_else(|| "-".into())),
                         };
                         kv("Type", s.transport.label().to_owned());
-                        kv("Target", s.target.clone());
+                        let target = kv("Target", s.target.clone());
+                        // As Claude Code runs it; what the plugin writes is a hover away.
+                        if let Some(written) =
+                            s.plugin.as_ref().and_then(|p| p.written_target.as_deref())
+                        {
+                            target.on_hover_text(format!("The plugin writes: {written}"));
+                        }
                         let enabled = if matches!(s.scope, Scope::User | Scope::Plugin)
                             && s.enabled
                             && s.disabled_in > 0
@@ -4397,13 +4465,7 @@ impl ShellApp {
                         self.start_sign_in(s);
                     }
                 }
-                if let Some(p) = &s.plugin {
-                    ui.add_space(12.0);
-                    ui.add(
-                        egui::Label::new(RichText::new(plugin_read_only(p)).color(pal.text_muted))
-                            .wrap(),
-                    );
-                } else if self.core.is_some() {
+                if s.plugin.is_none() && self.core.is_some() {
                     ui.add_space(12.0);
                     let form = ui.scope(|ui| self.definition_form(ui, s)).response;
                     self.reveal_definition(s, &form);
@@ -4416,7 +4478,9 @@ impl ShellApp {
                     .max_col_width(col_width)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Status").color(pal.text_muted));
-                        if self.last_known(i) {
+                        if s.scope == Scope::Plugin {
+                            ui.label(PLUGIN_STATUS);
+                        } else if self.last_known(i) {
                             ui.label(format!("{} (last known)", status.label()));
                         } else {
                             ui.label(status.label());
@@ -7822,6 +7886,12 @@ fn status_cell(
         );
         return;
     }
+    // Never checked here: where its status is, not a check still to come.
+    if s.scope == Scope::Plugin {
+        ui.label(RichText::new(PLUGIN_STATUS).color(pal.text_muted))
+            .on_hover_text(PLUGIN_NOT_CHECKED);
+        return;
+    }
     let color = match status {
         Status::Connected => pal.success,
         Status::Degraded | Status::NeedsAuth | Status::PendingApproval => pal.warn,
@@ -7866,15 +7936,16 @@ fn status_cell(
             }
         }
         _ => {
-            let not_checked = (s.scope == Scope::Plugin).then_some(PLUGIN_NOT_CHECKED);
-            if let Some(text) = detail.or(last_known.then_some(LAST_KNOWN)).or(not_checked) {
+            if let Some(text) = detail.or(last_known.then_some(LAST_KNOWN)) {
                 response.on_hover_text(text);
             }
         }
     }
 }
 
-/// Why a plugin's server stays "Not checked", and where its status is.
+/// A plugin's server's status, in the list and the details: where to see it.
+const PLUGIN_STATUS: &str = "See /mcp";
+/// Why Klefki has no status for a plugin's server, and where it is.
 const PLUGIN_NOT_CHECKED: &str =
     "Klefki does not check a plugin's servers. In Claude Code, /mcp shows their status.";
 
@@ -7952,9 +8023,6 @@ fn short_name(s: &ServerRow) -> &str {
         .unwrap_or(&s.name)
 }
 
-/// Why a plugin's server cannot be changed here, and where it can be.
-const READ_ONLY_PLUGIN: &str = "a plugin's server is changed in its plugin";
-
 /// What the details say under a plugin's server.
 fn plugin_read_only(p: &klefki_core::api::PluginInfo) -> String {
     format!(
@@ -7971,7 +8039,7 @@ const SHADOWED_NAMED: usize = 5;
 fn shadowed_text(s: &ServerRow, project_count: usize) -> String {
     if let Some(same) = s.plugin.as_ref().and_then(|p| p.same_as.as_deref()) {
         return if s.shadowed {
-            format!("yes: {same} has the same command or address")
+            format!("in every project: {same} has the same command or address")
         } else {
             let mut text = shadowed_in_text(s, project_count);
             text.push_str(&format!(" ({same} has the same command or address)"));
@@ -11200,6 +11268,7 @@ mod tests {
                 plugin: "docs".into(),
                 marketplace: "team".into(),
                 same_as: same_as.map(str::to_owned),
+                written_target: None,
             }),
             shadowed: same_as.is_some(),
             ..live_row(name, Scope::Plugin, None)
@@ -11238,8 +11307,18 @@ mod tests {
                 "{glyph}"
             );
         }
-        // Nor through the keyboard or the palette.
+        // The list says where its status is.
+        h.get_by_label("See /mcp");
+        // The note saying so comes first, before anyone looks for Edit.
+        let note = h
+            .get_by_label_contains("Read-only: Claude Code reads this server")
+            .rect()
+            .top();
+        assert!(note < h.get_by_label("docs, from team").rect().top());
+        // Nor through the keyboard or the palette; Del says why it does nothing.
         h.key_press(egui::Key::Delete);
+        h.run();
+        h.get_by_label_contains("plugin:docs:search comes from the plugin docs");
         h.key_press(egui::Key::Space);
         for key in [egui::Key::E, egui::Key::D] {
             h.key_press_modifiers(egui::Modifiers::COMMAND, key);
@@ -11277,10 +11356,64 @@ mod tests {
         h.get_all_by_label("events").nth(1).unwrap().click();
         h.run();
         h.get_by_label("Left out");
-        h.get_by_label("yes: events has the same command or address");
+        h.get_by_label("in every project: events has the same command or address");
         // No tabs for values or sign-in: there is no definition here to show them from.
         assert!(h.query_by_label("Env").is_none());
         assert!(h.query_by_label("Auth").is_none());
+    }
+
+    #[test]
+    fn a_selection_with_a_plugins_server_acts_on_the_others_and_says_what_it_left_out() {
+        let (mut h, engine) = live_harness();
+        let user = live_row("alpha", Scope::User, None);
+        let p = plugin_row("plugin:docs:search", None);
+        engine
+            .events
+            .send(snapshot_of(vec![user.clone(), p]))
+            .unwrap();
+        h.run();
+        h.state_mut().selected = BTreeSet::from([0, 1]);
+        h.run();
+        for glyph in [icon::TOGGLE_LEFT, icon::TRASH, icon::EXPORT] {
+            assert!(
+                !h.get_by_label(glyph).accesskit_node().is_disabled(),
+                "{glyph}"
+            );
+        }
+        // Edit takes one server; this selection holds two.
+        assert!(
+            h.get_by_label(icon::PENCIL_SIMPLE)
+                .accesskit_node()
+                .is_disabled()
+        );
+        drain(&engine);
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: user.id(),
+                enabled: false
+            }])]
+        );
+        h.get_by_label_contains("Left out 1 plugin server");
+        let offered: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
+        assert!(offered.contains(&"Turn on alpha".to_owned()), "{offered:?}");
+        // Export takes the rest too.
+        h.state_mut().plan = None;
+        h.state_mut().preparing = false;
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::Export(vec![user.id()])]);
+
+        // Only plugin servers selected: the buttons are off, and their hint names the server.
+        h.state_mut().exporting = None;
+        h.state_mut().selected = BTreeSet::from([1]);
+        h.run();
+        assert_eq!(
+            h.state().read_only_hint().as_deref(),
+            Some("plugin:docs:search comes from a plugin and is changed there")
+        );
     }
 
     #[test]

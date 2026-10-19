@@ -31,7 +31,10 @@ pub(crate) struct PluginServer {
     pub marketplace: String,
     /// The server's own name in the plugin's files.
     pub server: String,
+    /// The definition as the plugin's files write it.
     pub entry: Value,
+    /// The plugin's folder, which `${CLAUDE_PLUGIN_ROOT}` stands for.
+    pub root: PathBuf,
 }
 
 impl PluginServer {
@@ -39,11 +42,31 @@ impl PluginServer {
     pub fn full_name(&self) -> String {
         full_name(&self.plugin, &self.server)
     }
+
+    /// The definition as Claude Code runs it: `${CLAUDE_PLUGIN_ROOT}` replaced by the plugin's folder in every text.
+    /// Any other `${…}` comes from Claude Code's own environment, which Klefki does not know, and stays as written.
+    pub fn expanded(&self) -> Value {
+        let root = self.root.to_string_lossy();
+        let mut entry = self.entry.clone();
+        expand(&mut entry, &root);
+        entry
+    }
 }
 
 pub(crate) fn full_name(plugin: &str, server: &str) -> String {
     format!("plugin:{plugin}:{server}")
 }
+
+fn expand(value: &mut Value, root: &str) {
+    match value {
+        Value::String(text) if text.contains(ROOT_VAR) => *text = text.replace(ROOT_VAR, root),
+        Value::Array(items) => items.iter_mut().for_each(|v| expand(v, root)),
+        Value::Object(map) => map.values_mut().for_each(|v| expand(v, root)),
+        _ => {}
+    }
+}
+
+const ROOT_VAR: &str = "${CLAUDE_PLUGIN_ROOT}";
 
 /// The servers of every plugin that is on, in the order `enabledPlugins` lists the plugins. What could not be read
 /// is said in `warnings`, unsanitised: the caller cleans it.
@@ -87,6 +110,7 @@ pub(crate) fn load(paths: &ConfigPaths, warnings: &mut Vec<String>) -> Vec<Plugi
                 marketplace: marketplace.clone(),
                 server,
                 entry,
+                root: root.clone(),
             })),
             Err(e) => warnings.push(format!("Ignored the servers of the plugin {key}: {e}")),
         }
@@ -173,10 +197,15 @@ fn local_source(location: &Path, plugin: &str) -> Option<String> {
 
 /// `rel` under `base`, when it names something inside it: no `..`, no root, no drive.
 fn inside(base: &Path, rel: &str) -> Option<PathBuf> {
-    let rel = Path::new(rel);
-    rel.components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
-        .then(|| base.join(rel))
+    let mut path = base.to_path_buf();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(part) => path.push(part),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    Some(path)
 }
 
 /// No `..` anywhere in an absolute path from Claude Code's bookkeeping.
@@ -184,8 +213,8 @@ fn plain(path: &Path) -> bool {
     !path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-/// The servers of the plugin in `root`: those of `.mcp.json`, then those its manifest lists. A name defined twice
-/// keeps its first definition.
+/// The servers of the plugin in `root`: those of `.mcp.json`, then those its manifest lists. A name defined again
+/// takes the later definition, in the first one's place: the manifest's wins over `.mcp.json`'s, as in Claude Code.
 fn servers_of(root: &Path) -> Result<Vec<(String, Value)>, String> {
     let mut out: Vec<(String, Value)> = Vec::new();
     if let Some(file) = read(&root.join(".mcp.json")).map_err(|e| format!(".mcp.json: {e}"))? {
@@ -226,7 +255,8 @@ fn add(out: &mut Vec<(String, Value)>, file: &Value) -> Result<(), String> {
         },
     };
     for (name, entry) in servers {
-        if out.iter().any(|(n, _)| n == name) {
+        if let Some((_, earlier)) = out.iter_mut().find(|(n, _)| n == name) {
+            *earlier = entry.clone();
             continue;
         }
         if out.len() >= MAX_SERVERS {
@@ -402,6 +432,74 @@ mod tests {
     }
 
     #[test]
+    fn the_manifest_wins_over_mcp_json_for_a_name_both_define() {
+        let e = Env::new();
+        e.install("p@m", "p");
+        e.write(
+            "p/.mcp.json",
+            &json!({"mcpServers": {"dup": {"command": "echo", "args": ["dup"]}, "only": {"command": "a"}}}),
+        );
+        e.write(
+            "p/.claude-plugin/plugin.json",
+            &json!({"mcpServers": {"dup": {"command": "echo", "args": ["manifest"]}}}),
+        );
+        e.enable(&[("p@m", true)]);
+        let (servers, warnings) = e.load();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(names(&servers), ["plugin:p:dup", "plugin:p:only"]);
+        assert_eq!(
+            servers[0].entry,
+            json!({"command": "echo", "args": ["manifest"]})
+        );
+
+        // The same through a file the manifest names.
+        e.write(
+            "p/.claude-plugin/plugin.json",
+            &json!({"mcpServers": "./more.json"}),
+        );
+        e.write(
+            "p/more.json",
+            &json!({"dup": {"command": "echo", "args": ["file"]}}),
+        );
+        let (servers, _) = e.load();
+        assert_eq!(names(&servers), ["plugin:p:dup", "plugin:p:only"]);
+        assert_eq!(
+            servers[0].entry,
+            json!({"command": "echo", "args": ["file"]})
+        );
+    }
+
+    #[test]
+    fn the_plugin_root_variable_is_expanded_as_claude_code_runs_the_server() {
+        let e = Env::new();
+        e.install("p@m", "p");
+        e.write(
+            "p/.mcp.json",
+            &json!({
+                "rooted": {"command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/s.js", "--x"],
+                           "env": {"DATA": "${CLAUDE_PLUGIN_ROOT}/data"}},
+                "remote": {"type": "http", "url": "https://x.example.com/mcp"}
+            }),
+        );
+        e.enable(&[("p@m", true)]);
+        let (servers, _) = e.load();
+        let root = e.path("p");
+        let root = root.to_str().unwrap();
+        assert_eq!(
+            servers[0].expanded(),
+            json!({"command": "node", "args": [format!("{root}/s.js"), "--x"], "env": {"DATA": format!("{root}/data")}})
+        );
+        // Nothing to expand: the definition as written.
+        assert_eq!(servers[1].expanded(), servers[1].entry);
+        // Another variable is Claude Code's own environment, which Klefki does not know: left as written.
+        let other = PluginServer {
+            entry: json!({"command": "${HOME}/x", "args": ["${CLAUDE_PLUGIN_ROOTS}"]}),
+            ..servers[0].clone()
+        };
+        assert_eq!(other.expanded(), other.entry);
+    }
+
+    #[test]
     fn a_plugin_in_a_local_marketplace_is_read_where_it_lives_not_from_its_copy() {
         let e = Env::new();
         e.install("p@local", "cache/local/p/1.0.0");
@@ -420,7 +518,13 @@ mod tests {
         );
         e.write("src/p/.mcp.json", &json!({"live": {"command": "new"}}));
         e.enable(&[("p@local", true)]);
-        assert_eq!(names(&e.load().0), ["plugin:p:live"]);
+        let servers = e.load().0;
+        assert_eq!(names(&servers), ["plugin:p:live"]);
+        // The folder as Claude Code spells it in `${CLAUDE_PLUGIN_ROOT}`: no `./` left in it.
+        assert_eq!(
+            servers[0].root.to_string_lossy(),
+            e.path("src").join("p").to_string_lossy()
+        );
 
         // A source leaving the marketplace's folder is not followed; nor is a remote source, which uses the copy.
         e.write(
