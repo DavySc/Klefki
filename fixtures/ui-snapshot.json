@@ -8,7 +8,8 @@
       "target": "https://gateway.example.com/mcp",
       "status": "connected",
       "enabled": true,
-      "disabled_in": 3
+      "disabled_in": 3,
+      "shadowed_in": ["C:/Repos/Gateway"]
     },
     {
       "name": "issue-tracker",

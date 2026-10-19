@@ -3487,7 +3487,7 @@ impl ShellApp {
                         if let Some(approval) = s.approval {
                             kv("Approval", approval.label().to_owned());
                         }
-                        kv("Shadowed", if s.shadowed { "yes" } else { "no" }.to_owned());
+                        kv("Shadowed", shadowed_text(s, self.snapshot.project_count));
                     });
                 if s.casing_collision && self.core.is_some() {
                     ui.add_space(8.0);
@@ -6127,8 +6127,25 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     let pal = theme::palette(ui.ctx());
     let color = if s.enabled { pal.text } else { pal.disabled };
     ui.add(egui::Label::new(RichText::new(&s.name).color(color)).truncate());
+    if s.shadowed {
+        badge(ui, "shadowed", pal.warn).on_hover_text(if s.scope == Scope::User {
+            "Every project has a local or project server of the same name, which Claude Code uses instead"
+        } else {
+            "This project has a local server of the same name, which Claude Code uses instead"
+        });
+    } else if !s.shadowed_in.is_empty() {
+        badge(
+            ui,
+            &format!("shadowed in {}/{}", s.shadowed_in.len(), project_count),
+            pal.warn,
+        )
+        .on_hover_text(format!(
+            "In {} of {project_count} projects, a local or project server of the same name is used \
+             instead. The details name them.",
+            s.shadowed_in.len()
+        ));
+    }
     for (show, text, fill) in [
-        (s.shadowed, "shadowed", pal.warn),
         (s.casing_collision, "casing", pal.warn),
         (
             s.transport == klefki_core::api::TransportKind::Invalid,
@@ -6248,7 +6265,7 @@ fn hovered_for(ui: &Ui, id: egui::Id, rect: egui::Rect, delay: f64) -> bool {
     true
 }
 
-fn badge(ui: &mut Ui, text: &str, fill: Color32) {
+fn badge(ui: &mut Ui, text: &str, fill: Color32) -> egui::Response {
     let pal = theme::palette(ui.ctx());
     Frame::new()
         .fill(fill)
@@ -6256,7 +6273,36 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32) {
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.label(RichText::new(text).small().color(pal.on_bright));
-        });
+        })
+        .response
+}
+
+/// At most this many projects are named where a server is shadowed; the rest are counted.
+const SHADOWED_NAMED: usize = 5;
+
+/// Where another server of the same name is used instead of `s`, for the detail panel.
+fn shadowed_text(s: &ServerRow, project_count: usize) -> String {
+    if s.shadowed_in.is_empty() {
+        let text = if !s.shadowed {
+            "no"
+        } else if s.scope == Scope::User {
+            "yes, in every project"
+        } else {
+            "yes, by a local server of the same name"
+        };
+        return text.to_owned();
+    }
+    let count = s.shadowed_in.len();
+    let mut text = if s.shadowed {
+        format!("in all {count} projects: ")
+    } else {
+        format!("in {count} of {project_count} projects: ")
+    };
+    text.push_str(&s.shadowed_in[..count.min(SHADOWED_NAMED)].join(", "));
+    if count > SHADOWED_NAMED {
+        text.push_str(&format!(" and {} more", count - SHADOWED_NAMED));
+    }
+    text
 }
 
 /// A small icon button that reads as `label` to assistive technology.
@@ -6433,6 +6479,7 @@ mod tests {
             disabled_in: 0,
             approval: None,
             shadowed: false,
+            shadowed_in: Vec::new(),
             casing_collision: false,
             status_cached: false,
             oauth: None,
@@ -6558,6 +6605,7 @@ mod tests {
             disabled_in: 0,
             approval: None,
             shadowed: false,
+            shadowed_in: Vec::new(),
             casing_collision: false,
             status_cached: false,
             oauth: None,
@@ -7248,6 +7296,63 @@ mod tests {
         h.run();
         h.get_by_label_contains("Disabled");
         assert!(h.query_by_label_contains("off in").is_none());
+    }
+
+    #[test]
+    fn a_user_server_hidden_in_some_projects_says_how_many_and_where() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.shadowed_in = vec!["C:/Repos/WebApp".into(), "C:/Repos/Api".into()];
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label("shadowed in 2/17").hover();
+        h.run();
+        h.get_by_label_contains(
+            "In 2 of 17 projects, a local or project server of the same name is used",
+        );
+        assert!(
+            h.query_by_label("shadowed").is_none(),
+            "still used in 15 projects"
+        );
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("in 2 of 17 projects: C:/Repos/WebApp, C:/Repos/Api");
+    }
+
+    #[test]
+    fn a_user_server_hidden_everywhere_reads_shadowed_without_the_count() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.shadowed_in = vec!["C:/Repos/WebApp".into(), "C:/Repos/Api".into()];
+        row.shadowed = true;
+        engine
+            .events
+            .send(snapshot_with_projects(2, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label("shadowed");
+        assert!(h.query_by_label_contains("shadowed in").is_none());
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("in all 2 projects: C:/Repos/WebApp, C:/Repos/Api");
+    }
+
+    #[test]
+    fn a_long_list_of_projects_hiding_a_server_is_cut() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.shadowed_in = (1..=9).map(|n| format!("/p{n}")).collect();
+        engine
+            .events
+            .send(snapshot_with_projects(40, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label("gateway").click();
+        h.run();
+        h.get_by_label("in 9 of 40 projects: /p1, /p2, /p3, /p4, /p5 and 4 more");
     }
 
     #[test]

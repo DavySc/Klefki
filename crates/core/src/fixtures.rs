@@ -28,6 +28,8 @@ struct RawServer {
     #[serde(default)]
     shadowed: bool,
     #[serde(default)]
+    shadowed_in: Vec<String>,
+    #[serde(default)]
     casing_collision: bool,
 }
 
@@ -77,6 +79,7 @@ pub(crate) fn load() -> Snapshot {
                     _ => Approval::Pending,
                 }),
                 shadowed: s.shadowed,
+                shadowed_in: s.shadowed_in.iter().map(|p| sanitize(p)).collect(),
                 casing_collision: s.casing_collision,
                 status_cached: false,
                 oauth: None,

@@ -224,7 +224,16 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         ));
     }
     if row.shadowed {
-        notes.push("shadowed by a closer scope".to_owned());
+        notes.push(if row.scope == Scope::User {
+            "shadowed in every project".to_owned()
+        } else {
+            "shadowed by a local server".to_owned()
+        });
+    } else if !row.shadowed_in.is_empty() {
+        notes.push(format!(
+            "shadowed in {} of {project_count} projects",
+            row.shadowed_in.len()
+        ));
     }
     if row.casing_collision {
         notes.push("another server's name differs only in case".to_owned());
@@ -314,6 +323,9 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     }
     o.insert("approval".into(), json!(row.approval.map(approval_key)));
     o.insert("shadowed".into(), json!(row.shadowed));
+    if row.scope == Scope::User {
+        o.insert("shadowed_in".into(), json!(row.shadowed_in));
+    }
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
     o
@@ -585,6 +597,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_shadowed_server_says_where_another_is_used_instead() {
+        let s = fixture_snapshot();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let project = s
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Project)
+            .unwrap();
+        let partly = ServerRow {
+            shadowed_in: vec!["/a".into(), "/b".into()],
+            shadowed: false,
+            ..user.clone()
+        };
+        let everywhere = ServerRow {
+            shadowed: true,
+            ..partly.clone()
+        };
+        let by_local = ServerRow {
+            shadowed: true,
+            ..project.clone()
+        };
+        assert!(notes(&partly, 12).contains(&"shadowed in 2 of 12 projects".to_owned()));
+        assert!(notes(&everywhere, 2).contains(&"shadowed in every project".to_owned()));
+        assert!(notes(&by_local, 2).contains(&"shadowed by a local server".to_owned()));
+        let json = row_json(&partly, 12);
+        assert_eq!(json["shadowed"], json!(false));
+        assert_eq!(json["shadowed_in"], json!(["/a", "/b"]));
+        assert!(!row_json(&by_local, 2).contains_key("shadowed_in"));
     }
 
     #[test]
