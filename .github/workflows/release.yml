@@ -1,6 +1,6 @@
 name: release
-# Builds the installers for Windows, macOS and Linux. A `v*` tag publishes them as a draft GitHub Release;
-# a manual run only builds them and keeps them as workflow artifacts. Never runs on pull requests (the macOS
+# Builds the installers for Windows, macOS and Linux with SBOMs, checksums and build provenance. A `v*` tag
+# publishes them as a draft GitHub Release; a manual run keeps them as workflow artifacts. Never runs on pull requests (the macOS
 # job is billed at 10x). See docs/RELEASING.md.
 on:
   push:
@@ -13,6 +13,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_PACKAGER_VERSION: 0.11.8
+  CARGO_CYCLONEDX_VERSION: 0.5.9
 
 jobs:
   build:
@@ -44,6 +45,9 @@ jobs:
       # No build cache: a release is built from scratch, and caches saved under a tag could not be reused.
       - name: Install cargo-packager
         run: cargo install cargo-packager --locked --version "$CARGO_PACKAGER_VERSION"
+      - name: Install cargo-cyclonedx
+        if: runner.os == 'Linux'
+        run: cargo install cargo-cyclonedx --locked --version "$CARGO_CYCLONEDX_VERSION"
 
       - name: Version
         id: version
@@ -95,6 +99,10 @@ jobs:
               cargo packager --release -p klefki -f deb,appimage -o "$GITHUB_WORKSPACE/target/packages"
               cp target/packages/*.deb "dist/$base-linux-amd64.deb"
               cp target/packages/*.AppImage "dist/$base-linux-x86_64.AppImage"
+              # One SBOM per program, listing the dependencies for every target, so it covers all three systems.
+              cargo cyclonedx -f json --spec-version 1.5 --describe binaries --no-build-deps --target all
+              cp crates/app/klefki_bin.cdx.json "dist/klefki-$VERSION.cdx.json"
+              cp crates/cli/klefki-cli_bin.cdx.json "dist/klefki-cli-$VERSION.cdx.json"
               ;;
           esac
           ls -l dist
@@ -108,12 +116,16 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Checksums and provenance for every run, so a manual run's files can be checked like a release's.
+  # Only a tag publishes them.
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Signs the build provenance with GitHub's OIDC identity and stores it as an attestation.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -125,7 +137,29 @@ jobs:
           cd dist
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
+      # Records which workflow, commit and runner built each file, signed through Sigstore. Anyone can check a
+      # download with the `gh attestation verify` command in docs/release-notes.md; the next step runs the same check.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+      - name: Check the attestations
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for file in dist/*; do
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" > /dev/null
+            echo "attested: $file"
+          done
+      # A tag publishes these files in the release instead.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          name: klefki-all
+          path: dist/*
+          if-no-files-found: error
       - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

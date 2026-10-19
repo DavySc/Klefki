@@ -7,12 +7,13 @@
 
 It looks inside the files rather than trusting the build: the Windows app is a GUI program with the icon
 embedded and the CLI is a console program; the macOS app runs natively on Intel and Apple silicon and
-carries the release version; the Linux packages install both programs, the menu entry and the icon. Exits 1
-with every problem listed. Standard library only, so it runs on any CI runner.
+carries the release version; the Linux packages install both programs, the menu entry and the icon, and the
+SBOMs (made on the Linux job) describe both programs at this version. Exits 1 with every problem listed. Standard library only, so it runs on any CI runner.
 """
 
 import argparse
 import io
+import json
 import plistlib
 import struct
 import sys
@@ -160,6 +161,29 @@ def check_linux(dist, version, problems):
             problems.append(f"{appimage.name} is not an executable")
     else:
         problems.append(f"missing {appimage.name}")
+    check_sboms(dist, version, problems)
+
+
+def check_sboms(dist, version, problems):
+    """The CycloneDX SBOMs (built once, on Linux, for every target) describe each program at this version."""
+    for program in ("klefki", "klefki-cli"):
+        path = dist / f"{program}-{version}.cdx.json"
+        if not path.is_file():
+            problems.append(f"missing {path.name}")
+            continue
+        try:
+            sbom = json.loads(path.read_text(encoding="utf-8"))
+            component = sbom["metadata"]["component"]
+            count = len(sbom["components"])
+        except (ValueError, KeyError, TypeError) as err:
+            problems.append(f"{path.name} is not a CycloneDX SBOM: {err!r}")
+            continue
+        if sbom.get("bomFormat") != "CycloneDX":
+            problems.append(f"{path.name} is not a CycloneDX SBOM")
+        if (component.get("name"), component.get("version")) != (program, version):
+            problems.append(f"{path.name} describes {component.get('name')} {component.get('version')}, not {program} {version}")
+        if count == 0:
+            problems.append(f"{path.name} lists no dependencies")
 
 
 def main(argv):
