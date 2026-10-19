@@ -61,3 +61,11 @@ Every file is listed in `SHA256SUMS`. In the download folder:
 - Linux: `sha256sum -c SHA256SUMS --ignore-missing`
 - macOS: `shasum -a 256 -c SHA256SUMS --ignore-missing`
 - Windows (PowerShell): `Get-FileHash .\klefki-{version}-windows-x64-setup.exe`, then compare the hash with the line for that file in `SHA256SUMS`.
+
+To check that a file was built from this repository by its release workflow, and not changed since, use the [GitHub CLI](https://cli.github.com/):
+
+```
+gh attestation verify klefki-{version}-linux-amd64.deb --repo DavySc/Klefki
+```
+
+`klefki-{version}.cdx.json` and `klefki-cli-{version}.cdx.json` list every library in each program (CycloneDX SBOMs), for vulnerability scanners.
