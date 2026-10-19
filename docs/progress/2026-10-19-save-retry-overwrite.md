@@ -17,12 +17,14 @@ Goal: on Windows a refused rename of `.claude.json` is retried for about 0.6 s (
 - `a_settings_file_larger_than_the_inventory_reads_is_not_changed`, `the_settings_temp_file_is_named_after_the_settings_file`.
 
 ## Checks
-- Full verify (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`) on this branch from main 2279dd4: exit 0, 952 passed, 0 failed, deny "advisories ok, bans ok, licenses ok, sources ok".
+- Full verify (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`) on this branch from main 2279dd4: exit 0, 952 passed; after round 1: exit 0, 953 passed, 0 failed, deny "advisories ok, bans ok, licenses ok, sources ok".
 - `cargo test -p klefki-core --lib docstore` 20 runs in a row: 112 passed each time.
 - Windows and macOS: CI only (the refused-rename seam runs on every system; the real Windows sharing violation is covered by the existing `the_file_is_replaced_even_while_someone_has_it_open_for_a_moment`).
 
-## Trade-off
-- A backup made while the clock was far ahead pins later names to that time until the clock passes it, so the Activity log shows that time for them. Rotation stays correct.
+## Cross-review round 1 (another thread, review on #24)
+Verdict: ready once CI is green, nothing blocking; the mutation run (in-loop stamp check removed) fails the new test. Folded in both optional points:
+- N1: an oversized `settings.local.json` says which file, that Klefki won't change it, and to approve the server in Claude Code instead (was "file is larger than the 1048576 byte limit"). The size test now checks the message, seen failing first.
+- N2: a newest backup more than a day ahead of the clock is not followed, so one boot with a wrong date does not date every later backup. Test `a_backup_far_ahead_of_the_clock_does_not_date_the_next_one`, seen failing first.
 
 ## Not done (left open, larger than this slice)
 - The lock is not refreshed while held (Claude's rule: stale after 10 s), and two waiters can both take over one stale lock (the window between the age check and the removal).

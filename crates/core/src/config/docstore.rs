@@ -33,6 +33,8 @@ const BACKOFF_MS: [u64; 6] = [50, 100, 200, 400, 800, 1500];
 const MAX_VERIFY_ROUNDS: usize = 3;
 /// How often a write is redone because the file changed between our read and our rename, before giving up.
 const VALIDATION_ATTEMPTS: usize = 3;
+/// How far ahead of the clock the newest backup's time may be and still be followed (a day).
+const CLOCK_BACK_FOLLOWED_MS: u128 = 86_400_000;
 /// Waits between attempts to replace the file while Windows refuses because someone has it open.
 const DENIED_RETRY_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
 const BOM: &str = "\u{feff}";
@@ -511,7 +513,18 @@ impl Docstore {
             Kind::ClaudeJson => MAX_CLAUDE_JSON,
             Kind::ProjectSettings => MAX_MCP_JSON,
         };
-        match fsx::read_limited_bom(&self.path, max)? {
+        let read = fsx::read_limited_bom(&self.path, max).map_err(|e| {
+            if self.kind == Kind::ProjectSettings
+                && std::fs::metadata(&self.path).is_ok_and(|m| m.len() > max)
+            {
+                return StoreError::Invalid(format!(
+                    "{} is larger than 1 MB, so Klefki won't change it. Approve the server in Claude Code instead.",
+                    sanitize(&self.path.display().to_string())
+                ));
+            }
+            StoreError::from(e)
+        })?;
+        match read {
             Some((text, bom)) => Ok(Current {
                 text,
                 bom,
@@ -656,14 +669,18 @@ impl Docstore {
     }
 
     /// Names for a new backup, to try in turn: `<label>.<ms>-<n>.bak`, after the newest there is. A clock that went
-    /// back keeps the newest backup's time, so the new one still comes last and is not rotated out first.
+    /// back keeps the newest backup's time, so the new one still comes last and is not rotated out first. A newest
+    /// backup more than a day ahead is taken for a clock that was wrong then; it is not followed, so it does not
+    /// date every later backup.
     fn new_backup_names(&self) -> impl Iterator<Item = PathBuf> + '_ {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let (ms, first) = match self.backups_oldest_first().pop() {
-            Some(((ms, n), _)) if ms >= now => (ms, n.saturating_add(1)),
+            Some(((ms, n), _)) if ms >= now && ms - now <= CLOCK_BACK_FOLLOWED_MS => {
+                (ms, n.saturating_add(1))
+            }
             _ => (now, 0),
         };
         let label = self.backup_label();
@@ -3227,6 +3244,26 @@ mod tests {
     }
 
     #[test]
+    fn a_backup_far_ahead_of_the_clock_does_not_date_the_next_one() {
+        // The variant: a clock that was far ahead once (a wrong date at boot) does not pin every later backup's
+        // time, which the Activity log shows.
+        let f = Fixture::new(&pretty(&sample()));
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        backup_named(&f, now + 2 * 86_400_000, 0);
+        let made = f.store.keep_copy().unwrap();
+        let name = made.file_name().unwrap().to_str().unwrap().to_owned();
+        let ms: u128 = name
+            .strip_prefix("claude.json.")
+            .and_then(|r| r.split_once('-'))
+            .map(|(ms, _)| ms.parse().unwrap())
+            .unwrap();
+        assert!(ms < now + 60_000, "{name}");
+    }
+
+    #[test]
     fn backups_made_in_one_millisecond_are_rotated_in_the_order_made() {
         // The variant: `-10` and `-11` are newer than `-2`, though they sort before it as text.
         let mut f = Fixture::new(&pretty(&sample()));
@@ -3596,7 +3633,13 @@ mod tests {
         std::fs::create_dir(dir.path().join(".claude")).unwrap();
         let big = format!("{{\"pad\": \"{}\"}}", "x".repeat(MAX_MCP_JSON as usize));
         std::fs::write(&store.path, &big).unwrap();
-        assert!(store.prepare(vec![approve_op("ps")]).is_err());
+        let Err(StoreError::Invalid(why)) = store.prepare(vec![approve_op("ps")]) else {
+            panic!("an oversized settings file is refused");
+        };
+        // Which file, that it stays as it is, and what to do instead.
+        assert!(why.contains("settings.local.json"), "{why}");
+        assert!(why.contains("larger than 1 MB"), "{why}");
+        assert!(why.contains("Approve the server in Claude Code"), "{why}");
         assert_eq!(std::fs::read_to_string(&store.path).unwrap(), big);
     }
 
