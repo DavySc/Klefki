@@ -32,6 +32,20 @@ Store (MSIX) location, without ever writing to that file, and without costing an
 - Merged main 4b8fb5a (Secrets page) in: nav, go(), events and the top bar filter keep both pages. Full verify exit 0 again (core 689, app 332, cli 18 + 25), `cargo deny` ok.
 - Real app under Xvfb with a temp `HOME`/`CLAUDE_CONFIG_DIR` and a sample config: page at 1200x720 and 800x480.
 
+## Cross-review round 1 (review on f157bef)
+- Blocking 1, fixed: Delete, Ctrl+E, Ctrl+D and Ctrl+Shift+M acted on the hidden Connections selection from any
+  other page. They now work only on Connections (Ctrl+N, which needs no selection, works anywhere). Reproducer
+  `desktop::tests::shortcuts_for_the_selection_do_nothing_off_the_connections_page` (Desktop, Settings, Activity
+  log) failed first with `Prepare([Delete gateway])` and `Inspect(gateway)`.
+- Blocking 2, fixed: Claude Desktop does not connect to remote servers in its file. Entries with a `url` or an
+  http/sse/ws type carry `not_used` with the reason (add it under Settings, Connectors) and show "not used"; a bare
+  `{"url": …}` shows its URL. `desktop::tests::remote_entries_are_listed_as_not_used_by_claude_desktop`, app test
+  `a_remote_entry_says_claude_desktop_does_not_use_it`.
+- Fold-in: subtitle and empty state name the configuration file, and say extensions and connectors are not listed
+  (`an_empty_file_says_what_is_empty`). Optional Linux point taken: not found on Linux says Claude Desktop is made
+  for Windows and macOS.
+- Full verify exit 0 (core 690, app 335, cli 18 + 25), `cargo deny` ok.
+
 ## Not verified here
 - Windows with the real Store install (path and precedence come from Microsoft's docs and decision 003's look at
   the owner's machine); macOS location.

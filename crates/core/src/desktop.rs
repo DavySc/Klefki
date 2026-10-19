@@ -79,7 +79,14 @@ pub struct DesktopServer {
     pub env: Vec<String>,
     /// The names of its headers, for a remote server. Their values are not read into this.
     pub headers: Vec<String>,
+    /// Why Claude Desktop does not run this entry although it is in the file, when it does not.
+    pub not_used: Option<String>,
 }
+
+/// Claude Desktop starts the commands in its file but does not connect to remote servers listed there; those are
+/// added as connectors (Anthropic, "Building custom connectors via remote MCP servers").
+const REMOTE_NOT_USED: &str = "Claude Desktop does not connect to remote servers listed in this file. Add it in \
+                               Claude Desktop under Settings, Connectors.";
 
 /// Finds and reads Claude Desktop's configuration. Writes nothing.
 pub(crate) fn load(roots: &DesktopRoots) -> Desktop {
@@ -168,7 +175,23 @@ fn exists(path: &Path) -> bool {
 }
 
 fn server(name: &str, entry: &Value) -> DesktopServer {
-    let (transport, target) = inventory::classify(entry);
+    let (mut transport, mut target) = inventory::classify(entry);
+    let url = entry.get("url").and_then(Value::as_str);
+    let remote = url.is_some()
+        || matches!(
+            transport,
+            TransportKind::Http | TransportKind::Sse | TransportKind::Ws
+        );
+    // A URL with no type is what a remote entry for Claude Desktop usually looks like: shown as the URL it is, not
+    // as a command that is missing.
+    if let (Some(url), TransportKind::Invalid) = (url, transport)
+        && entry.get("type").is_none()
+        && entry.get("command").is_none()
+        && let Ok(shown) = inventory::display_url(url, &["http", "https"])
+    {
+        transport = TransportKind::Http;
+        target = shown;
+    }
     let names = |key: &str| -> Vec<String> {
         entry
             .get(key)
@@ -185,6 +208,7 @@ fn server(name: &str, entry: &Value) -> DesktopServer {
         target,
         env: names("env"),
         headers: names("headers"),
+        not_used: remote.then(|| REMOTE_NOT_USED.to_owned()),
     }
 }
 
@@ -293,7 +317,9 @@ mod tests {
         assert_eq!(alpha.transport, TransportKind::Http);
         assert_eq!(alpha.target, "https://example.com/mcp?…");
         assert_eq!(alpha.headers, ["Authorization"]);
+        assert_eq!(zeta.not_used, None);
         assert_eq!(d.servers[2].transport, TransportKind::Invalid);
+        assert_eq!(d.servers[2].not_used, None);
         // No value that may be a secret is anywhere in what is shown.
         let all = format!("{d:?}");
         for secret in [
@@ -306,6 +332,38 @@ mod tests {
         ] {
             assert!(!all.contains(secret), "{secret} in {all}");
         }
+    }
+
+    #[test]
+    fn remote_entries_are_listed_as_not_used_by_claude_desktop() {
+        // Cross-review: Claude Desktop does not connect to remote servers in its file, so listing them as servers
+        // it runs was false.
+        let r = Roots::new();
+        r.write(
+            &r.roaming_file(),
+            r#"{"mcpServers": {
+                "typed": {"type": "http", "url": "https://a.example/mcp"},
+                "sse": {"type": "sse", "url": "https://b.example/sse"},
+                "bare": {"url": "https://c.example/mcp?key=secret"},
+                "bad": {"url": "not a url"},
+                "local": {"command": "node", "args": ["s.js"]}
+            }}"#,
+        );
+        let d = load(&r.roots());
+        let by = |n: &str| d.servers.iter().find(|s| s.name == n).unwrap();
+        for name in ["typed", "sse", "bare", "bad"] {
+            let s = by(name);
+            assert!(
+                s.not_used
+                    .as_deref()
+                    .is_some_and(|w| w.contains("Connectors")),
+                "{name}: {s:?}"
+            );
+        }
+        assert_eq!(by("bare").transport, TransportKind::Http);
+        assert_eq!(by("bare").target, "https://c.example/mcp?…");
+        assert_eq!(by("bad").transport, TransportKind::Invalid);
+        assert_eq!(by("local").not_used, None);
     }
 
     #[test]

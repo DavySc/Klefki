@@ -1069,8 +1069,9 @@ impl ShellApp {
                 self.move_selection(step);
             }
         }
-        // Del and Ctrl+E act on the selection, unless a text field has the keyboard (Del edits text there).
-        if idle && self.core.is_some() {
+        // Del and Ctrl+E act on the selection, unless a text field has the keyboard (Del edits text there). Only where
+        // the selection is in view: on another page they would act on a server the user cannot see.
+        if idle && self.core.is_some() && self.page == Page::Connections {
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.prepare_delete();
             }
@@ -1087,9 +1088,13 @@ impl ShellApp {
             {
                 self.open_move();
             }
-            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N)) {
-                self.open_add();
-            }
+        }
+        // Adding needs no selection, so it works from any page.
+        if idle
+            && self.core.is_some()
+            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::N))
+        {
+            self.open_add();
         }
         let pal = theme::palette(ui.ctx());
         self.save_bar_shown = false;

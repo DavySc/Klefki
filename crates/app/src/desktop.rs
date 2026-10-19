@@ -66,8 +66,9 @@ impl DesktopPage {
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Claude Desktop's own servers, separate from Claude Code's. To change them, use Claude \
-                     Desktop: Settings, Developer, Edit Config, then restart it.",
+                    "The servers in Claude Desktop's configuration file, separate from Claude Code's. Extensions \
+                     and connectors are not listed. To change these servers, use Claude Desktop: Settings, \
+                     Developer, Edit Config, then restart it.",
                 )
                 .color(pal.text_muted),
             )
@@ -163,7 +164,7 @@ impl DesktopPage {
                         .color(pal.text_muted),
                 );
                 ui.add_space(8.0);
-                ui.label("No servers in Claude Desktop");
+                ui.label("No servers in Claude Desktop's configuration file");
             });
             return;
         }
@@ -211,7 +212,11 @@ fn not_found(ui: &mut Ui, desktop: &Desktop) {
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Claude Desktop writes it once a server is added there (Settings, Developer, Edit Config).",
+                    if cfg!(target_os = "linux") {
+                        "Claude Desktop is made for Windows and macOS, so on Linux there is usually nothing to show."
+                    } else {
+                        "Claude Desktop writes it once a server is added there (Settings, Developer, Edit Config)."
+                    },
                 )
                 .color(pal.text_muted),
             )
@@ -263,7 +268,14 @@ fn row(ui: &mut Ui, server: &DesktopServer, in_code: &str) {
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&server.name).strong());
-        let kind = if server.transport == TransportKind::Invalid {
+        let kind = if server.not_used.is_some() {
+            RichText::new(format!(
+                "{} {} · not used",
+                icon::WARNING,
+                server.transport.label()
+            ))
+            .color(pal.warn)
+        } else if server.transport == TransportKind::Invalid {
             RichText::new(format!("{} invalid", icon::WARNING)).color(pal.warn)
         } else {
             RichText::new(server.transport.label()).color(pal.text_muted)
@@ -279,6 +291,9 @@ fn row(ui: &mut Ui, server: &DesktopServer, in_code: &str) {
         }
     });
     ui.add(egui::Label::new(RichText::new(&server.target).monospace()).wrap());
+    if let Some(why) = &server.not_used {
+        ui.add(egui::Label::new(RichText::new(why.as_str()).small().color(pal.warn)).wrap());
+    }
     for (what, names) in [("Env", &server.env), ("Headers", &server.headers)] {
         if !names.is_empty() {
             ui.add(
@@ -340,6 +355,7 @@ mod tests {
             target: target.to_owned(),
             env: Vec::new(),
             headers: Vec::new(),
+            not_used: None,
         }
     }
 
@@ -391,6 +407,36 @@ mod tests {
         h.key_press(egui::Key::F5);
         h.run();
         assert_eq!(asked(&engine), 1);
+    }
+
+    #[test]
+    fn shortcuts_for_the_selection_do_nothing_off_the_connections_page() {
+        // Cross-review: Delete on this page prepared deleting the Claude Code server still selected out of sight.
+        // Settings and the Activity log had the same slip.
+        for page in ["Claude Desktop", "Settings", "Activity log"] {
+            let (mut h, engine) = harness(klefki_core::api::fixture_snapshot(), big());
+            h.run();
+            h.state_mut().selected.insert(0);
+            h.run();
+            h.get_by_label(page).click();
+            h.run();
+            std::iter::from_fn(|| engine.commands.try_recv().ok()).count();
+            h.key_press(egui::Key::Delete);
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+            h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+            h.key_press_modifiers(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::M,
+            );
+            h.run();
+            let sent: Vec<Command> = std::iter::from_fn(|| engine.commands.try_recv().ok())
+                .filter(|c| matches!(c, Command::Prepare(_) | Command::Inspect(_)))
+                .collect();
+            assert!(sent.is_empty(), "{page}: {sent:?}");
+            assert_ne!(h.state().page, Page::Connections, "{page}");
+            assert!(h.query_by_label("Duplicate gateway").is_none(), "{page}");
+            assert!(h.query_by_label("Move gateway").is_none(), "{page}");
+        }
     }
 
     #[test]
@@ -496,6 +542,44 @@ mod tests {
         h.get_by_label("No Claude Desktop servers match \"zzz\".");
         // The Connections list's own filter is untouched.
         assert_eq!(h.state().search, "");
+    }
+
+    #[test]
+    fn a_remote_entry_says_claude_desktop_does_not_use_it() {
+        let (mut h, engine) = harness(Arc::new(Snapshot::default()), big());
+        h.run();
+        open(&mut h);
+        let mut desktop = sample();
+        desktop.servers.push(DesktopServer {
+            transport: TransportKind::Http,
+            not_used: Some(
+                "Claude Desktop does not connect to remote servers listed in this file.".to_owned(),
+            ),
+            ..server("remote", "https://a.example/mcp")
+        });
+        engine.events.send(Event::Desktop(desktop)).unwrap();
+        h.run();
+        assert_eq!(h.get_all_by_label_contains("not used").count(), 1);
+        h.get_by_label_contains("http · not used");
+        h.get_by_label("Claude Desktop does not connect to remote servers listed in this file.");
+    }
+
+    #[test]
+    fn an_empty_file_says_what_is_empty() {
+        let (mut h, engine) = harness(Arc::new(Snapshot::default()), big());
+        h.run();
+        open(&mut h);
+        engine
+            .events
+            .send(Event::Desktop(Desktop {
+                servers: Vec::new(),
+                ..sample()
+            }))
+            .unwrap();
+        h.run();
+        // Extensions and connectors are not in the file, so the page does not claim Claude Desktop has no servers.
+        h.get_by_label("No servers in Claude Desktop's configuration file");
+        h.get_by_label_contains("Extensions and connectors are not listed.");
     }
 
     #[test]
