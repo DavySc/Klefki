@@ -17,7 +17,7 @@ use std::path::Path;
 
 pub(crate) const MAX_CLAUDE_JSON: u64 = 64 * 1024 * 1024;
 const MAX_CACHE_JSON: u64 = 4 * 1024 * 1024;
-const MAX_MCP_JSON: u64 = 1024 * 1024;
+pub(crate) const MAX_MCP_JSON: u64 = 1024 * 1024;
 const MAX_MCP_SERVERS: usize = 500;
 const MAX_TEXT_CHARS: usize = sanitize::MAX_SHOWN_CHARS;
 
