@@ -408,7 +408,7 @@ fn names_a_setting(flag: &str) -> bool {
 
 /// A value after a secret-sounding name that is worth hiding: not a reference, not a path, not a plain word such
 /// as `true`.
-fn hideable(value: &str) -> bool {
+pub(crate) fn hideable(value: &str) -> bool {
     !(only_references("", value)
         || value.starts_with(['/', '~', '.'])
         || value.contains('\\')

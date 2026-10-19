@@ -1209,6 +1209,18 @@ impl Recovery {
             .collect()
     }
 
+    /// The connections whose client secret this kept definition may still need: where it was, and where it was
+    /// going.
+    pub(crate) fn connections(&self) -> Vec<ConnectionId> {
+        let spot = Spot {
+            project: self.project.clone(),
+            name: self.name.clone(),
+        };
+        std::iter::once(spot.connection())
+            .chain(self.next.iter().map(|(next, _)| next.connection()))
+            .collect()
+    }
+
     fn is_back(&self, root: &Value) -> bool {
         let spot = Spot {
             project: self.project.clone(),

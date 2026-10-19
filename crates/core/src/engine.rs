@@ -95,6 +95,16 @@ pub enum Command {
     /// What Klefki changed, and the backups it kept (see [`Event::Activity`]). Read only when asked: the Activity log
     /// page asks each time it is opened.
     Activity,
+    /// Which servers use secrets and where each lives, and the client secrets nothing uses (see [`Event::Secrets`]).
+    /// Read only when asked: the Secrets page asks each time it is opened. No secret is read.
+    Secrets,
+    /// [`Command::Secrets`] again after the files changed: the definitions are read again, and the system's store is
+    /// not asked again (asking can prompt to unlock it, and Claude Code saves often); its last listing is used.
+    SecretsAfterFileChange,
+    /// Delete a client secret from the system's store that no server uses ([`crate::api::UnusedSecret`]). Refused
+    /// when a server, or a definition Klefki keeps to put back, uses it by now. Answers with
+    /// [`Event::UnusedSecretForgotten`], then [`Event::Secrets`].
+    ForgetUnusedSecret(crate::model::ConnectionId),
 }
 
 /// Where a sign-in is ([`Event::SignIn`]). Text is sanitised.
@@ -386,6 +396,13 @@ pub enum Event {
     },
     /// The activity log, after [`Command::Activity`].
     Activity(crate::activity::Activity),
+    /// What the Secrets page shows, after [`Command::Secrets`].
+    Secrets(crate::secret_uses::Secrets),
+    /// Whether [`Command::ForgetUnusedSecret`] deleted the secret, or why not (sanitised).
+    UnusedSecretForgotten {
+        connection: crate::model::ConnectionId,
+        result: Result<(), String>,
+    },
 }
 
 /// The UI's handle to the engine.
@@ -732,6 +749,8 @@ struct Shared {
     version: Mutex<Option<(ProgramStamp, Option<String>)>>,
     /// The secret store once opened. Not kept when opening failed, so a store unlocked later is found.
     secret_store: Mutex<Option<Arc<dyn SecretStore>>>,
+    /// What the system's store last listed for the Secrets page, or why it could not.
+    secrets_listed: Mutex<Option<Result<Vec<crate::model::ConnectionId>, String>>>,
     /// Per file, the redo log of klefki's changes whose check is still due.
     journals: Arc<Mutex<HashMap<PathBuf, Journal>>>,
     emitter: Emitter,
@@ -794,6 +813,7 @@ fn engine_main(
         version: Mutex::new(None),
         journals: Arc::default(),
         secret_store: Mutex::new(None),
+        secrets_listed: Mutex::new(None),
         emitter,
         input: input_tx.clone(),
     });
@@ -913,6 +933,11 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
+            Command::Secrets => secrets(&shared, &state, SecretsAsk::List),
+            Command::SecretsAfterFileChange => secrets(&shared, &state, SecretsAsk::Reuse),
+            Command::ForgetUnusedSecret(connection) => {
+                secrets(&shared, &state, SecretsAsk::Forget(connection));
+            }
         }
     }
     // The UI is gone: a sign-in still running is stopped, so no `claude` keeps listening after Klefki closes.
@@ -969,6 +994,98 @@ fn secret(shared: &Shared, snapshot: &Snapshot, id: ServerId, op: SecretOp) {
             stored: stored.map_err(|e| e.to_string()),
         });
     });
+}
+
+/// How the Secrets page asks about the system's store.
+enum SecretsAsk {
+    /// List it again.
+    List,
+    /// Use its last listing, if there is one.
+    Reuse,
+    /// Delete this unused client secret, if nothing uses it, then list the store again.
+    Forget(crate::model::ConnectionId),
+}
+
+/// The Secrets page: the definitions are read here, the system's store is listed on a thread of its own (it may be
+/// slow, or ask the user to unlock it).
+fn secrets(shared: &Arc<Shared>, state: &State, ask: SecretsAsk) {
+    let report = crate::secret_uses::read(
+        shared.config.paths.as_ref(),
+        shared.config.home.as_deref(),
+        &state.snapshot,
+        &state.keys,
+    );
+    let snapshot = Arc::clone(&state.snapshot);
+    let shared = Arc::clone(shared);
+    std::thread::spawn(move || {
+        // Definitions Klefki keeps to put back still use their client secret.
+        let kept: Vec<crate::model::ConnectionId> = shared
+            .config
+            .backup_dir
+            .as_deref()
+            .map(swap::Recovery::files)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(swap::Recovery::connections)
+            .collect();
+        let reused = match ask {
+            SecretsAsk::Reuse => lock(&shared.secrets_listed).clone(),
+            _ => None,
+        };
+        let listed = match reused {
+            Some(listed) => listed,
+            None => list_secrets(&shared, &snapshot, &kept, ask),
+        };
+        shared
+            .emitter
+            .emit(Event::Secrets(crate::secret_uses::with_store(
+                report, &snapshot, listed, &kept,
+            )));
+    });
+}
+
+/// The connections the system's store keeps a client secret for, or why it could not say; after deleting `ask`'s
+/// unused secret. Remembered for [`SecretsAsk::Reuse`].
+fn list_secrets(
+    shared: &Shared,
+    snapshot: &Snapshot,
+    kept: &[crate::model::ConnectionId],
+    ask: SecretsAsk,
+) -> Result<Vec<crate::model::ConnectionId>, String> {
+    let store = secret_store(shared);
+    if let SecretsAsk::Forget(connection) = ask {
+        let used = snapshot
+            .servers
+            .iter()
+            .any(|r| r.connection == connection && r.oauth.is_some())
+            || kept.contains(&connection);
+        let result = if used {
+            Err("A server uses this client secret now, so it was kept.".to_owned())
+        } else {
+            match &store {
+                Ok(store) => store
+                    .delete(&connection)
+                    .map(|_| ())
+                    .map_err(|e| sanitize(&e.to_string())),
+                Err(e) => Err(sanitize(&e.to_string())),
+            }
+        };
+        shared
+            .emitter
+            .emit(Event::UnusedSecretForgotten { connection, result });
+    }
+    let listed = match &store {
+        Ok(store) => store.list().map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    // A store that cannot be opened matters only when a server signs in with OAuth.
+    let signs_in = snapshot.servers.iter().any(|r| r.oauth.is_some());
+    let listed = match listed {
+        Err(_) if !signs_in => Ok(Vec::new()),
+        listed => listed,
+    };
+    *lock(&shared.secrets_listed) = Some(listed.clone());
+    listed
 }
 
 /// The store client secrets are kept in: the one tests give, else the system's own, opened the first time it is
@@ -4957,6 +5074,232 @@ mod tests {
         assert!(!dump.contains("s3cret"), "{dump}");
     }
 
+    // ---- the Secrets page
+
+    fn secrets_report(core: &Core) -> crate::secret_uses::Secrets {
+        core.send(Command::Secrets);
+        collect(core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Secrets(s) => Some(s),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn secrets_env() -> Env {
+        quiet_env(&serde_json::json!({
+            "mcpServers": {
+                "sso": {"type": "http", "url": "https://sso.example.com/mcp", "oauth": {"clientId": "klefki-1"}},
+                "gh": {"command": "npx", "env": {"GITHUB_TOKEN": "ghp_0123456789abcdefghijABCDEFGHIJ012345", "LOG_LEVEL": "debug"}},
+                "ref": {"type": "http", "url": "https://ref.example.com/", "headers": {"Authorization": "Bearer ${REF_TOKEN}"}},
+                "plain": {"command": "node", "args": ["server.js"]}
+            },
+            "projects": {"/work/a": {"mcpServers": {"sso2": {"type": "http", "url": "https://sso2.example.com/", "oauth": {"clientId": "c2"}}}}}
+        }))
+    }
+
+    #[test]
+    fn the_secrets_page_says_where_each_secret_lives_without_any_value() {
+        use crate::secret_uses::{Place, SecretKind};
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let gone = crate::model::ConnectionId::new(Scope::User, None, "gone");
+        for (id, value) in [
+            (user_id("sso").connection, "s3cret-one"),
+            (gone.clone(), "s3cret-two"),
+        ] {
+            store
+                .set(&id, &crate::secrets::Secret::new(value.into()))
+                .unwrap();
+        }
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        let places: Vec<(String, SecretKind, String, Place)> = report
+            .servers
+            .iter()
+            .flat_map(|s| {
+                s.uses
+                    .iter()
+                    .map(|u| (s.id.name.clone(), u.kind, u.name.clone(), u.place.clone()))
+            })
+            .collect();
+        assert_eq!(
+            places,
+            [
+                // Typed in first.
+                (
+                    "gh".into(),
+                    SecretKind::Env,
+                    "GITHUB_TOKEN".into(),
+                    Place::Written {
+                        instead: Some("${GITHUB_TOKEN}".into())
+                    }
+                ),
+                (
+                    "sso".into(),
+                    SecretKind::ClientSecret,
+                    "".into(),
+                    Place::Store(Some(true))
+                ),
+                (
+                    "ref".into(),
+                    SecretKind::Header,
+                    "Authorization".into(),
+                    Place::Environment(vec!["REF_TOKEN".into()])
+                ),
+            ]
+        );
+        assert!(
+            report.servers[0].file.ends_with(".claude.json"),
+            "{:?}",
+            report.servers[0]
+        );
+        assert_eq!(report.written(), 1);
+        let unused: Vec<&str> = report.unused.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(unused, ["gone"]);
+        assert_eq!(report.store_problem, None);
+        let everything = format!("{report:?}");
+        for value in ["s3cret", "ghp_0123"] {
+            assert!(!everything.contains(value), "{everything}");
+        }
+    }
+
+    #[test]
+    fn unused_means_unused_in_this_configuration_and_the_report_names_it() {
+        // Cross-review B1: one store, two Claude Code configurations (CLAUDE_CONFIG_DIR). The second one cannot
+        // see the first's servers, so the page must say which configuration it looked at.
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let sso = user_id("sso").connection;
+        store
+            .set(&sso, &crate::secrets::Secret::new("s3cret".into()))
+            .unwrap();
+        let second = quiet_env(&serde_json::json!({"mcpServers": {"plain": {"command": "node"}}}));
+        let core = with_store(&second, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        let unused: Vec<&str> = report.unused.iter().map(|u| u.name.as_str()).collect();
+        assert_eq!(unused, ["sso"]);
+        let config = second.dir.path().join("cfg").join(".claude.json");
+        assert_eq!(
+            report.config,
+            crate::sanitize::shown(&config.display().to_string())
+        );
+    }
+
+    #[test]
+    fn a_file_change_reads_the_definitions_again_but_not_the_store() {
+        // Cross-review N1/N2: listing the store can ask to unlock it, and Claude Code saves often.
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        assert_eq!(secrets_report(&core).store_problem, None);
+        *store.fail.lock().unwrap() =
+            Some(crate::secrets::SecretError::Unavailable("locked".into()));
+        let mut config = config_json(&env);
+        config["mcpServers"]["new"] =
+            serde_json::json!({"command": "x", "env": {"API_TOKEN": "${API_TOKEN}"}});
+        write_config(&env, &config);
+        core.send(Command::Refresh { live_all: false });
+        collect(&core, |e| !snapshots(e).is_empty());
+        core.send(Command::SecretsAfterFileChange);
+        let again = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Secrets(s) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(again.store_problem, None, "the store was not asked again");
+        assert!(
+            again.servers.iter().any(|s| s.id.name == "new"),
+            "{again:?}"
+        );
+        // Asked on purpose (opening the page, Try again), it is.
+        assert!(secrets_report(&core).store_problem.is_some());
+    }
+
+    #[test]
+    fn an_unused_client_secret_is_forgotten_only_while_nothing_uses_it() {
+        let env = secrets_env();
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        let gone = crate::model::ConnectionId::new(Scope::User, None, "gone");
+        let sso = user_id("sso").connection;
+        for id in [&gone, &sso] {
+            store
+                .set(id, &crate::secrets::Secret::new("s3cret".into()))
+                .unwrap();
+        }
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let forgotten = |core: &Core, id: &crate::model::ConnectionId| {
+            core.send(Command::ForgetUnusedSecret(id.clone()));
+            let events = collect(core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))));
+            let result = events
+                .iter()
+                .find_map(|e| match e {
+                    Event::UnusedSecretForgotten { connection, result } if connection == id => {
+                        Some(result.clone())
+                    }
+                    _ => None,
+                })
+                .expect("an answer before the new list");
+            let report = events
+                .into_iter()
+                .find_map(|e| match e {
+                    Event::Secrets(s) => Some(s),
+                    _ => None,
+                })
+                .unwrap();
+            (result, report)
+        };
+        let (result, report) = forgotten(&core, &gone);
+        assert_eq!(result, Ok(()));
+        assert!(report.unused.is_empty(), "{report:?}");
+        assert!(store.get(&gone).unwrap().is_none());
+        // A server's own client secret is not Forget's to take, whatever the page showed.
+        let (result, _) = forgotten(&core, &sso);
+        assert!(result.unwrap_err().contains("uses"));
+        assert!(store.get(&sso).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_used_is_said_only_when_a_server_needs_it() {
+        let store = Arc::new(crate::secrets::MemoryStore::default());
+        *store.fail.lock().unwrap() = Some(crate::secrets::SecretError::Unavailable(
+            "no Secret Service".into(),
+        ));
+        let env = secrets_env();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        assert!(
+            report
+                .store_problem
+                .as_deref()
+                .is_some_and(|p| p.contains("no Secret Service")),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .servers
+                .iter()
+                .flat_map(|s| &s.uses)
+                .any(|u| u.place == crate::secret_uses::Place::Store(None))
+        );
+        // Variant: nothing signs in with OAuth, so the store does not matter here.
+        let env = quiet_env(&serde_json::json!({
+            "mcpServers": {"gh": {"command": "npx", "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}
+        }));
+        let core = with_store(&env, store);
+        collect(&core, |e| !snapshots(e).is_empty());
+        let report = secrets_report(&core);
+        assert_eq!(report.store_problem, None);
+        assert_eq!(report.servers.len(), 1);
+    }
+
     /// Every file's text under `dir`, to look for a value that must not be there.
     fn walk(dir: &Path) -> String {
         let mut out = String::new();
@@ -7454,6 +7797,30 @@ mod tests {
             ["mcp", "add-json", "-s", "user", "--client-secret"]
         );
         assert_eq!(last.2.as_deref(), Some(sha256(CLIENT_SECRET).as_str()));
+    }
+
+    #[test]
+    fn a_kept_definitions_client_secret_is_not_offered_to_forget() {
+        // Put back hands the kept secret to Claude Code again, so it is in use although sso is in no file now.
+        let (env, store, key, _) = oauth_move_env(REMOVE_THEN_ADDS_FAIL);
+        std::fs::write(env.dir.path().join("failed.txt"), "simulated failure").unwrap();
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        keep_sso(&env, &core, &key);
+        let sso = user_id("sso").connection;
+        assert!(store.get(&sso).unwrap().is_some());
+        let report = secrets_report(&core);
+        assert!(report.unused.is_empty(), "{report:?}");
+        core.send(Command::ForgetUnusedSecret(sso.clone()));
+        let refused = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Secrets(_))))
+            .into_iter()
+            .find_map(|e| match e {
+                Event::UnusedSecretForgotten { result, .. } => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert!(refused.is_err());
+        assert!(store.get(&sso).unwrap().is_some());
     }
 
     #[test]
