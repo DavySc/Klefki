@@ -14,6 +14,18 @@ Branch `claude/review-core-y2uzla`, restarted from main `5c27260` after part 1 (
 - **Windows lock race** (`config/docstore.rs`, 4fd7534). Asked for by the coordinator after main went red on Windows: `two_writers_at_once_both_get_their_change_in` failed with `Access is denied. (os error 5)` (run 39178339976). Creating the lock folder while the previous holder's folder is still being removed (another process, or Klefki's own `is_stale` check, has it open) is refused on Windows as access denied, and `Lock::acquire` returned that at once. It is now waited out like a held lock; a refusal that lasts the whole wait is still returned as the error. The code dates from f23ebf8 (2026-10-17); #27 did not touch it, and the same tree passed Windows CI before. Unverified on Windows until CI runs again.
 - **Duplicate-key flood** (`config/inventory.rs`, 83b82c3). One warning per repeat (174,750 for a 1 MiB file) buried every other warning; now one per name.
 
+## Review round 1 (performance thread, comment 6257056794)
+No blockers. Done (6f702c7, 0a999fc):
+- `-H=value` (and `-e=`, `-s=`, `-t=`) says the value goes after a space; an unknown option is still "no option -x".
+- A double curly quote anywhere outside straight quotes is the problem, a single one when it starts a word or follows `=` (`O’Brien` is fine). The problem names the word, masked as the list masks it.
+- Fences and lines that clean to nothing are skipped silently. `1.`, `2)`, `-`, `*`, `+`, `>` and PowerShell/cmd prompts before a command are dropped.
+- When nothing is added, a line naming claude is quoted in the error (`claude mcp ad …`, `sudo claude …`).
+- A skipped line's note is masked (`export OPENAI_API_KEY=…`).
+- One Git Bash note for all switches.
+- Duplicate names: name index. A 1 MiB `.mcp.json` cycling through 499 names: `klefki-cli list` 50-53 ms before, 15-16 ms after, same output (release, interleaved, 9 runs each).
+- Found re-reading: since fb13a9b, `cd app && claude mcp add …` lost the command, which main read (checked on main). The command after `&&` or `;` is read again.
+Not done: auto-correcting typography (item 3's bigger option: changing pasted text silently is a product call; the problem now names the word); one mask for hidden values (item 8, a finding for Davy); folding prose notes into one (item 7, the performance thread's follow-up after #29 and #30 merge).
+
 ## Tests (each failed first; the later assertions in each were confirmed by temporarily reverting one rule at a time)
 - `diagnose::hints::tests::a_proxy_that_refuses_is_not_blamed_on_the_server`: main gave [NeedsAuthentication, Forbidden].
 - `config::inventory::tests::only_local_absolute_project_paths_are_opened` gained the two mixed-slash paths.
@@ -23,6 +35,7 @@ Branch `claude/review-core-y2uzla`, restarted from main `5c27260` after part 1 (
 - `diagnose::redact::tests::a_quoted_value_is_hidden_to_its_closing_quote` gained the escaped-quote case.
 - `paste::tests::prose_with_an_apostrophe_hides_none_of_the_commands_after_it` (main: "Nothing here adds a server"), `every_switch_git_bash_turned_into_a_drive_is_undone`, `an_option_without_its_value_is_a_problem`, `typography_from_a_web_page_is_read_or_named`.
 - `paste::tests::the_summary_hides_what_the_list_hides`, `a_problem_never_repeats_a_secret`.
+- Round 1: `paste::tests::an_option_written_with_equals_says_to_put_a_space`, `a_curly_quote_inside_a_word_is_named_too`, `a_readme_pasted_with_its_fences_bullets_and_prompts_reads_cleanly`, `when_nothing_is_added_the_line_meant_is_named`, `a_skipped_line_shows_no_secret`, `a_command_chained_after_another_is_still_read`, and `every_switch_git_bash_turned_into_a_drive_is_undone` now checks the one note.
 - `config::docstore::tests::a_lock_folder_still_being_removed_is_waited_for` (main: `Some(Io("permission denied"))` on the first refusal); with a refusal that lasts, the error is still returned, and off Windows it is returned at once.
 
 ## Checks
