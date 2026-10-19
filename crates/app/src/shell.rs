@@ -4733,9 +4733,41 @@ pub(crate) fn settle(ctx: &egui::Context, dialog: &egui::Response) {
 
 /// Esc, or a close the dialog asked for itself; not a click on the dimmed window beside it. That click is easily a
 /// slip (the one that brings Klefki back to the front, say), and a dialog holds what was pasted, typed or chosen:
-/// closing it takes Esc or Cancel.
+/// closing it takes Esc or Cancel. The click is not ignored silently: the dialog's outline flashes, as a desktop
+/// dialog does, so it is clear the dialog is still waiting.
 fn closed_on_purpose<T>(modal: &egui::ModalResponse<T>) -> bool {
+    let dialog = &modal.response;
+    let ctx = &dialog.ctx;
+    let id = dialog.layer_id.id.with("nudged_at");
+    let now = ctx.input(|i| i.time);
+    if modal.backdrop_response.clicked() {
+        ctx.data_mut(|d| d.insert_temp(id, now));
+    }
+    let at = ctx.data(|d| d.get_temp::<f64>(id));
+    if let Some(left) = at
+        .map(|at| NUDGE_SECS - (now - at))
+        .filter(|left| *left > 0.0)
+    {
+        let stroke = egui::Stroke::new(2.0, theme::palette(ctx).focus);
+        ctx.layer_painter(dialog.layer_id).rect_stroke(
+            dialog.rect,
+            ctx.global_style().visuals.menu_corner_radius,
+            stroke,
+            egui::StrokeKind::Outside,
+        );
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64(left));
+    }
     !modal.backdrop_response.clicked() && modal.should_close()
+}
+
+/// How long a dialog's outline flashes after a click beside it.
+const NUDGE_SECS: f64 = 0.2;
+
+/// Whether the dialog `id` (the id its `Modal` was made with) flashed its outline after a click beside it.
+#[cfg(test)]
+fn nudged(ctx: &egui::Context, id: egui::Id) -> bool {
+    ctx.data(|d| d.get_temp::<f64>(id.with("nudged_at")))
+        .is_some()
 }
 
 /// Why `name` cannot be a server's name, as a sentence; `None` when it can.
@@ -9022,6 +9054,25 @@ mod tests {
 
     // A click on the dimmed window beside a dialog is easily a slip (bringing Klefki back to the front, say), so it
     // never throws away what was pasted, typed or chosen. Esc and Cancel close on purpose.
+
+    #[test]
+    fn a_click_beside_a_dialog_flashes_its_outline() {
+        // The click beside does nothing to the dialog, so it shows that the dialog is still waiting for Esc or
+        // Cancel, instead of seeming not to respond.
+        let (mut h, _engine) = duplicate_harness();
+        open_duplicate_of(&mut h, "beta");
+        let id = egui::Id::new("duplicate_dialog");
+        assert!(!nudged(&h.ctx, id));
+        h.get_by_label_contains("Duplicate beta").click();
+        h.run();
+        assert!(!nudged(&h.ctx, id), "a click inside is no slip");
+        click_beside(&mut h);
+        assert!(nudged(&h.ctx, id));
+        assert!(h.state().duplicate.is_some());
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.state().duplicate.is_none());
+    }
 
     #[test]
     fn a_click_beside_the_add_dialog_keeps_what_was_pasted() {
