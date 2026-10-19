@@ -21,10 +21,13 @@ Goal: the roadmap item after Export (#12). Export's block can be saved to a file
 - Folded in: the path field opens with the file's name selected (as system save dialogs do), its button is "Save here", and on a window under 640 px the variables list folds once when saving's rows appear (opening it again keeps it open). The two app tests for these were seen failing with the change taken out. At 800x480 the block shows about 8 lines with the path row (`round2/01-path-800x480-folded.png`).
 - Size: the reviewer measured +93,768 bytes for be01718 (my +76 KB was the first commit); the PR text says so now.
 - Full verify after round 1: exit 0 (core 612, app 312, cli 18 + 24; deny ok).
+- Windows CI failed on be01718 and 0f588ab: the two app tests that type a path used `/home/me/...`, which is not a whole path on Windows, so the app (rightly) refused it. 3f4fe22 gives those tests `C:\home\me\...` there; test-only. CI on 3f4fe22: windows, macos, ubuntu all green.
+- Re-check by the reviewer on 0f588ab and 3f4fe22: no objection.
+- Main (#23, #24) merged in; full verify exit 0 (core 620, app 312, cli 18 + 24; deny ok).
 
 ## Open
 - **Next slice: an owner window for the save dialog.** Without one, a click on Klefki can send the Windows dialog behind it, and the portal cannot place it over Klefki. Proposed: the app passes `&eframe::Frame` (it implements `HasWindowHandle` and `HasDisplayHandle`) to a core function that builds rfd's `AsyncFileDialog` with `set_parent` on the UI thread and drives the future on a thread of its own, so no handle crosses threads and no `unsafe` is needed. Needs a try on Windows and macOS (a sheet).
 - For human review: on Linux, rfd's fallback starts `zenity` found through `PATH` (no shell, fixed arguments). The invariants only cover starting Claude.
 
 ## Next
-Cross-review, CI on 3 OSes, merge.
+Merge once CI is green on the merge commit; then the owner-window slice.
