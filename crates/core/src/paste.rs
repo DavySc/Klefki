@@ -937,7 +937,11 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
     let mut current = Words::default();
     let mut word = String::new();
     let mut in_word = false;
-    let mut chars = text.chars().peekable();
+    let mut chars = Cursor { rest: text };
+    // When pasting: where the line being read ends, found once per line (a line may hold many commands), and whether
+    // no command has started on it yet.
+    let mut line_end = 0;
+    let mut fresh = true;
     let end_word = |current: &mut Words, word: &mut String, in_word: &mut bool| {
         if *in_word {
             current.words.push(std::mem::take(word));
@@ -951,36 +955,34 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
     };
     while let Some(c) = chars.next() {
         if pasted && !in_word && current.words.is_empty() && !c.is_whitespace() {
-            let line: String = std::iter::once(c)
-                .chain(chars.clone().take_while(|&n| n != '\n'))
-                .collect();
-            if let Some(skip) = marker_len(&line) {
-                for _ in 1..skip {
-                    chars.next();
+            // Slices of the text, never copies: a line is looked at once per command in it.
+            let at = text.len() - chars.rest.len() - c.len_utf8();
+            if at >= line_end {
+                line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+            }
+            let line = &text[at..line_end];
+            if fresh {
+                if let Some(skip) = marker_len(line) {
+                    chars.rest = &text[at + skip..];
+                    continue;
                 }
-                continue;
+                let shows = |s: &str| !sanitize_line(s).trim().is_empty();
+                if is_fence(line) || !(shows(&line[..c.len_utf8()]) || shows(line)) {
+                    chars.rest = &text[line_end..];
+                    continue;
+                }
+                fresh = false;
             }
-            if is_fence(&line) || sanitize_line(&line).trim().is_empty() {
-                while chars.next_if(|&n| n != '\n').is_some() {}
-                continue;
-            }
-            let first = line.split_whitespace().next().unwrap_or_default();
-            if !"$#'\"\\`^".contains(c) && !is_claude(first) {
+            if !"$#'\"\\`^".contains(c) && !is_claude(first_word(line)) {
                 // Up to a claude command chained after it (`cd app && claude mcp add …`), which is read.
-                let mut line = line;
-                match chained_claude(&line) {
-                    Some((end, start)) => {
-                        for _ in 1..line[..start].chars().count() {
-                            chars.next();
-                        }
-                        line.truncate(end);
-                    }
-                    None => while chars.next_if(|&n| n != '\n').is_some() {},
-                }
-                let kept = line.trim_end().len();
-                line.truncate(kept);
-                if !line.is_empty() {
-                    current.words.push(line);
+                let (skipped, next) = match chained_claude(line) {
+                    Some((end, start)) => (&line[..end], at + start),
+                    None => (line, line_end),
+                };
+                chars.rest = &text[next..];
+                let skipped = skipped.trim_end();
+                if !skipped.is_empty() {
+                    current.words.push(skipped.to_owned());
                 }
                 end_command(&mut commands, &mut current);
                 continue;
@@ -994,6 +996,7 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
             '\n' | ';' => {
                 end_word(&mut current, &mut word, &mut in_word);
                 end_command(&mut commands, &mut current);
+                fresh |= c == '\n';
                 None
             }
             '&' if chars.next_if_eq(&'&').is_some() => {
@@ -1009,7 +1012,7 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
                 while chars.next_if(|&n| n != '\n').is_some() {}
                 None
             }
-            '$' if !in_word && current.words.is_empty() && chars.peek() == Some(&' ') => {
+            '$' if !in_word && current.words.is_empty() && chars.peek() == Some(' ') => {
                 // A prompt copied with the command.
                 None
             }
@@ -1097,15 +1100,15 @@ fn lex_with(text: &str, pasted: bool) -> Lexed {
     }
 }
 
-/// How many characters at the start of a pasted line are a list or quote marker, or a PowerShell or cmd prompt,
-/// copied with the command: `1. `, `2) `, `- `, `* `, `+ `, `> `, `PS C:\…> `, `C:\…> `.
+/// How many bytes at the start of a pasted line are a list or quote marker, or a PowerShell or cmd prompt, copied
+/// with the command: `1. `, `2) `, `- `, `* `, `+ `, `> `, `PS C:\…> `, `C:\…> `.
 fn marker_len(line: &str) -> Option<usize> {
     let then_space = |marker: &str| {
         let spaces = line[marker.len()..]
-            .chars()
-            .take_while(|c| matches!(c, ' ' | '\t'))
+            .bytes()
+            .take_while(|b| matches!(b, b' ' | b'\t'))
             .count();
-        (spaces > 0).then(|| marker.chars().count() + spaces)
+        (spaces > 0).then(|| marker.len() + spaces)
     };
     let digits = line.chars().take_while(char::is_ascii_digit).count();
     if (1..=3).contains(&digits) && matches!(line.as_bytes().get(digits), Some(b'.' | b')')) {
@@ -1136,19 +1139,56 @@ fn chained_claude(line: &str) -> Option<(usize, usize)> {
     line.char_indices().find_map(|(i, _)| {
         let rest = &line[i..];
         let after = rest.strip_prefix("&&").or_else(|| rest.strip_prefix(';'))?;
-        let first = after.split_whitespace().next()?;
-        is_claude(first).then(|| (i, line.len() - after.len()))
+        is_claude(first_word(after)).then(|| (i, line.len() - after.len()))
     })
+}
+
+/// The first word of `text`: up to a space or the end of a command, so each word is looked at once.
+fn first_word(text: &str) -> &str {
+    let text = text.trim_start_matches([' ', '\t']);
+    let end = text
+        .find(|c: char| c.is_whitespace() || c == ';' || c == '&')
+        .unwrap_or(text.len());
+    &text[..end]
 }
 
 /// A Markdown code fence: three backticks or tildes, maybe with the language.
 fn is_fence(line: &str) -> bool {
-    let line = line.trim();
     line.starts_with("```") || line.starts_with("~~~")
 }
 
+/// The text still to read, a character at a time, which can be looked at as a slice.
+#[derive(Clone)]
+struct Cursor<'a> {
+    rest: &'a str,
+}
+
+impl Cursor<'_> {
+    fn peek(&self) -> Option<char> {
+        self.rest.chars().next()
+    }
+
+    fn next_if(&mut self, f: impl FnOnce(&char) -> bool) -> Option<char> {
+        let c = self.peek().filter(f)?;
+        self.rest = &self.rest[c.len_utf8()..];
+        Some(c)
+    }
+
+    fn next_if_eq(&mut self, expected: &char) -> Option<char> {
+        self.next_if(|c| c == expected)
+    }
+}
+
+impl Iterator for Cursor<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        self.next_if(|_| true)
+    }
+}
+
 /// After `\`, `` ` `` or `^`: is the rest of the line a line break (the command goes on)? Consumes it if so.
-fn continues_line(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+fn continues_line(chars: &mut Cursor<'_>) -> bool {
     let mut ahead = chars.clone();
     ahead.next_if_eq(&'\r');
     if ahead.next_if_eq(&'\n').is_some() {
@@ -1161,7 +1201,7 @@ fn continues_line(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> bool 
 /// After a `$`: `$NAME` and `${NAME}` become `${NAME}`, which Claude Code fills in when it starts the server; a
 /// lone `$` stays. `$(…)` would run a command: the error says so.
 fn variable(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    chars: &mut Cursor<'_>,
     word: &mut String,
     variables: &mut Vec<String>,
 ) -> Result<(), &'static str> {
@@ -1184,7 +1224,7 @@ fn variable(
                 .collect();
             word.push_str(&format!("${{{inner}}}"));
         }
-        Some(&c) if c.is_ascii_alphabetic() || c == '_' => {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
             while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
                 name.push(c);
             }
@@ -1926,6 +1966,36 @@ mod tests {
             "{:?}",
             s.problem
         );
+    }
+
+    #[test]
+    fn a_full_paste_of_one_long_line_is_read_quickly() {
+        // Review round 2 (#30): each command start copied the rest of its line, so one 256 KiB line of prompts,
+        // markers or commands took up to 37 s, and the dialog reads the paste again after every key.
+        let tail = "claude mcp add z -- npx z";
+        for unit in [
+            "$ ",
+            "> ",
+            "- ",
+            "1. ",
+            "PS C:\\> ",
+            "claude mcp add s -- x; ",
+            "claude mcp add s -- x && ",
+            "cd a && ",
+            "x;",
+            ";",
+            "claude;",
+            "\u{1b}[0m && claude mcp add s -- x; ",
+        ] {
+            let text = unit.repeat((MAX_PASTE_BYTES - tail.len()) / unit.len()) + tail;
+            let started = std::time::Instant::now();
+            let _ = Pasted::parse(&text);
+            let took = started.elapsed();
+            assert!(
+                took < std::time::Duration::from_secs(2),
+                "{unit:?}: {took:?}"
+            );
+        }
     }
 
     #[test]
