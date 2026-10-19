@@ -28,6 +28,28 @@ const MAX_TEXT_CHARS: usize = sanitize::MAX_SHOWN_CHARS;
 pub(crate) struct FileKey {
     pub project: Option<String>,
     pub name: String,
+    /// The definition's fingerprint ([`fingerprint`]): it differs once the server was edited.
+    pub definition: u64,
+}
+
+/// A fingerprint of a server's definition as the file has it, telling an edited server from the one it was. Kept
+/// instead of the definition itself, which can be large.
+pub(crate) fn fingerprint(entry: &Value) -> u64 {
+    use std::hash::Hasher;
+    struct Feed(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for Feed {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut feed = Feed(std::collections::hash_map::DefaultHasher::new());
+    // Serialising a `Value` into a sink that cannot fail does not fail.
+    let _ = serde_json::to_writer(&mut feed, entry);
+    feed.0.finish()
 }
 
 /// Every row's [`FileKey`], by its connection.
@@ -121,6 +143,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                 FileKey {
                     project: None,
                     name: name.clone(),
+                    definition: fingerprint(entry),
                 },
             );
             r.disabled_in = disabled_by_project
@@ -159,6 +182,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                         FileKey {
                             project: Some((*key).to_owned()),
                             name: name.clone(),
+                            definition: fingerprint(entry),
                         },
                     );
                     snap.servers.push(r);
@@ -206,6 +230,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                         FileKey {
                             project: Some(project.raw.clone()),
                             name: name.clone(),
+                            definition: fingerprint(&entry),
                         },
                     );
                     // Claude Code compares names as the file spells them, not as shown.

@@ -405,7 +405,7 @@ impl ShellApp {
                 let selected = self.selected.iter().filter_map(|&i| moved(i)).collect();
                 let mut live = vec![None; snapshot.servers.len()];
                 for (old, result) in self.live.iter_mut().enumerate() {
-                    // A check that was running is cut off by a refresh.
+                    // Dropped; the engine says again, right after each snapshot, which checks still run.
                     if let (Some(new), Some(r)) = (moved(old), result.take())
                         && r.status != Status::Checking
                     {
