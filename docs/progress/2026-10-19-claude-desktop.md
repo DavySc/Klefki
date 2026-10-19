@@ -46,6 +46,12 @@ Store (MSIX) location, without ever writing to that file, and without costing an
   for Windows and macOS.
 - Full verify exit 0 (core 690, app 335, cli 18 + 25), `cargo deny` ok.
 
+## Review round 2
+- No objection, ready to merge. Optional point taken: an entry with a command and a URL is started, so it is not marked
+  not used (case added to `remote_entries_are_listed_as_not_used_by_claude_desktop`).
+- Merged main f5724b3 (#29, background checks through `claude mcp list`). Full verify exit 0 (core 715, app 335, cli
+  18 + 25), `cargo deny` ok.
+
 ## Not verified here
 - Windows with the real Store install (path and precedence come from Microsoft's docs and decision 003's look at
   the owner's machine); macOS location.
