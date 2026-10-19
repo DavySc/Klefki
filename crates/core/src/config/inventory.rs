@@ -163,7 +163,8 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     for (key, project) in &projects {
         let disabled = &disabled_by_project[key];
         let mut seen_local = BTreeSet::new();
-        // The user rows that a local or approved project server of this project replaces.
+        // The user rows that a local or approved project server of this project replaces. A name that is off here
+        // hides nothing: the toggle goes by name, so nothing of that name runs here at all.
         let mut hidden = BTreeSet::new();
         for (value, key) in project.values.iter().zip(&project.keys) {
             let Some(servers) = value.get("mcpServers").and_then(Value::as_object) else {
@@ -171,7 +172,9 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
-                    hidden.extend(user_rows.get(name.as_str()));
+                    if !disabled.contains(name) {
+                        hidden.extend(user_rows.get(name.as_str()));
+                    }
                     let mut r = row(
                         name,
                         entry,
@@ -241,7 +244,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                     // Claude Code compares names as the file spells them, not as shown, and loads a project
                     // server only once it is approved.
                     r.shadowed = seen_local.contains(&name);
-                    if approval == Approval::Approved {
+                    if approval == Approval::Approved && !disabled.contains(&name) {
                         hidden.extend(user_rows.get(name.as_str()));
                     }
                     snap.servers.push(r);
@@ -1417,6 +1420,35 @@ mod tests {
                 .filter(|r| r.scope != Scope::User)
                 .all(|r| r.shadowed_in.is_empty())
         );
+    }
+
+    #[test]
+    fn a_project_where_the_name_is_off_hides_nothing() {
+        // The toggle goes by name: where `gh` is off, neither the user server nor the closer one runs, so nothing
+        // is used instead of the user server there (cross-review of #21).
+        let e = Env::new();
+        let (a, b, c) = (e.project("a"), e.project("b"), e.project("c"));
+        std::fs::write(
+            b.join(".mcp.json"),
+            r#"{"mcpServers":{"gh":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"gh": {"command": "gh"}},
+                "projects": {
+                    a.to_string_lossy(): {"mcpServers": {"gh": {"command": "mine"}}, "disabledMcpServers": ["gh"]},
+                    b.to_string_lossy(): {"enableAllProjectMcpServers": true, "disabledMcpServers": ["gh"]},
+                    c.to_string_lossy(): {}
+                }
+            }),
+        );
+        let s = e.load();
+        let gh = find(&s, Scope::User, "gh");
+        assert_eq!(gh.disabled_in, 2);
+        assert!(gh.shadowed_in.is_empty(), "{:?}", gh.shadowed_in);
+        assert!(!gh.shadowed);
     }
 
     #[test]

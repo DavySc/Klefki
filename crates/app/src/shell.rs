@@ -3459,6 +3459,14 @@ impl ShellApp {
         let col_width = (ui.available_width() - 110.0).max(100.0);
         match self.tab {
             DetailTab::General => {
+                // A local or project server that runs where a user server of its name is hidden.
+                let replaces = s.scope != Scope::User
+                    && !s.shadowed
+                    && s.project.as_ref().is_some_and(|p| {
+                        self.snapshot.servers.iter().any(|u| {
+                            u.scope == Scope::User && u.name == s.name && u.shadowed_in.contains(p)
+                        })
+                    });
                 egui::Grid::new("general")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
@@ -3466,8 +3474,9 @@ impl ShellApp {
                     .show(ui, |ui| {
                         let mut kv = |k: &str, v: String| {
                             ui.label(RichText::new(k).color(pal.text_muted));
-                            ui.add(egui::Label::new(v).wrap());
+                            let value = ui.add(egui::Label::new(v).wrap());
                             ui.end_row();
+                            value
                         };
                         kv("Scope", s.scope.label().to_owned());
                         kv("Project", s.project.clone().unwrap_or_else(|| "-".into()));
@@ -3487,7 +3496,14 @@ impl ShellApp {
                         if let Some(approval) = s.approval {
                             kv("Approval", approval.label().to_owned());
                         }
-                        kv("Shadowed", shadowed_text(s, self.snapshot.project_count));
+                        let shadowed =
+                            kv("Shadowed", shadowed_text(s, self.snapshot.project_count));
+                        if !s.shadowed_in.is_empty() {
+                            shadowed.on_hover_text(shadowed_paths(s));
+                        }
+                        if replaces {
+                            kv("Replaces", format!("the user server {}", s.name));
+                        }
                     });
                 if s.casing_collision && self.core.is_some() {
                     ui.add_space(8.0);
@@ -6123,51 +6139,97 @@ fn group_header(ui: &mut Ui, group: &Group, right: f32) {
     response.on_hover_text(&group.full);
 }
 
+/// A badge beside a server's name: what it says, its colours, and its hover text if any.
+struct Badge {
+    text: String,
+    fill: Color32,
+    color: Color32,
+    hover: Option<String>,
+}
+
 fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     let pal = theme::palette(ui.ctx());
     let color = if s.enabled { pal.text } else { pal.disabled };
     ui.add(egui::Label::new(RichText::new(&s.name).color(color)).truncate());
+    let loud = |text: &str, fill: Color32, hover: Option<&str>| Badge {
+        text: text.to_owned(),
+        fill,
+        color: pal.on_bright,
+        hover: hover.map(str::to_owned),
+    };
+    // Most important first: those that don't fit beside the name are the ones left to the "+N".
+    let mut badges = Vec::new();
+    if s.transport == klefki_core::api::TransportKind::Invalid {
+        badges.push(loud("invalid", pal.danger, None));
+    }
+    if s.approval == Some(Approval::Rejected) {
+        badges.push(loud("rejected", pal.danger, None));
+    }
     if s.shadowed {
-        badge(ui, "shadowed", pal.warn).on_hover_text(if s.scope == Scope::User {
-            "Every project has a local or project server of the same name, which Claude Code uses instead"
-        } else {
-            "This project has a local server of the same name, which Claude Code uses instead"
-        });
-    } else if !s.shadowed_in.is_empty() {
-        badge(
-            ui,
-            &format!("shadowed in {}/{}", s.shadowed_in.len(), project_count),
+        badges.push(loud(
+            "shadowed",
             pal.warn,
-        )
-        .on_hover_text(format!(
-            "In {} of {project_count} projects, a local or project server of the same name is used \
-             instead. The details name them.",
-            s.shadowed_in.len()
+            Some(if s.scope == Scope::User {
+                "Every project has a local or project server of the same name, which Claude Code uses instead"
+            } else {
+                "This project has a local server of the same name, which Claude Code uses instead"
+            }),
         ));
     }
-    for (show, text, fill) in [
-        (s.casing_collision, "casing", pal.warn),
-        (
-            s.transport == klefki_core::api::TransportKind::Invalid,
-            "invalid",
-            pal.danger,
-        ),
-    ] {
-        if show {
-            badge(ui, text, fill);
-        }
+    if s.casing_collision {
+        badges.push(loud("casing", pal.warn, None));
     }
     // The toggle is per project: a user server can be off in some and on in others.
     if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
-        badge(
-            ui,
+        badges.push(loud(
             &format!("off in {}/{}", s.disabled_in, project_count),
             pal.warn,
-        );
+            None,
+        ));
     }
-    if s.approval == Some(Approval::Rejected) {
-        badge(ui, "rejected", pal.danger);
+    if !s.shadowed && !s.shadowed_in.is_empty() {
+        // Often a deliberate per-project override, so quiet; hidden everywhere is the one worth acting on.
+        badges.push(Badge {
+            text: format!("shadowed in {}/{}", s.shadowed_in.len(), project_count),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(format!(
+                "In {} of {project_count} projects, a local or project server of the same name is used \
+                 instead. The details name them.",
+                s.shadowed_in.len()
+            )),
+        });
     }
+    // Badges never widen the column into the next one's text.
+    let gap = ui.spacing().item_spacing.x;
+    for (i, b) in badges.iter().enumerate() {
+        let rest = badges.len() - i - 1;
+        let reserve = if rest > 0 {
+            gap + badge_width(ui, &format!("+{rest}"))
+        } else {
+            0.0
+        };
+        if gap + badge_width(ui, &b.text) + reserve > ui.available_width() {
+            let more = &badges[i..];
+            if gap + badge_width(ui, &format!("+{}", more.len())) <= ui.available_width() {
+                let names: Vec<&str> = more.iter().map(|b| b.text.as_str()).collect();
+                badge(ui, &format!("+{}", more.len()), pal.border, pal.text)
+                    .on_hover_text(names.join("\n"));
+            }
+            return;
+        }
+        let response = badge(ui, &b.text, b.fill, b.color);
+        if let Some(hover) = &b.hover {
+            response.on_hover_text(hover);
+        }
+    }
+}
+
+/// How wide [`badge`] draws `text`.
+fn badge_width(ui: &Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE));
+    galley.size().x + 12.0
 }
 
 const LAST_KNOWN: &str = "What Claude Code last saw, from its own cache, which can be old.";
@@ -6265,14 +6327,13 @@ fn hovered_for(ui: &Ui, id: egui::Id, rect: egui::Rect, delay: f64) -> bool {
     true
 }
 
-fn badge(ui: &mut Ui, text: &str, fill: Color32) -> egui::Response {
-    let pal = theme::palette(ui.ctx());
+fn badge(ui: &mut Ui, text: &str, fill: Color32, color: Color32) -> egui::Response {
     Frame::new()
         .fill(fill)
         .corner_radius(4)
         .inner_margin(Margin::symmetric(6, 1))
         .show(ui, |ui| {
-            ui.label(RichText::new(text).small().color(pal.on_bright));
+            ui.label(RichText::new(text).small().color(color));
         })
         .response
 }
@@ -6298,9 +6359,27 @@ fn shadowed_text(s: &ServerRow, project_count: usize) -> String {
     } else {
         format!("in {count} of {project_count} projects: ")
     };
-    text.push_str(&s.shadowed_in[..count.min(SHADOWED_NAMED)].join(", "));
+    // By folder name, as the list's group headers name them; the whole paths are on hover.
+    let named: Vec<&str> = s.shadowed_in[..count.min(SHADOWED_NAMED)]
+        .iter()
+        .map(|p| folder_name(p))
+        .collect();
+    text.push_str(&named.join(", "));
     if count > SHADOWED_NAMED {
         text.push_str(&format!(" and {} more", count - SHADOWED_NAMED));
+    }
+    text
+}
+
+/// At most this many whole paths are shown on hover; a tooltip taller than the window helps no one.
+const SHADOWED_PATHS: usize = 20;
+
+/// The whole paths of the projects where `s` is shadowed, one per line.
+fn shadowed_paths(s: &ServerRow) -> String {
+    let count = s.shadowed_in.len();
+    let mut text = s.shadowed_in[..count.min(SHADOWED_PATHS)].join("\n");
+    if count > SHADOWED_PATHS {
+        text.push_str(&format!("\nand {} more", count - SHADOWED_PATHS));
     }
     text
 }
@@ -7319,7 +7398,10 @@ mod tests {
         );
         h.get_by_label("gateway").click();
         h.run();
-        h.get_by_label("in 2 of 17 projects: C:/Repos/WebApp, C:/Repos/Api");
+        // Named as their groups are; the whole paths on hover.
+        h.get_by_label("in 2 of 17 projects: WebApp, Api").hover();
+        h.run();
+        h.get_by_label_contains("C:/Repos/WebApp\nC:/Repos/Api");
     }
 
     #[test]
@@ -7337,7 +7419,7 @@ mod tests {
         assert!(h.query_by_label_contains("shadowed in").is_none());
         h.get_by_label("gateway").click();
         h.run();
-        h.get_by_label("in all 2 projects: C:/Repos/WebApp, C:/Repos/Api");
+        h.get_by_label("in all 2 projects: WebApp, Api");
     }
 
     #[test]
@@ -7352,7 +7434,74 @@ mod tests {
         h.run();
         h.get_by_label("gateway").click();
         h.run();
-        h.get_by_label("in 9 of 40 projects: /p1, /p2, /p3, /p4, /p5 and 4 more");
+        h.get_by_label("in 9 of 40 projects: p1, p2, p3, p4, p5 and 4 more");
+    }
+
+    #[test]
+    fn badges_that_do_not_fit_beside_the_name_are_counted_not_spilled() {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", Scope::User, None);
+        row.disabled_in = 3;
+        row.shadowed_in = vec!["C:/Repos/WebApp".into(), "C:/Repos/Api".into()];
+        row.casing_collision = true;
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![row]))
+            .unwrap();
+        for size in [SMALLEST_SIZE, OPENING_SIZE] {
+            h.set_size(size);
+            h.run();
+            h.get_by_label("gateway");
+            let type_left = h.get_by_label("Type").rect().left();
+            let mut shown = 0;
+            for text in ["casing", "off in 3/17", "shadowed in 2/17"] {
+                if let Some(b) = h.query_by_label(text) {
+                    assert!(b.rect().right() <= type_left, "{text} spills at {size:?}");
+                    shown += 1;
+                }
+            }
+            let more = (1..=3)
+                .find_map(|n| h.query_by_label(&format!("+{n}")).map(|b| (n, b.rect())))
+                .map_or(0, |(n, rect)| {
+                    assert!(rect.right() <= type_left, "+{n} spills at {size:?}");
+                    n
+                });
+            assert_eq!(shown + more, 3, "at {size:?}");
+        }
+    }
+
+    #[test]
+    fn the_server_used_instead_says_which_user_server_it_replaces() {
+        let (mut h, engine) = live_harness();
+        let mut user = live_row("gateway", Scope::User, None);
+        user.shadowed_in = vec!["C:/Repos/WebApp".into()];
+        let local = live_row("gateway", Scope::Local, Some("C:/Repos/WebApp"));
+        // Same name elsewhere, but the user server is not hidden there (say, turned off): it replaces nothing.
+        let other = live_row("gateway", Scope::Local, Some("C:/Repos/Api"));
+        engine
+            .events
+            .send(snapshot_with_projects(3, vec![user, local, other]))
+            .unwrap();
+        h.run();
+        // The two local rows follow the user row, in either order; the detail panel says which is selected.
+        h.get_all_by_label("gateway").nth(1).unwrap().click();
+        h.run();
+        let mut seen = 0;
+        for step in 0..2 {
+            if step == 1 {
+                h.key_press(egui::Key::ArrowDown);
+                h.run();
+            }
+            if h.query_by_label("C:/Repos/WebApp").is_some() {
+                h.get_by_label("Replaces");
+                h.get_by_label("the user server gateway");
+                seen += 1;
+            } else {
+                h.get_by_label("C:/Repos/Api");
+                assert!(h.query_by_label("Replaces").is_none());
+            }
+        }
+        assert_eq!(seen, 1);
     }
 
     #[test]
