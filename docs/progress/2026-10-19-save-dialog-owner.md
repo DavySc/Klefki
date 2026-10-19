@@ -23,7 +23,7 @@ Klefki sent it behind, so the app looked stuck, and on Linux the desktop portal 
 - Tests written first: `export_file::a_shown_dialog_is_opened_once_where_asked_and_its_answer_taken_once`,
   `engine::the_save_dialog_opens_over_the_window_where_it_lives_and_its_answer_is_awaited_elsewhere`,
   `shell::the_save_dialog_opens_over_klefkis_window_from_the_ui_thread` (seen failing with `None` as owner).
-- Full verify exit 0: fmt, clippy `-D warnings`, tests (core 614, app 313, cli 18 + 24), `cargo deny` ok.
+- Full verify exit 0: fmt, clippy `-D warnings`, tests (core 648, app 315, cli 18 + 24, on main 5fc9dc1), `cargo deny` ok.
 - Real app under Xvfb (X11, no portal, no zenity): Save to file… with a real X11 owner falls back to the path field
   as before.
 - Linux release size: app 17,903,424 (PR #26 head) → 17,964,864 bytes (+61 KB: +10 KB the owned async dialog,
@@ -35,4 +35,4 @@ Klefki sent it behind, so the app looked stuck, and on Linux the desktop portal 
 - Linux desktop: GNOME/KDE portal places the dialog over Klefki on X11 and Wayland.
 
 ## Next
-Rebase onto main once #26 lands, PR, CI on 3 OSes, cross-review, merge.
+PR, CI on 3 OSes, cross-review, merge.
