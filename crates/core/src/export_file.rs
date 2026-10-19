@@ -4,7 +4,11 @@
 use crate::config::ConfigPaths;
 use crate::config::fsx::{self, WriteError};
 use crate::sanitize::shown;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Why an export was not saved. The text is a sentence to show.
@@ -40,19 +44,68 @@ pub enum FileChoice {
     NoDialog { suggested: PathBuf },
 }
 
-/// Shows the system's save dialog, starting with `name` as the file name; the file picked, or `None`.
-pub(crate) type ChooseFile = std::sync::Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+/// The window a save dialog belongs to. The dialog opens over it (a sheet on macOS) and stays above it until it
+/// closes, so a click on the window cannot hide it.
+pub trait Owner: HasWindowHandle + HasDisplayHandle {}
+
+impl<T: HasWindowHandle + HasDisplayHandle + ?Sized> Owner for T {}
+
+/// The user's answer to a save dialog that is open: the file picked, or `None`.
+pub type Answer = Pin<Box<dyn Future<Output = Option<PathBuf>> + Send>>;
+
+/// Shows the system's save dialog, starting with `name` as the file name, over `owner` when there is one. It returns
+/// once the dialog is open; the answer comes later.
+pub(crate) type OpenDialog = Arc<dyn Fn(&str, Option<&dyn Owner>) -> Answer + Send + Sync>;
+
+/// A save dialog the UI opened over its window, with the time it opened, waiting for the user. Opening it where the
+/// window lives is what lets it belong to the window (a handle to the window cannot leave that thread); the answer
+/// is waited for elsewhere, so the UI keeps drawing. The answer is taken once.
+#[derive(Clone)]
+pub struct ShownDialog(Arc<Mutex<Option<(Instant, Answer)>>>);
+
+impl ShownDialog {
+    /// Opens the dialog through `open`, on the calling thread.
+    pub(crate) fn open(open: &OpenDialog, name: &str, owner: Option<&dyn Owner>) -> Self {
+        let opened = Instant::now();
+        let answer = open(name, owner);
+        Self(Arc::new(Mutex::new(Some((opened, answer)))))
+    }
+
+    /// When the dialog opened, and the answer to wait for: `None` once taken.
+    pub(crate) fn take(&self) -> Option<(Instant, Answer)> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// The same dialog, not another one that looks alike.
+impl PartialEq for ShownDialog {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ShownDialog {}
+
+impl std::fmt::Debug for ShownDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ShownDialog")
+    }
+}
 
 /// A dialog closed sooner than this was never seen: nobody cancels a save dialog this fast, while a system without
 /// one answers at once. Neither case says which it was, so the time tells them apart.
 const UNSEEN: Duration = Duration::from_millis(150);
 
-/// Asks where to save, through `choose`.
-pub(crate) fn choose(choose: &ChooseFile, name: &str, home: Option<&Path>) -> FileChoice {
-    let asked = Instant::now();
-    match choose(name) {
+/// What the answer `picked`, to a dialog opened at `opened`, means.
+pub(crate) fn answered(
+    opened: Instant,
+    picked: Option<PathBuf>,
+    name: &str,
+    home: Option<&Path>,
+) -> FileChoice {
+    match picked {
         Some(path) => FileChoice::Chosen(path),
-        None if asked.elapsed() >= UNSEEN => FileChoice::Cancelled {
+        None if opened.elapsed() >= UNSEEN => FileChoice::Cancelled {
             suggested: default_folder(home).join(name),
         },
         None => FileChoice::NoDialog {
@@ -148,7 +201,6 @@ fn refused(paths: Option<&ConfigPaths>, path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     const BLOCK: &str = "{\n  \"mcpServers\": {}\n}";
 
@@ -287,27 +339,56 @@ mod tests {
     #[test]
     fn a_dialog_that_closes_at_once_was_not_shown_and_a_path_is_suggested() {
         let home = tempfile::tempdir().unwrap();
-        let quick: ChooseFile = Arc::new(|_| None);
-        match choose(&quick, "mcp-servers.json", Some(home.path())) {
+        match answered(Instant::now(), None, "mcp-servers.json", Some(home.path())) {
             FileChoice::NoDialog { suggested } => {
                 assert!(suggested.is_absolute(), "{suggested:?}");
                 assert!(suggested.ends_with("mcp-servers.json"), "{suggested:?}");
             }
             other => panic!("{other:?}"),
         }
-        let slow: ChooseFile = Arc::new(|_| {
-            std::thread::sleep(UNSEEN + Duration::from_millis(50));
-            None
-        });
-        match choose(&slow, "x.json", Some(home.path())) {
+        let long_ago = Instant::now() - (UNSEEN + Duration::from_millis(50));
+        match answered(long_ago, None, "x.json", Some(home.path())) {
             FileChoice::Cancelled { suggested } => assert!(suggested.ends_with("x.json")),
             other => panic!("{other:?}"),
         }
-        let picked: ChooseFile = Arc::new(|name| Some(PathBuf::from("/picked").join(name)));
         assert_eq!(
-            choose(&picked, "x.json", None),
+            answered(
+                Instant::now(),
+                Some(PathBuf::from("/picked/x.json")),
+                "x.json",
+                None
+            ),
             FileChoice::Chosen(PathBuf::from("/picked/x.json"))
         );
+    }
+
+    #[test]
+    fn a_shown_dialog_is_opened_once_where_asked_and_its_answer_taken_once() {
+        let opened: Arc<Mutex<Vec<(String, std::thread::ThreadId)>>> = Arc::default();
+        let open: OpenDialog = {
+            let opened = Arc::clone(&opened);
+            Arc::new(move |name, _| {
+                opened
+                    .lock()
+                    .unwrap()
+                    .push((name.to_owned(), std::thread::current().id()));
+                Box::pin(std::future::ready(Some(PathBuf::from(name))))
+            })
+        };
+        let shown = ShownDialog::open(&open, "x.json", None);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![("x.json".to_owned(), std::thread::current().id())]
+        );
+        // A copy is the same dialog; another one is not.
+        assert_eq!(shown.clone(), shown);
+        assert_ne!(ShownDialog::open(&open, "x.json", None), shown);
+        let taken = shown
+            .clone()
+            .take()
+            .map(|(_, answer)| pollster::block_on(answer));
+        assert_eq!(taken, Some(Some(PathBuf::from("x.json"))));
+        assert!(shown.take().is_none());
     }
 
     #[test]
