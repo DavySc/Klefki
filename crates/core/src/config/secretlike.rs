@@ -185,7 +185,7 @@ fn is_known_shape(credential: &str) -> bool {
                 .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
 }
 
-fn sounds_secret(name: &str) -> bool {
+pub(crate) fn sounds_secret(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     // Without separators or invisible characters, so "api_key" and "t\u{202e}oken" read as they are meant.
     let joined: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();

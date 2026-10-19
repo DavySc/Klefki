@@ -3912,6 +3912,15 @@ impl ShellApp {
                         self.open_casing();
                     }
                 }
+                if s.scope == Scope::User && !s.relative_paths.is_empty() {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(relative_text(&s.relative_paths)).color(pal.warn),
+                        )
+                        .wrap(),
+                    );
+                }
                 if s.scope == Scope::Project
                     && s.approval.is_some_and(|a| a != Approval::Approved)
                     && self.core.is_some()
@@ -6622,6 +6631,16 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     if s.casing_collision {
         badges.push(loud("casing", pal.warn, None));
     }
+    if s.scope == Scope::User && !s.relative_paths.is_empty() {
+        badges.push(loud(
+            "relative path",
+            pal.warn,
+            Some(
+                "Claude Code starts this server in the folder the session started in, so in a project without \
+                 the file its command names, it fails. The details say which.",
+            ),
+        ));
+    }
     // The toggle is per project: a user server can be off in some and on in others.
     if s.scope == Scope::User && s.enabled && s.disabled_in > 0 {
         badges.push(loud(
@@ -6815,6 +6834,20 @@ fn badge(ui: &mut Ui, text: &str, fill: Color32, color: Color32) -> egui::Respon
             ui.label(RichText::new(text).small().color(color));
         })
         .response
+}
+
+/// Why a user server whose command names `paths` relative to where it starts can fail, for the detail panel.
+fn relative_text(paths: &[String]) -> String {
+    let (named, it) = match paths {
+        [one] => (one.clone(), "it"),
+        [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "them"),
+        [] => (String::new(), "it"),
+    };
+    format!(
+        "This server is used in every project, and Claude Code starts it in the folder the session started in, so \
+         it looks for {named} there and fails in projects without {it}. Klefki checks it from your home folder, \
+         so a check can pass where a session fails. Write full paths in the command."
+    )
 }
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
@@ -7125,6 +7158,7 @@ mod tests {
             shadowed: false,
             shadowed_in: Vec::new(),
             casing_collision: false,
+            relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
         };
@@ -7251,6 +7285,7 @@ mod tests {
             shadowed: false,
             shadowed_in: Vec::new(),
             casing_collision: false,
+            relative_paths: Vec::new(),
             status_cached: false,
             oauth: None,
         }
@@ -8088,6 +8123,33 @@ mod tests {
         h.get_by_label("in 2 of 17 projects: WebApp, Api").hover();
         h.run();
         h.get_by_label_contains("C:/Repos/WebApp\nC:/Repos/Api");
+    }
+
+    #[test]
+    fn a_user_server_with_a_relative_path_is_marked_and_its_details_name_the_paths() {
+        let (mut h, engine) = live_harness();
+        let mut user = live_row("docs", Scope::User, None);
+        user.relative_paths = vec!["build/index.js".into(), "CFG=./c.json".into()];
+        // In its own project's folder a relative path is what it should be.
+        let mut local = live_row("tools", Scope::Local, Some("C:/Repos/WebApp"));
+        local.relative_paths = vec!["server.py".into()];
+        engine
+            .events
+            .send(snapshot_with_projects(3, vec![user, local]))
+            .unwrap();
+        h.run();
+        let badges: Vec<_> = h.query_all_by_label("relative path").collect();
+        assert_eq!(badges.len(), 1, "only the user server");
+        h.get_by_label("relative path").hover();
+        h.run();
+        h.get_by_label_contains("in a project without the file its command names, it fails");
+        h.get_by_label("docs").click();
+        h.run();
+        h.get_by_label_contains("it looks for build/index.js and CFG=./c.json there");
+        h.get_by_label_contains("a check can pass where a session fails");
+        h.get_by_label("tools").click();
+        h.run();
+        assert!(h.query_by_label_contains("it looks for").is_none());
     }
 
     #[test]
