@@ -944,8 +944,30 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
             .iter()
             .all(|f| matches!(f, Fault::Works | Fault::Overtaken));
         match step {
-            Step::Forget { .. } if !before.kept.is_empty() => {
-                prop_assert!(matches!(outcome, Outcome::Done), "{}", said);
+            Step::Forget { pick } if !before.kept.is_empty() => {
+                // Except one whose removal took the client secret of a server sharing its sign-in: only putting
+                // it back hands that secret to Claude Code again (decision 007).
+                let (_, (project, name, entry)) =
+                    before.kept.iter().nth(pick % before.kept.len()).unwrap();
+                let shares = entry_signs_in(entry)
+                    && !before
+                        .servers
+                        .contains_key(&(project.clone(), name.clone()))
+                    && before.servers.iter().any(|((p, n), e)| {
+                        n == name
+                            && !same_place(p, project)
+                            && entry_signs_in(e)
+                            && sign_in_key(n, e) == sign_in_key(name, entry)
+                    });
+                if shares {
+                    prop_assert!(
+                        matches!(&outcome, Outcome::Refused(why) if why.contains("Put this one back instead")),
+                        "{}",
+                        said
+                    );
+                } else {
+                    prop_assert!(matches!(outcome, Outcome::Done), "{}", said);
+                }
             }
             Step::PutBack { pick } if nothing_fails && !before.kept.is_empty() => {
                 let (_, (project, name, _)) =
@@ -1896,5 +1918,52 @@ fn a_copy_into_the_place_a_failed_edit_kept_is_refused() {
             StoreFault::Works,
         ),
     ];
+    check(&cases).unwrap();
+}
+
+#[test]
+fn a_kept_definition_that_took_a_shared_client_secret_is_not_forgotten() {
+    // Found by the model-based test (seed e896270e): b copied into pb shares its sign-in with b in pa. An edit of b
+    // in pa fails twice, so Klefki keeps it, and Claude Code's remove took the client secret of both. Forgetting it
+    // left b in pb without one in Claude Code. Forget is now refused, and putting it back restores both.
+    use Fault::*;
+    let cases = [
+        (
+            Step::Copy {
+                pick: 2,
+                to: 2,
+                rename: false,
+            },
+            vec![],
+            StoreFault::Works,
+        ),
+        (Step::Move { pick: 1, to: 2 }, vec![], StoreFault::Works),
+        (
+            Step::Edit {
+                pick: 1,
+                oauth: true,
+                url: 1,
+                client: 1,
+            },
+            vec![FailsAfter, FailsBefore, TimesOutBefore],
+            StoreFault::Works,
+        ),
+        (Step::Forget { pick: 0 }, vec![], StoreFault::Works),
+        (Step::PutBack { pick: 0 }, vec![], StoreFault::Works),
+    ];
+    check(&cases).unwrap();
+    // The variant: once nothing shares its sign-in (the other b now has another address), it can be forgotten.
+    let mut cases = cases[..3].to_vec();
+    cases.push((
+        Step::Edit {
+            pick: 2,
+            oauth: true,
+            url: 2,
+            client: 0,
+        },
+        vec![],
+        StoreFault::Works,
+    ));
+    cases.push((Step::Forget { pick: 0 }, vec![], StoreFault::Works));
     check(&cases).unwrap();
 }

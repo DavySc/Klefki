@@ -64,6 +64,13 @@ and local scope, and PLAN's model-based test as the acceptance bar.
 - **The listing opens the system's store** when a change got through (2026-10-19): it was given only a test's store,
   so in the app it took every such change as done and never checked or moved Klefki's copy. A store that cannot be
   opened keeps the definition listed.
+- **Forget waits for a shared sign-in** (2026-10-19, model seed `e896270e`): when Claude Code's remove of a kept
+  server also took the client secret of a server elsewhere sharing its sign-in, Forget is refused (at review and
+  again when applied) and says to put it back instead, which hands both their secret again. Forgetting it left the
+  other server without a client secret in Claude Code, while Klefki held one it could not hand over. Not once the
+  kept server is back where it was, or when nothing shares its sign-in any more (another address, say).
+  Alternatives not taken: Forget re-adding the other server with its secret (more commands that can fail, and a
+  second sign-in), or only warning (the server stays broken until fixed by hand).
 - **Klefki's keyring copy** is moved (or a stale copy at the new place deleted) before the recovery file is
   discarded; a keyring failure after Claude Code succeeded is a note, not a failure.
 - **Progress:** each of Claude Code's commands is announced (`Event::Applying`), and the dialog asks to keep Klefki
@@ -84,7 +91,7 @@ step the whole world is read back and compared to the prediction: servers, kept 
 Claude's credentials; no project-scope entry or `.mcp.json`; the rest of the file and its key order kept; no secret
 in argv; refusals sanitised. Klefki's own keyring can fail to set or delete. A failure keeps every server in place or in a kept definition with
 its secret, and Put back (with Claude Code working and the place free) and Forget must then succeed: a refusal
-fails the test. Failing
+fails the test, except Forget while a server shares the kept one's sign-in (above). Failing
 seeds are kept in `crates/core/proptest-regressions/`.
 
 Why not as PLAN wrote it:
