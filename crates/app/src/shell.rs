@@ -1922,6 +1922,7 @@ impl ShellApp {
             save: Saving::Idle,
             status: None,
             size: egui::Vec2::ZERO,
+            status_height: 26.0,
             what,
             names: (rows.len() > 1).then(|| names_in_a_line(&names)),
             scope,
@@ -2025,11 +2026,15 @@ impl ShellApp {
                         Saving::Typing { .. } | Saving::Exists { .. } => 64.0,
                         Saving::Writing { typed: Some(_), .. } => 40.0,
                         _ => 0.0,
-                    } + if view.status.is_some() { 26.0 } else { 0.0 };
+                    } + if view.status.is_some() {
+                        view.status_height
+                    } else {
+                        0.0
+                    };
                     let room = screen.height() - 64.0 - used - 80.0 - below;
                     egui::ScrollArea::vertical()
                         .id_salt("export_block")
-                        .max_height(room.clamp(96.0, 320.0))
+                        .max_height(room.clamp(if below > 0.0 { 64.0 } else { 96.0 }, 320.0))
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::multiline(&mut result.text.as_str())
@@ -2144,12 +2149,28 @@ impl ShellApp {
             }
             if let Some(status) = &view.status {
                 ui.add_space(6.0);
-                let (text, color) = match status {
-                    Ok(text) => (text, pal.success),
-                    Err(text) => (text, pal.warn),
+                let said = match status {
+                    // One line, however long the path: its start gives way, so the file's name stays in view.
+                    Ok(text) => {
+                        let shown = keep_the_end(ui, text, ui.available_width());
+                        let said = ui.add(egui::Label::new(
+                            RichText::new(&shown).color(pal.success),
+                        ));
+                        if shown != *text {
+                            ui.ctx()
+                                .accesskit_node_builder(said.id, |node| node.set_value(text.clone()));
+                            said.on_hover_text(text)
+                        } else {
+                            said
+                        }
+                    }
+                    Err(text) => {
+                        ui.add(egui::Label::new(RichText::new(text).color(pal.warn)).wrap())
+                    }
                 };
-                let said = ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
                 announce(ui.ctx(), said.id);
+                // A long path wraps; the block gives up that much room in the next frame.
+                view.status_height = said.rect.height() + 6.0;
             }
         });
         if choose {
@@ -5880,6 +5901,8 @@ struct ExportView {
     status: Option<Result<String, String>>,
     /// The dialog's size in the last frame.
     size: egui::Vec2,
+    /// How tall the save status was in the last frame (it wraps a long path).
+    status_height: f32,
 }
 
 /// Where saving the export to a file is.
@@ -6566,6 +6589,42 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         if let Some(hover) = &b.hover {
             response.on_hover_text(hover);
         }
+    }
+}
+
+/// `text` in one line of `width`: as it is when it fits, or else its `Saved to ` (when it has one), `…` and as much of
+/// its end as fits.
+fn keep_the_end(ui: &Ui, text: &str, width: f32) -> String {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let fits = |t: &str| {
+        ui.fonts_mut(|f| f.layout_no_wrap(t.to_owned(), font.clone(), Color32::WHITE))
+            .size()
+            .x
+            <= width
+    };
+    if fits(text) {
+        return text.to_owned();
+    }
+    let head = if text.starts_with("Saved to ") {
+        "Saved to "
+    } else {
+        ""
+    };
+    let tail = &text[head.len()..];
+    // The shortest cut that fits, found by halving: layout is the cost, not the length.
+    let starts: Vec<usize> = tail.char_indices().map(|(i, _)| i).collect();
+    let (mut lo, mut hi) = (0, starts.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if fits(&format!("{head}…{}", &tail[starts[mid]..])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    match starts.get(lo) {
+        Some(&at) => format!("{head}…{}", &tail[at..]),
+        None => format!("{head}…"),
     }
 }
 
@@ -13536,6 +13595,42 @@ mod tests {
         h.run();
         assert!(drain(&engine).is_empty());
         assert!(h.state().exporting.is_some());
+    }
+
+    #[test]
+    fn a_long_saved_path_keeps_to_one_line_and_its_file_name_in_view() {
+        let (mut h, engine) = export_open(vec![live_row("a", Scope::User, None)], "{}");
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        let long = format!("/{}/a-mcp.json", "a-very-long-folder-name/".repeat(12));
+        let file = std::path::PathBuf::from(&long);
+        engine
+            .events
+            .send(Event::ExportFileChosen(FileChoice::Chosen(file.clone())))
+            .unwrap();
+        h.run();
+        engine
+            .events
+            .send(Event::ExportSaved {
+                path: file,
+                shown: long.clone(),
+                result: Ok(()),
+            })
+            .unwrap();
+        h.run();
+        // Read out whole; drawn as one line ending in the file's name, inside the dialog.
+        let said = format!("Saved to {long}");
+        let rect = h.get_by_label(&said).rect();
+        let copy = h
+            .get_by_role_and_label(egui::accesskit::Role::Button, "Copy")
+            .rect();
+        assert!(rect.height() < copy.height(), "{rect:?}");
+        // The dialog's content is 640 wide, starting where Copy does.
+        assert!(
+            rect.left() >= copy.left() && rect.right() <= copy.left() + 640.0,
+            "{rect:?}"
+        );
     }
 
     #[test]
