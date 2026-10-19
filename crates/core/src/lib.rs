@@ -6,6 +6,7 @@ mod config;
 mod diagnose;
 mod engine;
 mod export;
+mod export_file;
 mod fixtures;
 mod form;
 mod model;

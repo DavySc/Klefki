@@ -9,6 +9,7 @@ pub use crate::engine::{
     SignInFailure, SignInStep,
 };
 pub use crate::export::{Exported, Variable};
+pub use crate::export_file::{FileChoice, SaveError, file_name as export_file_name};
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
@@ -304,9 +305,19 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         watch_settle: std::time::Duration::from_millis(300),
         secrets: None,
         open_url: std::sync::Arc::new(open_https),
+        choose_file: std::sync::Arc::new(choose_save_file),
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
     }
+}
+
+/// The system's own save dialog, starting at `name` in the folder it last used. It asks before replacing a file.
+fn choose_save_file(name: &str) -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Save the export")
+        .set_file_name(name)
+        .add_filter("JSON", &["json"])
+        .save_file()
 }
 
 /// Opens `link` in the user's browser, if it is https (CLAUDE.md: URLs opened are https only). No shell is involved.
@@ -350,6 +361,12 @@ pub fn export(ids: &[ServerId]) -> Exported {
         .unwrap_or_default();
     let sources = crate::export::sources(paths.as_ref(), &inventory.snapshot, &inventory.keys, ids);
     crate::export::export(sources)
+}
+
+/// Writes an exported block to `path` for a command-line run, as [`Command::SaveExport`] does: never over an existing
+/// file unless `replace`, and never into Claude Code's own configuration or a `.mcp.json`.
+pub fn save_export(path: &std::path::Path, text: &str, replace: bool) -> Result<(), SaveError> {
+    crate::export_file::save(ConfigPaths::discover().as_ref(), path, text, replace)
 }
 
 pub fn load_snapshot_from(paths: &ConfigPaths) -> Arc<Snapshot> {

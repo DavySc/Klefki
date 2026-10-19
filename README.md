@@ -22,5 +22,6 @@ cargo run -p klefki
 cargo run -p klefki-cli -- list            # the servers, grouped by scope and project; runs nothing
 cargo run -p klefki-cli -- status [NAME]   # asks Claude Code whether they connect; --json for scripts
 cargo run -p klefki-cli -- export [NAME]   # one {"mcpServers": …} block, secrets as ${VAR} references
+cargo run -p klefki-cli -- export -o servers.json   # the same block in a new file (--force replaces one)
 cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
