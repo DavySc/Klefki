@@ -8,6 +8,7 @@ pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
     SignInFailure, SignInStep,
 };
+pub use crate::export::{Exported, Variable};
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
@@ -325,6 +326,19 @@ pub fn load_snapshot() -> Arc<Snapshot> {
             ..Snapshot::default()
         }),
     }
+}
+
+/// The definitions of the servers `ids` names, in the real configuration, as one `{"mcpServers": {…}}` block with
+/// values that may be secrets replaced by `${VAR}` references: [`Command::Export`] without an engine, for a
+/// command-line run. Reads the files; writes nothing.
+pub fn export(ids: &[ServerId]) -> Exported {
+    let paths = ConfigPaths::discover();
+    let inventory = paths
+        .as_ref()
+        .map(crate::config::inventory::load)
+        .unwrap_or_default();
+    let sources = crate::export::sources(paths.as_ref(), &inventory.snapshot, &inventory.keys, ids);
+    crate::export::export(sources)
 }
 
 pub fn load_snapshot_from(paths: &ConfigPaths) -> Arc<Snapshot> {
