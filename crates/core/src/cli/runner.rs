@@ -76,7 +76,8 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> io::Result<RunOutput> {
             // Not waited for yet, so the tree still has its id.
             tree.kill();
             let _ = child.kill();
-            break child.wait().ok();
+            let _ = child.wait();
+            break None;
         }
         std::thread::sleep(POLL);
     };
@@ -88,11 +89,7 @@ pub(crate) fn run(spec: &RunSpec<'_>) -> io::Result<RunOutput> {
     Ok(RunOutput {
         stdout: text(&stdout, out_cut),
         stderr: text(&stderr, err_cut),
-        exit_code: if timed_out {
-            None
-        } else {
-            status.and_then(|s| s.code())
-        },
+        exit_code: status.and_then(|s| s.code()),
         timed_out,
         truncated: out_cut || err_cut,
     })
@@ -146,8 +143,8 @@ impl Capture {
         let _ = self
             .done
             .recv_timeout(until.saturating_duration_since(Instant::now()));
-        let guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        (guard.0.clone(), guard.1)
+        let mut guard = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        (std::mem::take(&mut guard.0), guard.1)
     }
 }
 
