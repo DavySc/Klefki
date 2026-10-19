@@ -198,6 +198,16 @@ struct Outcome {
 /// How long a success message stays.
 const SUCCESS_SECONDS: f64 = 4.0;
 
+/// The outcome message: its text's widest, its narrowest beside the detail panel, the room its frame takes around
+/// the text, and its distance from the window's edges.
+const TOAST_WIDTH: f32 = 420.0;
+const TOAST_NARROWEST: f32 = 280.0;
+const TOAST_FRAME: f32 = 26.0;
+const TOAST_MARGIN: f32 = 16.0;
+
+/// The navigation column's width.
+const NAV_WIDTH: f32 = 220.0;
+
 /// The size Klefki opens at.
 pub const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
 /// The smallest it can be made; also the room the opening size gives at 150 % zoom.
@@ -245,6 +255,9 @@ pub struct ShellApp {
     save_bar_wanted: bool,
     /// How tall the save bar was last frame (none: 0), so the scroll area above it leaves that much room.
     save_bar_height: f32,
+    /// Where the save bar was drawn in this frame, and the detail panel's left edge: the outcome message keeps
+    /// clear of it.
+    save_bar_at: Option<(egui::Rect, f32)>,
     cli_version: Option<String>,
     cli_problem: Option<String>,
     /// A change the engine has prepared and the user has not yet confirmed.
@@ -327,6 +340,7 @@ impl ShellApp {
             reveal_diagnosis: None,
             save_bar_wanted: false,
             save_bar_height: 0.0,
+            save_bar_at: None,
             cli_version: None,
             cli_problem: None,
             plan: None,
@@ -897,12 +911,13 @@ impl ShellApp {
             }
         }
         let pal = theme::palette(ui.ctx());
+        self.save_bar_at = None;
         egui::Panel::top("top_bar")
             .frame(bar_frame(pal))
             .show(ui, |ui| self.top_bar(ui));
         egui::Panel::left("nav")
             .resizable(false)
-            .exact_size(220.0)
+            .exact_size(NAV_WIDTH)
             .frame(
                 Frame::new()
                     .fill(pal.chrome)
@@ -913,7 +928,7 @@ impl ShellApp {
             // A share of the window, so explanations get room on a wide screen without crowding a narrow one.
             let width = ui.available_width();
             // Named anew when its sizes changed: egui remembers a panel's width by name.
-            egui::Panel::right("detail-panel")
+            let panel = egui::Panel::right("detail-panel")
                 .default_size((width * 0.34).clamp(360.0, 640.0))
                 .min_size(280.0)
                 .max_size((width * 0.5).max(460.0))
@@ -923,6 +938,9 @@ impl ShellApp {
                     ..Margin::same(12)
                 }))
                 .show(ui, |ui| self.detail(ui));
+            if let Some((_, left)) = &mut self.save_bar_at {
+                *left = panel.response.rect.left();
+            }
         }
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
@@ -2827,8 +2845,22 @@ impl ShellApp {
         let mut sign_in = false;
         let mut undo = false;
         let mut log = false;
+        // In the window's bottom-right corner, but never over the save bar, whose buttons may be wanted while it
+        // shows: beside the detail panel, over the list, where there is room; otherwise just above the bar.
+        let screen = ctx.content_rect();
+        let mut offset = egui::vec2(-TOAST_MARGIN, -TOAST_MARGIN);
+        let mut width = TOAST_WIDTH;
+        if let Some((bar, panel_left)) = self.save_bar_at {
+            let beside = panel_left - NAV_WIDTH - 2.0 * TOAST_MARGIN - TOAST_FRAME;
+            if beside >= TOAST_NARROWEST {
+                offset.x = panel_left - screen.right() - TOAST_MARGIN;
+                width = beside.min(TOAST_WIDTH);
+            } else {
+                offset.y = bar.top() - screen.bottom() - TOAST_MARGIN / 2.0;
+            }
+        }
         egui::Area::new(egui::Id::new("outcome"))
-            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+            .anchor(egui::Align2::RIGHT_BOTTOM, offset)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 Frame::new()
@@ -2843,7 +2875,7 @@ impl ShellApp {
                         color: Color32::from_black_alpha(80),
                     })
                     .show(ui, |ui| {
-                        ui.set_max_width(420.0);
+                        ui.set_max_width(width);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(glyph).size(16.0).color(color));
                             ui.add(
@@ -3305,6 +3337,7 @@ impl ShellApp {
                 ui.separator();
                 self.save_bar(ui, s);
             });
+            self.save_bar_at = Some((bar.response.rect, bar.response.rect.left()));
             bar.response.rect.height() + ui.spacing().item_spacing.y
         } else {
             0.0
@@ -7578,6 +7611,61 @@ mod tests {
             wheel_the_detail_panel_to(&mut h, size, "Add argument");
             assert_eq!(h.get_by_label("Review and save…").rect(), save, "{size:?}");
             h.get_by_label("Revert");
+        }
+    }
+
+    #[test]
+    fn the_outcome_message_never_covers_the_save_bar() {
+        // Found in the UI review: for four seconds after a change was applied, its message sat over Review and
+        // save… and Revert; one that offers Undo or warns stays until dismissed, and covered them all that time.
+        let long = "Moved files to webapp. The previous file is kept in \
+            /home/me/.local/share/klefki/backups/claude.json.0001792408049204-0.bak";
+        let outcomes = [
+            ("success", "Saved.", false, None),
+            ("warning", long, true, None),
+            (
+                "undo",
+                long,
+                false,
+                Some(Change::Move {
+                    id: live_row("alpha", Scope::User, None).id(),
+                    to: Target::User,
+                }),
+            ),
+        ];
+        for size in SIZES {
+            for (kind, text, warn, undo) in outcomes.clone() {
+                let mut h = long_form(size);
+                form(&mut h).command = "node22".into();
+                h.run();
+                h.state_mut().outcome = Some(Outcome {
+                    text: text.into(),
+                    ok: true,
+                    shown_at: None,
+                    sign_in: None,
+                    warn,
+                    // With the button that opens the log, the widest the card's buttons get.
+                    logged: kind != "success",
+                    undo,
+                });
+                h.run();
+                let toast = h
+                    .ctx
+                    .memory(|m| m.area_rect(egui::Id::new("outcome")))
+                    .expect("the message is shown");
+                let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                assert!(window.contains_rect(toast), "{size:?} {kind}: {toast:?}");
+                for label in ["Review and save…", "Revert", "Unsaved"] {
+                    let rect = h.get_by_label(label).rect();
+                    assert!(
+                        !toast.intersects(rect),
+                        "{size:?} {kind}: the message at {toast:?} covers {label} at {rect:?}"
+                    );
+                }
+                h.get_by_label("Revert").click();
+                h.run();
+                assert_eq!(form(&mut h).command, "node", "{size:?} {kind}");
+            }
         }
     }
 
