@@ -3,6 +3,7 @@ mod activity;
 pub mod api;
 mod cli;
 mod config;
+mod desktop;
 mod diagnose;
 mod engine;
 mod export;

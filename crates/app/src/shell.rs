@@ -19,6 +19,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Connections,
+    Desktop,
     ScopeDrift,
     Secrets,
     Settings,
@@ -26,8 +27,9 @@ pub enum Page {
 }
 
 impl Page {
-    const ALL: [(Page, &'static str, &'static str); 5] = [
+    const ALL: [(Page, &'static str, &'static str); 6] = [
         (Page::Connections, icon::PLUGS_CONNECTED, "Connections"),
+        (Page::Desktop, icon::DESKTOP, "Claude Desktop"),
         (Page::ScopeDrift, icon::GIT_DIFF, "Scope drift"),
         (Page::Secrets, icon::KEY, "Secrets"),
         (Page::Settings, icon::GEAR, "Settings"),
@@ -50,12 +52,15 @@ impl Page {
 
     /// Pages that are not built yet say what they will do, so the menu is a map rather than a dead end.
     fn ready(self) -> bool {
-        matches!(self, Page::Connections | Page::Settings | Page::ActivityLog)
+        matches!(
+            self,
+            Page::Connections | Page::Desktop | Page::Settings | Page::ActivityLog
+        )
     }
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections | Page::ActivityLog => "",
+            Page::Connections | Page::Desktop | Page::ActivityLog => "",
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
             }
@@ -337,6 +342,8 @@ pub struct ShellApp {
     pub page: Page,
     /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
     pub activity: Option<crate::activity::ActivityPage>,
+    /// The Claude Desktop page while it is shown; like the Activity log, read when opened and let go when left.
+    pub desktop: Option<crate::desktop::DesktopPage>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -398,6 +405,7 @@ impl ShellApp {
             snapshot,
             page: Page::Connections,
             activity: None,
+            desktop: None,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -419,7 +427,8 @@ impl ShellApp {
         }
     }
 
-    /// Shows `page`. The Activity log is read each time it is opened and let go when it is left.
+    /// Shows `page`. The Activity log and Claude Desktop's servers are read each time their page is opened and let
+    /// go when it is left.
     fn go(&mut self, page: Page) {
         if page == Page::ActivityLog {
             if self.activity.is_none() {
@@ -429,12 +438,23 @@ impl ShellApp {
         } else {
             self.activity = None;
         }
+        if page == Page::Desktop {
+            if self.desktop.is_none() {
+                self.desktop = Some(crate::desktop::DesktopPage::default());
+                self.send(Command::Desktop);
+            }
+        } else {
+            self.desktop = None;
+        }
         self.page = page;
     }
 
-    /// Re-reads the configuration and re-checks every server.
+    /// Re-reads the configuration and re-checks every server; on the Claude Desktop page, its file too.
     fn refresh(&self) {
         self.send(Command::Refresh { live_all: true });
+        if self.desktop.is_some() {
+            self.send(Command::Desktop);
+        }
     }
 
     fn poll_core(&mut self) {
@@ -460,6 +480,12 @@ impl ShellApp {
             self.send(Command::Activity);
         }
         match event {
+            Event::Desktop(desktop) => {
+                // Not kept once the page is left: it is read again when the page is opened.
+                if let Some(page) = &mut self.desktop {
+                    page.set(desktop);
+                }
+            }
             Event::Activity(log) => {
                 // Not kept once the page is left: it is read again when the page is opened.
                 if let Some(page) = &mut self.activity {
@@ -1091,6 +1117,11 @@ impl ShellApp {
                             bring_focus_into_view(ui);
                         });
                 }
+                Page::Desktop => {
+                    if let Some(page) = &mut self.desktop {
+                        page.show(ui, &self.snapshot);
+                    }
+                }
                 Page::ActivityLog => {
                     let restore = self.activity.as_mut().and_then(|page| page.show(ui));
                     if let Some(backup) = restore {
@@ -1169,12 +1200,16 @@ impl ShellApp {
                 // On the Activity log it filters the changes, and says so: a box that filtered the hidden list of
                 // servers would find nothing there.
                 // The shortcut is left out there, so the longer words fit the box.
-                let (query, hint) = match &mut self.activity {
-                    Some(page) => (
+                let (query, hint) = match (&mut self.activity, &mut self.desktop) {
+                    (Some(page), _) => (
                         &mut page.filter,
                         format!("{} Filter changes", icon::MAGNIFYING_GLASS),
                     ),
-                    None => (
+                    (None, Some(page)) => (
+                        &mut page.filter,
+                        format!("{} Filter servers", icon::MAGNIFYING_GLASS),
+                    ),
+                    (None, None) => (
                         &mut self.search,
                         format!("{} Filter  {}", icon::MAGNIFYING_GLASS, shortcut("F")),
                     ),
@@ -1716,6 +1751,13 @@ impl ShellApp {
             None,
             command::Action::ActivityLog,
         );
+        add(
+            icon::DESKTOP,
+            "Claude Desktop".into(),
+            "The servers in Claude Desktop's configuration, read-only".into(),
+            None,
+            command::Action::Desktop,
+        );
         // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
         if live {
             add(
@@ -1779,6 +1821,7 @@ impl ShellApp {
             }
             A::Settings => self.go(Page::Settings),
             A::ActivityLog => self.go(Page::ActivityLog),
+            A::Desktop => self.go(Page::Desktop),
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),
