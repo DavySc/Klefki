@@ -331,6 +331,9 @@ pub struct ShellApp {
     exports_pending: usize,
     /// Save dialogs asked for and not answered yet: an answer counts only when it is the last one asked for.
     export_choices_pending: usize,
+    /// The file name for a save dialog asked for in this frame: it is opened after drawing, where Klefki's window is
+    /// at hand, so that the dialog belongs to it.
+    export_choice_asked: Option<String>,
     pub page: Page,
     /// The Activity log page while it is shown; `None` on every other page, so the log is not held in memory.
     pub activity: Option<crate::activity::ActivityPage>,
@@ -391,6 +394,7 @@ impl ShellApp {
             exporting: None,
             exports_pending: 0,
             export_choices_pending: 0,
+            export_choice_asked: None,
             snapshot,
             page: Page::Connections,
             activity: None,
@@ -2211,10 +2215,7 @@ impl ShellApp {
             view.save = Saving::Choosing;
             view.status = None;
             self.export_choices_pending += 1;
-            let name = view.file_name.clone();
-            if let Some(core) = &self.core {
-                core.send(Command::ChooseExportFile { name });
-            }
+            self.export_choice_asked = Some(view.file_name.clone());
         }
         if (save_typed || replace)
             && let Some(result) = &view.result
@@ -4597,8 +4598,15 @@ impl ShellApp {
 }
 
 impl eframe::App for ShellApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         self.show(ui);
+        // The save dialog opens over Klefki's window, which only this thread may touch, and belongs to it: a click
+        // on Klefki cannot send it behind, and on macOS it is the window's sheet.
+        if let Some(name) = self.export_choice_asked.take()
+            && let Some(core) = &self.core
+        {
+            core.choose_export_file(name, Some(frame));
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -13617,6 +13625,66 @@ mod tests {
     }
 
     #[test]
+    fn the_save_dialog_opens_over_klefkis_window_from_the_ui_thread() {
+        let opened: Arc<std::sync::Mutex<Vec<(String, bool, std::thread::ThreadId)>>> =
+            Arc::default();
+        let (core, engine) = klefki_core::api::Core::detached_with_dialog({
+            let opened = Arc::clone(&opened);
+            move |name, owned| {
+                opened
+                    .lock()
+                    .unwrap()
+                    .push((name.to_owned(), owned, std::thread::current().id()));
+                None
+            }
+        });
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1100.0, 900.0))
+            .build_eframe(move |cc| {
+                crate::theme::apply(&cc.egui_ctx, ThemeChoice::Dark);
+                ShellApp::with_core(core, ThemeChoice::Dark)
+            });
+        engine
+            .events
+            .send(snapshot_of(vec![live_row("github", Scope::User, None)]))
+            .unwrap();
+        h.run();
+        h.get_by_label(icon::EXPORT).click();
+        h.run();
+        engine
+            .events
+            .send(exported_block("{\n  \"mcpServers\": {}\n}", &[], &[]))
+            .unwrap();
+        h.run();
+        drain(&engine);
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Save to file…")
+            .click();
+        h.run();
+        // Opened once, by the UI's own thread, with Klefki's window as its owner.
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![(
+                "github-mcp.json".to_owned(),
+                true,
+                std::thread::current().id()
+            )]
+        );
+        // The engine is handed that open dialog to wait for.
+        let sent = drain(&engine);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Command::ChooseExportFile { name, shown: Some(_) }] if name == "github-mcp.json"
+            ),
+            "{sent:?}"
+        );
+        // Nearby: more frames open no second dialog while the first is waiting.
+        h.run();
+        assert_eq!(opened.lock().unwrap().len(), 1);
+        assert!(drain(&engine).is_empty());
+    }
+
+    #[test]
     fn save_to_file_asks_where_in_the_systems_dialog_and_says_where_it_was_saved() {
         let block = "{\n  \"mcpServers\": {}\n}";
         let (mut h, engine) = export_open(vec![live_row("github", Scope::User, None)], block);
@@ -13627,7 +13695,8 @@ mod tests {
         assert_eq!(
             drain(&engine),
             vec![Command::ChooseExportFile {
-                name: "github-mcp.json".into()
+                name: "github-mcp.json".into(),
+                shown: None
             }]
         );
         // While the system's dialog is open, a second one is not asked for.
@@ -13863,7 +13932,8 @@ mod tests {
         assert_eq!(
             drain(&engine),
             vec![Command::ChooseExportFile {
-                name: "mcp-servers.json".into()
+                name: "mcp-servers.json".into(),
+                shown: None
             }]
         );
         let file = std::path::PathBuf::from("/home/me/.claude.json");
