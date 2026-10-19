@@ -138,7 +138,7 @@ jobs:
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
       # Records which workflow, commit and runner built each file, signed through Sigstore. Anyone can check a
-      # download with `gh attestation verify <file> --repo DavySc/Klefki`.
+      # download with the `gh attestation verify` command in docs/release-notes.md; the next step runs the same check.
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
@@ -147,10 +147,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           for file in dist/*; do
-            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" > /dev/null
+            gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" > /dev/null
             echo "attested: $file"
           done
+      # A tag publishes these files in the release instead.
       - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: klefki-all
           path: dist/*

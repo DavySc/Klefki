@@ -27,6 +27,15 @@ restarted from main after #40 merged.
   against the release workflow; draft-release step skipped as intended (not a tag). Attestation
   https://github.com/DavySc/Klefki/attestations/57570117, Rekor log index 3327068904.
 
+- Cross-review (review 5578471289 on 2902da4), one blocker fixed: the users' verify command now pins
+  `--signer-workflow .../release.yml --source-ref refs/tags/v{version}`, since `--repo` alone accepts any
+  workflow or branch (and manual runs from any branch now attest). The CI self-check adds `--source-ref
+  "$GITHUB_REF"`. Polish: the notes say to `gh auth login` first (checked: gh 2.89 without a token asks for it)
+  and that success prints `✓ Verification succeeded!` (string checked in the gh binary); `klefki-all` is uploaded
+  on manual runs only.
+
 ## Not verified / open
+- `--source-ref` in the CI self-check first runs on the next manual or tag run (the trial artifacts could not be
+  downloaded here to test it by hand: the proxy refuses the artifact storage host).
 - The draft-release step itself still first runs on a real tag.
 - Next slice: minisign signature on `SHA256SUMS`, which needs a key from the owner.

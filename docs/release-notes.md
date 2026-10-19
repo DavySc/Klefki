@@ -62,10 +62,12 @@ Every file is listed in `SHA256SUMS`. In the download folder:
 - macOS: `shasum -a 256 -c SHA256SUMS --ignore-missing`
 - Windows (PowerShell): `Get-FileHash .\klefki-{version}-windows-x64-setup.exe`, then compare the hash with the line for that file in `SHA256SUMS`.
 
-To check that a file was built from this repository by its release workflow, and not changed since, use the [GitHub CLI](https://cli.github.com/):
+To check that a file was built by this release's workflow from the `v{version}` tag, and not changed since, use the [GitHub CLI](https://cli.github.com/) (sign in once with `gh auth login`; any GitHub account works):
 
 ```
-gh attestation verify klefki-{version}-linux-amd64.deb --repo DavySc/Klefki
+gh attestation verify klefki-{version}-linux-amd64.deb --repo DavySc/Klefki --signer-workflow DavySc/Klefki/.github/workflows/release.yml --source-ref refs/tags/v{version}
 ```
+
+It prints `✓ Verification succeeded!` for a genuine file. Anything else means: do not run that file.
 
 `klefki-{version}.cdx.json` and `klefki-cli-{version}.cdx.json` list every library in each program (CycloneDX SBOMs), for vulnerability scanners.
