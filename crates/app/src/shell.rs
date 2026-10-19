@@ -1011,8 +1011,9 @@ impl ShellApp {
                         });
                 }
                 Page::ActivityLog => {
-                    if let Some(page) = &mut self.activity {
-                        page.show(ui);
+                    let restore = self.activity.as_mut().and_then(|page| page.show(ui));
+                    if let Some(backup) = restore {
+                        self.prepare(vec![Change::Restore { backup }]);
                     }
                 }
                 other => {

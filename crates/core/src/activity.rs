@@ -130,6 +130,13 @@ fn append(path: &Path, line: &[u8]) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
+    // Cut back first when this line would take the log past its size, so the line is never lost with it.
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.len() + line.len() as u64 > MAX_BYTES
+        && !compact(path)?
+    {
+        set_aside(path)?;
+    }
     let mut file = match create_private_file(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -137,20 +144,15 @@ fn append(path: &Path, line: &[u8]) -> io::Result<()> {
         }
         Err(e) => return Err(e),
     };
-    file.write_all(line)?;
-    if file.metadata()?.len() > MAX_BYTES {
-        drop(file);
-        compact(path)?;
-    }
-    Ok(())
+    file.write_all(line)
 }
 
 /// Keeps the newest whole lines that fit in half of [`MAX_BYTES`], written to a new file that then replaces the
-/// log. A log that cannot be read (too large, not text) is left as it is: the page says it cannot be read, and
-/// nothing in it is lost.
-fn compact(path: &Path) -> io::Result<()> {
+/// log. `false` for a log that cannot be read (too large, not text): it is left as it is, for the caller to set
+/// aside.
+fn compact(path: &Path) -> io::Result<bool> {
     let Ok(Some(text)) = fsx::read_limited(path, READ_LIMIT) else {
-        return Ok(());
+        return Ok(false);
     };
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut size = 0;
@@ -172,7 +174,24 @@ fn compact(path: &Path) -> io::Result<()> {
     }
     temp.as_file().sync_all()?;
     temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    Ok(true)
+}
+
+/// Moves a log that cannot be read out of the way, as it is, next to it (`activity.unreadable-<ms>-<n>.jsonl`), so
+/// a new one can start and nothing in it is lost. Returns where it went.
+fn set_aside(path: &Path) -> io::Result<PathBuf> {
+    let at = now_ms();
+    for n in 0u32.. {
+        let aside = path.with_file_name(format!("activity.unreadable-{at:016}-{n}.jsonl"));
+        match std::fs::symlink_metadata(&aside) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::rename(path, &aside)?;
+                return Ok(aside);
+            }
+            _ => {}
+        }
+    }
+    unreachable!("some name is free")
 }
 
 /// Reads the log and the backup folder: every change, and every backup no change mentions, newest first.
@@ -182,10 +201,14 @@ pub(crate) fn load(backup_dir: &Path) -> Activity {
     let text = match fsx::read_limited(&log_path(backup_dir), READ_LIMIT) {
         Ok(text) => text.unwrap_or_default(),
         Err(e) => {
-            problem = Some(format!(
-                "The activity log could not be read: {}",
-                sanitize_line(&e.to_string())
-            ));
+            let why = sanitize_line(&e.to_string());
+            problem = Some(match set_aside(&log_path(backup_dir)) {
+                Ok(aside) => format!(
+                    "The activity log could not be read ({why}), so Klefki moved it to {} and starts a new one.",
+                    clip(&sanitize_line(&aside.display().to_string()), MAX_PATH)
+                ),
+                Err(_) => format!("The activity log could not be read: {why}"),
+            });
             String::new()
         }
     };
@@ -293,7 +316,7 @@ fn backups_on_disk(backup_dir: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
-fn backup_time(name: &str) -> Option<u64> {
+pub(crate) fn backup_time(name: &str) -> Option<u64> {
     let stem = name.strip_suffix(".bak")?;
     let (rest, n) = stem.rsplit_once('-')?;
     n.parse::<u32>().ok()?;
@@ -352,6 +375,25 @@ fn when(at_ms: u64, now_ms: u64, offset: impl Fn(i64) -> i64) -> String {
     } else {
         format!("{d} {} {y} {clock}", MONTHS[m as usize - 1])
     }
+}
+
+/// `at` (milliseconds since 1970) in local time as a sentence says it, the same whenever it is read (it is logged):
+/// "13 Oct 2026 at 18:40".
+pub(crate) fn moment(at_ms: u64) -> String {
+    on_day_at(at_ms, local_offset_secs)
+}
+
+fn on_day_at(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
+    let secs = (at_ms / 1000) as i64;
+    let local = secs + offset(secs);
+    let (day, time) = (local.div_euclid(86_400), local.rem_euclid(86_400));
+    let (y, m, d) = civil(day);
+    format!(
+        "{d} {} {y} at {:02}:{:02}",
+        MONTHS[m as usize - 1],
+        time / 3600,
+        time % 3600 / 60
+    )
 }
 
 /// `at` to the second, in local time, with the offset it had then.
@@ -509,6 +551,15 @@ mod tests {
             exact(NOW, |_| -(9 * HOUR + 30 * 60)),
             "19 Oct 2026, 01:14:29 (UTC-09:30)"
         );
+    }
+
+    #[test]
+    fn a_moment_in_a_sentence_has_its_date_and_minute() {
+        // 19 Oct 2026, 09:07:23 UTC.
+        let at = 1_792_400_843_000;
+        assert_eq!(on_day_at(at, |_| 0), "19 Oct 2026 at 09:07");
+        assert_eq!(on_day_at(at, |_| 2 * 3600), "19 Oct 2026 at 11:07");
+        assert_eq!(on_day_at(at, |_| -10 * 3600), "18 Oct 2026 at 23:07");
     }
 
     #[test]
@@ -764,8 +815,26 @@ mod tests {
         assert_eq!((entry.backups.len(), entry.more_backups), (MAX_LINES, 0));
     }
 
+    /// The files next to the log that hold an unreadable one, set aside.
+    fn set_aside(backups: &Path) -> Vec<PathBuf> {
+        let dir = backups.parent().unwrap();
+        let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("activity.unreadable-"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
-    fn a_log_too_large_to_read_is_left_alone() {
+    fn a_log_too_large_to_read_is_set_aside_whole_and_a_new_one_started() {
+        // Cross-review of the activity log, R2: a log that cannot be read was appended to, and reported as
+        // unreadable, for ever. Nothing in it is lost: it is moved aside as it is.
         let dir = tempfile::tempdir().unwrap();
         let backups = dir.path().join("backups");
         let line = format!(
@@ -775,10 +844,51 @@ mod tests {
         let old = line.repeat(READ_LIMIT as usize / line.len() + 1);
         std::fs::write(log_path(&backups), &old).unwrap();
         record(&backups, &summary("Turn off alpha"), None, &[]).unwrap();
-        let now = std::fs::read_to_string(log_path(&backups)).unwrap();
-        assert!(now.starts_with(&old), "nothing that was there is lost");
-        assert_eq!(now.lines().count(), old.lines().count() + 1);
-        assert!(load(&backups).problem.is_some());
+        let [aside] = &set_aside(&backups)[..] else {
+            panic!("set aside once: {:?}", set_aside(&backups));
+        };
+        assert_eq!(
+            std::fs::read_to_string(aside).unwrap(),
+            old,
+            "nothing that was there is lost"
+        );
+        let log = load(&backups);
+        assert_eq!(log.problem, None, "{log:?}");
+        let [entry] = &log.entries[..] else {
+            panic!("the new log has the new change: {log:?}");
+        };
+        assert_eq!(entry.summary, ["Turn off alpha"]);
+    }
+
+    #[test]
+    fn a_log_that_is_not_text_is_set_aside_when_read_and_says_where() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let junk = [0xffu8, 0xfe, b'\n', 0x80, b'{'];
+        std::fs::write(log_path(&backups), junk).unwrap();
+        let log = load(&backups);
+        let [aside] = &set_aside(&backups)[..] else {
+            panic!("set aside once: {:?}", set_aside(&backups));
+        };
+        assert_eq!(std::fs::read(aside).unwrap(), junk);
+        assert!(!log_path(&backups).exists());
+        let problem = log.problem.unwrap();
+        assert!(
+            problem.starts_with("The activity log could not be read"),
+            "{problem}"
+        );
+        assert!(problem.contains(&aside.display().to_string()), "{problem}");
+        // Said once: the next look finds a new, empty log, and the next change starts it.
+        assert_eq!(load(&backups), Activity::default());
+        record(&backups, &summary("Turn on beta"), None, &[]).unwrap();
+        let log = load(&backups);
+        assert_eq!(log.problem, None);
+        assert_eq!(log.entries.len(), 1);
+        // A second unreadable log does not replace the first one set aside.
+        std::fs::write(log_path(&backups), junk).unwrap();
+        load(&backups);
+        assert_eq!(set_aside(&backups).len(), 2);
     }
 
     #[cfg(unix)]

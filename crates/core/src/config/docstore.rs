@@ -1573,7 +1573,6 @@ fn edit_servers<'o>(
     let mut removed = Vec::new();
     let mut renamed: Vec<(usize, &str)> = Vec::new();
     let mut added: Vec<(&str, Value)> = Vec::new();
-    let mut changed_existing = false;
     for op in ops {
         let name = op.server_name();
         let index = object.and_then(|o| {
@@ -1651,7 +1650,6 @@ fn edit_servers<'o>(
             )));
         }
         found.push(*op);
-        changed_existing = true;
         lines.push(header.clone());
         match op {
             Op::RemoveServer { .. } => {
@@ -1710,12 +1708,10 @@ fn edit_servers<'o>(
     if let (Some(object), false) = (object, removed.is_empty()) {
         splices.extend(remove_members(object, &removed));
     }
+    // Added after the last member, whatever is done to it: its replacement or removal ends where the addition
+    // starts, so the edits meet without overlapping. When every member goes, they would overlap, and `finish`
+    // refuses the plan.
     if !added.is_empty() {
-        if changed_existing {
-            return Err(invalid(
-                "adding a server and changing another in the same list is not supported in one plan".to_owned(),
-            ));
-        }
         let keyed = |(name, value): (&str, Value)| -> Result<(String, Value), StoreError> {
             Ok((
                 serde_json::to_string(name).map_err(|e| invalid(e.to_string()))?,
@@ -2403,6 +2399,75 @@ mod tests {
         other["numStartups"] = json!(13);
         std::fs::write(&f.store.path, pretty(&other)).unwrap();
         assert_eq!(f.store.still_applies(&preview), Ok(()));
+    }
+
+    #[test]
+    fn servers_can_be_added_and_others_changed_in_one_list_in_one_plan() {
+        // A restore puts back a server and changes another one back, in the same list: the added one goes after the
+        // last member, whatever happens to that member.
+        let entry = |c: &str| json!({"command": c});
+        let doc = |servers: Value| {
+            let mut d = sample();
+            d["mcpServers"] = servers;
+            d
+        };
+        let replace = |name: &str, c: &str| Op::ReplaceServer {
+            project: None,
+            name: name.into(),
+            entry: entry(c),
+        };
+        let remove = |name: &str| Op::RemoveServer {
+            project: None,
+            name: name.into(),
+        };
+        let add = |name: &str, c: &str| Op::AddServer {
+            project: None,
+            name: name.into(),
+            entry: entry(c),
+        };
+        let three = json!({"a": entry("a"), "b": entry("b"), "c": entry("c")});
+        let cases = [
+            (
+                vec![replace("c", "c2"), add("d", "d")],
+                json!({"a": entry("a"), "b": entry("b"), "c": entry("c2"), "d": entry("d")}),
+            ),
+            (
+                vec![add("d", "d"), remove("b"), replace("a", "a2")],
+                json!({"a": entry("a2"), "c": entry("c"), "d": entry("d")}),
+            ),
+            (
+                vec![remove("c"), add("d", "d"), replace("b", "b2")],
+                json!({"a": entry("a"), "b": entry("b2"), "d": entry("d")}),
+            ),
+        ];
+        for (ops, servers) in cases {
+            for text in [pretty(&doc(three.clone())), doc(three.clone()).to_string()] {
+                let f = Fixture::new(&text);
+                let plan = f.store.prepare(ops.clone()).unwrap();
+                f.store.apply(&plan).unwrap();
+                assert_eq!(f.json(), doc(servers.clone()), "{ops:?}");
+                let keys: Vec<_> = f.json()["mcpServers"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect();
+                let expected: Vec<_> = servers.as_object().unwrap().keys().cloned().collect();
+                assert_eq!(keys, expected, "{ops:?}");
+                if text.contains('\n') {
+                    assert_eq!(f.text(), pretty(&doc(servers.clone())), "layout kept");
+                }
+                // Checked again after the write, it is all in place: nothing to redo.
+                assert_eq!(
+                    f.store.prepare(ops.clone()).map(|p| p.is_empty()).ok(),
+                    None,
+                    "the add is refused, the name is taken"
+                );
+            }
+        }
+        // Every member removed and one added, the edits would overlap: refused, the file left as it is.
+        let f = Fixture::new(&pretty(&doc(json!({"a": entry("a")}))));
+        assert!(f.store.prepare(vec![remove("a"), add("d", "d")]).is_err());
     }
 
     fn rename_disabled(project: &str, name: &str, new_name: &str) -> Op {
