@@ -16,4 +16,8 @@ disallowed-methods = [
   { path = "std::net::TcpStream::connect", reason = "UI does no network IO; use klefki_core::api" },
   { path = "std::net::UdpSocket::bind", reason = "UI does no network IO; use klefki_core::api" },
   { path = "std::net::TcpListener::bind", reason = "UI does no network IO; use klefki_core::api" },
+  { path = "std::net::TcpStream::connect_timeout", reason = "UI does no network IO; use klefki_core::api" },
+  { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "UI does no network IO (a DNS lookup); use klefki_core::api" },
+  { path = "std::os::unix::net::UnixListener::bind", reason = "UI does no IO; use klefki_core::api" },
+  { path = "std::os::unix::net::UnixStream::connect", reason = "UI does no IO; use klefki_core::api" },
 ]
