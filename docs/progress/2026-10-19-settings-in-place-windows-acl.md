@@ -13,6 +13,8 @@ Goal: part 2 of the docstore leftovers from PR #24 (part 1, the lock, is `2026-1
 ## Checks
 - Full verify (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`) on this branch from main e5583c6 (with #27 and #28): exit 0; core 640, app 305, cli 17 + 22, 0 failed; deny "advisories ok, bans ok, licenses ok, sources ok".
 - `cargo clippy -p klefki-core --all-targets --target x86_64-pc-windows-gnu -- -D warnings`: exit 0.
+- CI on 15eb385: green on Windows, macOS and Linux; the Windows log shows `backups_and_their_folder_are_owner_only_on_windows ... ok` (core 635 there).
+- Cross-review (another thread, review on #30): ready, nothing blocking; each `unsafe` block checked. Optional O1 folded in as a comment: unlike Unix, folders made above the private one keep their inherited access.
 
 ## Left open
 - Existing backup folders on Windows keep their old access list; new backups in them are owner-only.

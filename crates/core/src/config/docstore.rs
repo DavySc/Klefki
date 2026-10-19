@@ -791,7 +791,8 @@ pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// The folder is made owner-only when this makes it; what is made in it inherits that. A folder that was already
-/// there is left as it is, as on Unix.
+/// there is left as it is, as on Unix. Unlike Unix, folders made above it on the way keep their inherited access:
+/// nothing private lives in them.
 #[cfg(windows)]
 pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     if path.is_dir() {
