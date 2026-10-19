@@ -14,6 +14,7 @@ pub(crate) enum HintKind {
     HostNotFound,
     CertificateProblem,
     TimedOut,
+    ProxyRefused,
     NeedsAuthentication,
     Forbidden,
     UrlNotFound,
@@ -26,7 +27,7 @@ pub(crate) enum HintKind {
 
 impl HintKind {
     #[cfg(test)]
-    pub(crate) const ALL: [HintKind; 16] = [
+    pub(crate) const ALL: [HintKind; 17] = [
         HintKind::CommandNotFound,
         HintKind::MissingFile,
         HintKind::PackageInstallFailed,
@@ -35,6 +36,7 @@ impl HintKind {
         HintKind::HostNotFound,
         HintKind::CertificateProblem,
         HintKind::TimedOut,
+        HintKind::ProxyRefused,
         HintKind::NeedsAuthentication,
         HintKind::Forbidden,
         HintKind::UrlNotFound,
@@ -55,6 +57,7 @@ impl HintKind {
             Self::HostNotFound => "Can't reach the server's host",
             Self::CertificateProblem => "The server's certificate is not trusted",
             Self::TimedOut => "The server took too long to answer",
+            Self::ProxyRefused => "Your proxy refused the connection",
             Self::NeedsAuthentication => "The server needs you to sign in",
             Self::Forbidden => "The server refused access",
             Self::UrlNotFound => "The URL was not found on the server",
@@ -100,6 +103,10 @@ impl HintKind {
                 "The server may be slow to start, or blocked by a firewall or proxy.",
                 "Try again, and check the server's own logs.",
             ],
+            Self::ProxyRefused => &[
+                "A proxy between you and the server (HTTPS_PROXY) turned the connection away; the server never saw it.",
+                "Check that the proxy allows this host, and that you are signed in to the proxy if it asks for that.",
+            ],
             Self::NeedsAuthentication => &[
                 "The server rejected the request, or no token is stored for it.",
                 "Use Sign in again: Claude Code opens the sign-in page in your browser.",
@@ -142,6 +149,7 @@ impl HintKind {
             Self::HostNotFound => Some((Focus::Host, "this name could not be looked up")),
             Self::CertificateProblem => Some((Focus::Host, "its certificate is not trusted")),
             Self::TimedOut => Some((Focus::Host, "no answer in time")),
+            Self::ProxyRefused => Some((Focus::Host, "your proxy would not connect here")),
             Self::UrlNotFound => Some((Focus::Path, "not found on this server")),
             _ => None,
         }
@@ -165,6 +173,7 @@ impl HintKind {
                 "CERT_UNTRUSTED",
             ],
             Self::TimedOut => &["ETIMEDOUT", "ESOCKETTIMEDOUT"],
+            Self::ProxyRefused => &["ERR_PROXY_TUNNEL", "ERR_PROXY_CONNECTION_FAILED", "407"],
             Self::NeedsAuthentication => &["401"],
             Self::Forbidden => &["403"],
             Self::UrlNotFound => &["404"],
@@ -225,6 +234,11 @@ const PATTERNS: &[(HintKind, &str)] = &[
         HintKind::TimedOut,
         r"(?i)ETIMEDOUT|ESOCKETTIMEDOUT|timed out|timeout after|request timeout",
     ),
+    // Before the server's own refusals: behind a proxy, a 403 or "authentication required" can be the proxy's.
+    (
+        HintKind::ProxyRefused,
+        r"(?i)ERR_PROXY_TUNNEL|ERR_PROXY_CONNECTION_FAILED|proxy refused|proxy authentication required|when HTTP Tunneling",
+    ),
     (
         HintKind::NeedsAuthentication,
         r"(?i)\b401\b|unauthorized|no token data found|needs[- ]auth|invalid_token|authentication required|www-authenticate",
@@ -267,7 +281,8 @@ pub(crate) fn hints_for(text: &str) -> Vec<HintKind> {
     let transport_failure = has(HintKind::ConnectionRefused)
         || has(HintKind::HostNotFound)
         || has(HintKind::CertificateProblem)
-        || has(HintKind::TimedOut);
+        || has(HintKind::TimedOut)
+        || has(HintKind::ProxyRefused);
     let launch_failure = has(HintKind::CommandNotFound)
         || has(HintKind::MissingFile)
         || has(HintKind::PackageInstallFailed)
@@ -279,6 +294,8 @@ pub(crate) fn hints_for(text: &str) -> Vec<HintKind> {
         .filter(|kind| match kind {
             // "No token data found" is logged for every HTTP server before it connects.
             HintKind::NeedsAuthentication => !transport_failure,
+            // The proxy's 403, not the server's.
+            HintKind::Forbidden => !has(HintKind::ProxyRefused),
             // A package manager's 404 is about the package, not about the server's URL.
             HintKind::UrlNotFound => !has(HintKind::PackageInstallFailed),
             // "Connection closed" is only news when nothing explains why the process exited.
@@ -357,6 +374,26 @@ mod tests {
         ] {
             assert_eq!(kinds(text), vec![want], "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_proxy_that_refuses_is_not_blamed_on_the_server() {
+        // Seen in the real app behind a proxy (Claude Code 2.1.303): the 403 is the proxy's, but the hint said the
+        // server refused access and to check the account.
+        let real = "MCP server \"github\": No token data found\nMCP server \"github\": HTTP Connection failed: ERR_PROXY_TUNNEL: Proxy refused to open a tunnel: 403 Forbidden";
+        assert_eq!(kinds(real), vec![ProxyRefused]);
+        assert_eq!(ProxyRefused.code_in(real), Some("ERR_PROXY_TUNNEL"));
+        for text in [
+            "ERR_PROXY_CONNECTION_FAILED",
+            "HTTP/1.1 407 Proxy Authentication Required",
+            "Proxy response (403) !== 200 when HTTP Tunneling",
+        ] {
+            assert_eq!(kinds(text), vec![ProxyRefused], "{text:?}");
+        }
+        // A server's own 403, with no proxy in the story, is still the server's; a bare 407 (a line number, say) is
+        // not taken for a proxy.
+        assert_eq!(kinds("HTTP 403 Forbidden"), vec![Forbidden]);
+        assert_eq!(kinds("at server.js:407:12"), vec![]);
     }
 
     #[test]

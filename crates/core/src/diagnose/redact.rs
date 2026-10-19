@@ -6,8 +6,8 @@ use std::sync::LazyLock;
 
 /// Applied in order. Each replacement keeps the label and hides the value, so the text stays readable. A quote may
 /// arrive escaped (`\"`), once or more: the client logs a server's stderr inside a quoted string, JSON the server
-/// printed included, and a server may log JSON inside JSON. A value that opens with a quote is hidden up to the next
-/// quote, spaces included.
+/// printed included, and a server may log JSON inside JSON. A value that opens with a quote is hidden up to its
+/// closing quote, spaces included: past `\"` when the quote was plain, up to the next quote when it was escaped.
 const RULES: &[(&str, &str)] = &[
     // Whole header and environment objects, quoted (JSON) and bare (`Environment: {...}`).
     (
@@ -17,14 +17,14 @@ const RULES: &[(&str, &str)] = &[
     (r#"(?i)(\b(?:headers|env)\s*:\s*)\{[^{}]*\}"#, "${1}{***}"),
     // Authentication headers: everything after the name up to the end of the value.
     (
-        r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)((?:\\*["'])?\s*[:=]\s*)(?:(\\*")[^"\r\n]*|(\\*')[^'\r\n]*|[^"',}\r\n]+)"#,
-        "${1}${2}${3}${4}***",
+        r#"(?i)\b(authorization|proxy-authorization|x-api-key|api-key|cookie|set-cookie)((?:\\*["'])?\s*[:=]\s*)(?:(")(?:[^"\\\r\n]|\\.)*|(\\+")[^"\r\n]*|(\\*')[^'\r\n]*|[^"',}\r\n]+)"#,
+        "${1}${2}${3}${4}${5}***",
     ),
     (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}", "Bearer ***"),
     // Names that say they hold a secret, whatever the separator.
     (
-        r#"(?i)\b([a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|code[_-]?verifier)(?:\\*["'])?\s*[:=]\s*)(?:(\\*")[^"\r\n]*|(\\*')[^'\r\n]*|[^\s"',&}]+)"#,
-        "${1}${2}${3}***",
+        r#"(?i)\b([a-z0-9_-]*(?:token|secret|password|passwd|api[_-]?key|apikey|private[_-]?key|code[_-]?verifier)(?:\\*["'])?\s*[:=]\s*)(?:(")(?:[^"\\\r\n]|\\.)*|(\\+")[^"\r\n]*|(\\*')[^'\r\n]*|[^\s"',&}]+)"#,
+        "${1}${2}${3}${4}***",
     ),
     // OAuth redirect parameters.
     (
@@ -186,6 +186,8 @@ mod tests {
             r#"{"password":"correct horse battery"}"#,
             r#"{\"password\":\"correct horse battery\"}"#,
             "password='correct horse battery'",
+            // Review of #27, round 2: an escaped quote inside a plain-quoted value.
+            r#"{"password":"x\"y horse battery"}"#,
             r#"{"Cookie":"sid=1, correct horse battery"}"#,
         ] {
             for word in ["horse", "battery"] {
