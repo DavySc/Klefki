@@ -5,8 +5,6 @@ name: release
 on:
   push:
     tags: ["v*"]
-    # TEMPORARY: one trial run before merge; removed in the next commit.
-    branches: [claude/packaging-release-407cg1]
   workflow_dispatch:
 
 permissions:
