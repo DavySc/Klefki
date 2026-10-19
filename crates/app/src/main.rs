@@ -10,8 +10,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Klefki")
-            .with_inner_size([1200.0, 720.0])
-            .with_min_inner_size([800.0, 480.0]),
+            .with_inner_size(shell::OPENING_SIZE)
+            .with_min_inner_size(shell::SMALLEST_SIZE),
         ..Default::default()
     };
     eframe::run_native(

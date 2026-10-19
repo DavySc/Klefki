@@ -181,6 +181,11 @@ struct Outcome {
 /// How long a success message stays.
 const SUCCESS_SECONDS: f64 = 4.0;
 
+/// The size Klefki opens at.
+pub const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
+/// The smallest it can be made; also the room the opening size gives at 150 % zoom.
+pub const SMALLEST_SIZE: egui::Vec2 = egui::vec2(800.0, 480.0);
+
 enum GridRow {
     Group(Group),
     Server(usize),
@@ -217,6 +222,12 @@ pub struct ShellApp {
     on_screen_now: Vec<usize>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
+    /// A diagnosis that came in for the server shown on its Status tab, to bring into view once drawn.
+    reveal_diagnosis: Option<ServerId>,
+    /// The detail panel's tab drew a definition that can be saved: the save bar goes under it this frame.
+    save_bar_wanted: bool,
+    /// How tall the save bar was last frame (none: 0), so the scroll area above it leaves that much room.
+    save_bar_height: f32,
     cli_version: Option<String>,
     cli_problem: Option<String>,
     /// A change the engine has prepared and the user has not yet confirmed.
@@ -273,6 +284,9 @@ impl ShellApp {
             explained: None,
             legacy_cache: None,
             diagnoses: HashMap::new(),
+            reveal_diagnosis: None,
+            save_bar_wanted: false,
+            save_bar_height: 0.0,
             cli_version: None,
             cli_problem: None,
             plan: None,
@@ -381,6 +395,13 @@ impl ShellApp {
             }
             Event::Diagnosis { id, diagnosis } => {
                 if self.snapshot.servers.iter().any(|r| r.is(&id)) {
+                    // It is drawn under the status and its explanation, often below the window: brought into view
+                    // when it is for the server being looked at, and left where it is otherwise.
+                    if self.tab == DetailTab::Status
+                        && self.single_selected().is_some_and(|s| s.is(&id))
+                    {
+                        self.reveal_diagnosis = Some(id.clone());
+                    }
                     self.diagnoses.insert(id, diagnosis);
                 }
             }
@@ -715,28 +736,12 @@ impl ShellApp {
                 .default_size((width * 0.34).clamp(360.0, 640.0))
                 .min_size(280.0)
                 .max_size((width * 0.5).max(460.0))
-                // The right margin is mostly inside the scroll area, where the scroll bar shows, so that the bar
-                // never covers a button at the panel's edge.
+                // The right margin is mostly inside, where the scroll bar shows (`scroll_gutter`).
                 .frame(Frame::new().fill(pal.panel).inner_margin(Margin {
-                    right: 12 - DETAIL_SCROLL_BAR,
+                    right: 12 - scroll_gutter(ui.style()).min(12),
                     ..Margin::same(12)
                 }))
-                .show(ui, |ui| {
-                    // A diagnosis or an open form is often taller than the window. Each selection and tab keeps
-                    // a place of its own, so another server's details start at the top.
-                    let shown = (self.selected.first().copied(), self.tab);
-                    egui::ScrollArea::vertical()
-                        .id_salt(("detail", shown))
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            Frame::new()
-                                .inner_margin(Margin {
-                                    right: DETAIL_SCROLL_BAR,
-                                    ..Margin::ZERO
-                                })
-                                .show(ui, |ui| self.detail(ui));
-                        });
-                });
+                .show(ui, |ui| self.detail(ui));
         }
         self.plan_dialog(&ctx);
         self.duplicate_dialog(&ctx);
@@ -2368,48 +2373,51 @@ impl ShellApp {
 
     fn detail(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        // Long values must wrap inside the panel; without a cap a grid cell grows to fit its text, and the whole
-        // panel grows with it.
-        let col_width = (ui.available_width() - 110.0).max(100.0);
+        let gutter = Margin {
+            right: scroll_gutter(ui.style()),
+            ..Margin::ZERO
+        };
         let Some(&i) = self
             .selected
             .iter()
             .next()
             .filter(|_| self.selected.len() == 1)
         else {
-            ui.add_space(24.0);
-            ui.vertical_centered(|ui| {
-                if self.selected.is_empty() {
-                    ui.label(
-                        RichText::new(icon::PLUGS_CONNECTED)
-                            .size(28.0)
-                            .color(pal.text_muted),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Select a connection").strong());
-                } else {
-                    ui.label(
-                        RichText::new(format!("{} connections selected", self.selected.len()))
-                            .strong(),
-                    );
-                    ui.label(
-                        RichText::new("Turn them on or off, or delete them, together.")
-                            .color(pal.text_muted),
-                    );
-                }
-                ui.add_space(12.0);
-                for (keys, what) in [
-                    ("↑ ↓".to_owned(), "move through the list"),
-                    (shortcut("K"), "all commands"),
-                    (shortcut("F"), "filter"),
-                    ("F5".to_owned(), "check every server again"),
-                ] {
-                    ui.horizontal(|ui| {
-                        ui.add_space((ui.available_width() - 240.0).max(0.0) / 2.0);
-                        ui.label(RichText::new(keys).monospace().color(pal.text));
-                        ui.label(RichText::new(what).color(pal.text_muted));
-                    });
-                }
+            Frame::new().inner_margin(gutter).show(ui, |ui| {
+                ui.add_space(24.0);
+                ui.vertical_centered(|ui| {
+                    if self.selected.is_empty() {
+                        ui.label(
+                            RichText::new(icon::PLUGS_CONNECTED)
+                                .size(28.0)
+                                .color(pal.text_muted),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Select a connection").strong());
+                    } else {
+                        ui.label(
+                            RichText::new(format!("{} connections selected", self.selected.len()))
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new("Turn them on or off, or delete them, together.")
+                                .color(pal.text_muted),
+                        );
+                    }
+                    ui.add_space(12.0);
+                    for (keys, what) in [
+                        ("↑ ↓".to_owned(), "move through the list"),
+                        (shortcut("K"), "all commands"),
+                        (shortcut("F"), "filter"),
+                        ("F5".to_owned(), "check every server again"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.add_space((ui.available_width() - 240.0).max(0.0) / 2.0);
+                            ui.label(RichText::new(keys).monospace().color(pal.text));
+                            ui.label(RichText::new(what).color(pal.text_muted));
+                        });
+                    }
+                });
             });
             return;
         };
@@ -2435,17 +2443,65 @@ impl ShellApp {
                 built
             }
         };
-        ui.label(RichText::new(&s.name).heading());
-        ui.horizontal(|ui| {
-            flat_items(ui);
-            // Compact pills: smaller text and padding, so the tabs sit on one line and do not shout.
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for (tab, title) in DetailTab::ALL {
-                ui.selectable_value(&mut self.tab, tab, RichText::new(title).size(13.5));
-            }
+        // The name and the tabs stay in view while what is under them scrolls.
+        Frame::new().inner_margin(gutter).show(ui, |ui| {
+            ui.label(RichText::new(&s.name).heading());
+            ui.horizontal(|ui| {
+                flat_items(ui);
+                // Compact pills: smaller text and padding, so the tabs sit on one line and do not shout.
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (tab, title) in DetailTab::ALL {
+                    ui.selectable_value(&mut self.tab, tab, RichText::new(title).size(13.5));
+                }
+            });
+            ui.separator();
         });
-        ui.separator();
+        // A diagnosis or an open form is often taller than the window. Each server and tab keeps a place of its
+        // own, by identity: rows are kept by position, which another server added or removed above changes. The
+        // save bar's room is left below, as tall as it was last frame.
+        self.save_bar_wanted = false;
+        egui::ScrollArea::vertical()
+            .id_salt(("detail", &s.connection, self.tab))
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - self.save_bar_height).max(0.0))
+            .content_margin(gutter)
+            .show(ui, |ui| {
+                self.detail_tab(ui, i, s, status, detail.as_deref(), explanation.as_deref());
+                bring_focus_into_view(ui);
+            });
+        // Under the form rather than at its end, so it, and why saving is blocked, stay in view; drawn after the
+        // form, so Tab reaches it last. A change in its height is laid out again before the frame is shown.
+        let height = if self.save_bar_wanted {
+            let bar = Frame::new().inner_margin(gutter).show(ui, |ui| {
+                ui.separator();
+                self.save_bar(ui, s);
+            });
+            bar.response.rect.height() + ui.spacing().item_spacing.y
+        } else {
+            0.0
+        };
+        if (height - self.save_bar_height).abs() > 0.5 {
+            self.save_bar_height = height;
+            ui.ctx()
+                .request_discard("the detail panel's save bar changed height");
+        }
+    }
+
+    /// The detail panel's open tab for the row `i`, `s`, under the name and tabs.
+    fn detail_tab(
+        &mut self,
+        ui: &mut Ui,
+        i: usize,
+        s: &ServerRow,
+        status: Status,
+        detail: Option<&str>,
+        explanation: Option<&Explanation>,
+    ) {
+        let pal = theme::palette(ui.ctx());
+        // Long values must wrap inside the panel; without a cap a grid cell grows to fit its text, and the whole
+        // panel grows with it.
+        let col_width = (ui.available_width() - 110.0).max(100.0);
         match self.tab {
             DetailTab::General => {
                 egui::Grid::new("general")
@@ -2552,14 +2608,10 @@ impl ShellApp {
                         ui.end_row();
                         if explanation.is_none() {
                             ui.label(RichText::new("Detail").color(pal.text_muted));
-                            ui.add(egui::Label::new(detail.as_deref().unwrap_or("-")).wrap());
+                            ui.add(egui::Label::new(detail.unwrap_or("-")).wrap());
                             ui.end_row();
                         }
                     });
-                if let Some(explanation) = &explanation {
-                    ui.add_space(10.0);
-                    explanation.show(ui, ui.id().with("status"));
-                }
                 ui.add_space(8.0);
                 if s.scope == Scope::Project && s.transport == TransportKind::Stdio {
                     ui.label(
@@ -2603,8 +2655,16 @@ impl ShellApp {
                     self.send(Command::Diagnose(s.id()));
                 }
                 });
+                // Under the actions, so they are in view without scrolling, even at the smallest window.
+                if let Some(explanation) = &explanation {
+                    ui.add_space(10.0);
+                    explanation.show(ui, ui.id().with("status"));
+                }
                 if let Some(d) = self.diagnoses.get(&s.id()) {
-                    diagnosis_panel(ui, s, d);
+                    let shown = ui.scope(|ui| diagnosis_panel(ui, s, d)).response;
+                    if self.reveal_diagnosis.take_if(|id| s.is(id)).is_some() {
+                        shown.scroll_to_me(Some(Align::TOP));
+                    }
                 }
             }
             DetailTab::Auth => {
@@ -2723,8 +2783,7 @@ impl ShellApp {
                 .desired_width(f32::INFINITY)
                 .desired_rows(14),
         );
-        ui.add_space(6.0);
-        self.save_bar(ui, s);
+        self.save_bar_wanted = true;
     }
 
     /// The OAuth client secret of `s`: whether the system's secret store holds one, and setting, replacing or
@@ -2982,8 +3041,7 @@ impl ShellApp {
                 f.args.push(String::new());
             }
         }
-        ui.add_space(8.0);
-        self.save_bar(ui, s);
+        self.save_bar_wanted = true;
     }
 
     /// The Env tab's form: environment variables for a command, headers for an address. Values that are there
@@ -3070,8 +3128,7 @@ impl ShellApp {
         if ui.small_button(format!("Add {noun}")).clicked() {
             pairs.push((String::new(), String::new()));
         }
-        ui.add_space(8.0);
-        self.save_bar(ui, s);
+        self.save_bar_wanted = true;
     }
 
     /// What stops saving, then Review and save… and Revert, and on the right the way to the JSON and back.
@@ -3090,17 +3147,16 @@ impl ShellApp {
             return;
         };
         if let Some(problem) = problem {
-            let mut c = problem.chars();
-            let shown: String = c
-                .next()
-                .map(|f| f.to_uppercase().chain(c).collect())
-                .unwrap_or_default();
-            ui.add(egui::Label::new(RichText::new(shown).color(pal.danger)).wrap());
+            ui.add(egui::Label::new(RichText::new(sentence(problem)).color(pal.danger)).wrap());
         }
         let edited = text != original;
         let ready = edited && problem.is_none() && can_prepare;
         let mut review = None;
-        ui.horizontal(|ui| {
+        // The way to the JSON is quiet, after the buttons: the fields are the way to edit, the JSON the way out when
+        // they fall short. One line, which wraps in a narrow panel: the bar stays in view, so it is kept short.
+        let quiet =
+            |text: &str| egui::Button::new(RichText::new(text).color(pal.link)).frame(false);
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(ready, egui::Button::new("Review and save…"))
                 .clicked()
@@ -3113,26 +3169,24 @@ impl ShellApp {
             {
                 *text = original.clone();
             }
-        });
-        // Quiet, on a line of its own under the buttons (beside them it would not fit a narrow panel): the fields
-        // are the way to edit, the JSON the way out when they fall short.
-        let quiet =
-            |text: &str| egui::Button::new(RichText::new(text).color(pal.link)).frame(false);
-        if *as_json || form.is_err() {
-            if ui
-                .add_enabled(form.is_ok(), quiet("Back to the form"))
-                .on_disabled_hover_text("The form cannot show the JSON as it is now: see above")
+            if *as_json || form.is_err() {
+                if ui
+                    .add_enabled(form.is_ok(), quiet("Back to the form"))
+                    .on_disabled_hover_text("The form cannot show the JSON as it is now: see above")
+                    .clicked()
+                {
+                    *as_json = false;
+                }
+            } else if ui
+                .add(quiet("Edit as JSON"))
+                .on_hover_text(
+                    "Every key of the definition, including those the form does not show",
+                )
                 .clicked()
             {
-                *as_json = false;
+                *as_json = true;
             }
-        } else if ui
-            .add(quiet("Edit as JSON"))
-            .on_hover_text("Every key of the definition, including those the form does not show")
-            .clicked()
-        {
-            *as_json = true;
-        }
+        });
         if let Some(json) = review {
             self.prepare(vec![Change::Replace { id: s.id(), json }]);
         }
@@ -3270,8 +3324,25 @@ fn search_id() -> egui::Id {
     egui::Id::new("search")
 }
 
-/// Room kept free for the detail panel's scroll bar: egui's bar at its widest, when the pointer is on it.
-const DETAIL_SCROLL_BAR: i8 = 10;
+/// Room kept free at the right of the detail panel's content: its scroll bar floats over the content and, at its
+/// widest when the pointer is on it, takes the clicks there.
+fn scroll_gutter(style: &egui::Style) -> i8 {
+    let bar = &style.spacing.scroll;
+    (bar.bar_width + bar.bar_outer_margin).ceil() as i8
+}
+
+/// Scrolls the scroll area `ui` is in to a widget in it that has just gained keyboard focus. egui does not, as GTK
+/// and WinUI do, so Tab could take focus below the window. Focus gained anywhere else is left to its own place.
+fn bring_focus_into_view(ui: &Ui) {
+    if let Some(r) = ui
+        .memory(|m| m.focused())
+        .and_then(|id| ui.ctx().read_response(id))
+        && r.gained_focus()
+        && ui.min_rect().contains_rect(r.rect)
+    {
+        ui.scroll_to_rect(r.rect, None);
+    }
+}
 
 /// What the Fix casing dialog holds: the servers that differ only in case, and the spelling they are to get.
 struct CasingForm {
@@ -4301,13 +4372,17 @@ pub(crate) fn settle(ctx: &egui::Context, dialog: &egui::Response) {
 
 /// Why `name` cannot be a server's name, as a sentence; `None` when it can.
 fn name_problem(name: &str) -> Option<String> {
-    ServerName::parse(name).err().map(|e| {
-        let e = e.to_string();
-        let mut c = e.chars();
-        c.next()
-            .map(|f| f.to_uppercase().chain(c).collect::<String>())
-            .unwrap_or(e)
-    })
+    ServerName::parse(name)
+        .err()
+        .map(|e| sentence(&e.to_string()))
+}
+
+/// `text` with its first letter made upper case, as a sentence starts.
+fn sentence(text: &str) -> String {
+    let mut c = text.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 /// `a`, `a and b`, `a, b and c`; more than three are counted: `5 projects`.
@@ -5857,25 +5932,51 @@ mod tests {
         h.get_by_label_contains("the client wrote no debug output");
     }
 
-    /// The size the app opens at (`main.rs`).
-    const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
+    /// Both sizes the detail panel must work at: the one Klefki opens at, and the smallest it can be made (which is
+    /// also the room the opening size gives at 150 % zoom).
+    const SIZES: [egui::Vec2; 2] = [OPENING_SIZE, SMALLEST_SIZE];
 
-    /// Turns the wheel over the detail panel, a notch at a time, until `label` is inside the window, and says
-    /// where it was at first and where it ended up. It must start outside, or the test proves nothing.
+    /// Where the detail panel's content can be seen: the height of its scroll bar, the rightmost one, when it has
+    /// one; otherwise under its tabs to the bottom of the window.
+    fn detail_view(h: &Harness<'static, ShellApp>, size: egui::Vec2) -> egui::Rect {
+        use egui::accesskit::Role;
+        let bar = h
+            .query_all_by_role(Role::ScrollBar)
+            .map(|b| b.rect())
+            .max_by(|a, b| a.right().total_cmp(&b.right()))
+            .filter(|b| b.right() > size.x - 40.0);
+        let (top, bottom) = match bar {
+            Some(b) => (b.top(), b.bottom()),
+            None => (
+                h.get_by_role_and_label(Role::Button, "General")
+                    .rect()
+                    .bottom(),
+                size.y,
+            ),
+        };
+        egui::Rect::from_min_max(
+            egui::pos2(0.0, top.max(0.0)),
+            egui::pos2(size.x, bottom.min(size.y)),
+        )
+    }
+
+    /// Turns the wheel over the detail panel, a notch at a time, until `label` can be seen, and says where it was at
+    /// first and where it ended up. It must start out of view, or the test proves nothing.
     fn wheel_the_detail_panel_to(
         h: &mut Harness<'static, ShellApp>,
+        size: egui::Vec2,
         label: &str,
     ) -> (egui::Rect, egui::Rect) {
-        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, OPENING_SIZE);
         let first = h.get_by_label(label).rect();
+        let view = detail_view(h, size);
         assert!(
-            !window.contains_rect(first),
-            "{label} is already in view at {first:?}; the panel must be taller than the window"
+            !view.contains_rect(first),
+            "{label} is already in view at {first:?} in {view:?}; the panel must be taller than that"
         );
-        let over = egui::pos2(first.center().x, window.center().y);
+        let over = egui::pos2(first.center().x, view.center().y);
         let mut rect = first;
-        for _ in 0..40 {
-            if window.contains_rect(rect) {
+        for _ in 0..60 {
+            if detail_view(h, size).contains_rect(rect) {
                 break;
             }
             h.event(egui::Event::PointerMoved(over));
@@ -5893,15 +5994,18 @@ mod tests {
         (first, rect)
     }
 
-    #[test]
-    fn a_long_diagnosis_scrolls_into_view_at_the_opening_size() {
-        // Several causes and what the server said make the Status tab taller than the window the app opens at;
-        // the report, and the button that copies it, must still be reachable.
+    /// The live rows `rows` at `size`, the last one shown on its Status tab with a diagnosis of `lines` lines of what
+    /// the server said: taller than the window.
+    fn long_diagnosis_shown(
+        size: egui::Vec2,
+        rows: &[ServerRow],
+        lines: usize,
+    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         let (mut h, engine) = live_harness();
-        h.set_size(OPENING_SIZE);
-        let row = live_row("bad-stdio", Scope::User, None);
-        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-        let said: Vec<String> = (0..8).map(|i| format!("server line {i}")).collect();
+        h.set_size(size);
+        let row = rows.last().expect("a row to show");
+        engine.events.send(snapshot_of(rows.to_vec())).unwrap();
+        let said: Vec<String> = (0..lines).map(|i| format!("server line {i}")).collect();
         let said: Vec<&str> = said.iter().map(String::as_str).collect();
         engine
             .events
@@ -5921,12 +6025,52 @@ mod tests {
             })
             .unwrap();
         h.run();
-        open_status_tab(&mut h, "bad-stdio");
-        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, OPENING_SIZE);
-        let (_, rect) = wheel_the_detail_panel_to(&mut h, "Copy report");
-        assert!(window.contains_rect(rect), "Copy report at {rect:?}");
-        // What was scrolled past is still there, above.
-        h.get_by_label("The command was not found");
+        open_status_tab(&mut h, &row.name);
+        (h, engine)
+    }
+
+    #[test]
+    fn a_long_diagnosis_scrolls_into_view() {
+        // Several causes and what the server said make the Status tab taller than the window; the report, and the
+        // button that copies it, must still be reachable.
+        for size in SIZES {
+            let row = live_row("bad-stdio", Scope::User, None);
+            let (mut h, _engine) = long_diagnosis_shown(size, &[row], 8);
+            let (_, rect) = wheel_the_detail_panel_to(&mut h, size, "Copy report");
+            assert!(
+                detail_view(&h, size).contains_rect(rect),
+                "{size:?}: Copy report at {rect:?}"
+            );
+            // What was scrolled past is still there, above.
+            h.get_by_label("The command was not found");
+        }
+    }
+
+    #[test]
+    fn the_name_and_tabs_stay_in_view_while_the_details_scroll() {
+        use egui::accesskit::Role;
+        for size in SIZES {
+            let row = live_row("bad-stdio", Scope::User, None);
+            let (mut h, _engine) = long_diagnosis_shown(size, &[row], 8);
+            let tabs = h.get_by_role_and_label(Role::Button, "General").rect();
+            wheel_the_detail_panel_to(&mut h, size, "Copy report");
+            assert_eq!(
+                h.get_by_role_and_label(Role::Button, "General").rect(),
+                tabs,
+                "{size:?}: the tabs moved"
+            );
+            // The heading, and the row in the list, which both name the server.
+            for name in h.query_all_by_label("bad-stdio") {
+                assert!(
+                    name.rect().top() >= 0.0,
+                    "{size:?}: a name at {:?}",
+                    name.rect()
+                );
+            }
+            h.get_by_role_and_label(Role::Button, "General").click();
+            h.run();
+            h.get_by_label("Shadowed");
+        }
     }
 
     #[test]
@@ -5952,7 +6096,7 @@ mod tests {
         }
         h.run();
         open_status_tab(&mut h, "first-stdio");
-        let (first, scrolled) = wheel_the_detail_panel_to(&mut h, "Copy report");
+        let (first, scrolled) = wheel_the_detail_panel_to(&mut h, OPENING_SIZE, "Copy report");
         assert!(scrolled.top() < first.top());
         h.get_by_label("second-stdio").click();
         h.run();
@@ -5963,47 +6107,305 @@ mod tests {
         );
     }
 
+    /// Scrolls the last of `rows` to its Copy report, then lists `then` instead, and says where Copy report was
+    /// before and after.
+    fn copy_report_across_a_new_list(
+        rows: &[ServerRow],
+        then: Vec<ServerRow>,
+    ) -> (egui::Rect, egui::Rect) {
+        let (mut h, engine) = long_diagnosis_shown(OPENING_SIZE, rows, 30);
+        let (_, before) = wheel_the_detail_panel_to(&mut h, OPENING_SIZE, "Copy report");
+        engine.events.send(snapshot_of(then)).unwrap();
+        h.run();
+        (before, h.get_by_label("Copy report").rect())
+    }
+
     #[test]
-    fn a_long_definition_form_scrolls_to_its_save_button_at_the_opening_size() {
+    fn a_server_added_above_leaves_the_details_where_they_were() {
+        // Rows are kept by position, so the server shown moves down a place when one is added above it (Add,
+        // Duplicate, or `claude mcp add` in a terminal). Where its details were scrolled to goes with it.
+        let (a, b, c) = (
+            live_row("a-stdio", Scope::User, None),
+            live_row("b-stdio", Scope::User, None),
+            live_row("c-stdio", Scope::User, None),
+        );
+        let (before, after) = copy_report_across_a_new_list(&[b.clone(), c.clone()], vec![a, b, c]);
+        assert!(
+            (after.top() - before.top()).abs() < 1.0,
+            "{before:?} then {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_removed_above_leaves_the_details_where_they_were() {
+        let (a, b, c) = (
+            live_row("a-stdio", Scope::User, None),
+            live_row("b-stdio", Scope::User, None),
+            live_row("c-stdio", Scope::User, None),
+        );
+        let (before, after) = copy_report_across_a_new_list(&[a, b.clone(), c.clone()], vec![b, c]);
+        assert!(
+            (after.top() - before.top()).abs() < 1.0,
+            "{before:?} then {after:?}"
+        );
+    }
+
+    /// A row that failed, with an explanation of several steps on its Status tab.
+    fn failed_with_steps(row: &ServerRow) -> klefki_core::api::Event {
+        klefki_core::api::Event::Status {
+            id: row.id(),
+            status: Status::Failed,
+            detail: Some("spawn npx ENOENT".to_owned()),
+            hint: Some(klefki_core::api::Hint {
+                title: "The command was not found".to_owned(),
+                code: Some("ENOENT".to_owned()),
+                help: vec![
+                    "Claude Code could not find npx on the PATH it starts servers with.".to_owned(),
+                    "Install Node.js, which brings npx with it, then open a new terminal so the PATH is read again.".to_owned(),
+                    "If it is installed somewhere unusual, write the whole path to npx as the command instead.".to_owned(),
+                    "On Windows, a server started through npx may need `cmd /c npx …` as its command.".to_owned(),
+                    "Check that the server's package name is spelled as its documentation gives it, scope included.".to_owned(),
+                    "Run the command yourself in a terminal to see the error it prints before Claude Code does.".to_owned(),
+                    "If the server needs a newer Node.js than the one installed, update Node.js and check again.".to_owned(),
+                ],
+                points_at: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn the_status_actions_are_in_view_without_scrolling() {
+        for size in SIZES {
+            let (mut h, engine) = live_harness();
+            h.set_size(size);
+            let row = live_row("bad-stdio", Scope::User, None);
+            engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+            engine.events.send(failed_with_steps(&row)).unwrap();
+            h.run();
+            open_status_tab(&mut h, "bad-stdio");
+            h.get_by_label_contains("write the whole path to npx");
+            let view = detail_view(&h, size);
+            for action in ["Check now", "Diagnose"] {
+                let rect = h.get_by_label(action).rect();
+                assert!(view.contains_rect(rect), "{size:?}: {action} at {rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_diagnosis_that_arrives_is_brought_into_view() {
+        for size in SIZES {
+            let (mut h, engine) = live_harness();
+            h.set_size(size);
+            let row = live_row("bad-stdio", Scope::User, None);
+            engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+            engine.events.send(failed_with_steps(&row)).unwrap();
+            h.run();
+            open_status_tab(&mut h, "bad-stdio");
+            engine
+                .events
+                .send(klefki_core::api::Event::Diagnosis {
+                    id: row.id(),
+                    diagnosis: diagnosis(
+                        Status::Failed,
+                        &[("The command was not found", "Install Node.js.")],
+                        &["server line"],
+                        &[],
+                        None,
+                    ),
+                })
+                .unwrap();
+            h.run();
+            let rect = h.get_by_label("What probably went wrong").rect();
+            assert!(
+                detail_view(&h, size).contains_rect(rect),
+                "{size:?}: the diagnosis starts at {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_diagnosis_of_a_server_not_shown_waits_where_it_is() {
+        // Brought into view only for the server being looked at: one opened later starts at the top.
+        let (mut h, engine) = live_harness();
+        h.set_size(OPENING_SIZE);
+        let (a, b) = (
+            live_row("a-stdio", Scope::User, None),
+            live_row("b-stdio", Scope::User, None),
+        );
+        engine
+            .events
+            .send(snapshot_of(vec![a.clone(), b.clone()]))
+            .unwrap();
+        engine.events.send(failed_with_steps(&b)).unwrap();
+        h.run();
+        open_status_tab(&mut h, "a-stdio");
+        engine
+            .events
+            .send(klefki_core::api::Event::Diagnosis {
+                id: b.id(),
+                diagnosis: diagnosis(Status::Failed, &[], &["server line"; 40], &[], None),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label("b-stdio").click();
+        h.run();
+        let view = detail_view(&h, OPENING_SIZE);
+        let diagnose = h.get_by_label("Diagnose").rect();
+        assert!(view.contains_rect(diagnose), "Diagnose at {diagnose:?}");
+        let report = h.get_by_label("Copy report").rect();
+        assert!(!view.contains_rect(report), "Copy report at {report:?}");
+    }
+
+    /// A definition with 14 arguments: the form is taller than the window.
+    fn long_form(size: egui::Vec2) -> Harness<'static, ShellApp> {
         let args: Vec<String> = (0..14).map(|i| format!("\"--flag-{i}\"")).collect();
         let json = format!(
             "{{\n  \"command\": \"node\",\n  \"args\": [{}]\n}}",
             args.join(", ")
         );
         let (mut h, _engine, _) = form_harness(&json, true);
-        h.set_size(OPENING_SIZE);
+        h.set_size(size);
         h.run();
-        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, OPENING_SIZE);
-        let (_, rect) = wheel_the_detail_panel_to(&mut h, "Review and save…");
-        assert!(window.contains_rect(rect), "Review and save… at {rect:?}");
+        h
+    }
+
+    #[test]
+    fn a_long_definition_form_scrolls_to_its_last_field() {
+        for size in SIZES {
+            let mut h = long_form(size);
+            let (_, rect) = wheel_the_detail_panel_to(&mut h, size, "Add argument");
+            assert!(
+                detail_view(&h, size).contains_rect(rect),
+                "{size:?}: Add argument at {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_save_bar_stays_in_view_while_a_long_form_scrolls() {
+        for size in SIZES {
+            let mut h = long_form(size);
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            let save = h.get_by_label("Review and save…").rect();
+            assert!(
+                window.contains_rect(save),
+                "{size:?}: Review and save… at {save:?}"
+            );
+            wheel_the_detail_panel_to(&mut h, size, "Add argument");
+            assert_eq!(h.get_by_label("Review and save…").rect(), save, "{size:?}");
+            h.get_by_label("Revert");
+        }
+    }
+
+    #[test]
+    fn why_saving_is_blocked_shows_beside_the_save_button() {
+        for size in SIZES {
+            let mut h = long_form(size);
+            form(&mut h).command.clear();
+            h.run();
+            let Some(Editor {
+                state:
+                    EditorState::Ready {
+                        problem: Some(problem),
+                        ..
+                    },
+                ..
+            }) = &h.state().editor
+            else {
+                panic!("an empty command is a problem");
+            };
+            let problem = sentence(problem);
+            let rect = h.get_by_label(&problem).rect();
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            assert!(
+                window.contains_rect(rect),
+                "{size:?}: {problem:?} at {rect:?}"
+            );
+            assert!(
+                h.get_by_label("Review and save…")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        }
+    }
+
+    #[test]
+    fn tab_from_the_last_field_goes_on_to_the_save_bar() {
+        // The save bar sits below the form, so it comes next, not first.
+        let mut h = long_form(OPENING_SIZE);
+        form(&mut h).args[13].push('x');
+        h.run();
+        h.get_by_label("Add argument").focus();
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert!(h.get_by_label("Review and save…").is_focused());
+    }
+
+    #[test]
+    fn keyboard_focus_brings_what_it_reaches_into_view() {
+        // egui does not bring a widget that gains focus into view, as GTK and WinUI do.
+        for size in SIZES {
+            let mut h = long_form(size);
+            h.get_by_label("Remove argument 1").focus();
+            h.run();
+            for _ in 0..40 {
+                if h.get_by_label("Add argument").is_focused() {
+                    break;
+                }
+                h.key_press(egui::Key::Tab);
+                h.run();
+            }
+            let add = h.get_by_label("Add argument");
+            assert!(add.is_focused(), "{size:?}: Tab reaches Add argument");
+            let rect = add.rect();
+            assert!(
+                detail_view(&h, size).contains_rect(rect),
+                "{size:?}: Add argument has focus at {rect:?}, out of view"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_elsewhere_leaves_the_details_where_they_are() {
+        let mut h = long_form(OPENING_SIZE);
+        let (_, scrolled) = wheel_the_detail_panel_to(&mut h, OPENING_SIZE, "Add argument");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F);
+        h.run();
+        assert_eq!(h.get_by_label("Add argument").rect(), scrolled);
     }
 
     #[test]
     fn the_detail_panels_scroll_bar_leaves_the_buttons_beside_it_clickable() {
-        let args: Vec<String> = (0..14).map(|i| format!("\"--flag-{i}\"")).collect();
-        let json = format!(
-            "{{\n  \"command\": \"node\",\n  \"args\": [{}]\n}}",
-            args.join(", ")
-        );
-        let (mut h, _engine, _) = form_harness(&json, true);
-        h.set_size(OPENING_SIZE);
-        h.run();
-        // The very edge of a button at the panel's right side, where the scroll bar shows.
-        let rect = h.get_by_label("Remove argument 1").rect();
-        let edge = egui::pos2(rect.right() - 2.0, rect.center().y);
-        h.event(egui::Event::PointerMoved(edge));
-        h.run();
-        for pressed in [true, false] {
-            h.event(egui::Event::PointerButton {
-                pos: edge,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: egui::Modifiers::NONE,
-            });
+        // Also with a wider bar than egui's own: the room kept for it follows the style.
+        for bar_width in [None, Some(16.0)] {
+            let mut h = long_form(OPENING_SIZE);
+            if let Some(width) = bar_width {
+                h.ctx.all_styles_mut(|s| s.spacing.scroll.bar_width = width);
+                h.run();
+            }
+            // The very edge of a button at the panel's right side, where the scroll bar shows.
+            let rect = h.get_by_label("Remove argument 1").rect();
+            let edge = egui::pos2(rect.right() - 2.0, rect.center().y);
+            h.event(egui::Event::PointerMoved(edge));
             h.run();
+            for pressed in [true, false] {
+                h.event(egui::Event::PointerButton {
+                    pos: edge,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.run();
+            }
+            assert_eq!(
+                form(&mut h).args.len(),
+                13,
+                "{bar_width:?}: the click reached the button"
+            );
+            assert_eq!(form(&mut h).args[0], "--flag-1");
         }
-        assert_eq!(form(&mut h).args.len(), 13, "the click reached the button");
-        assert_eq!(form(&mut h).args[0], "--flag-1");
     }
 
     #[test]
