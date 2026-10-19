@@ -451,6 +451,28 @@ fn set_enabled(
     keys: &FileKeys,
     out: &mut Resolved,
 ) -> Result<(), String> {
+    // A plugin's server: switched like a user server, by the name Claude Code gives it (decision 008, finding 2).
+    // Only `.claude.json` changes, never the plugin's files.
+    if let Some(row) = snapshot
+        .servers
+        .iter()
+        .find(|r| r.is(id) && r.scope == Scope::Plugin)
+    {
+        // The name as the plugin's files spell it, from its connection; the row's own is cleaned for showing.
+        let Some((Scope::Plugin, None, name)) =
+            crate::model::ConnectionId::parse(row.connection.as_str())
+        else {
+            return Err(from_plugin(row));
+        };
+        return switch_everywhere(
+            &row.name,
+            &name,
+            "a plugin's server",
+            enabled,
+            snapshot,
+            out,
+        );
+    }
     let (row, file) = find(id, snapshot, keys)?;
     let shown = &row.name;
     let disabled = !enabled;
@@ -473,25 +495,38 @@ fn set_enabled(
         }
         Scope::Plugin => return Err(from_plugin(row)),
         Scope::User => {
-            if snapshot.projects.is_empty() {
-                return Err(format!(
-                    "Claude Code knows no projects yet, so there is nowhere to switch {shown} {}.",
-                    if enabled { "on" } else { "off" }
-                ));
-            }
-            for project in &snapshot.projects {
-                out.claude.push(Op::SetDisabled {
-                    project: project.clone(),
-                    name: file.name.clone(),
-                    disabled,
-                });
-            }
-            out.warnings.push(format!(
-                "{shown} is a user server, and Claude Code switches it per project. This changes the {} it knows today; a project it first opens later is not covered.",
-                count(snapshot.projects.len(), "project")
-            ));
+            switch_everywhere(shown, &file.name, "a user server", enabled, snapshot, out)?;
         }
     }
+    Ok(())
+}
+
+/// Switches a server that is loaded in every project, `name` as the file spells it, in each project Claude Code knows.
+fn switch_everywhere(
+    shown: &str,
+    name: &str,
+    what: &str,
+    enabled: bool,
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    if snapshot.projects.is_empty() {
+        return Err(format!(
+            "Claude Code knows no projects yet, so there is nowhere to switch {shown} {}.",
+            if enabled { "on" } else { "off" }
+        ));
+    }
+    for project in &snapshot.projects {
+        out.claude.push(Op::SetDisabled {
+            project: project.clone(),
+            name: name.to_owned(),
+            disabled: !enabled,
+        });
+    }
+    out.warnings.push(format!(
+        "{shown} is {what}, and Claude Code switches it per project. This changes the {} it knows today; a project it first opens later is not covered.",
+        count(snapshot.projects.len(), "project")
+    ));
     Ok(())
 }
 
@@ -1463,14 +1498,6 @@ mod tests {
             .unwrap();
         let id = row.id();
         for change in [
-            Change::SetEnabled {
-                id: id.clone(),
-                enabled: false,
-            },
-            Change::SetEnabled {
-                id: id.clone(),
-                enabled: true,
-            },
             Change::Approve { id: id.clone() },
             Change::Delete { id: id.clone() },
             Change::Replace {
@@ -1499,6 +1526,81 @@ mod tests {
                 "{change:?}: {why}"
             );
         }
+    }
+
+    /// A plugin `p@m` that is on, with one server `s`, and the projects given.
+    fn plugin_inventory(dir: &Path, claude_json: Value) -> inventory::Inventory {
+        let root = dir.join("plugins/cache/p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".mcp.json"), r#"{"s":{"command":"x"}}"#).unwrap();
+        std::fs::write(
+            dir.join("plugins/installed_plugins.json"),
+            json!({"plugins": {"p@m": [{"scope": "user", "installPath": root.to_string_lossy()}]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(".claude.json"), claude_json.to_string()).unwrap();
+        inventory::load(&crate::config::ConfigPaths::in_dir(dir))
+    }
+
+    #[test]
+    fn a_plugins_server_is_switched_by_its_full_name_in_every_project() {
+        use crate::engine::Change;
+        let dir = tempfile::tempdir().unwrap();
+        let inv = plugin_inventory(dir.path(), json!({"projects": {"/q": {}, "/r": {}}}));
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Plugin)
+            .unwrap();
+        for enabled in [false, true] {
+            let change = Change::SetEnabled {
+                id: row.id(),
+                enabled,
+            };
+            let out = resolve(&[change], &inv.snapshot, &inv.keys).unwrap();
+            assert_eq!(
+                out.claude,
+                ["/q", "/r"]
+                    .map(|project| Op::SetDisabled {
+                        project: project.into(),
+                        name: "plugin:p:s".into(),
+                        disabled: !enabled,
+                    })
+                    .to_vec()
+            );
+            assert!(out.settings.is_empty());
+            // As for a user server: per project, and a project opened later is not covered.
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("2 projects") && w.contains("later")),
+                "{:?}",
+                out.warnings
+            );
+        }
+
+        // No project yet: nowhere to switch it.
+        let dir = tempfile::tempdir().unwrap();
+        let inv = plugin_inventory(dir.path(), json!({}));
+        let row = &inv.snapshot.servers[0];
+        let why = resolve(
+            &[Change::SetEnabled {
+                id: row.id(),
+                enabled: false,
+            }],
+            &inv.snapshot,
+            &inv.keys,
+        )
+        .err()
+        .unwrap();
+        assert!(why.contains("no projects"), "{why}");
     }
 
     #[test]
