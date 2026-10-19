@@ -946,6 +946,8 @@ impl Lock {
         let (owned, mut held) = (dir.to_owned(), Held::Ours(made.clone()));
         let refresher = std::thread::Builder::new()
             .name("klefki-lock".to_owned())
+            // It only waits and sets a time: a small stack is plenty.
+            .stack_size(64 * 1024)
             .spawn(move || {
                 while let Err(mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(every) {
                     held = refresh(&owned, held);

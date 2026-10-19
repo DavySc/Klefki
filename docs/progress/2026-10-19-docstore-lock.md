@@ -24,5 +24,8 @@ Goal: the docstore leftovers PR #24 listed, part 1 of 2. This slice: the lock is
 - Claude Code does not know our marker: Claude and Klefki finding the same lock stale at the same moment can still both take it (microsecond window). The validation before the rename still keeps either write from overwriting the other.
 - A refresh and a takeover by someone else in the same microsecond can leave us refreshing theirs once; at worst our drop then removes theirs. Same window as Claude's own library.
 
+- A save that hangs (a stalled network drive) keeps the lock fresh until Klefki ends, so a second Klefki gets `Locked` meanwhile. Claude Code is not held up: it writes without the lock after about 1.5 s. Claude's own library behaves the same (cross-review O1).
+- Cross-review O2 folded in: the refresh thread gets a 64 KiB stack.
+
 ## Next
 - Cross-review, CI on three systems, merge. Then part 2.
