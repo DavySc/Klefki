@@ -56,6 +56,7 @@ AppImages need FUSE 2. If it does not start, install it: `sudo apt install libfu
 
 ### Check a download
 
+{minisign}
 Every file is listed in `SHA256SUMS`. In the download folder:
 
 - Linux: `sha256sum -c SHA256SUMS --ignore-missing`
