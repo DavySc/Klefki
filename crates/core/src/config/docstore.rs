@@ -969,6 +969,14 @@ fn edit_valid_claude_json(
         .map(|op| op.project().map(normalise_project))
         .collect();
     let user_servers = targets.iter().any(Option::is_none);
+    // The ops on each project: a server switched on or off for the user has one op in every project, so looking
+    // them up must not go through the whole list for each project.
+    let mut by_target: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, target) in targets.iter().enumerate() {
+        if let Some(target) = target {
+            by_target.entry(target.as_str()).or_default().push(i);
+        }
+    }
     let local_servers = ops
         .iter()
         .any(|op| op.is_server_op() && op.project().is_some());
@@ -978,10 +986,7 @@ fn edit_valid_claude_json(
             (key == "projects" && targets.iter().any(Option::is_some))
                 || (key == "mcpServers" && user_servers)
         }
-        1 => targets
-            .iter()
-            .flatten()
-            .any(|t| *t == normalise_project(key)),
+        1 => by_target.contains_key(normalise_project(key).as_str()),
         2 => key == "mcpServers" && local_servers,
         _ => false,
     })
@@ -1024,15 +1029,21 @@ fn edit_valid_claude_json(
         .iter()
         .map(|m| normalise_project(&m.key))
         .collect();
-    for (i, member) in projects.members.iter().enumerate() {
-        if projects.members[..i].iter().any(|m| m.key == member.key) {
+    let mut listed = HashSet::new();
+    for member in &projects.members {
+        if !listed.insert(member.key.as_str()) {
             return Err(invalid(format!(
                 "the project {} is listed twice; refusing to guess which one Claude Code uses",
                 sanitize(&member.key)
             )));
         }
     }
-    if let Some(missing) = targets.iter().flatten().find(|t| !keys.contains(t)) {
+    let known: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    if let Some(missing) = targets
+        .iter()
+        .flatten()
+        .find(|t| !known.contains(t.as_str()))
+    {
         return Err(invalid(format!(
             "{} is not a project Claude Code knows about",
             sanitize(missing)
@@ -1071,15 +1082,10 @@ fn edit_valid_claude_json(
 
     let mut server_found = vec![false; ops.len()];
     for (i, (member, key)) in projects.members.iter().zip(&keys).enumerate() {
-        let here: Vec<&Op> = ops
-            .iter()
-            .zip(&targets)
-            .filter(|(_, t)| t.as_deref() == Some(key.as_str()))
-            .map(|(op, _)| op)
-            .collect();
-        if here.is_empty() {
+        let Some(at) = by_target.get(key.as_str()) else {
             continue;
-        }
+        };
+        let here: Vec<&Op> = at.iter().map(|&j| &ops[j]).collect();
         let Some(entry) = &member.object else {
             return Err(invalid(format!(
                 "the entry for {} is not an object",
@@ -1107,9 +1113,9 @@ fn edit_valid_claude_json(
                 false,
                 &mut out,
             )?;
-            for (i, op) in ops.iter().enumerate() {
-                if found.iter().any(|f| std::ptr::eq(*f, op)) {
-                    server_found[i] = true;
+            for &j in at {
+                if found.iter().any(|f| std::ptr::eq(*f, &ops[j])) {
+                    server_found[j] = true;
                 }
             }
         }
