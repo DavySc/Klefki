@@ -15,7 +15,10 @@ Goal: the docstore leftovers PR #24 listed, part 1 of 2. This slice: the lock is
 - Mutations: refresh without the "still ours" check fails the variant; takeover without the second age check fails `two_waiters_…`.
 
 ## Checks
-- See the PR description for the final runs.
+- Full verify (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check`) on a12a9c1 from main efe73f2: exit 0; core 615, app 303, cli 17 + 22 passed, 0 failed; deny "advisories ok, bans ok, licenses ok, sources ok".
+- `cargo clippy -p klefki-core --all-targets --target x86_64-pc-windows-gnu -- -D warnings`: exit 0 (the Windows `touch`).
+- `cargo test -p klefki-core --lib docstore` 10 runs in a row: 117 passed each time.
+- Windows and macOS tests: CI only.
 
 ## Left open
 - Claude Code does not know our marker: Claude and Klefki finding the same lock stale at the same moment can still both take it (microsecond window). The validation before the rename still keeps either write from overwriting the other.
