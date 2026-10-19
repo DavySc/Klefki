@@ -940,18 +940,22 @@ impl ShellApp {
                     .or(self.snapshot.cli_version.as_deref())
                     .filter(|_| self.cli_problem.is_none())
                 {
-                    // Only where it fits: in a narrow window it would be drawn over the title.
-                    let version = egui::WidgetText::from(
-                        RichText::new(format!("Claude CLI {version}")).color(pal.text_muted),
-                    )
-                    .into_galley(
-                        ui,
-                        Some(egui::TextWrapMode::Extend),
-                        f32::INFINITY,
-                        egui::TextStyle::Body,
-                    );
-                    if version.size().x <= ui.available_width() {
-                        ui.label(version);
+                    // Only where it fits: in a narrow window it would be drawn over the title. Where the whole
+                    // of it does not, the number alone, named in full on hover.
+                    let full = format!("Claude CLI {version}");
+                    let fitting = [full.as_str(), version].into_iter().find_map(|text| {
+                        let galley =
+                            egui::WidgetText::from(RichText::new(text).color(pal.text_muted))
+                                .into_galley(
+                                    ui,
+                                    Some(egui::TextWrapMode::Extend),
+                                    f32::INFINITY,
+                                    egui::TextStyle::Body,
+                                );
+                        (galley.size().x <= ui.available_width()).then_some(galley)
+                    });
+                    if let Some(galley) = fitting {
+                        ui.label(galley).on_hover_text(full);
                     }
                 }
             });
@@ -6296,6 +6300,20 @@ mod tests {
                 "2.1.303".to_owned(),
             )))
             .unwrap();
+        h.run();
+        h.get_by_label("Claude CLI 2.1.303");
+        // Where the whole of it does not fit, the number alone, which says what it is on hover.
+        let (mut h, engine) = live_harness();
+        h.set_size(egui::vec2(900.0, SMALLEST_SIZE.y));
+        engine
+            .events
+            .send(klefki_core::api::Event::CliVersion(Some(
+                "2.1.303".to_owned(),
+            )))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label("Claude CLI 2.1.303").is_none());
+        h.get_by_label("2.1.303").hover();
         h.run();
         h.get_by_label("Claude CLI 2.1.303");
     }
