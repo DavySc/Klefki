@@ -48,4 +48,6 @@ are only listed, deleting one is an explicit user action) plus a read-only map o
     line and `SecretsAfterFileChange` on a snapshot.
   - Checks after the fold-in and main 950b096 merged in (Linux): full verify + `cargo clippy -p klefki` exit 0 (673
     core, 324 app, 18 + 25 cli).
-- **Next:** merge main in, re-verify, reviewer re-checks B1, merge.
+- **Re-check** by the reviewer at ef7ceeb: ready to merge, nothing blocking. Main 99f3ab3 (#32) merged in; full
+  verify + `cargo clippy -p klefki` exit 0 (679 core, 324 app, 18 + 25 cli).
+- **Next:** merge on green CI (3 systems).
