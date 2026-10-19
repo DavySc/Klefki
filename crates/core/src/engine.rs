@@ -1037,6 +1037,13 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         let mut fresh = fresh;
         fresh.snapshot.kept = kept_list(shared);
         let mut resolved = ops::resolve(changes, &fresh.snapshot, &fresh.keys)?;
+        // A kept definition whose removal also took another server's client secret is put back, not forgotten.
+        for id in &resolved.forget {
+            let kept = swap::Recovery::find(&backup_dir(shared)?, id)?;
+            if let Some(why) = swap::forget_problem(&paths.claude_json, &kept) {
+                return Err(why);
+            }
+        }
         // A kept definition's place stays free until it is put back or forgotten: its client secret is filed there.
         let arrivals = resolved.arrivals();
         if !arrivals.is_empty() {
@@ -1335,7 +1342,18 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
             Err(e) => return fail(e),
         };
         for kept in &forget {
-            if let Err(e) = swap::forget(&dir, kept) {
+            let claude_json = shared
+                .config
+                .paths
+                .as_ref()
+                .map(|p| p.claude_json.as_path());
+            let forgot_it = match claude_json {
+                Some(claude_json) => swap::forget(&dir, claude_json, kept),
+                None => {
+                    Err("Could not determine where Claude Code keeps its configuration.".to_owned())
+                }
+            };
+            if let Err(e) = forgot_it {
                 if !added.is_empty() || !written.is_empty() || forgot {
                     log_activity(shared, &summary, Some(&e), &backups);
                 }
