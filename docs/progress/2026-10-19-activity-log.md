@@ -20,4 +20,4 @@ Roadmap slice (M3): the Activity log page lists every change Klefki saved, newes
 
 ## Open / next
 - No restore from a backup yet. Restoring a whole `.claude.json` would also undo Claude Code's own writes since; a safe restore needs its own design (per change, through Prepare → diff → Apply).
-- Overlaps PR #12 (Export) in `shell.rs`, `engine.rs`, `api.rs` and `lib.rs`; the edits here are small and in other places.
+- Main (#12 Export, #14 engine check fixes) merged in without conflicts. Full verify on the merge: exit 0 (279 app + 593 core + 38 cli tests, deny ok); Windows clippy exit 0.
