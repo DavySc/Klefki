@@ -96,6 +96,13 @@ impl std::fmt::Debug for ShownDialog {
 /// one answers at once. Neither case says which it was, so the time tells them apart.
 const UNSEEN: Duration = Duration::from_millis(150);
 
+/// No dialog was opened: a path is typed instead, starting from the suggested one.
+pub(crate) fn not_shown(name: &str, home: Option<&Path>) -> FileChoice {
+    FileChoice::NoDialog {
+        suggested: default_folder(home).join(name),
+    }
+}
+
 /// What the answer `picked`, to a dialog opened at `opened`, means.
 pub(crate) fn answered(
     opened: Instant,
@@ -108,9 +115,7 @@ pub(crate) fn answered(
         None if opened.elapsed() >= UNSEEN => FileChoice::Cancelled {
             suggested: default_folder(home).join(name),
         },
-        None => FileChoice::NoDialog {
-            suggested: default_folder(home).join(name),
-        },
+        None => not_shown(name, home),
     }
 }
 

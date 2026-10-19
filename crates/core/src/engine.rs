@@ -57,7 +57,7 @@ pub enum Command {
     Export(Vec<ServerId>),
     /// Ask the user, in the system's save dialog, where to save an export; `name` is the file name to start from
     /// (see [`Event::ExportFileChosen`]). `shown` is the dialog when the UI already opened it over its window
-    /// ([`Core::choose_export_file`]); without it the engine opens one that belongs to no window.
+    /// ([`Core::choose_export_file`]); without it no dialog is opened, and a path is asked for instead.
     ChooseExportFile {
         name: String,
         shown: Option<crate::export_file::ShownDialog>,
@@ -851,20 +851,30 @@ fn engine_main(
                     .emit(Event::Exported(crate::export::export(sources)));
             }
             Command::ChooseExportFile { name, shown } => {
-                // The dialog waits for the user, so its answer is waited for on a thread of its own: the engine keeps
-                // going.
-                let open = Arc::clone(&shared.config.open_dialog);
                 let home = shared.config.home.clone();
-                let emitter = shared.emitter.clone();
-                std::thread::spawn(move || {
-                    let (opened, answer) = shown
-                        .and_then(|s| s.take())
-                        .unwrap_or_else(|| (std::time::Instant::now(), open(&name, None)));
-                    let picked = pollster::block_on(answer);
-                    let choice =
-                        crate::export_file::answered(opened, picked, &name, home.as_deref());
-                    emitter.emit(Event::ExportFileChosen(choice));
-                });
+                // Only the UI's thread may open a dialog (on macOS, AppKit is main-thread only), so without one
+                // opened there, a path is asked for instead.
+                match shown.and_then(|s| s.take()) {
+                    None => {
+                        let choice = crate::export_file::not_shown(&name, home.as_deref());
+                        shared.emitter.emit(Event::ExportFileChosen(choice));
+                    }
+                    // The dialog waits for the user, so its answer is waited for on a thread of its own: the engine
+                    // keeps going.
+                    Some((opened, answer)) => {
+                        let emitter = shared.emitter.clone();
+                        std::thread::spawn(move || {
+                            let picked = pollster::block_on(answer);
+                            let choice = crate::export_file::answered(
+                                opened,
+                                picked,
+                                &name,
+                                home.as_deref(),
+                            );
+                            emitter.emit(Event::ExportFileChosen(choice));
+                        });
+                    }
+                }
             }
             Command::SaveExport {
                 path,
@@ -5771,6 +5781,23 @@ mod tests {
             ),
             "{chosen:?}"
         );
+
+        // A command with no dialog opened by the UI opens none here, off the UI's thread (on macOS, AppKit is
+        // main-thread only): a path is asked for instead.
+        let before = lock(&opened).len();
+        core.send(Command::ChooseExportFile {
+            name: "y.json".into(),
+            shown: None,
+        });
+        let chosen = first_event(&core, |e| match e {
+            Event::ExportFileChosen(choice) => Some(choice.clone()),
+            _ => None,
+        });
+        assert!(
+            matches!(&chosen, crate::export_file::FileChoice::NoDialog { suggested } if suggested.ends_with("y.json")),
+            "{chosen:?}"
+        );
+        assert_eq!(lock(&opened).len(), before);
     }
 
     #[test]
@@ -5789,7 +5816,7 @@ mod tests {
                 _ => None,
             })
         };
-        // No dialog could be shown: a path to start from instead.
+        // No dialog opened by the UI: a path to start from instead, and no dialog is opened here.
         core.send(Command::ChooseExportFile {
             name: "mcp-servers.json".into(),
             shown: None,
@@ -5800,10 +5827,7 @@ mod tests {
         ));
         let file = env.dir.path().join("home").join("servers.json");
         *lock(&env.chosen) = Some(file.clone());
-        core.send(Command::ChooseExportFile {
-            name: "servers.json".into(),
-            shown: None,
-        });
+        core.choose_export_file("servers.json".into(), None);
         assert_eq!(
             chosen(&core),
             crate::export_file::FileChoice::Chosen(file.clone())
