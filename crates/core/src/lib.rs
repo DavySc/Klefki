@@ -12,6 +12,7 @@ mod form;
 mod model;
 mod ops;
 mod paste;
+mod restore;
 mod sanitize;
 mod secrets;
 mod swap;

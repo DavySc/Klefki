@@ -20,7 +20,8 @@ pub struct ActivityPage {
 }
 
 impl ActivityPage {
-    pub fn show(&mut self, ui: &mut Ui) {
+    /// Draws the page. Returns the backup the user asked to restore, for the shell to have reviewed.
+    pub fn show(&mut self, ui: &mut Ui) -> Option<String> {
         let pal = theme::palette(ui.ctx());
         ui.add_space(8.0);
         ui.label(RichText::new("Activity log").heading());
@@ -29,7 +30,8 @@ impl ActivityPage {
             egui::Label::new(
                 RichText::new(
                     "Changes Klefki saved, newest first. Before each one it keeps a copy of every file it \
-                     changes; it keeps the newest 20 copies of each file.",
+                     changes; it keeps the newest 20 copies of each file. Restoring a copy of .claude.json \
+                     shows what it would change before anything is saved.",
                 )
                 .color(pal.text_muted),
             )
@@ -39,7 +41,7 @@ impl ActivityPage {
         let Some(log) = &self.log else {
             // No spinner: reading takes a moment, and a spinner would keep the window repainting.
             ui.label(RichText::new("Loading…").color(pal.text_muted));
-            return;
+            return None;
         };
         if let Some(problem) = &log.problem {
             ui.label(RichText::new(format!("{} {problem}", icon::WARNING)).color(pal.warn));
@@ -66,7 +68,7 @@ impl ActivityPage {
                     .wrap(),
                 );
             });
-            return;
+            return None;
         }
         let now = ui.input(|i| i.time);
         if self
@@ -92,7 +94,7 @@ impl ActivityPage {
             .filter(shown)
             .collect();
         let copied = self.copied.as_ref().map(|(path, _)| path.as_str());
-        let mut copy = None;
+        let mut asked = Asked::default();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -106,7 +108,7 @@ impl ActivityPage {
                     if i > 0 {
                         ui.separator();
                     }
-                    copy = row(ui, entry, copied).or(copy.take());
+                    asked.or(row(ui, entry, copied, true));
                 }
                 if !others.is_empty() {
                     ui.add_space(12.0);
@@ -126,12 +128,12 @@ impl ActivityPage {
                                 .wrap(),
                             );
                             for entry in &others {
-                                copy = row(ui, entry, copied).or(copy.take());
+                                asked.or(row(ui, entry, copied, false));
                             }
                         });
                 }
             });
-        if let Some(path) = copy {
+        if let Some(path) = asked.copy {
             ui.ctx().copy_text(path.clone());
             self.copied = Some((path, now));
         }
@@ -141,6 +143,23 @@ impl ActivityPage {
                     (COPIED_SECONDS - (now - at)).max(0.0),
                 ));
         }
+        asked.restore
+    }
+}
+
+/// What a row's buttons asked for.
+#[derive(Default)]
+struct Asked {
+    /// A path to copy.
+    copy: Option<String>,
+    /// A backup to restore.
+    restore: Option<String>,
+}
+
+impl Asked {
+    fn or(&mut self, other: Asked) {
+        self.copy = other.copy.or(self.copy.take());
+        self.restore = other.restore.or(self.restore.take());
     }
 }
 
@@ -153,10 +172,10 @@ fn matches(entry: &ActivityEntry, query: &str) -> bool {
         || entry.backups.iter().any(|b| has(&b.path) || has(&b.of))
 }
 
-/// One change. Returns the path to copy when its button was clicked.
-fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<String> {
+/// One change, or with `change` false, a backup no change mentions. Returns what its buttons asked for.
+fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>, change: bool) -> Asked {
     let pal = theme::palette(ui.ctx());
-    let mut copy = None;
+    let mut asked = Asked::default();
     ui.add_space(6.0);
     ui.horizontal_top(|ui| {
         // Wide enough for "Yesterday 23:59" and "13 Oct 2025 18:40", so the changes line up.
@@ -183,7 +202,7 @@ fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<Strin
                 );
             }
             for backup in &entry.backups {
-                copy = backup_line(ui, backup, copied).or(copy.take());
+                asked.or(backup_line(ui, backup, copied, change));
             }
             if entry.more_backups > 0 {
                 ui.label(
@@ -198,12 +217,12 @@ fn row(ui: &mut Ui, entry: &ActivityEntry, copied: Option<&str>) -> Option<Strin
         });
     });
     ui.add_space(6.0);
-    copy
+    asked
 }
 
 /// What a backup is, with a button that copies where it is; the path itself shows on hover, so it does not take
-/// over the page.
-fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<String> {
+/// over the page. A copy of `.claude.json` can be restored: of a change, to how things were before it (`change`).
+fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>, change: bool) -> Asked {
     let pal = theme::palette(ui.ctx());
     if !backup.kept {
         ui.add(
@@ -217,9 +236,9 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<Str
             )
             .wrap(),
         );
-        return None;
+        return Asked::default();
     }
-    let mut copy = None;
+    let mut asked = Asked::default();
     ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(format!("Backup of {}", backup.of))
@@ -231,7 +250,24 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<Str
             .on_hover_text(backup.path.as_str())
             .clicked()
         {
-            copy = Some(backup.path.clone());
+            asked.copy = Some(backup.path.clone());
+        }
+        if backup.of == ".claude.json" {
+            let label = if change {
+                "Restore all servers to before this…"
+            } else {
+                "Restore all servers to this copy…"
+            };
+            if ui
+                .small_button(format!("{} {label}", icon::CLOCK_COUNTER_CLOCKWISE))
+                .on_hover_text(
+                    "Shows which servers and switches would go back to how this copy has them, and asks before \
+                     saving anything. Servers added since are kept, and Klefki keeps a copy of how things are now.",
+                )
+                .clicked()
+            {
+                asked.restore = Some(backup.path.clone());
+            }
         }
     });
     // What was copied, in the open: hover text is out of reach of the keyboard.
@@ -245,7 +281,7 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>) -> Option<Str
             .wrap(),
         );
     }
-    copy
+    asked
 }
 
 #[cfg(test)]
@@ -255,7 +291,7 @@ mod tests {
     use egui_kittest::Harness;
     use egui_kittest::kittest::Queryable;
     use klefki_core::api::{
-        Activity, ActivityEntry, Backup, Command, Core, Detached, Event, Snapshot,
+        Activity, ActivityEntry, Backup, Change, Command, Core, Detached, Event, Snapshot,
     };
     use std::sync::Arc;
 
@@ -394,6 +430,55 @@ mod tests {
             h.query_by_label_contains("Copied").is_none(),
             "the note goes away"
         );
+    }
+
+    fn prepared(engine: &Detached) -> Vec<Vec<Change>> {
+        std::iter::from_fn(|| engine.commands.try_recv().ok())
+            .filter_map(|c| match c {
+                Command::Prepare(changes) => Some(changes),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_kept_backup_of_claude_json_can_be_restored_after_review() {
+        let (mut h, engine) = harness();
+        h.run();
+        open(&mut h);
+        let mut log = sample();
+        log.entries[0].backups.push(Backup {
+            of: "a project's settings.local.json".to_owned(),
+            path: "/data/backups/settings.local-0123.1-0.bak".to_owned(),
+            kept: true,
+        });
+        engine.events.send(Event::Activity(log)).unwrap();
+        h.run();
+        prepared(&engine);
+        // Only for a copy of .claude.json that is still kept: not the gone one, not a project's settings.
+        let [button] = &h
+            .get_all_by_label_contains("Restore all servers to before this…")
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("one restore button");
+        };
+        button.click();
+        h.run();
+        assert_eq!(
+            prepared(&engine),
+            [vec![Change::Restore {
+                backup: "/data/backups/claude.json.1-0.bak".to_owned()
+            }]],
+            "the review comes first; nothing is written yet"
+        );
+        // A backup no change mentions is a copy as it was then.
+        h.get_by_label("Other backups (1)").click();
+        h.run();
+        h.get_by_label_contains("Restore all servers to this copy…")
+            .click();
+        h.run();
+        // The first review is still on its way: one review at a time.
+        assert!(prepared(&engine).is_empty());
     }
 
     #[test]
