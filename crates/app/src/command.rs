@@ -21,6 +21,8 @@ pub enum Action {
     Tone(crate::theme::Tone),
     Settings,
     Duplicate,
+    /// Move the selected server to another project or the user.
+    Move,
     Add,
     FixCasing,
     /// Move every old switch-off list (`mcpServersDisabled`) into the one Claude Code reads.

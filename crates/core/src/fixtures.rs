@@ -38,6 +38,7 @@ pub(crate) fn load() -> Snapshot {
         project_count: raw.project_count,
         projects: Vec::new(),
         legacy_disabled: Vec::new(),
+        kept: Vec::new(),
         servers: raw
             .servers
             .into_iter()

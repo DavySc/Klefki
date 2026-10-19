@@ -47,3 +47,4 @@ zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-cr
 
 [dev-dependencies]
 filetime = "0.2"
+proptest = "1"

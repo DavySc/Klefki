@@ -110,7 +110,13 @@ impl Definition {
                 }
             }
         }
-        entry::validate(&Value::Object(self.to_map())).err()
+        let entry = Value::Object(self.to_map());
+        // One that signs in with OAuth is saved through Claude Code's own command, which takes its `oauth` settings.
+        if self.signs_in_with_oauth() {
+            entry::validate_new(&entry).err()
+        } else {
+            entry::validate(&entry).err()
+        }
     }
 
     /// For a value typed into `env` or `headers` that looks like a secret: what to write instead, a `${VAR}`
@@ -323,6 +329,27 @@ mod tests {
         let oauth =
             def(json!({"type": "http", "url": "https://h.example", "oauth": {"clientId": "c"}}));
         assert!(oauth.signs_in_with_oauth());
-        assert!(oauth.problem().unwrap().contains("OAuth"));
+        // Saved through Claude Code's own command, with its settings checked as that command takes them.
+        assert_eq!(oauth.problem(), None);
+        let port = def(
+            json!({"type": "http", "url": "https://h.example", "oauth": {"callbackPort": 70000}}),
+        );
+        assert!(
+            port.problem().unwrap().contains("callback port"),
+            "{:?}",
+            port.problem()
+        );
+        let secret = def(
+            json!({"type": "http", "url": "https://h.example", "oauth": {"clientSecret": "s"}}),
+        );
+        assert!(secret.problem().is_some());
+        let mut stdio = oauth;
+        stdio.transport = TransportKind::Stdio;
+        stdio.command = "node".into();
+        assert!(
+            stdio.problem().unwrap().contains("http and sse"),
+            "{:?}",
+            stdio.problem()
+        );
     }
 }

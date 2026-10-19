@@ -152,9 +152,10 @@ impl Op {
 enum Purpose {
     Change,
     Verify,
-    /// To show a change another program will write: Claude Code's own `mcp add-json`, which adds servers that sign
-    /// in with OAuth. Only here may a new server have `oauth` settings; a plan made this way is never written (its
-    /// ops are made again as a [`Purpose::Change`] to write them, which refuses them).
+    /// To show a change another program will write: Claude Code's own `mcp add-json` and `mcp remove`, which add,
+    /// and remove, servers that sign in with OAuth. Only here may a server with `oauth` settings be added, replaced,
+    /// copied or removed; a plan made this way is never written (its ops are made again as a [`Purpose::Change`] to
+    /// write them, which refuses them).
     Preview,
 }
 
@@ -307,6 +308,16 @@ impl Docstore {
     }
 
     fn prepare_current(&self, current: Current, ops: Vec<Op>) -> Result<Plan, StoreError> {
+        // A copy is kept in the plan as the add it is now. Checked later, it must not depend on its original still
+        // being there: an earlier change's check, replayed before it, may remove what it added, and only the
+        // definition itself can put that back.
+        let start = jsonspan::skip_ws(current.text.as_bytes(), 0);
+        let ops =
+            if self.kind == Kind::ClaudeJson && current.text.as_bytes().get(start) == Some(&b'{') {
+                expand_copies(&current.text, start, &ops, Purpose::Change)?.into_owned()
+            } else {
+                ops
+            };
         let (hash, edited) = alongside(
             current.text.len() >= PARALLEL_FROM,
             || current.hash(),
@@ -429,9 +440,9 @@ impl Docstore {
     /// are all in place. Each plan is applied to the result of the one before, as it was when it was written.
     fn replay(&self, current: &Current, log: &[Plan]) -> Result<Option<Splices>, StoreError> {
         let mut redone: Option<Current> = None;
-        for plan in log {
+        for ops in as_they_ended(log) {
             let base = redone.as_ref().unwrap_or(current);
-            if let (Some(edits), _) = self.edit(base, &plan.ops, Purpose::Verify)? {
+            if let (Some(edits), _) = self.edit(base, &ops, Purpose::Verify)? {
                 redone = Some(Current {
                     text: spliced(&base.text, &edits),
                     bom: current.bom,
@@ -573,6 +584,36 @@ impl Docstore {
         }))
     }
 
+    /// Keeps a private copy of the file as it is now, in the rotation, before another program (Claude Code's own
+    /// commands) changes it. A copy, not a link: that program may write the file in place.
+    pub(crate) fn keep_copy(&self) -> Result<PathBuf, StoreError> {
+        let current = self.read()?;
+        create_private_dir(&self.backup_dir)?;
+        let ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        for n in 0u32.. {
+            let path = self
+                .backup_dir
+                .join(format!("{}.{ms:016}-{n}.bak", self.backup_label()));
+            match create_private_file(&path) {
+                Ok(mut file) => {
+                    if current.bom {
+                        file.write_all(BOM.as_bytes())?;
+                    }
+                    file.write_all(current.text.as_bytes())?;
+                    file.sync_all()?;
+                    self.rotate_backups();
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!("some backup name is free")
+    }
+
     /// Keeps the bytes about to be replaced. A hard link to the current file costs nothing, whatever its size: the
     /// rename that follows leaves the old file to the link alone. Where a link is not possible (another drive, a
     /// file system without links) the text that was read is copied instead.
@@ -668,7 +709,7 @@ fn make_private(path: &Path) {
 fn make_private(_path: &Path) {}
 
 #[cfg(unix)]
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -677,12 +718,12 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> io::Result<()> {
     std::fs::create_dir_all(path)
 }
 
 #[cfg(unix)]
-fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .write(true)
@@ -692,7 +733,7 @@ fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1287,9 +1328,100 @@ fn legacy_names(
     Ok(Some((at, names)))
 }
 
-/// A delete being checked whose server is already gone: that is the delete in place.
+/// The log's operations for a replay, with each server added by one plan and deleted or renamed by a later one
+/// replayed as it ended. An add finds its server missing whether Claude Code overwrote the file or a later plan of
+/// ours took it away, and would add it back; so a server deleted later is not added, and one renamed later is
+/// added (and edited) under its new name. The later delete or rename then finds it gone, which is done.
+fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
+    let mut plans: Vec<Vec<Option<Op>>> = log
+        .iter()
+        .map(|p| p.ops.iter().cloned().map(Some).collect())
+        .collect();
+    let here = |project: &Option<String>, name: &str, at: &Option<String>, n: &str| {
+        n == name
+            && match (project, at) {
+                (Some(a), Some(b)) => crate::api::same_project(a, b),
+                (a, b) => a == b,
+            }
+    };
+    for j in 0..plans.len() {
+        for k in 0..plans[j].len() {
+            let (at, n, to) = match &plans[j][k] {
+                Some(Op::RemoveServer { project, name }) => (project.clone(), name.clone(), None),
+                Some(Op::RenameServer {
+                    project,
+                    name,
+                    new_name,
+                }) => (project.clone(), name.clone(), Some(new_name.clone())),
+                _ => continue,
+            };
+            // Back to where this server came in. Only an add, with the edits since, is rewritten: one that came
+            // in by a rename, or a copy whose definition is not in the plan, replays as it is. A rename into this
+            // name is passed over: an add before it was already given this name when that rename was reached.
+            let mut edits = Vec::new();
+            let mut added = None;
+            'back: for i in (0..j).rev() {
+                for o in (0..plans[i].len()).rev() {
+                    match &plans[i][o] {
+                        Some(Op::ReplaceServer { project, name, .. })
+                            if here(project, name, &at, &n) =>
+                        {
+                            edits.push((i, o));
+                        }
+                        Some(Op::AddServer { project, name, .. })
+                            if here(project, name, &at, &n) =>
+                        {
+                            added = Some((i, o));
+                            break 'back;
+                        }
+                        Some(Op::RemoveServer { project, name })
+                            if here(project, name, &at, &n) =>
+                        {
+                            break 'back;
+                        }
+                        Some(Op::RenameServer { project, name, .. })
+                            if here(project, name, &at, &n) =>
+                        {
+                            break 'back;
+                        }
+                        Some(Op::CopyServer { to, new_name, .. })
+                            if here(to, new_name, &at, &n) =>
+                        {
+                            break 'back;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let Some((i, o)) = added else { continue };
+            match &to {
+                None => plans[i][o] = None,
+                Some(new_name) => {
+                    for (i, o) in edits.into_iter().chain([(i, o)]) {
+                        if let Some(Op::AddServer { name, .. } | Op::ReplaceServer { name, .. }) =
+                            &mut plans[i][o]
+                        {
+                            name.clone_from(new_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    plans
+        .into_iter()
+        .map(|ops| ops.into_iter().flatten().collect())
+        .collect()
+}
+
+/// A change being checked whose server is already gone. For a delete (or a rename) that is the change in place. For an
+/// edit, a later change, ours or someone else's, deleted the server; the edit is no reason to bring it back.
 fn gone_is_done(op: &Op, purpose: Purpose) -> bool {
-    purpose == Purpose::Verify && matches!(op, Op::RemoveServer { .. } | Op::RenameServer { .. })
+    purpose == Purpose::Verify
+        && matches!(
+            op,
+            Op::RemoveServer { .. } | Op::RenameServer { .. } | Op::ReplaceServer { .. }
+        )
 }
 
 /// What an edit of `.claude.json` produces so far.
@@ -1410,7 +1542,8 @@ fn edit_servers<'o>(
         let member = &object.members[index];
         let old: Value = serde_json::from_str(&text[member.value.clone()])
             .map_err(|e| invalid(sanitize(&e.to_string())))?;
-        if old.get("oauth").is_some() {
+        // Claude Code's own commands change a server that signs in with OAuth; klefki only shows what they will do.
+        if old.get("oauth").is_some() && purpose != Purpose::Preview {
             return Err(invalid(oauth_refusal(name)));
         }
         if removed.contains(&index)
@@ -1455,7 +1588,11 @@ fn edit_servers<'o>(
             }
             Op::ReplaceServer { entry: new, .. } => {
                 let new = entry::unmasked(new, &old).map_err(invalid)?;
-                entry::validate(&new).map_err(invalid)?;
+                if purpose == Purpose::Preview {
+                    entry::validate_new(&new).map_err(invalid)?;
+                } else {
+                    entry::validate(&new).map_err(invalid)?;
+                }
                 let pretty =
                     |v: &Value| serde_json::to_string_pretty(&entry::masked(v)).unwrap_or_default();
                 let diff = entry::diff_lines(&pretty(&old), &pretty(&new));
@@ -1523,7 +1660,7 @@ fn edit_servers<'o>(
 
 fn oauth_refusal(name: &str) -> String {
     format!(
-        "{} signs in with OAuth; it is changed through Claude Code's own command, which Klefki does not run yet",
+        "{} signs in with OAuth; only Claude Code's own commands change it",
         sanitize(name)
     )
 }
@@ -1629,7 +1766,7 @@ fn expand_copies<'a>(
                 )));
             }
         };
-        if definition.get("oauth").is_some() {
+        if definition.get("oauth").is_some() && purpose != Purpose::Preview {
             return Err(invalid(oauth_refusal(name)));
         }
         out.push(Op::AddServer {
@@ -2766,6 +2903,32 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_then_a_delete_of_the_same_server_checks_out() {
+        // Found by the model-based test: an edit and then a delete of one server within the check's delay. The log
+        // is replayed on the file, where the server is already gone; the edit must not fail the check.
+        let f = Fixture::new(&pretty(&sample()));
+        let edit = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "a"}))]);
+        let delete = apply_ops(&f, vec![remove(None, "gateway")]);
+        assert_eq!(f.store.verify(&[edit, delete], &|| false), Ok(false));
+        assert!(f.json()["mcpServers"].get("gateway").is_none());
+    }
+
+    #[test]
+    fn an_edit_of_a_server_deleted_from_outside_is_not_put_back() {
+        // The variant: someone else deleted it before the check. The edit is not a reason to bring it back.
+        let f = Fixture::new(&pretty(&sample()));
+        let edit = apply_ops(&f, vec![replace(None, "gateway", json!({"command": "a"}))]);
+        let mut theirs = f.json();
+        theirs["mcpServers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gateway");
+        std::fs::write(&f.store.path, pretty(&theirs)).unwrap();
+        assert_eq!(f.store.verify(&[edit], &|| false), Ok(false));
+        assert!(f.json()["mcpServers"].get("gateway").is_none());
+    }
+
+    #[test]
     fn a_write_landing_between_our_read_and_our_rename_is_not_overwritten() {
         // Claude writes without the lock while we hold it. Checked just before the rename (validation, as in
         // optimistic concurrency control), the change is redone on Claude's version instead of replacing it.
@@ -3630,6 +3793,162 @@ mod tests {
             f.store.verify(std::slice::from_ref(&plan), &|| false),
             Ok(false)
         );
+    }
+
+    #[test]
+    fn a_later_copy_back_into_a_deleted_place_survives_the_earlier_deletes_check() {
+        // Found by the model-based test (engine/machine.rs): delete gateway in app, then move the user's gateway
+        // into app. Checked together, oldest first, the delete removed what the move added, and the move, whose
+        // original was gone by then, could not put it back.
+        let mut doc = sample();
+        doc["projects"]["C:/work/app"]["mcpServers"] = json!({"gateway": {"command": "old"}});
+        let f = Fixture::new(&pretty(&doc));
+        let delete = apply_ops(&f, vec![remove(Some("C:/work/app"), "gateway")]);
+        let moved = apply_ops(
+            &f,
+            vec![
+                copy(None, "gateway", Some("C:/work/app"), "gateway"),
+                remove(None, "gateway"),
+            ],
+        );
+        let after = f.json();
+        assert_eq!(
+            f.store.verify(&[delete.clone(), moved], &|| false),
+            Ok(false)
+        );
+        assert_eq!(f.json(), after);
+        assert_eq!(
+            after["projects"]["C:/work/app"]["mcpServers"]["gateway"],
+            sample()["mcpServers"]["gateway"]
+        );
+        // The variant: a copy that leaves the original, under another name.
+        let f = Fixture::new(&pretty(&doc));
+        let delete = apply_ops(&f, vec![remove(Some("C:/work/app"), "gateway")]);
+        let copied = apply_ops(
+            &f,
+            vec![copy(None, "gateway", Some("C:/work/app"), "gateway")],
+        );
+        let after = f.json();
+        assert_eq!(f.store.verify(&[delete, copied], &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_moves_check_does_not_add_back_a_server_renamed_since() {
+        // Found by the model-based test: move gateway into app, then rename it there. Checked together, the move
+        // added gateway back (it was missing under that name), and the rename then found its new name taken.
+        let original = pretty(&sample());
+        let f = Fixture::new(&original);
+        let moved = apply_ops(
+            &f,
+            vec![
+                copy(None, "gateway", Some("C:/work/app"), "gateway"),
+                remove(None, "gateway"),
+            ],
+        );
+        let renamed = apply_ops(
+            &f,
+            vec![rename_server(Some("C:/work/app"), "gateway", "gw")],
+        );
+        let after = f.json();
+        let log = [moved, renamed];
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+        // Claude Code overwrote both: put back as they ended, the server under its new name.
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+        // With an edit between them, the edit is kept too.
+        let f = Fixture::new(&original);
+        let edited = json!({"command": "new"});
+        let log = [
+            apply_ops(
+                &f,
+                vec![copy(None, "gateway", Some("C:/work/app"), "gateway")],
+            ),
+            apply_ops(
+                &f,
+                vec![replace(Some("C:/work/app"), "gateway", edited.clone())],
+            ),
+            apply_ops(
+                &f,
+                vec![rename_server(Some("C:/work/app"), "gateway", "gw")],
+            ),
+        ];
+        let after = f.json();
+        assert_eq!(after["projects"]["C:/work/app"]["mcpServers"]["gw"], edited);
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_adds_check_follows_a_chain_of_renames() {
+        // Found in cross-review: added, renamed, renamed again, all checked together.
+        let original = pretty(&sample());
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(
+                &f,
+                vec![copy(None, "gateway", Some("C:/work/app"), "gateway")],
+            ),
+            apply_ops(
+                &f,
+                vec![rename_server(Some("C:/work/app"), "gateway", "gw")],
+            ),
+            apply_ops(&f, vec![rename_server(Some("C:/work/app"), "gw", "gz")]),
+        ];
+        let after = f.json();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
+        // The variant: deleted at the end of the chain.
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(
+                &f,
+                vec![copy(None, "gateway", Some("C:/work/app"), "gateway")],
+            ),
+            apply_ops(
+                &f,
+                vec![rename_server(Some("C:/work/app"), "gateway", "gw")],
+            ),
+            apply_ops(&f, vec![remove(Some("C:/work/app"), "gw")]),
+        ];
+        let after = f.json();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+    }
+
+    #[test]
+    fn an_earlier_adds_check_does_not_add_back_a_server_deleted_since() {
+        // The variant: added, then deleted.
+        let original = pretty(&sample());
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![copy(None, "gateway", Some("C:/work/app"), "gw")]),
+            apply_ops(&f, vec![remove(Some("C:/work/app"), "gw")]),
+        ];
+        let after = f.json();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.json(), after);
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        assert_eq!(f.text(), original);
+        // A server renamed into that name first, then deleted: the rename is replayed and so is the delete.
+        let f = Fixture::new(&original);
+        let log = [
+            apply_ops(&f, vec![rename_server(None, "gateway", "gw")]),
+            apply_ops(&f, vec![remove(None, "gw")]),
+        ];
+        let after = f.json();
+        assert!(after["mcpServers"].get("gateway").is_none());
+        std::fs::write(&f.store.path, &original).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), after);
     }
 
     fn copy(from: Option<&str>, name: &str, to: Option<&str>, new_name: &str) -> Op {

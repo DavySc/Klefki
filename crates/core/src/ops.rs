@@ -7,6 +7,7 @@ use crate::config::inventory::{FileKey, FileKeys};
 use crate::config::{entry, fsx, inventory, secretlike};
 use crate::sanitize::sanitize;
 use crate::secrets::Secret;
+use crate::swap::{self, Spot, Swap};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -37,9 +38,14 @@ pub(crate) struct Resolved {
     pub guards: Vec<Guard>,
     /// Servers Claude Code adds itself, with `claude mcp add-json`: those that sign in with OAuth.
     pub cli: Vec<CliAdd>,
-    /// What [`Self::cli`] will change in `~/.claude.json`, as edits klefki never makes: they show the change in the
-    /// plan, and say whether the file still allows it just before the command runs.
+    /// What [`Self::cli`] and [`Self::swaps`] will change in `~/.claude.json`, as edits klefki never makes: they show
+    /// the change in the plan, and say whether the file still allows it just before the command runs.
     pub preview: Vec<Op>,
+    /// Servers removed and added again (or copied) through Claude Code's own commands: those that sign in with OAuth.
+    pub swaps: Vec<Swap>,
+    /// Definitions Klefki kept, to add back ([`Change::PutBack`]) or to forget ([`Change::ForgetKept`]).
+    pub put_back: Vec<String>,
+    pub forget: Vec<String>,
 }
 
 /// A server Claude Code adds with its own command, `claude mcp add-json`, because it signs in with OAuth: Claude
@@ -94,11 +100,14 @@ pub(crate) fn resolve(
             Change::Duplicate { .. } => "Duplicate",
             Change::MigrateLegacyDisabled { .. } => "Migrate",
             Change::Add { .. } => "Add",
+            Change::Move { .. } => "Move",
+            Change::PutBack { .. } => "Put back",
+            Change::ForgetKept { .. } => "Forget",
         };
         if !verbs.contains(&verb) {
             verbs.push(verb);
         }
-        out.destructive |= matches!(change, Change::Delete { .. });
+        out.destructive |= matches!(change, Change::Delete { .. } | Change::ForgetKept { .. });
         out.summary.push(summarise(change, snapshot));
         match change {
             Change::SetEnabled { id, enabled } => {
@@ -113,6 +122,19 @@ pub(crate) fn resolve(
             }
             Change::MigrateLegacyDisabled { project } => {
                 migrate_legacy(project, snapshot, &mut out)?;
+            }
+            Change::Move { id, to } => move_server(id, to, snapshot, keys, &mut out)?,
+            Change::PutBack { kept } => {
+                find_kept(kept, snapshot)?;
+                out.put_back.push(kept.clone());
+            }
+            Change::ForgetKept { kept } => {
+                find_kept(kept, snapshot)?;
+                out.forget.push(kept.clone());
+                out.warnings.push(
+                    "Klefki deletes the only copy it has of this definition. The copy of the configuration it kept first is still in its backups folder."
+                        .to_owned(),
+                );
             }
             Change::Add {
                 name,
@@ -134,7 +156,11 @@ pub(crate) fn resolve(
         [one] => (*one).to_owned(),
         _ => "Apply".to_owned(),
     };
-    if !out.claude.is_empty() || !out.cli.is_empty() {
+    if !out.claude.is_empty()
+        || !out.cli.is_empty()
+        || !out.swaps.is_empty()
+        || !out.put_back.is_empty()
+    {
         out.notes.push(
             "A running Claude Code session may need a restart before it notices this.".to_owned(),
         );
@@ -194,6 +220,24 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         }
         Change::Add { name, targets, .. } => {
             return format!("Add {}{}", sanitize(name), places(targets));
+        }
+        Change::Move { id, to } => {
+            let to = match to {
+                Target::User => "the user".to_owned(),
+                Target::Local(p) => sanitize(&folder_name(p)),
+            };
+            return format!("Move {} to {to}", shown(id).2);
+        }
+        Change::PutBack { kept } | Change::ForgetKept { kept } => {
+            let verb = if matches!(change, Change::PutBack { .. }) {
+                "Put back"
+            } else {
+                "Forget the kept copy of"
+            };
+            return match snapshot.kept.iter().find(|k| k.id == *kept) {
+                Some(k) => format!("{verb} {} {}", k.name, k.place),
+                None => format!("{verb} a kept definition"),
+            };
         }
     };
     let (scope, project, name) = shown(id);
@@ -393,14 +437,131 @@ fn replace(
             sanitize(&e.to_string())
         )
     })?;
+    let (row, _) = find(id, snapshot, keys)?;
+    let oauth = row.oauth.is_some() || swap::signs_in(&value);
     // Checked again after hidden values are put back; this catches mistakes before anything is read.
-    entry::validate(&value).map_err(|why| format!("The definition is not usable: {why}."))?;
-    out.claude.push(Op::ReplaceServer {
+    if oauth {
+        entry::validate_new(&value)
+    } else {
+        entry::validate(&value)
+    }
+    .map_err(|why| format!("The definition is not usable: {why}."))?;
+    if !oauth {
+        out.claude.push(Op::ReplaceServer {
+            project: file.project.clone(),
+            name: file.name.clone(),
+            entry: value,
+        });
+        return Ok(());
+    }
+    if swap::signs_in(&value) {
+        typed_secret_refused(&row.name, &value)?;
+    }
+    let here = Spot {
         project: file.project.clone(),
         name: file.name.clone(),
-        entry: value,
+    };
+    out.swaps.push(Swap {
+        from: here.clone(),
+        remove: true,
+        to: here,
+        edited: Some(value),
     });
     Ok(())
+}
+
+/// Moves a user or local server, keeping its name, to `to`. One that signs in with OAuth is moved by Claude Code's
+/// own commands (see [`Swap`]); any other in one write, where it is added before it is removed.
+fn move_server(
+    id: &ServerId,
+    to: &Target,
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let file = own_server(id, snapshot, keys, "move")?;
+    let (row, _) = find(id, snapshot, keys)?;
+    let here = match (&file.project, to) {
+        (None, Target::User) => true,
+        (Some(p), Target::Local(q)) => {
+            inventory::normalise_project(p) == inventory::normalise_project(q)
+        }
+        _ => false,
+    };
+    if here {
+        return Err(format!("{} is already there.", row.name));
+    }
+    let to = new_places(
+        &file.name,
+        std::slice::from_ref(to),
+        "it",
+        Some(&row.connection),
+        snapshot,
+        keys,
+        out,
+    )?
+    .pop()
+    .expect("one place asked, one given");
+    match (&file.project, &to) {
+        (_, None) => out.notes.push(format!(
+            "As a user server, {} is on in every project, except where it is switched off.",
+            row.name
+        )),
+        // The main consequence of narrowing it to one project.
+        (None, Some(there)) => {
+            let others: Vec<String> = snapshot
+                .projects
+                .iter()
+                .filter(|p| inventory::normalise_project(p) != inventory::normalise_project(there))
+                .map(|p| sanitize(&folder_name(p)))
+                .collect();
+            if !others.is_empty() {
+                out.warnings.push(format!(
+                    "{} will only be in {}: it is no longer there for you in {}.",
+                    row.name,
+                    sanitize(&folder_name(there)),
+                    some_of(&others)
+                ));
+            }
+        }
+        _ => {}
+    }
+    let copy = Op::CopyServer {
+        from: file.project.clone(),
+        name: file.name.clone(),
+        to: to.clone(),
+        new_name: file.name.clone(),
+    };
+    let remove = Op::RemoveServer {
+        project: file.project.clone(),
+        name: file.name.clone(),
+    };
+    if row.oauth.is_none() {
+        out.claude.extend([copy, remove]);
+    } else {
+        out.swaps.push(Swap {
+            from: Spot {
+                project: file.project.clone(),
+                name: file.name.clone(),
+            },
+            remove: true,
+            to: Spot {
+                project: to,
+                name: file.name.clone(),
+            },
+            edited: None,
+        });
+    }
+    Ok(())
+}
+
+/// The kept definition `id` names, or why it cannot be used.
+fn find_kept<'a>(id: &str, snapshot: &'a Snapshot) -> Result<&'a crate::api::Kept, String> {
+    snapshot
+        .kept
+        .iter()
+        .find(|k| k.id == id)
+        .ok_or_else(|| "That kept definition is gone. Refresh and look again.".to_owned())
 }
 
 /// Gives a user or local server another name where it is: only its key changes, and the new name is switched off
@@ -552,12 +713,28 @@ fn duplicate(
     if targets.is_empty() {
         return Err("Choose where the copy goes.".to_owned());
     }
-    for to in new_places(name, targets, "this copy", snapshot, keys, out)? {
-        out.claude.push(Op::CopyServer {
+    for to in new_places(name, targets, "this copy", None, snapshot, keys, out)? {
+        let op = Op::CopyServer {
             from: from.clone(),
             name: file.name.clone(),
-            to,
+            to: to.clone(),
             new_name: name.to_owned(),
+        };
+        if row.oauth.is_none() {
+            out.claude.push(op);
+            continue;
+        }
+        out.swaps.push(Swap {
+            from: Spot {
+                project: from.clone(),
+                name: file.name.clone(),
+            },
+            remove: false,
+            to: Spot {
+                project: to,
+                name: name.to_owned(),
+            },
+            edited: None,
         });
     }
     out.notes.push(
@@ -570,10 +747,12 @@ fn duplicate(
 /// Where a new server called `name` goes, as the file spells each project: refused when a target is unknown or
 /// already has a server by that name (the docstore refuses one added twice in a plan), with a warning wherever
 /// Claude Code would use another server of that name instead. `what` names the new server in those warnings.
+/// `leaving` is the server a move takes away in the same plan, which is not another server.
 fn new_places(
     name: &str,
     targets: &[Target],
     what: &str,
+    leaving: Option<&crate::model::ConnectionId>,
     snapshot: &Snapshot,
     keys: &FileKeys,
     out: &mut Resolved,
@@ -584,6 +763,7 @@ fn new_places(
     let others: Vec<(&ServerRow, &FileKey)> = snapshot
         .servers
         .iter()
+        .filter(|r| Some(&r.connection) != leaving)
         .filter_map(|r| Some((r, keys.get(&r.connection)?)))
         .filter(|(_, k)| k.name == name)
         .collect();
@@ -701,11 +881,25 @@ fn add(
     }
     if oauth {
         typed_secret_refused(&new, &value)?;
+        let lost: Vec<String> = value
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+            .filter(|k| swap::as_claude_writes(&value).get(k.as_str()).is_none())
+            .map(|k| sanitize(k))
+            .collect();
+        if !lost.is_empty() {
+            out.warnings.push(format!(
+                "Claude Code keeps only the settings it uses, so {new} loses {}.",
+                lost.join(", ")
+            ));
+        }
     }
     // Typed-in values are not shown (they may be secrets); which of the user's variables are read still is.
     let lines = describe(&shown_values(&value))
         .map_err(|why| format!("{new} cannot be reviewed safely, so it is not added: {why}."))?;
-    for to in new_places(name, targets, "this server", snapshot, keys, out)? {
+    for to in new_places(name, targets, "this server", None, snapshot, keys, out)? {
         let op = Op::AddServer {
             project: to.clone(),
             name: name.to_owned(),
@@ -723,7 +917,12 @@ fn add(
                 sanitize(&folder_name(project))
             ));
         }
-        out.preview.push(op);
+        // Shown as Claude Code writes it.
+        out.preview.push(Op::AddServer {
+            project: to.clone(),
+            name: name.to_owned(),
+            entry: swap::as_claude_writes(&value),
+        });
         out.cli.push(CliAdd {
             name: name.to_owned(),
             json: value.to_string(),

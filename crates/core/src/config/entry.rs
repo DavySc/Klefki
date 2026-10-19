@@ -59,7 +59,7 @@ pub(crate) fn validate(entry: &Value) -> Result<(), String> {
         .ok_or("the definition must be a JSON object")?;
     if object.contains_key("oauth") {
         return Err(
-            "servers that sign in with OAuth are changed through Claude Code's own command, which Klefki does not run yet"
+            "servers that sign in with OAuth are changed through Claude Code's own commands"
                 .to_owned(),
         );
     }
