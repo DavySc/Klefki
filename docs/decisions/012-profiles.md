@@ -23,9 +23,9 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   one project Claude Code knows, or in every one it knows today (the review says a project opened later is not
   covered).
 - It turns its servers on there. With "Only these servers there" (`only`), every other server in that project goes
-  off, and the review names them. The box is ticked at first (owner, 2026-10-20): servers are on unless switched off,
-  so without it using a profile mostly changes nothing. A name a member shares with another server stays on, since Claude Code switches by
-  name.
+  off, and the review names every one (in every project, with how many projects). The box is ticked at first (owner,
+  2026-10-20): servers are on unless switched off, so without it using a profile mostly changes nothing. A name a
+  member shares with another server stays on, since Claude Code switches by name.
 - The review says what Claude Code will really load. A member that still will not load there is named, with why:
   another server of its name loads instead (a local or approved project server over a user one), policy or the
   organisation holds it back, its plugin is off there, Claude Code leaves it out as a duplicate, or connectors are

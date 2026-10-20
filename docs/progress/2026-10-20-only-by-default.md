@@ -21,3 +21,8 @@ starts ticked on each profile card. Follows #60.
 
 ## Next
 - None for this slice.
+
+## Cross-review (approved, two optional items folded in)
+- "This also turns off" names every server (`and_list`, not "and N more"), and in every project says in how many
+  projects: `using_a_profile_alone_names_every_server_it_turns_off` failed before. Decision 012 re-wrapped to 120.
+- Full verify again: exit 0 (core 901, app 414, cli 25 and 33).
