@@ -24,7 +24,7 @@ release is out, and tell the user. Download and install follow in 6b. Design: `d
 ## Checks run
 - `cargo fmt --check` exit 0; `cargo clippy --workspace --all-targets -- -D warnings` exit 0; `cargo test --workspace`
   exit 0 (770 core lib, 360 app, 25 + 20 others; 1175 total); `cargo deny check` exit 0 (advisories, bans, licenses,
-  sources ok). Re-run after rebasing onto main with #45 and #46: see the PR.
+  sources ok). Re-run on the branch rebuilt from main with #45 and #46 (commit applied with cherry-pick, no PR yet then): all four exit 0; 777 core lib, 362 app, 1184 total.
 - New tests: 12 in `update.rs` (newer/older/same, numeric order, altered checksums, other key, `main`/pre-release/
   other comment, garbage, no key fetches nothing, fetch failure, version parsing, http refused), 2 engine tests
   (found + page opened; no key), 7 in `updates.rs` (timing, daily, failure retried, off stays off, remembered,
