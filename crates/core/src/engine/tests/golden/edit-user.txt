@@ -1,0 +1,59 @@
+== review
+summary:
+  Save changes to gw (user server)
+warnings:
+  gw: use full paths. Claude Code starts user servers in each session's folder, so sessions in other folders can't find gw.js.
+notes:
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    mcpServers
+  ~ gw
+    {
+      "type": "stdio",
+      "command": "node",
+  +   "args": [
+  +     "gw.js"
+  +   ],
+      "env": {
+  +     "TOKEN": "<hidden>",
+  +     "MODE": "<hidden>"
+  -     "TOKEN": "<hidden>"
+      }
+    }
+button: Save
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "gw.js"
+      ],
+      "env": {
+        "TOKEN": "s3cret-value",
+        "MODE": "fast"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}

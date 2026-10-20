@@ -1,0 +1,52 @@
+== review
+summary:
+  Add sso2 for the user
+notes:
+  Claude Code adds it with its own command (claude mcp add-json), and keeps the client secret in its own secure storage; Klefki keeps a copy in the system's secret store. Sign in to it from Claude Code (/mcp) once it is added.
+  Klefki checks a new server once it is added: it starts its command, or connects to its address.
+  A running Claude Code session may need a restart before it notices this.
+review sso2 would connect:
+  Connects to: https://sso.example.com/mcp
+  Sends headers: X-Team
+  Header X-Team sends your environment variable TEAM
+  Signs in with OAuth as client client-7, callback port 8123
+diff .claude.json:
+    mcpServers
+  + sso2
+  + {
+  +   "type": "http",
+  +   "url": "https://sso.example.com/mcp",
+  +   "headers": {
+  +     "X-Team": "<hidden>"
+  +   },
+  +   "oauth": {
+  +     "clientId": "client-7",
+  +     "callbackPort": 8123
+  +   }
+  + }
+button: Add
+== Claude Code ran
+  mcp add-json -s user --client-secret -- sso2 {"type":"http","url":"https://sso.example.com/mcp","headers":{"X-Team":"${TEAM}"},"oauth":{"clientId":"client-7","callbackPort":8123}} (client secret in MCP_CLIENT_SECRET)
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 1,
+  "projects": {
+    "<tmp>/repo": {
+      "mcpServers": {}
+    }
+  },
+  "mcpServers": {
+    "sso2": {
+      "type": "http",
+      "url": "https://sso.example.com/mcp",
+      "headers": {
+        "X-Team": "${TEAM}"
+      },
+      "oauth": {
+        "clientId": "client-7",
+        "callbackPort": 8123
+      }
+    }
+  }
+}

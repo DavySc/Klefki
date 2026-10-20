@@ -1,0 +1,8 @@
+$ klefki-cli use Work --project <project>
+exit: Some(0)
+--- stdout
+Use the profile Work in Repo
+Nothing to change.
+The servers of Work, alpha and gamma, are already on in Repo. Other servers there are left as they are.
+To turn the other servers there off, use it with --only.
+--- stderr

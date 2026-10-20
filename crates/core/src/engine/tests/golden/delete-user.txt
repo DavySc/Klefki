@@ -1,0 +1,35 @@
+== review
+summary:
+  Delete gw (user server)
+warnings:
+  Deleting removes the definition only. A sign-in Claude Code keeps for this server is not removed.
+notes:
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    mcpServers
+  - gw
+button: Delete (dangerous)
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {},
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}

@@ -1,0 +1,70 @@
+$ klefki-cli --help
+exit: Some(0)
+--- stdout
+klefki-cli: list Claude Code's MCP servers, check whether they connect, export them,
+and use Klefki's profiles.
+
+Examples:
+  klefki-cli status                 check every server that is on
+  klefki-cli status docs            check one server, a project server too
+  klefki-cli status --json | jq '.servers[] | select(.status == "failed") | .name'
+  klefki-cli export github -o servers.json
+  klefki-cli use Writing --only     only the Writing profile's servers in this project
+
+Usage:
+  klefki-cli list   [NAME...] [--json]
+  klefki-cli status [NAME...] [--json] [--claude PATH]
+  klefki-cli export [NAME...] [-o FILE [--force]]
+  klefki-cli profiles [--json]
+  klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]
+  klefki-cli help
+  klefki-cli --version
+
+Commands:
+  list     Show the configured servers, grouped by scope and project. Reads the
+           configuration only; runs nothing.
+  status   Ask Claude Code whether each server connects. Checks the user and local
+           servers that are on. Project (.mcp.json) servers run the repository's own
+           command, so they are checked only when named.
+  export   Print the servers' definitions as one {"mcpServers": {...}} block, the
+           shape a .mcp.json has and Klefki's Add reads. Every environment and
+           header value, and anything else that looks like a secret, is written
+           as a ${VAR} reference; stderr lists the variables to set. Reads the
+           configuration only and runs nothing; writes only the --output file.
+  profiles List the profiles made in Klefki: their servers, and the projects
+           where their servers are the only ones on. Reads only.
+  use      Turn a profile's servers on in a project: the one of the current
+           folder, the --project folder, or --all projects Claude Code knows.
+           Shows the change first and saves it once you say yes (or --yes),
+           keeping a backup, as the app does.
+
+Options:
+  NAME           Only these servers (by name, in every scope).
+  --json         Print JSON for scripts instead of the table (list, status).
+  --claude PATH  The Claude CLI to use (default: found like the Klefki app does).
+  -o, --output FILE
+                 Write the export to FILE instead of stdout. An existing file
+                 is kept unless you confirm, or add --force. Claude Code's own
+                 files and .mcp.json files are never written.
+  --project DIR  use: the project to use the profile in (default: this folder).
+  --all          use: every project Claude Code knows today.
+  --only         use: turn every other server in those projects off.
+  -y, --yes      use: save without asking.
+  -h, --help     Show this help.
+  -V, --version  Show the version.
+
+  Servers that are off, or rejected for their project, are never checked.
+
+Exit status:
+  0  Done; for status, every server checked is connected; for export, every
+     server named is in the block.
+  1  status found a server that is not connected; export left one out; use
+     could not make or save the change.
+  2  The command line was wrong, a NAME matches no server, or use names a
+     profile or folder that is not there.
+  3  Claude Code could not be used: not found, or no check got an answer.
+  4  export could not write the --output file (it is there, or not allowed);
+     use saved nothing: not confirmed, or nobody at a terminal and no --yes.
+
+Reads CLAUDE_CONFIG_DIR like Claude Code does.
+--- stderr

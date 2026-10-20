@@ -1,0 +1,19 @@
+$ klefki-cli use Work --project <project> --only
+exit: Some(4)
+--- stdout
+Use the profile Work in Repo, and turn off every other server there
+
+warning: This also turns off beta, docs and remote, which are not in Work.
+note: Klefki remembers what this switches: stop using Work, or delete it, to put it back.
+note: gone is in Work but no longer configured, so nothing is switched for it.
+note: A running Claude Code session may need a restart before it notices this.
+
+.claude.json
+    projects["<project>"].disabledMcpServers
+  + beta
+    projects["<project>"].disabledMcpServers
+  + remote
+    projects["<project>"].disabledMcpServers
+  + docs
+--- stderr
+Nothing was saved: no one at a terminal to ask. Add --yes to save without asking.

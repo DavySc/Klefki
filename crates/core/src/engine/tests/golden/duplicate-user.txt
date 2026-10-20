@@ -1,0 +1,74 @@
+== review
+summary:
+  Duplicate gw as gw-copy for the user and in b
+notes:
+  The copy keeps the original's environment and header values; it does not share a sign-in.
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    mcpServers
+  + gw-copy
+  + {
+  +   "type": "stdio",
+  +   "command": "node",
+  +   "env": {
+  +     "TOKEN": "<hidden>"
+  +   }
+  + }
+    projects["/work/b"].mcpServers
+  + gw-copy
+  + {
+  +   "type": "stdio",
+  +   "command": "node",
+  +   "env": {
+  +     "TOKEN": "<hidden>"
+  +   }
+  + }
+button: Duplicate
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    },
+    "gw-copy": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ],
+      "mcpServers": {
+        "gw-copy": {
+          "type": "stdio",
+          "command": "node",
+          "env": {
+            "TOKEN": "s3cret-value"
+          }
+        }
+      }
+    }
+  },
+  "tail": "end"
+}

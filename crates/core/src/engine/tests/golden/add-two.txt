@@ -1,0 +1,92 @@
+== review
+summary:
+  Add files for the user
+  Add docs in a
+notes:
+  Klefki checks a new server once it is added: it starts its command, or connects to its address.
+  A running Claude Code session may need a restart before it notices this.
+review files would run:
+  Command: npx
+  Argument 1: -y
+  Argument 2: files-mcp
+  Argument 3: /work
+  Environment: API_KEY=${FILES_KEY}
+  Environment API_KEY uses your environment variable FILES_KEY
+review docs would connect:
+  Connects to: https://docs.example.com/mcp
+  Sends headers: Authorization
+  Header Authorization sends your environment variable DOCS_TOKEN
+diff .claude.json:
+    mcpServers
+  + files
+  + {
+  +   "command": "npx",
+  +   "args": [
+  +     "-y",
+  +     "files-mcp",
+  +     "/work"
+  +   ],
+  +   "env": {
+  +     "API_KEY": "<hidden>"
+  +   }
+  + }
+    projects["/work/a"].mcpServers
+  + docs
+  + {
+  +   "type": "http",
+  +   "url": "https://docs.example.com/mcp",
+  +   "headers": {
+  +     "Authorization": "<hidden>"
+  +   }
+  + }
+button: Add
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    },
+    "files": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "files-mcp",
+        "/work"
+      ],
+      "env": {
+        "API_KEY": "${FILES_KEY}"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        },
+        "docs": {
+          "type": "http",
+          "url": "https://docs.example.com/mcp",
+          "headers": {
+            "Authorization": "Bearer ${DOCS_TOKEN}"
+          }
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}
