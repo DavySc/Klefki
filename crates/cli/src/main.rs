@@ -1,7 +1,9 @@
 //! `klefki-cli`: Klefki without a window. `list` shows the configured MCP servers, `status` asks Claude Code whether
-//! they connect. Output and exit codes: docs/decisions/006-cli-output.md.
+//! they connect, `export` prints their definitions, `profiles` and `use` list and use Klefki's profiles. Output and
+//! exit codes: docs/decisions/006-cli-output.md.
 mod args;
 mod check;
+mod profile;
 mod render;
 mod suggest;
 
@@ -20,7 +22,7 @@ const UNAVAILABLE: u8 = 3;
 /// `export --output` wrote nothing: the file is there, or Klefki does not write there.
 const NOT_WRITTEN: u8 = 4;
 
-const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
+const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 
 fn main() -> ExitCode {
     let code = match args::parse(std::env::args_os().skip(1)) {
@@ -37,6 +39,13 @@ fn main() -> ExitCode {
             output,
             force,
         }) => export(&names, output.as_deref(), force),
+        Ok(Cmd::Profiles { json }) => profiles(json),
+        Ok(Cmd::Use {
+            profile,
+            place,
+            only,
+            yes,
+        }) => use_profile(&profile, &place, only, yes),
         Err(Usage::NoCommand) => {
             eprint!("{}", args::HELP);
             USAGE
@@ -64,6 +73,43 @@ fn list(names: &[String], json: bool) -> u8 {
         render::list_text(&snapshot, &rows, home().as_deref())
     };
     out(&text)
+}
+
+fn profiles(json: bool) -> u8 {
+    let snapshot = api::load_snapshot();
+    let profiles = api::load_profiles();
+    warn(&snapshot);
+    if let Some(problem) = &profiles.problem {
+        eprintln!("warning: {problem}");
+    }
+    let text = if json {
+        render::profiles_json(&profiles, &snapshot)
+    } else {
+        render::profiles_text(&profiles, &snapshot, home().as_deref())
+    };
+    out(&text)
+}
+
+/// Shows the change using `typed` makes, and saves it once confirmed. Reads the profile and the project first, so a
+/// typo starts nothing.
+fn use_profile(typed: &str, place: &args::Place, only: bool, yes: bool) -> u8 {
+    let snapshot = api::load_snapshot();
+    warn(&snapshot);
+    let profiles = api::load_profiles();
+    let found =
+        profile::find(&profiles, typed).and_then(|p| Ok((p, profile::project(&snapshot, place)?)));
+    let (chosen, project) = match found {
+        Ok(found) => found,
+        Err(why) => return usage(&why),
+    };
+    match profile::use_profile(chosen, project, only, yes) {
+        profile::Used::Saved | profile::Used::Nothing => OK,
+        profile::Used::NotSaved => NOT_WRITTEN,
+        profile::Used::Failed(why) => {
+            eprintln!("klefki-cli: {why}");
+            PROBLEM
+        }
+    }
 }
 
 /// The block goes to stdout, so `> servers.json` holds only the block, or to the `--output` file; what to know about

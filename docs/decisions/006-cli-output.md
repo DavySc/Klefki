@@ -46,5 +46,25 @@ Written for people first, with `--json` for scripts (clig.dev: "Human-readable o
 - Exit 0 when every server is in the block, 1 when one could not be read (the note says why), 2 for a name that matches no server.
 - **`--output FILE` / `-o FILE`** (2026-10-19) writes the block to `FILE` instead of stdout (stdout stays empty), and stderr says `Saved <name or N servers> to FILE.` before the variables. The file is written whole (a temporary file beside it, then moved into place). An existing file is kept: at a terminal the CLI asks `Replace it? [y/N]`; otherwise it names `--force`, which replaces it (clig.dev: "Confirm before doing anything dangerous", with a flag for scripts). Claude Code's own files (`.claude.json`, anything in its configuration folder or a `.claude` folder) and `.mcp.json` files are refused even with `--force`: they change only through a reviewed plan, and a project's servers belong to its repository. A link is never followed. Exit **4** when the file was not written, so a script can tell it from a server left out (1).
 
+## `profiles` and `use` (2026-10-20, decision 012; the owner chose "list and use")
+- **`profiles [--json]`** lists the profiles made in Klefki, read like the app reads them: each with its servers
+  (`User`, `Local in <project>`, or `no longer configured`) and the projects where its servers are the only ones on.
+  It reads only. JSON: `{"schema": 1, "profiles": [{"name", "servers": [{"name", "scope", "project", "configured"}],
+  "alone_in": [paths]}], "warnings": [...]}`; a profiles file Klefki cannot read in full is a warning, and what could
+  be read is listed.
+- **`use PROFILE [--project DIR | --all] [--only] [--yes]`** is the first command that changes Claude Code's
+  configuration. It makes the same plan as the app's "Use profile…" (`Change::UseProfile`, Prepare → diff → Apply
+  through the engine, a backup first, the Activity log) and prints it on stdout: what it does, warnings, notes, then
+  each file's changes, values that may be secret hidden as in the app. Then it asks `<action>? [y/N]` at a terminal;
+  with nobody there it saves nothing and names `--yes` (clig.dev: "Confirm before doing anything dangerous", a flag
+  for scripts). The profile is found by name, case aside, with the closest name suggested; the project is the current
+  folder's unless `--project` or `--all` says otherwise, matched as given and then with links resolved. A folder
+  Claude Code does not know is a usage error, as is an unknown profile: both are checked before anything starts.
+- `use` exits 0 when saved or when nothing needs changing, 4 when nothing was saved (not confirmed), 1 when the plan
+  could not be made or saved, 2 for a profile or folder that is not there. It runs no Claude Code command beyond the
+  `--version` the engine asks for when it starts. `--json` is refused: the plan is for people.
+- `KLEFKI_DATA_DIR` names Klefki's own folder (backups, profiles, the Activity log) instead of the machine's, like
+  `KLEFKI_MANAGED_DIR`, so tests and try-outs never touch it.
+
 ## Not done here
 Filtering by project or scope, colour. Ctrl+C does not yet stop running checks and the servers they started (follow-up, with #24's process-tree kill).
