@@ -19,4 +19,5 @@ mod sanitize;
 mod secret_uses;
 mod secrets;
 mod swap;
+mod update;
 mod watch;

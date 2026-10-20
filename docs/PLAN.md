@@ -159,8 +159,8 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
    - macOS: universal .app/.dmg with an ad-hoc signature. No Developer ID or notarisation: they need the paid Apple Developer Program, so Gatekeeper asks users to allow Klefki once.
    - Linux: deb and AppImage.
    - Every release: checksums signed with minisign, build provenance attestation and an SBOM.
-   - Auto-update only from an org-owned, signature-verified source.
-   - Slices, in order: (1) unsigned release builds from a `v*` tag, with checksums and the MIT OR Apache-2.0 licence (`docs/RELEASING.md`); (2) provenance attestation and SBOM; (3) minisign; (4) macOS ad-hoc signature; (5) Authenticode through SignPath Foundation, which signs only projects that have already released, so it follows the first release; (6) update check. Slices 3 and 5 need the owner's key or account.
+   - Klefki updates itself (owner's decision, 2026-10-20), only to releases signed with the release key (decision 009).
+   - Slices, in order: (1) unsigned release builds from a `v*` tag, with checksums and the MIT OR Apache-2.0 licence (`docs/RELEASING.md`); (2) provenance attestation and SBOM; (3) minisign; (4) macOS ad-hoc signature; (5) Authenticode through SignPath Foundation, which signs only projects that have already released, so it follows the first release; (6) auto-update: (6a) a signed update check with a notice, (6b) download and install. Slices 3 and 5 need the owner's key or account.
 
 ## Nice to have (after M4)
 Ideas from an outside brainstorm, compared with this plan and checked on a real machine in `docs/decisions/003-brainstorm-comparison.md`. None of them blocks M0 to M4, and they are in rough order of value.
