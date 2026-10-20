@@ -103,6 +103,9 @@ jobs:
               ditto "$app" dmg/Klefki.app
               ln -s /Applications dmg/Applications
               hdiutil create -volname Klefki -srcfolder dmg -fs HFS+ -format UDZO "dist/$base-macos-universal.dmg"
+              # What Klefki updates itself from (decision 009): the same signed app, zipped by ditto so the signature
+              # and the bundle's attributes survive.
+              ditto -c -k --keepParent "$app" "dist/$base-macos-universal.app.zip"
               ;;
             linux)
               cargo packager --release -p klefki -f deb,appimage -o "$GITHUB_WORKSPACE/target/packages"

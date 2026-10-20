@@ -11,7 +11,7 @@ use klefki_core::api::{
     Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Exported,
     FileChoice, Hint, ImportFile, LegacyDisabled, Part, Pasted, PastedServer, PlanView, SaveError,
     Scope, Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status, Target,
-    TransportKind, UpdateCheck, same_project, secret_reference,
+    TransportKind, UpdateCheck, UpdateDownload, same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -359,6 +359,9 @@ pub struct ShellApp {
     pub updates: crate::updates::Updates,
     /// This build can check for updates (it has a release key).
     checks_for_updates: bool,
+    /// Why this copy of Klefki is updated by hand (the MSI, the zip, the `.deb`); `None` when it installs updates
+    /// itself.
+    updated_by_hand: Option<String>,
 }
 
 impl ShellApp {
@@ -426,14 +429,16 @@ impl ShellApp {
             tone: Tone::default(),
             updates: crate::updates::Updates::default(),
             checks_for_updates: false,
+            updated_by_hand: None,
         }
     }
 
     /// The app driven by the engine: the snapshot and every status arrive as events.
     pub fn with_core(core: Core, theme: ThemeChoice) -> Self {
         let mut app = Self::new(Arc::new(Snapshot::default()), theme);
+        app.updated_by_hand = core.updated_by_hand().map(str::to_owned);
+        app.checks_for_updates = core.checks_for_updates();
         app.core = Some(core);
-        app.checks_for_updates = klefki_core::api::checks_for_updates();
         app
     }
 
@@ -535,7 +540,19 @@ impl ShellApp {
             }
         }
         match event {
-            Event::Update(found) => self.updates.answered(found, crate::updates::now()),
+            Event::Update(found) => {
+                self.updates.answered(found, crate::updates::now());
+                if self.updated_by_hand.is_none() && self.updates.download_due() {
+                    self.download_update();
+                }
+            }
+            Event::UpdateDownload(done) => {
+                // Found out only now (the app's folder cannot be changed): the page is the way from here.
+                if let UpdateDownload::Manual(why) = &done {
+                    self.updated_by_hand = Some(why.clone());
+                }
+                self.updates.downloaded(done);
+            }
             Event::Desktop(desktop) => {
                 // Not kept once the page is left: it is read again when the page is opened.
                 if let Some(page) = &mut self.desktop {
@@ -1296,17 +1313,21 @@ impl ShellApp {
                 {
                     self.refresh();
                 }
-                if let Some(version) = self.updates.available()
+                if let Some(version) = self.updates.available() {
+                    self.update_button(ui, version, pal.primary);
+                } else if let Some(version) = self.updates.updated
                     && ui
                         .button(
-                            RichText::new(format!("{} Update: {version}", icon::ARROW_CIRCLE_UP))
-                                .color(pal.primary),
+                            RichText::new(format!(
+                                "{} Updated to {version} · What's new",
+                                icon::CHECK_CIRCLE
+                            ))
+                            .color(pal.primary),
                         )
-                        .on_hover_text(format!(
-                            "Klefki {version} is out. Opens its page on GitHub, with what is new and the downloads."
-                        ))
+                        .on_hover_text("Opens the release's page on GitHub.")
                         .clicked()
                 {
+                    self.updates.updated = None;
                     self.send(Command::OpenReleasePage(version));
                 }
                 let mut changed = false;
@@ -1402,6 +1423,91 @@ impl ShellApp {
                 crate::updates::START_DELAY - uptime,
             ));
         }
+    }
+
+    /// The top bar's way to the update found: download it, then restart into it. Installs updated by hand open the
+    /// release's page instead.
+    fn update_button(&mut self, ui: &mut Ui, version: klefki_core::api::Version, color: Color32) {
+        let label =
+            |text: String| RichText::new(format!("{} {text}", icon::ARROW_CIRCLE_UP)).color(color);
+        if let Some(why) = &self.updated_by_hand {
+            let hover = format!(
+                "Klefki {version} is out. Opens its page on GitHub, with what is new and the downloads. {why}"
+            );
+            if ui
+                .button(label(format!("Update: {version}")))
+                .on_hover_text(hover)
+                .clicked()
+            {
+                self.send(Command::OpenReleasePage(version));
+            }
+        } else if self.updates.downloading {
+            ui.add_enabled(
+                false,
+                egui::Button::new(label(format!("Downloading {version}…"))),
+            );
+        } else if self.updates.ready() == Some(version) {
+            let busy = self.change_open();
+            let response = ui
+                .add_enabled(!busy, egui::Button::new(label("Restart to update".into())))
+                .on_hover_text(format!(
+                    "Installs Klefki {version} and starts it again. Otherwise it installs when Klefki closes."
+                ))
+                .on_disabled_hover_text(format!(
+                    "Finish the open change first. Klefki {version} also installs when Klefki closes."
+                ));
+            if response.clicked() {
+                self.restart_to_update(ui.ctx());
+            }
+        } else {
+            let hover = match self.updates.download_failed() {
+                Some(why) => format!("{why} Click to try again."),
+                None => {
+                    format!("Klefki {version} is out. Downloads it; you choose when to restart.")
+                }
+            };
+            if ui
+                .button(label(format!("Update: {version}")))
+                .on_hover_text(hover)
+                .clicked()
+            {
+                self.download_update();
+            }
+        }
+    }
+
+    fn download_update(&mut self) {
+        self.updates.downloading();
+        self.send(Command::DownloadUpdate);
+    }
+
+    /// Installs the downloaded update and closes Klefki, which the new version replaces.
+    fn restart_to_update(&mut self, ctx: &egui::Context) {
+        let Some(core) = &self.core else {
+            return;
+        };
+        match core.install_update(true) {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(why) => self.updates.downloaded(UpdateDownload::Failed(why)),
+        }
+    }
+
+    /// A change is being made or reviewed: restarting now would lose it.
+    fn change_open(&self) -> bool {
+        self.plan.is_some()
+            || self.applying
+            || self.preparing
+            || self.editor.is_some()
+            || self.add.is_some()
+            || self.duplicate.is_some()
+            || self.moving.is_some()
+            || self.sign_in.is_some()
+            || self.secret.is_some()
+            || self.secret_input.is_some()
+            || self.casing.is_some()
+            || self.forgetting.is_some()
+            || self.exporting.is_some()
+            || self.import_waiting
     }
 
     fn check_for_updates_now(&mut self) {
@@ -3582,12 +3688,44 @@ impl ShellApp {
                         return;
                     }
                     if let Some(version) = self.updates.available() {
-                        ui.label(
-                            RichText::new(format!("{version} is available")).color(pal.primary),
-                        );
+                        if self.updated_by_hand.is_some() {
+                            ui.label(
+                                RichText::new(format!("{version} is available")).color(pal.primary),
+                            );
+                        } else if self.updates.downloading {
+                            ui.spinner();
+                            ui.label(
+                                RichText::new(format!("Downloading {version}…"))
+                                    .color(pal.text_muted),
+                            );
+                        } else if self.updates.ready() == Some(version) {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{version} is ready: it installs when Klefki closes"
+                                ))
+                                .color(pal.primary),
+                            );
+                            let busy = self.change_open();
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Restart now"))
+                                .on_disabled_hover_text("Finish the open change first.")
+                                .clicked()
+                            {
+                                self.restart_to_update(ui.ctx());
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new(format!("{version} is available")).color(pal.primary),
+                            );
+                            if ui.button("Download").clicked() {
+                                self.download_update();
+                            }
+                        }
                         if ui.button("What's new").clicked() {
                             self.send(Command::OpenReleasePage(version));
                         }
+                        // Checking again would only find the same release.
+                        return;
                     } else if let Some(UpdateCheck::NoRelease) = &self.updates.found {
                         ui.label(
                             RichText::new("No signed release is published yet")
@@ -3608,14 +3746,37 @@ impl ShellApp {
             ui.add_space(8.0);
             ui.add(egui::Label::new(RichText::new(why.as_str()).color(pal.warn)).wrap());
         }
+        if self.updates.available().is_some() {
+            let note = match (&self.updated_by_hand, self.updates.download_failed()) {
+                (Some(why), _) => Some((why.clone(), pal.text_muted)),
+                (None, Some(why)) => Some((why.to_owned(), pal.warn)),
+                (None, None) => None,
+            };
+            if let Some((text, color)) = note {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
+            }
+        }
         ui.add_space(10.0);
-        ui.checkbox(&mut self.updates.auto, "Check for updates automatically");
+        let automatic = if self.updated_by_hand.is_some() {
+            "Check for updates automatically"
+        } else {
+            "Update Klefki automatically"
+        };
+        ui.checkbox(&mut self.updates.auto, automatic);
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Once a day, Klefki asks GitHub whether a newer version is out. GitHub sees your IP address \
-                     and Klefki's version, as with any download; nothing about your servers or settings is sent. \
-                     A release is offered only if it carries Klefki's signature.",
+                    if self.updated_by_hand.is_some() {
+                        "Once a day, Klefki asks GitHub whether a newer version is out. GitHub sees your IP address \
+                         and Klefki's version, as with any download; nothing about your servers or settings is sent. \
+                         A release is offered only if it carries Klefki's signature."
+                    } else {
+                        "Once a day, Klefki asks GitHub whether a newer version is out, and downloads it; it installs \
+                         when Klefki closes, or when you restart. GitHub sees your IP address and Klefki's version, \
+                         as with any download; nothing about your servers or settings is sent. A release is used only \
+                         if it carries Klefki's signature, and each file only if it matches the signed checksum."
+                    },
                 )
                 .small()
                 .color(pal.text_muted),
@@ -5381,6 +5542,15 @@ impl eframe::App for ShellApp {
         theme::save_choice(storage, self.theme);
         theme::save_tone(storage, self.tone);
         self.updates.save(storage);
+    }
+
+    /// A downloaded update installs as Klefki closes, unless the user restarted into it already.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(core) = &self.core
+            && self.updates.ready().is_some()
+        {
+            let _ = core.install_update(false);
+        }
     }
 }
 
@@ -17736,7 +17906,7 @@ mod tests {
     #[test]
     fn a_found_update_shows_in_the_top_bar_and_opens_its_page() {
         let (mut h, engine) = update_harness();
-        h.state_mut().updates.auto = false;
+        h.state_mut().updated_by_hand = Some("Klefki was installed from the .deb package.".into());
         h.run();
         let version = klefki_core::api::Version::parse("999.0.0").unwrap();
         engine
@@ -17755,9 +17925,112 @@ mod tests {
         h.state_mut().go(Page::Settings);
         h.run();
         h.get_by_label("999.0.0 is available");
+        h.get_by_label("Klefki was installed from the .deb package.");
         h.get_by_label("What's new").click();
         h.run();
-        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+        let sent = drain_all(&engine);
+        assert!(sent.contains(&Command::OpenReleasePage(version)));
+        assert!(
+            !sent.contains(&Command::DownloadUpdate),
+            "an install updated by hand downloads nothing"
+        );
+        assert!(h.query_by_label("Download").is_none());
+    }
+
+    fn found(engine: &klefki_core::api::Detached, version: klefki_core::api::Version) {
+        engine
+            .events
+            .send(Event::Update(UpdateCheck::Available {
+                version,
+                page: format!("https://github.com/DavySc/Klefki/releases/tag/v{version}"),
+            }))
+            .unwrap();
+    }
+
+    fn downloads_sent(engine: &klefki_core::api::Detached) -> usize {
+        drain_all(engine)
+            .into_iter()
+            .filter(|c| matches!(c, Command::DownloadUpdate))
+            .count()
+    }
+
+    #[test]
+    fn a_found_update_downloads_by_itself_then_offers_a_restart() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1);
+        h.get_by_label_contains("Downloading 999.0.0");
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Ready(version)))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Restart to update");
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label("999.0.0 is ready: it installs when Klefki closes");
+        // Restarting installs it; the stand-in engine has nothing downloaded, so this says why it could not.
+        h.get_by_label("Restart now").click();
+        h.run();
+        h.get_by_label("No update has been downloaded.");
+        h.get_by_label_contains("Update: 999.0.0");
+    }
+
+    #[test]
+    fn with_automatic_updates_off_the_download_waits_for_a_click() {
+        let (mut h, engine) = update_harness();
+        h.state_mut().updates.auto = false;
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        h.run();
+        assert_eq!(downloads_sent(&engine), 0);
+        h.get_by_label_contains("Update: 999.0.0").click();
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1);
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Failed(
+                "Could not download the update: no connection.".into(),
+            )))
+            .unwrap();
+        h.run();
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label("Could not download the update: no connection.");
+        h.get_by_label("Download").click();
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1, "tried again on request");
+    }
+
+    #[test]
+    fn restarting_to_update_waits_until_the_open_change_is_done() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Ready(version)))
+            .unwrap();
+        h.run();
+        h.state_mut().applying = true;
+        h.run();
+        assert!(
+            h.get_by_label_contains("Restart to update")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.state_mut().applying = false;
+        h.run();
+        assert!(
+            !h.get_by_label_contains("Restart to update")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 
     #[test]
@@ -17803,11 +18076,107 @@ mod tests {
     }
 
     #[test]
+    fn the_switch_says_whether_it_updates_or_only_checks() {
+        let (mut h, _engine) = update_harness();
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label("Update Klefki automatically");
+        h.state_mut().updated_by_hand = Some("Klefki was installed with the MSI.".into());
+        h.run();
+        h.get_by_label("Check for updates automatically");
+    }
+
+    #[test]
+    fn an_app_that_cannot_replace_itself_says_why_and_offers_the_page() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1);
+        let why =
+            "Klefki cannot replace itself in this folder. Move Klefki to a folder you can change.";
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Manual(why.into())))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Update: 999.0.0").click();
+        h.run();
+        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label(why);
+    }
+
+    #[test]
+    fn an_update_that_failed_at_close_is_shown_and_not_downloaded_again_unasked() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        let why = "The update could not be installed when Klefki closed: denied.";
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Failed(why.into())))
+            .unwrap();
+        found(&engine, version);
+        h.run();
+        assert_eq!(downloads_sent(&engine), 0);
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label(why);
+        h.get_by_label("Download").click();
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1, "on request");
+    }
+
+    #[test]
+    fn after_an_update_klefki_says_so_once() {
+        let (mut h, engine) = update_harness();
+        let version = klefki_core::api::Version::current();
+        h.state_mut().updates.updated = Some(version);
+        h.run();
+        h.get_by_label_contains(&format!("Updated to {version}"))
+            .click();
+        h.run();
+        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+        assert!(h.query_by_label_contains("Updated to").is_none());
+    }
+
+    #[test]
+    fn restarting_waits_for_every_open_dialog() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Ready(version)))
+            .unwrap();
+        h.run();
+        h.state_mut().forgetting = Some("x".into());
+        h.run();
+        assert!(
+            h.get_by_label_contains("Restart to update")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.state_mut().forgetting = None;
+        h.state_mut().import_waiting = true;
+        h.run_steps(2);
+        assert!(
+            h.get_by_label_contains("Restart to update")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
     fn turning_automatic_checks_off_is_remembered() {
         let (mut h, _engine) = update_harness();
         h.state_mut().go(Page::Settings);
         h.run();
-        h.get_by_label("Check for updates automatically").click();
+        h.get_by_label("Update Klefki automatically").click();
         h.run();
         assert!(!h.state().updates.auto);
         let mut storage = crate::theme::tests::MemoryStorage::default();

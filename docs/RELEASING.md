@@ -7,12 +7,12 @@ Releases are built by `.github/workflows/release.yml` with [cargo-packager](http
 | System | Files | Built on |
 |---|---|---|
 | Windows x64 | NSIS installer (per-user, no admin), MSI, portable zip | `windows-latest` |
-| macOS 11+ | universal (Intel + Apple silicon) `.app` with an ad-hoc signature, in a `.dmg` | `macos-latest` |
+| macOS 11+ | universal (Intel + Apple silicon) `.app` with an ad-hoc signature, in a `.dmg`, and the same app as `.app.zip` for Klefki's own updates | `macos-latest` |
 | Linux x86_64 | `.deb`, AppImage | `ubuntu-22.04`, for older glibc |
 
 Each package holds both `klefki` and `klefki-cli`. The Linux job also writes a CycloneDX SBOM per program (`cargo cyclonedx --target all`, so one SBOM covers all three systems). The publish job adds `SHA256SUMS` and a build provenance attestation for every file (`actions/attest-build-provenance`, signed through Sigstore), then checks each one with `gh attestation verify`. It does this on manual runs too; only a tag creates the release (a manual run keeps the combined files as the `klefki-all` artifact). Attestations need the repository to be public, or a paid plan. Install instructions for users are in `docs/release-notes.md`, which becomes the top of the release notes with every `{version}` replaced by the release's version (so each command and file name can be pasted as is); GitHub appends the list of merged pull requests. Keep its file names in step with the `Package` step of the workflow.
 
-Before upload, `scripts/check-release.py` looks inside each package: the Windows app is a GUI program with its icon embedded and the CLI a console program, the macOS app (checked inside the mounted `.dmg`) holds both architectures, carries the version in `Info.plist` and passes `codesign --verify --deep --strict`, and the `.deb` installs both programs, a menu entry and an icon.
+Before upload, `scripts/check-release.py` looks inside each package: the Windows app is a GUI program with its icon embedded and the CLI a console program, the macOS app (checked inside the mounted `.dmg`, and present and signed in the `.app.zip`) holds both architectures, carries the version in `Info.plist` and passes `codesign --verify --deep --strict`, and the `.deb` installs both programs, a menu entry and an icon.
 
 ## Code signing: free options only
 
@@ -46,7 +46,7 @@ To set it up (once, by the owner):
 
 1. `minisign -G -p minisign.pub -s klefki.key`, with a strong password. Keep `klefki.key` and the password backed up offline: losing them means users must move to a new key.
 2. Settings, Environments, **New environment** `release`. Under *Deployment branches and tags* choose *Selected branches and tags* and add the branch `main` and the tag pattern `v*`. Create it before the first run on main or a tag: otherwise GitHub creates it on that run with no rules.
-3. In that environment, add the secrets `MINISIGN_SECRET_KEY` (the whole content of `klefki.key`) and `MINISIGN_PASSWORD`. Do not add them as repository secrets.
+3. In that environment, add the secrets `MINISIGN_SECRET_KEY` (the whole content of `klefki.key`, or only its second line: the script adds the comment line back) and `MINISIGN_PASSWORD`. Do not add them as repository secrets.
 4. Commit `minisign.pub` through a pull request.
 5. Turn on the tag ruleset and the required reviewer above.
 6. Start the release workflow by hand on main, approve the `sign` job when it asks: it should print `Signature and comment signature verified`.
