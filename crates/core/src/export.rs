@@ -92,6 +92,10 @@ pub(crate) fn sources(
                     Scope::Managed => {
                         "your organisation sets it, for everyone on this machine".to_owned()
                     }
+                    Scope::ClaudeAi => {
+                        "it is a connector of your claude.ai account, which Claude Code fetches from claude.ai"
+                            .to_owned()
+                    }
                     _ => "it is no longer in the configuration".to_owned(),
                 }),
             },

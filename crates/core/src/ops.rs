@@ -442,6 +442,12 @@ fn find<'a>(
 /// Why a plugin's or the organisation's server cannot be changed here: Claude Code reads it from files that are not
 /// the user's.
 fn read_only(row: &ServerRow) -> String {
+    if row.scope == Scope::ClaudeAi {
+        return format!(
+            "{} is a connector of your claude.ai account, and is changed on claude.ai. Klefki can switch it on and off.",
+            row.name
+        );
+    }
     if row.scope == Scope::Managed {
         return format!(
             "{} is set by your organisation{}, and only an administrator can change it. Klefki can switch it on and off.",
@@ -548,10 +554,10 @@ fn switch(
             Some((scope, None, name)) if scope == row.scope => name,
             _ => return Err(read_only(row)),
         };
-        let what = if row.scope == Scope::Managed {
-            "a server your organisation sets"
-        } else {
-            "a plugin's server"
+        let what = match row.scope {
+            Scope::Managed => "a server your organisation sets",
+            Scope::ClaudeAi => "a claude.ai connector",
+            _ => "a plugin's server",
         };
         return switch_everywhere(&row.name, &name, what, enabled, snapshot, out);
     }
@@ -575,7 +581,7 @@ fn switch(
                 ));
             }
         }
-        Scope::Plugin | Scope::Managed => return Err(read_only(row)),
+        Scope::Plugin | Scope::Managed | Scope::ClaudeAi => return Err(read_only(row)),
         Scope::User => {
             switch_everywhere(shown, &file.name, "a user server", enabled, snapshot, out)?;
         }
@@ -625,7 +631,7 @@ fn own_server<'a>(
         Scope::User => Ok(file),
         Scope::Local if file.project.is_some() => Ok(file),
         Scope::Local => Err(format!("{} has no project", row.name)),
-        Scope::Plugin | Scope::Managed => Err(read_only(row)),
+        Scope::Plugin | Scope::Managed | Scope::ClaudeAi => Err(read_only(row)),
         Scope::Project => Err(format!(
             "{} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here.",
             row.name
@@ -934,7 +940,7 @@ fn duplicate(
     let (row, file) = find(id, snapshot, keys)?;
     let shown = &row.name;
     let from = match row.scope {
-        Scope::Plugin | Scope::Managed => return Err(read_only(row)),
+        Scope::Plugin | Scope::Managed | Scope::ClaudeAi => return Err(read_only(row)),
         Scope::User => None,
         Scope::Local => Some(
             file.project
@@ -1100,6 +1106,7 @@ fn new_places(
                 Scope::Project => "project",
                 Scope::Plugin => "plugin",
                 Scope::Managed => "organisation",
+                Scope::ClaudeAi => "claude.ai",
             };
             match (&to, other.scope) {
                 (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
@@ -1677,6 +1684,43 @@ mod tests {
         let mut paths = crate::config::ConfigPaths::in_dir(dir);
         paths.managed_dir = Some(org);
         inventory::load(&paths)
+    }
+
+    #[test]
+    fn a_claude_ai_connector_is_switched_by_its_full_name_in_every_project_and_nothing_else() {
+        use crate::engine::Change;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({"claudeAiMcpEverConnected": ["claude.ai Slack"], "projects": {"/q": {}}})
+                .to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::ClaudeAi)
+            .unwrap();
+        let change = Change::SetEnabled {
+            id: row.id(),
+            enabled: false,
+        };
+        let out = resolve(&[change], &inv.snapshot, &inv.keys).unwrap();
+        assert_eq!(
+            out.claude,
+            [Op::SetDisabled {
+                project: "/q".into(),
+                name: "claude.ai Slack".into(),
+                disabled: true,
+            }]
+        );
+        let change = Change::Delete { id: row.id() };
+        let Err(why) = resolve(&[change], &inv.snapshot, &inv.keys) else {
+            panic!("a connector was deleted");
+        };
+        assert!(why.contains("changed on claude.ai"), "{why}");
     }
 
     #[test]

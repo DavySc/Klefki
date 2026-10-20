@@ -58,6 +58,7 @@ impl ConnectionId {
             "project" => crate::api::Scope::Project,
             "plugin" => crate::api::Scope::Plugin,
             "managed" => crate::api::Scope::Managed,
+            "claudeai" => crate::api::Scope::ClaudeAi,
             _ => return None,
         };
         (!parts.n.is_empty()).then_some((scope, parts.p.filter(|p| !p.is_empty()), parts.n))
@@ -83,6 +84,7 @@ fn scope_word(scope: crate::api::Scope) -> &'static str {
         crate::api::Scope::Project => "project",
         crate::api::Scope::Plugin => "plugin",
         crate::api::Scope::Managed => "managed",
+        crate::api::Scope::ClaudeAi => "claudeai",
     }
 }
 

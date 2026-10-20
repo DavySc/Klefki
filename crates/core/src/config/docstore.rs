@@ -1546,17 +1546,30 @@ fn legacy_names(
 /// replayed as it ended. An add finds its server missing whether Claude Code overwrote the file or a later plan of
 /// ours took it away, and would add it back; so a server deleted later is not added, and one renamed later is
 /// added (and edited) under its new name. The later delete or rename then finds it gone, which is done.
+///
+/// A server renamed later that was not added in the log (it was there before, or came in by a copy or a rename) has
+/// its edits and switch-offs replayed after the rename, under its new name, each as a plan of its own. Under the old
+/// name they would land on whatever is there now, such as a server copied or moved in since. A switch-off is this
+/// server's when it is in the server's project, or, for a user server, in any project.
 fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
     let mut plans: Vec<Vec<Option<Op>>> = log
         .iter()
         .map(|p| p.ops.iter().cloned().map(Some).collect())
         .collect();
+    // The edits and switch-offs moved after each plan's renames, replayed right after it, in order.
+    let mut after: Vec<Vec<Option<Op>>> = vec![Vec::new(); plans.len()];
     let here = |project: &Option<String>, name: &str, at: &Option<String>, n: &str| {
         n == name
             && match (project, at) {
                 (Some(a), Some(b)) => crate::api::same_project(a, b),
                 (a, b) => a == b,
             }
+    };
+    let switched_here = |project: &str, name: &str, at: &Option<String>, n: &str| {
+        n == name
+            && at
+                .as_ref()
+                .is_none_or(|p| crate::api::same_project(project, p))
     };
     for j in 0..plans.len() {
         for k in 0..plans[j].len() {
@@ -1572,15 +1585,26 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
             // Back to where this server came in. Only an add, with the edits since, is rewritten: one that came
             // in by a rename, or a copy whose definition is not in the plan, replays as it is. A rename into this
             // name is passed over: an add before it was already given this name when that rename was reached.
+            // Each plan's moved edits come after it, so they are looked at first.
             let mut edits = Vec::new();
             let mut added = None;
             'back: for i in (0..j).rev() {
-                for o in (0..plans[i].len()).rev() {
-                    match &plans[i][o] {
+                for (moved, o) in (0..after[i].len())
+                    .rev()
+                    .map(|o| (true, o))
+                    .chain((0..plans[i].len()).rev().map(|o| (false, o)))
+                {
+                    let op = if moved { &after[i][o] } else { &plans[i][o] };
+                    match op {
                         Some(Op::ReplaceServer { project, name, .. })
                             if here(project, name, &at, &n) =>
                         {
-                            edits.push((i, o));
+                            edits.push((i, moved, o));
+                        }
+                        Some(Op::SetDisabled { project, name, .. })
+                            if switched_here(project, name, &at, &n) =>
+                        {
+                            edits.push((i, moved, o));
                         }
                         Some(Op::AddServer { project, name, .. })
                             if here(project, name, &at, &n) =>
@@ -1607,15 +1631,45 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                     }
                 }
             }
-            let Some((i, o)) = added else { continue };
-            match &to {
-                None => plans[i][o] = None,
-                Some(new_name) => {
-                    for (i, o) in edits.into_iter().chain([(i, o)]) {
-                        if let Some(Op::AddServer { name, .. } | Op::ReplaceServer { name, .. }) =
+            let Some(new_name) = &to else {
+                if let Some((i, o)) = added {
+                    plans[i][o] = None;
+                }
+                continue;
+            };
+            match added {
+                Some((i, o)) => {
+                    for (i, moved, o) in edits {
+                        let slot = if moved {
+                            &mut after[i][o]
+                        } else {
                             &mut plans[i][o]
+                        };
+                        if let Some(Op::ReplaceServer { name, .. } | Op::SetDisabled { name, .. }) =
+                            slot
                         {
                             name.clone_from(new_name);
+                        }
+                    }
+                    if let Some(Op::AddServer { name, .. }) = &mut plans[i][o] {
+                        name.clone_from(new_name);
+                    }
+                }
+                None => {
+                    // Oldest first, so the last change has the last word.
+                    for (i, moved, o) in edits.into_iter().rev() {
+                        let slot = if moved {
+                            &mut after[i][o]
+                        } else {
+                            &mut plans[i][o]
+                        };
+                        if let Some(mut op @ (Op::ReplaceServer { .. } | Op::SetDisabled { .. })) =
+                            slot.take()
+                            && let Op::ReplaceServer { name, .. } | Op::SetDisabled { name, .. } =
+                                &mut op
+                        {
+                            name.clone_from(new_name);
+                            after[j].push(Some(op));
                         }
                     }
                 }
@@ -1624,7 +1678,13 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
     }
     plans
         .into_iter()
-        .map(|ops| ops.into_iter().flatten().collect())
+        .zip(after)
+        .flat_map(|(ops, after)| {
+            // One plan each: two edits of one server in one plan would be refused as changing it twice.
+            [ops.into_iter().flatten().collect()]
+                .into_iter()
+                .chain(after.into_iter().flatten().map(|op| vec![op]))
+        })
         .collect()
 }
 
@@ -5275,6 +5335,102 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("OAuth"), "{err}");
+    }
+
+    #[test]
+    fn an_edit_of_a_server_renamed_since_stays_with_it_when_another_takes_its_old_name() {
+        // Found by the model-based test: a is edited, renamed to A, and c copied in as a. Replayed under its old name,
+        // the edit landed on the copy.
+        let edited = json!({"command": "edited"});
+        let at_once = |overwritten: bool| {
+            let f = Fixture::new(&pretty(&servers_doc()));
+            let log = [
+                apply_ops(&f, vec![replace(None, "a", edited.clone())]),
+                apply_ops(&f, vec![rename_server(None, "a", "A")]),
+                apply_ops(&f, vec![copy(None, "c", None, "a")]),
+            ];
+            let done = f.json();
+            if overwritten {
+                // Claude Code saves a copy it read before all three.
+                std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+            }
+            assert_eq!(f.store.verify(&log, &|| false), Ok(overwritten));
+            assert_eq!(f.json(), done, "overwritten: {overwritten}");
+            assert_eq!(f.json()["mcpServers"]["A"], edited);
+            assert_eq!(
+                f.json()["mcpServers"]["a"],
+                servers_doc()["mcpServers"]["c"]
+            );
+        };
+        at_once(false);
+        at_once(true);
+    }
+
+    #[test]
+    fn a_switch_off_of_a_server_renamed_since_stays_with_it_when_another_takes_its_old_name() {
+        // Found in review: a is switched off in /q, renamed to A, and c copied in as a. Replayed under its old name,
+        // the switch-off turned the copy off.
+        for overwritten in [false, true] {
+            let f = Fixture::new(&pretty(&servers_doc()));
+            let log = [
+                apply_ops(&f, vec![disable("/q", "a")]),
+                apply_ops(
+                    &f,
+                    vec![
+                        rename_server(None, "a", "A"),
+                        rename_disabled("/q", "a", "A"),
+                    ],
+                ),
+                apply_ops(&f, vec![copy(None, "c", None, "a")]),
+            ];
+            let done = f.json();
+            assert_eq!(done["projects"]["/q"]["disabledMcpServers"], json!(["A"]));
+            if overwritten {
+                std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+            }
+            assert_eq!(f.store.verify(&log, &|| false), Ok(overwritten));
+            assert_eq!(f.json(), done, "overwritten: {overwritten}");
+        }
+    }
+
+    #[test]
+    fn switching_a_server_on_again_before_its_rename_leaves_the_newcomer_under_its_old_name_alone()
+    {
+        // The variant: off, on again, renamed; the copy under the old name is then switched off on its own.
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let log = [
+            apply_ops(&f, vec![disable("/q", "a")]),
+            apply_ops(&f, vec![enable("/q", "a")]),
+            apply_ops(&f, vec![rename_server(None, "a", "A")]),
+            apply_ops(&f, vec![copy(None, "c", None, "a")]),
+            apply_ops(&f, vec![disable("/q", "a")]),
+        ];
+        let done = f.json();
+        assert_eq!(done["projects"]["/q"]["disabledMcpServers"], json!(["a"]));
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), done);
+    }
+
+    #[test]
+    fn an_edit_of_a_server_renamed_twice_ends_on_its_last_name() {
+        // The variant: renamed twice, with another edit in between; the old names are taken again by copies.
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let log = [
+            apply_ops(&f, vec![replace(None, "a", json!({"command": "one"}))]),
+            apply_ops(&f, vec![rename_server(None, "a", "A")]),
+            apply_ops(&f, vec![replace(None, "A", json!({"command": "two"}))]),
+            apply_ops(&f, vec![rename_server(None, "A", "AA")]),
+            apply_ops(&f, vec![copy(None, "c", None, "a")]),
+            apply_ops(&f, vec![copy(None, "c", None, "A")]),
+        ];
+        let done = f.json();
+        assert_eq!(done["mcpServers"]["AA"], json!({"command": "two"}));
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), done);
     }
 
     #[test]

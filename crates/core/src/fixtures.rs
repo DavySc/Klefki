@@ -24,6 +24,8 @@ struct RawServer {
     enabled: bool,
     #[serde(default)]
     disabled_in: usize,
+    #[serde(default)]
+    disabled_projects: Vec<String>,
     approval: Option<String>,
     #[serde(default)]
     shadowed: bool,
@@ -73,6 +75,7 @@ pub(crate) fn load() -> Snapshot {
                     "http" => TransportKind::Http,
                     "sse" => TransportKind::Sse,
                     "ws" => TransportKind::Ws,
+                    "claude.ai" => TransportKind::ClaudeAi,
                     _ => TransportKind::Invalid,
                 },
                 target: sanitize(&s.target),
@@ -88,6 +91,7 @@ pub(crate) fn load() -> Snapshot {
                 },
                 enabled: s.enabled,
                 disabled_in: s.disabled_in,
+                disabled_projects: s.disabled_projects.iter().map(|p| sanitize(p)).collect(),
                 approval: s.approval.as_deref().map(|a| match a {
                     "approved" => Approval::Approved,
                     "rejected" => Approval::Rejected,
@@ -112,6 +116,7 @@ pub(crate) fn load() -> Snapshot {
                 managed: s.managed.as_deref().map(sanitize),
                 not_loaded: s.not_loaded.as_deref().map(sanitize),
                 blocked: None,
+                may_not_load: None,
             })
             .collect(),
         warnings: Vec::new(),
@@ -124,6 +129,7 @@ fn scope_of(word: &str) -> Scope {
         "local" => Scope::Local,
         "plugin" => Scope::Plugin,
         "managed" => Scope::Managed,
+        "claudeai" => Scope::ClaudeAi,
         _ => Scope::Project,
     }
 }

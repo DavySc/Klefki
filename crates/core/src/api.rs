@@ -8,7 +8,7 @@ pub use crate::config::definition::Definition;
 pub use crate::desktop::{Desktop, DesktopServer};
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
-    SignInFailure, SignInStep,
+    SignInFailure, SignInStep, UpdateDownload,
 };
 pub use crate::export::{Exported, Variable};
 pub use crate::export_file::{
@@ -42,6 +42,9 @@ pub enum Scope {
     Project,
     /// A server a Claude Code plugin brings. Read-only: it is changed in the plugin.
     Plugin,
+    /// A connector of the user's claude.ai account, which Claude Code fetches each session (decision 011). Read-only:
+    /// it is changed on claude.ai. Klefki knows the ones Claude Code has connected before, by name.
+    ClaudeAi,
 }
 
 impl Scope {
@@ -51,18 +54,22 @@ impl Scope {
             Self::Local => "Local",
             Self::Project => "Project",
             Self::Plugin => "Plugin",
+            Self::ClaudeAi => "claude.ai",
             Self::Managed => "Organisation",
         }
     }
 
     /// A server Klefki only switches on and off: no file of the user's holds it.
     pub fn is_read_only(self) -> bool {
-        matches!(self, Self::Plugin | Self::Managed)
+        matches!(self, Self::Plugin | Self::Managed | Self::ClaudeAi)
     }
 
     /// One row for every project, switched per project (`disabledMcpServers`).
     pub fn is_everywhere(self) -> bool {
-        matches!(self, Self::User | Self::Plugin | Self::Managed)
+        matches!(
+            self,
+            Self::User | Self::Plugin | Self::Managed | Self::ClaudeAi
+        )
     }
 }
 
@@ -72,6 +79,8 @@ pub enum TransportKind {
     Http,
     Sse,
     Ws,
+    /// A claude.ai connector, which Claude Code reaches through claude.ai (decision 011).
+    ClaudeAi,
     Invalid,
 }
 
@@ -82,6 +91,7 @@ impl TransportKind {
             Self::Http => "http",
             Self::Sse => "sse",
             Self::Ws => "ws",
+            Self::ClaudeAi => "claude.ai",
             Self::Invalid => "invalid",
         }
     }
@@ -202,6 +212,8 @@ pub struct ServerRow {
     pub enabled: bool,
     /// User servers only: in how many known projects the toggle is off (out of `Snapshot::project_count`).
     pub disabled_in: usize,
+    /// Those projects (as shown), in the inventory's order, where the inventory names them.
+    pub disabled_projects: Vec<String>,
     /// Project (`.mcp.json`) servers only.
     pub approval: Option<Approval>,
     /// Another server of the same name is loaded in its place. For a project server: a local one in its project.
@@ -237,6 +249,9 @@ pub struct ServerRow {
     /// Policy holds this server back in some projects only (decision 010). Where it does so everywhere it would load,
     /// [`ServerRow::not_loaded`] says so instead.
     pub blocked: Option<Blocked>,
+    /// Claude Code may not load this server, for a reason Klefki cannot check: why, as a note rather than a warning.
+    /// A claude.ai connector under an allowed list of addresses, as Klefki does not know its address (decision 011).
+    pub may_not_load: Option<String>,
 }
 
 /// Where policy keeps a server from loading, and why. Sanitised.
@@ -246,6 +261,9 @@ pub struct Blocked {
     pub why: String,
     /// The projects (as shown), in the inventory's order.
     pub projects: Vec<String>,
+    /// A rule on which servers load: policy. `false`: a setting that turns claude.ai connectors off, the user's or
+    /// the organisation's (decision 011).
+    pub policy: bool,
 }
 
 /// Where a plugin server comes from (decision 008). Sanitised.
@@ -353,6 +371,9 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
     let config = crate::engine::EngineConfig {
         releases,
         release_key: crate::update::RELEASE_KEY.map(str::to_owned),
+        install: crate::install::this_install(),
+        updates_dir: directories::ProjectDirs::from("dev", "klefki", "klefki")
+            .map(|d| d.data_local_dir().join("updates")),
         ..real_config(None)
     };
     crate::engine::start_with(config, wake)
@@ -395,6 +416,10 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         // Only the app looks for updates ([`start`]): the command-line tool then carries no TLS code at all.
         releases: std::sync::Arc::new(crate::update::Offline),
         release_key: None,
+        install: crate::install::InstallKind::Manual(
+            "The command-line tool does not update Klefki.".into(),
+        ),
+        updates_dir: None,
     }
 }
 
@@ -451,11 +476,6 @@ fn open_https(link: &str) -> std::io::Result<()> {
 fn default_backup_dir() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("dev", "klefki", "klefki")
         .map(|d| d.data_local_dir().join("backups"))
-}
-
-/// Whether this build checks for updates: only one with the release key built in (decision 009).
-pub fn checks_for_updates() -> bool {
-    crate::update::RELEASE_KEY.is_some()
 }
 
 /// Reads the real Claude Code configuration (read-only), once, without live checks.

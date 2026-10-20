@@ -74,6 +74,13 @@ pub enum UpdateCheck {
 /// Fetches a file over https, refusing anything longer than `limit` bytes.
 pub(crate) trait Fetch: Send + Sync {
     fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, FetchError>;
+
+    /// Like [`Fetch::get`], into `to` as it arrives, for files too large to hold in memory.
+    fn save(&self, url: &str, limit: u64, to: &mut dyn std::io::Write) -> Result<(), FetchError> {
+        let bytes = self.get(url, limit)?;
+        to.write_all(&bytes)
+            .map_err(|e| FetchError::Failed(format!("could not save it ({e})")))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,10 +91,27 @@ pub(crate) enum FetchError {
     Failed(String),
 }
 
+/// A newer release whose checksums are signed by the release key: what it is, and the SHA-256 of each of its files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Release {
+    pub version: Version,
+    pub sums: std::collections::HashMap<String, [u8; 32]>,
+}
+
 /// Asks GitHub for the latest release and checks its signature with `key`.
+#[cfg(test)]
 pub(crate) fn check(fetch: &dyn Fetch, current: Version, key: Option<&str>) -> UpdateCheck {
+    check_release(fetch, current, key).0
+}
+
+/// [`check`], with the release when it is newer.
+pub(crate) fn check_release(
+    fetch: &dyn Fetch,
+    current: Version,
+    key: Option<&str>,
+) -> (UpdateCheck, Option<Release>) {
     let Some(key) = key else {
-        return UpdateCheck::NoKey;
+        return (UpdateCheck::NoKey, None);
     };
     let fetched = fetch
         .get(&format!("{LATEST}SHA256SUMS"), MAX_SUMS)
@@ -99,19 +123,54 @@ pub(crate) fn check(fetch: &dyn Fetch, current: Version, key: Option<&str>) -> U
         });
     let (sums, signature) = match fetched {
         Ok(files) => files,
-        Err(FetchError::NotFound) => return UpdateCheck::NoRelease,
+        Err(FetchError::NotFound) => return (UpdateCheck::NoRelease, None),
         Err(FetchError::Failed(why)) => {
-            return UpdateCheck::Failed(format!("Could not check for updates: {why}."));
+            return (
+                UpdateCheck::Failed(format!("Could not check for updates: {why}.")),
+                None,
+            );
         }
     };
-    match signed_version(&sums, &signature, key) {
-        Ok(version) if version > current => UpdateCheck::Available {
-            version,
-            page: release_page(version),
-        },
-        Ok(_) => UpdateCheck::UpToDate,
-        Err(why) => UpdateCheck::Failed(why),
+    let version = match signed_version(&sums, &signature, key) {
+        Ok(version) => version,
+        Err(why) => return (UpdateCheck::Failed(why), None),
+    };
+    if version <= current {
+        return (UpdateCheck::UpToDate, None);
     }
+    // Signed, so a list that does not read is a broken release, not an attack; refused all the same.
+    let Some(sums) = parse_sums(&sums) else {
+        return (
+            UpdateCheck::Failed("The release's list of checksums could not be read.".into()),
+            None,
+        );
+    };
+    let found = UpdateCheck::Available {
+        version,
+        page: release_page(version),
+    };
+    (found, Some(Release { version, sums }))
+}
+
+/// `sha256sum` output: one `<64 hex digits>  <name>` (or ` *<name>`) per line. `None` if any line is not.
+fn parse_sums(text: &[u8]) -> Option<std::collections::HashMap<String, [u8; 32]>> {
+    let text = std::str::from_utf8(text).ok()?;
+    let mut sums = std::collections::HashMap::new();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let (hex, name) = line.split_at_checked(64)?;
+        let name = name
+            .strip_prefix("  ")
+            .or_else(|| name.strip_prefix(" *"))?;
+        if name.is_empty() || name.contains(['/', '\\']) {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        for (byte, pair) in hash.iter_mut().zip(hex.as_bytes().chunks(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        }
+        sums.insert(name.to_owned(), hash);
+    }
+    Some(sums)
 }
 
 /// The page of a release, with its notes and downloads.
@@ -165,6 +224,12 @@ pub(crate) fn test_release() -> (std::sync::Arc<dyn Fetch>, String) {
             match url.strip_prefix(LATEST) {
                 Some("SHA256SUMS") => Ok(include_bytes!("update/SHA256SUMS").to_vec()),
                 Some("SHA256SUMS.minisig") => Ok(include_bytes!("update/v0.2.0.minisig").to_vec()),
+                // The setup's checksum in `SHA256SUMS` is that of "b".
+                _ if url
+                    == "https://github.com/DavySc/Klefki/releases/download/v0.2.0/klefki-0.2.0-windows-x64-setup.exe" =>
+                {
+                    Ok(b"b".to_vec())
+                }
                 _ => Err(FetchError::NotFound),
             }
         }
@@ -213,6 +278,19 @@ impl Https {
 }
 
 impl Fetch for Https {
+    fn save(&self, url: &str, limit: u64, to: &mut dyn std::io::Write) -> Result<(), FetchError> {
+        if !url.starts_with("https://") {
+            return Err(FetchError::Failed("only https is used".into()));
+        }
+        let mut response = self.agent().get(url).call().map_err(|e| plain_error(&e))?;
+        let mut body = response.body_mut().with_config().limit(limit).reader();
+        std::io::copy(&mut body, to).map_err(|e| match e.downcast::<ureq::Error>() {
+            Ok(e) => plain_error(&e),
+            Err(e) => FetchError::Failed(format!("the download stopped ({})", e.kind())),
+        })?;
+        Ok(())
+    }
+
     fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, FetchError> {
         if !url.starts_with("https://") {
             return Err(FetchError::Failed("only https is used".into()));
@@ -310,6 +388,37 @@ mod tests {
                 .all(|(url, _)| url.starts_with("https://github.com/DavySc/Klefki/releases/"))
         );
         assert!(asked.iter().all(|(_, limit)| *limit <= MAX_SUMS));
+    }
+
+    #[test]
+    fn a_newer_release_comes_with_the_checksum_of_each_file() {
+        let github = FakeGitHub::serving(SUMS, signature("v0.2.0.minisig"));
+        let (_, release) = check_release(&github, v("0.1.0"), Some(key()));
+        let release = release.unwrap();
+        assert_eq!(release.version, v("0.2.0"));
+        let deb = release.sums["klefki-0.2.0-linux-amd64.deb"];
+        assert_eq!(deb[..4], [0xca, 0x97, 0x81, 0x12], "sha256 of \"a\"");
+        assert_eq!(release.sums.len(), 2);
+        // Nothing to install when nothing is newer.
+        assert_eq!(check_release(&github, v("0.2.0"), Some(key())).1, None);
+    }
+
+    #[test]
+    fn checksum_lists_parse_strictly() {
+        let hash = "ab".repeat(32);
+        let sums = parse_sums(format!("{hash}  a.deb\n{hash} *b.exe\n").as_bytes()).unwrap();
+        assert_eq!(sums["a.deb"], [0xab; 32]);
+        assert_eq!(sums["b.exe"], [0xab; 32]);
+        for bad in [
+            format!("{hash} a.deb"),
+            format!("{}  a.deb", &hash[..62]),
+            format!("{}zz  a.deb", &hash[..62]),
+            format!("{hash}  ../a.deb"),
+            format!("{hash}  dir\\a.deb"),
+            format!("{hash}  "),
+        ] {
+            assert_eq!(parse_sums(bad.as_bytes()), None, "{bad:?}");
+        }
     }
 
     #[test]
