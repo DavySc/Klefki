@@ -12,6 +12,8 @@ use std::collections::HashMap;
 const NAMED: usize = 5;
 /// Above this many projects, the project list has a box to type in.
 const FILTER_FROM: usize = 10;
+/// Why a profile cannot be made, changed or deleted while the file is not read in full.
+const READ_ONLY: &str = "Not until the profiles file can be read in full (see above).";
 
 #[derive(Default)]
 pub struct ProfilesPage {
@@ -133,8 +135,16 @@ impl ProfilesPage {
                     muted(ui, "Loading…");
                     return;
                 };
+                // Said once, up front: Klefki changes nothing in a file it could not read in full.
+                let editable = profiles.problem.is_none();
                 if let Some(problem) = &profiles.problem {
-                    warn(ui, problem);
+                    warn(
+                        ui,
+                        &format!(
+                            "{problem} No profile can be made, changed or deleted until the file is fixed; they \
+                             can still be used."
+                        ),
+                    );
                     ui.add_space(8.0);
                 }
                 if let Some(draft) = &mut self.editing {
@@ -172,7 +182,14 @@ impl ProfilesPage {
                              those servers are the ones on there.",
                         );
                         ui.add_space(10.0);
-                        if ui.button(format!("{} New profile", icon::PLUS)).clicked() {
+                        if ui
+                            .add_enabled(
+                                editable,
+                                egui::Button::new(format!("{} New profile", icon::PLUS)),
+                            )
+                            .on_disabled_hover_text(READ_ONLY)
+                            .clicked()
+                        {
                             self.editing = Some(new(None));
                             self.refused = None;
                         }
@@ -180,8 +197,12 @@ impl ProfilesPage {
                     return;
                 }
                 if ui
-                    .button(format!("{} New profile", icon::PLUS))
+                    .add_enabled(
+                        editable,
+                        egui::Button::new(format!("{} New profile", icon::PLUS)),
+                    )
                     .on_hover_text("Pick the servers that belong together and give them a name.")
+                    .on_disabled_hover_text(READ_ONLY)
                     .clicked()
                 {
                     self.editing = Some(new(None));
@@ -206,6 +227,7 @@ impl ProfilesPage {
                         choice,
                         &mut self.confirm,
                         &mut self.project_filter,
+                        editable,
                     );
                     match out {
                         Some(Card::Edit) => {
@@ -236,6 +258,7 @@ fn card(
     choice: &mut Choice,
     confirm: &mut Option<String>,
     project_filter: &mut String,
+    editable: bool,
 ) -> Option<Card> {
     let pal = theme::palette(ui.ctx());
     let mut out = None;
@@ -254,15 +277,23 @@ fn card(
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .small_button(format!("{} Delete", icon::TRASH))
+                        .add_enabled(
+                            editable,
+                            egui::Button::new(format!("{} Delete", icon::TRASH)).small(),
+                        )
                         .on_hover_text("Forget this profile. Klefki asks first.")
+                        .on_disabled_hover_text(READ_ONLY)
                         .clicked()
                     {
                         *confirm = Some(profile.name.clone());
                     }
                     if ui
-                        .small_button(format!("{} Edit", icon::PENCIL_SIMPLE))
+                        .add_enabled(
+                            editable,
+                            egui::Button::new(format!("{} Edit", icon::PENCIL_SIMPLE)).small(),
+                        )
                         .on_hover_text("Rename it, or change its servers.")
+                        .on_disabled_hover_text(READ_ONLY)
                         .clicked()
                     {
                         out = Some(Card::Edit);

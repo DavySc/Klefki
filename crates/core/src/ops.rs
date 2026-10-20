@@ -680,8 +680,8 @@ fn use_profile(
     let mut turned_off = BTreeSet::new();
     // (project, name as the file spells it) and whether it goes off, in the order the servers are listed.
     let mut switches: Vec<((String, String), bool)> = Vec::new();
-    // A member that will still not load, and why → the places (folder names) where.
-    let mut held: Vec<((String, String), Vec<String>)> = Vec::new();
+    // The members and the places they are turned on in: judged once every switch is known.
+    let mut loaded_here: Vec<(&ServerRow, &String)> = Vec::new();
     for row in &snapshot.servers {
         // The scope, project and name as the files spell them.
         let Some((scope, own_project, file_name)) =
@@ -715,13 +715,8 @@ fn use_profile(
             if !member && only {
                 turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
             }
-            if member && let Some(why) = held_back(row, place, snapshot) {
-                let at = project_label(place, snapshot);
-                let key = (row.name.clone(), why);
-                match held.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, at_places)) => at_places.push(at),
-                    None => held.push((key, vec![at])),
-                }
+            if member {
+                loaded_here.push((row, *place));
             }
         }
         if member && !here_any {
@@ -740,6 +735,24 @@ fn use_profile(
             && row.approval != Some(Approval::Approved)
         {
             unapproved.push(row.name.clone());
+        }
+    }
+    // A member that will still not load, and why → the places (folder names) where. Judged as things will be after
+    // this change: what it turns off no longer hides a duplicate.
+    let off_after = |place: &str, name: &str| {
+        switches
+            .iter()
+            .any(|((p, n), off)| *off && p == place && n == name)
+    };
+    let mut held: Vec<((String, String), Vec<String>)> = Vec::new();
+    for (row, place) in loaded_here {
+        if let Some(why) = held_back(row, place, snapshot, &off_after) {
+            let at = project_label(place, snapshot);
+            let key = (row.name.clone(), why);
+            match held.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, at_places)) => at_places.push(at),
+                None => held.push((key, vec![at])),
+            }
         }
     }
     for ((project, name), disabled) in &switches {
@@ -844,8 +857,14 @@ fn project_label(path: &str, snapshot: &Snapshot) -> String {
 }
 
 /// Why Claude Code will not load `row` in `place` (a project as `.claude.json` spells it) even when it is on there,
-/// as the rest of a sentence; `None` when nothing holds it back.
-fn held_back(row: &ServerRow, place: &str, snapshot: &Snapshot) -> Option<String> {
+/// as the rest of a sentence; `None` when nothing holds it back. `off_after` says whether the change turns a server
+/// (by name) off in a place.
+fn held_back(
+    row: &ServerRow,
+    place: &str,
+    snapshot: &Snapshot,
+    off_after: &dyn Fn(&str, &str) -> bool,
+) -> Option<String> {
     let here = crate::sanitize::shown(place);
     if let Some(why) = &row.not_loaded {
         return Some(why.clone());
@@ -859,6 +878,7 @@ fn held_back(row: &ServerRow, place: &str, snapshot: &Snapshot) -> Option<String
         }
         if let Some(same) = p.same_as.as_deref()
             && (row.shadowed || row.shadowed_in.contains(&here))
+            && !off_after(place, same)
         {
             return Some(format!(
                 "it has the same command or address as {same}, so Claude Code leaves it out."
@@ -2975,5 +2995,63 @@ mod profile_review_regressions {
             "{:?}",
             out.warnings
         );
+    }
+
+    /// Two plugins bring servers of the same command: Claude Code loads the first and leaves the second out.
+    fn two_plugins(dir: &Path) -> inventory::Inventory {
+        let mut plugins = serde_json::Map::new();
+        let mut enabled = serde_json::Map::new();
+        for p in ["p1", "p2"] {
+            let root = dir.join("plugins/cache").join(p);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join(".mcp.json"),
+                json!({format!("dup{}", &p[1..]): {"command": "echo", "args": ["dup"]}})
+                    .to_string(),
+            )
+            .unwrap();
+            plugins.insert(
+                format!("{p}@m"),
+                json!([{"scope": "user", "installPath": root.to_string_lossy()}]),
+            );
+            enabled.insert(format!("{p}@m"), json!(true));
+        }
+        std::fs::create_dir_all(dir.join("plugins")).unwrap();
+        std::fs::write(
+            dir.join("plugins/installed_plugins.json"),
+            json!({"plugins": plugins}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            json!({"enabledPlugins": enabled}).to_string(),
+        )
+        .unwrap();
+        inv(dir, json!({"projects": {"/q": {}}}))
+    }
+
+    /// With "only", the server a duplicate repeats may be the one this change turns off: then the duplicate loads,
+    /// and the review must not say it will not (found in re-review, PR #57).
+    #[test]
+    fn a_duplicate_is_judged_after_the_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = two_plugins(dir.path());
+        let dup = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.plugin.as_ref().is_some_and(|p| p.same_as.is_some()))
+            .unwrap_or_else(|| panic!("fixture: no duplicate in {:?}", inv.snapshot.servers));
+        let warned = |out: &Resolved| {
+            out.warnings
+                .iter()
+                .any(|w| w.contains("same command or address"))
+        };
+        // Alone: what it repeats goes off, so it loads.
+        let out = use_profile(&inv, vec![dup.connection.clone()], true);
+        assert!(!warned(&out), "{:?}", out.warnings);
+        // Without "only", what it repeats stays on, and it stays left out.
+        let out = use_profile(&inv, vec![dup.connection.clone()], false);
+        assert!(warned(&out), "{:?}", out.warnings);
     }
 }

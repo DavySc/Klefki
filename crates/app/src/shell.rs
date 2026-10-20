@@ -19387,8 +19387,23 @@ mod tests {
             "profiles.json has 2 entries Klefki does not understand; they are left out.".into(),
         );
         open_profiles(&mut h, &engine, profiles);
+        // Said once, with what it means; the profiles can still be used, not changed.
         h.get_by_label_contains("2 entries Klefki does not understand");
+        h.get_by_label_contains("until the file is fixed");
         h.get_by_label("Work");
+        for button in ["New profile", "Edit", "Delete"] {
+            assert!(
+                h.get_by_label_contains(button)
+                    .accesskit_node()
+                    .is_disabled(),
+                "{button}"
+            );
+        }
+        assert!(
+            !h.get_by_label("Use profile…")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 
     #[test]
