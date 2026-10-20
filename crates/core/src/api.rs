@@ -233,6 +233,18 @@ pub struct ServerRow {
     /// Claude Code loads this server nowhere, though it is configured: why, as a sentence. Set when the
     /// organisation's `managed-mcp.json` decides which servers load, or its server of the same name replaces this one.
     pub not_loaded: Option<String>,
+    /// Policy holds this server back in some projects only (decision 010). Where it does so everywhere it would load,
+    /// [`ServerRow::not_loaded`] says so instead.
+    pub blocked: Option<Blocked>,
+}
+
+/// Where policy keeps a server from loading, and why. Sanitised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blocked {
+    /// The rule and its file, as a sentence (for the first project in `projects`).
+    pub why: String,
+    /// The projects (as shown), in the inventory's order.
+    pub projects: Vec<String>,
 }
 
 /// Where a plugin server comes from (decision 008). Sanitised.

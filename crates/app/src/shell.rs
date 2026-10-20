@@ -4614,6 +4614,19 @@ impl ShellApp {
                         if replaces {
                             kv("Replaces", format!("the user server {}", s.name));
                         }
+                        // Everywhere, the reason leads the details already.
+                        if let Some(b) = s.blocked.as_ref().filter(|_| s.not_loaded.is_none()) {
+                            let count = self.snapshot.project_count;
+                            kv(
+                                "Blocked",
+                                format!(
+                                    "{}. {}",
+                                    in_projects_text(&b.projects, count, false),
+                                    b.why
+                                ),
+                            )
+                            .on_hover_text(projects_paths(&b.projects));
+                        }
                     });
                 if s.casing_collision && self.core.is_some() {
                     ui.add_space(8.0);
@@ -8010,6 +8023,19 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
             )),
         });
     }
+    // Policy in some projects only: often deliberate, so quiet; everywhere is the status's to say.
+    if let Some(b) = s.blocked.as_ref().filter(|_| s.not_loaded.is_none()) {
+        badges.push(Badge {
+            text: format!("blocked in {}/{}", b.projects.len(), project_count),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(format!(
+                "In {} of {project_count} projects, Claude Code's policy keeps this server from loading. {}",
+                b.projects.len(),
+                b.why
+            )),
+        });
+    }
     if let (false, false, Some(same)) = (s.shadowed, s.shadowed_in.is_empty(), same_as) {
         badges.push(Badge {
             text: format!("left out in {}/{}", s.shadowed_in.len(), project_count),
@@ -8113,9 +8139,15 @@ fn status_cell(
     last_known: bool,
 ) {
     let pal = theme::palette(ui.ctx());
-    // Before the switch: on or off, Claude Code runs another server in its place.
+    // Before the switch: on or off, Claude Code runs another server in its place, or policy keeps it out. Policy
+    // says so: Claude Code itself drops such a server without a word.
     if let Some(why) = not_checked(s).filter(|_| s.not_loaded.is_some()) {
-        ui.label(RichText::new(NOT_LOADED).color(pal.text_muted))
+        let text = if s.blocked.is_some() {
+            BLOCKED_BY_POLICY
+        } else {
+            NOT_LOADED
+        };
+        ui.label(RichText::new(text).color(pal.text_muted))
             .on_hover_text(why);
         return;
     }
@@ -8214,6 +8246,8 @@ fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<Strin
 
 /// The status of a server Claude Code loads nowhere (decision 009).
 const NOT_LOADED: &str = "Not loaded";
+/// The status of a server Claude Code's policy keeps out wherever it would load (decision 010).
+const BLOCKED_BY_POLICY: &str = "Blocked by policy";
 
 /// Why Klefki never checks `s`, if it doesn't: Claude Code does not load it, or it is not one Klefki passes to Claude
 /// Code (decisions 008 and 009).
@@ -8373,14 +8407,19 @@ fn shadowed_text(s: &ServerRow, project_count: usize) -> String {
 
 /// The projects `s` is shadowed in, by folder name, at most a few.
 fn shadowed_in_text(s: &ServerRow, project_count: usize) -> String {
-    let count = s.shadowed_in.len();
-    let mut text = if s.shadowed {
+    in_projects_text(&s.shadowed_in, project_count, s.shadowed)
+}
+
+/// "in 1 of 3 projects: p", or "in all 2 projects: p, q" when `all`: by folder name, at most a few.
+fn in_projects_text(projects: &[String], project_count: usize, all: bool) -> String {
+    let count = projects.len();
+    let mut text = if all {
         format!("in all {count} projects: ")
     } else {
         format!("in {count} of {project_count} projects: ")
     };
     // By folder name, as the list's group headers name them; the whole paths are on hover.
-    let named: Vec<&str> = s.shadowed_in[..count.min(SHADOWED_NAMED)]
+    let named: Vec<&str> = projects[..count.min(SHADOWED_NAMED)]
         .iter()
         .map(|p| folder_name(p))
         .collect();
@@ -8396,8 +8435,13 @@ const SHADOWED_PATHS: usize = 20;
 
 /// The whole paths of the projects where `s` is shadowed, one per line.
 fn shadowed_paths(s: &ServerRow) -> String {
-    let count = s.shadowed_in.len();
-    let mut text = s.shadowed_in[..count.min(SHADOWED_PATHS)].join("\n");
+    projects_paths(&s.shadowed_in)
+}
+
+/// The whole paths of `projects`, one per line, at most a screenful.
+fn projects_paths(projects: &[String]) -> String {
+    let count = projects.len();
+    let mut text = projects[..count.min(SHADOWED_PATHS)].join("\n");
     if count > SHADOWED_PATHS {
         text.push_str(&format!("\nand {} more", count - SHADOWED_PATHS));
     }
@@ -8686,6 +8730,7 @@ mod tests {
             plugin: None,
             managed: None,
             not_loaded: None,
+            blocked: None,
         };
         let mut h = harness_with(Snapshot {
             servers: vec![row("REMOTE_1"), row("REMOTE_2")],
@@ -8816,6 +8861,7 @@ mod tests {
             plugin: None,
             managed: None,
             not_loaded: None,
+            blocked: None,
         }
     }
 
@@ -11795,6 +11841,55 @@ mod tests {
             )),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn a_server_policy_holds_back_in_some_projects_says_where_and_why() {
+        let (mut h, engine) = live_harness();
+        let why = "Blocked by policy: deniedMcpServers in /p/.claude/settings.json has serverName \"mine\".";
+        let mine = ServerRow {
+            blocked: Some(klefki_core::api::Blocked {
+                why: why.into(),
+                projects: vec!["/home/me/p".into()],
+            }),
+            ..live_row("mine", Scope::User, None)
+        };
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![mine],
+                project_count: 3,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.get_by_label("blocked in 1/3");
+        h.get_by_label("mine").click();
+        h.run();
+        h.get_by_label("Blocked");
+        // Named like "Shadowed" (cross-review of #49).
+        h.get_by_label(&format!("in 1 of 3 projects: p. {why}"));
+    }
+
+    #[test]
+    fn a_server_policy_blocks_everywhere_says_so_in_the_list() {
+        let (mut h, engine) = live_harness();
+        let why =
+            "A rule in your settings blocks the command localx. Remove the rule to let it load.";
+        let x = ServerRow {
+            not_loaded: Some(why.into()),
+            blocked: Some(klefki_core::api::Blocked {
+                why: why.into(),
+                projects: vec!["/home/me/p".into()],
+            }),
+            ..live_row("x", Scope::Local, Some("/home/me/p"))
+        };
+        engine.events.send(snapshot_of(vec![x])).unwrap();
+        h.run();
+        // The cause in the status, not only "Not loaded"; no "blocked in" badge for the whole of it.
+        h.get_by_label(BLOCKED_BY_POLICY);
+        assert!(h.query_by_label(NOT_LOADED).is_none());
+        assert!(h.query_by_label_contains("blocked in").is_none());
     }
 
     #[test]

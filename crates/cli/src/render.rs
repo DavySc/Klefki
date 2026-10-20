@@ -253,6 +253,18 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if let Some(file) = &row.managed {
         notes.push(format!("set by your organisation in {file}"));
     }
+    // Blocked everywhere is the state column's to say, with the reason above.
+    if let Some(b) = row.blocked.as_ref().filter(|_| row.not_loaded.is_none()) {
+        let mut note = format!(
+            "blocked by policy in {} of {project_count} projects: ",
+            b.projects.len()
+        );
+        note.push_str(&b.projects[..b.projects.len().min(PROJECTS_NAMED)].join(", "));
+        if b.projects.len() > PROJECTS_NAMED {
+            let _ = write!(note, " and {} more", b.projects.len() - PROJECTS_NAMED);
+        }
+        notes.push(note);
+    }
     // A plugin's or the organisation's server, like a user server, is one row for every project.
     let everywhere = row.scope.is_everywhere();
     if let Some(plugin) = &row.plugin {
@@ -313,7 +325,10 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     notes
 }
 
-/// The state column: on, off, or not loaded wherever it is on.
+/// At most this many projects are named in a note.
+const PROJECTS_NAMED: usize = 3;
+
+/// The state column: on, off, or not loaded (blocked, by policy) wherever it is on.
 fn state(row: &ServerRow, project_count: usize) -> &'static str {
     // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
     let plugin_off = project_count > 0
@@ -323,6 +338,8 @@ fn state(row: &ServerRow, project_count: usize) -> &'static str {
             .is_some_and(|p| p.off_in.len() == project_count);
     if !row.enabled || plugin_off {
         "off"
+    } else if row.not_loaded.is_some() && row.blocked.is_some() {
+        "blocked"
     } else if row.not_loaded.is_some() {
         "not loaded"
     } else {
@@ -427,6 +444,12 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
         o.insert("managed".into(), json!(row.managed));
     }
     o.insert("not_loaded".into(), json!(row.not_loaded));
+    if let Some(b) = &row.blocked {
+        o.insert(
+            "blocked".into(),
+            json!({"why": b.why, "projects": b.projects}),
+        );
+    }
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
     o
@@ -802,6 +825,46 @@ mod tests {
         );
         assert_eq!(row_json(user, 2)["relative_paths"], json!([]));
         assert!(!row_json(&in_repo, 2).contains_key("relative_paths"));
+    }
+
+    #[test]
+    fn a_server_policy_holds_back_in_some_projects_says_how_many() {
+        let s = fixture_snapshot();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let row = ServerRow {
+            blocked: Some(klefki_core::api::Blocked {
+                why: "Blocked by policy: deniedMcpServers in /p/.claude/settings.json has serverName \"x\".".into(),
+                projects: vec!["/p".into()],
+            }),
+            ..user.clone()
+        };
+        assert!(
+            notes(&row, 3).contains(&"blocked by policy in 1 of 3 projects: /p".to_owned()),
+            "{:?}",
+            notes(&row, 3)
+        );
+        // Blocked everywhere: the state column says so, and no count.
+        let everywhere = ServerRow {
+            not_loaded: row.blocked.as_ref().map(|b| b.why.clone()),
+            ..row.clone()
+        };
+        assert_eq!(state(&everywhere, 3), "blocked");
+        assert!(
+            !notes(&everywhere, 3)
+                .iter()
+                .any(|n| n.contains("blocked by policy in")),
+            "{:?}",
+            notes(&everywhere, 3)
+        );
+        let json = row_json(&row, 3);
+        assert_eq!(json["blocked"]["projects"], json!(["/p"]));
+        assert!(
+            json["blocked"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("deniedMcpServers")
+        );
+        assert!(!row_json(user, 3).contains_key("blocked"));
     }
 
     #[test]

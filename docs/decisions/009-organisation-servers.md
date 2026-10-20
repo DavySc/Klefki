@@ -40,7 +40,7 @@ loaded when Claude Code ignored them.
   the machine has. `ConfigPaths::in_dir` reads no organisation folder.
 
 ## Not yet (next slices)
-- "Blocked by policy" (finding 7), naming the rule and its file; it will reuse `not_loaded`.
+- "Blocked by policy" (finding 7): done, decision 010.
 - Policy from the Windows registry or macOS profiles, and settings a server delivers (`remote-settings.json`).
 - claude.ai connectors (decision 008, finding 9).
 

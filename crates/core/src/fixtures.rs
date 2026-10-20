@@ -111,6 +111,7 @@ pub(crate) fn load() -> Snapshot {
                 }),
                 managed: s.managed.as_deref().map(sanitize),
                 not_loaded: s.not_loaded.as_deref().map(sanitize),
+                blocked: None,
             })
             .collect(),
         warnings: Vec::new(),
