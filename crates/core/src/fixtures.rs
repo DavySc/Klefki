@@ -41,6 +41,9 @@ struct RawServer {
     /// Plugin servers: the projects where the plugin is off.
     #[serde(default)]
     plugin_off_in: Vec<String>,
+    /// Organisation servers: the file that sets it.
+    managed: Option<String>,
+    not_loaded: Option<String>,
 }
 
 pub(crate) fn load() -> Snapshot {
@@ -51,6 +54,8 @@ pub(crate) fn load() -> Snapshot {
         projects: Vec::new(),
         legacy_disabled: Vec::new(),
         kept: Vec::new(),
+        organisation_only: None,
+        organisation_notes: Vec::new(),
         servers: raw
             .servers
             .into_iter()
@@ -104,6 +109,8 @@ pub(crate) fn load() -> Snapshot {
                         off_in: s.plugin_off_in.iter().map(|p| sanitize(p)).collect(),
                     }
                 }),
+                managed: s.managed.as_deref().map(sanitize),
+                not_loaded: s.not_loaded.as_deref().map(sanitize),
             })
             .collect(),
         warnings: Vec::new(),
@@ -115,6 +122,7 @@ fn scope_of(word: &str) -> Scope {
         "user" => Scope::User,
         "local" => Scope::Local,
         "plugin" => Scope::Plugin,
+        "managed" => Scope::Managed,
         _ => Scope::Project,
     }
 }

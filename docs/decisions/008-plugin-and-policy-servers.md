@@ -50,7 +50,7 @@ marketplace and from a plugin with a git source; each result was read back with 
 - Turning off a server that a plugin's server repeats says, in the review, that the plugin's server loads instead.
 
 ## Not yet (next slices)
-- Organisation servers (`managed-mcp.json`, `managedMcpServers`), plugins from managed settings, and `.mcpb` bundles.
+- Organisation servers: done in decision 009. Plugins from managed settings, and `.mcpb` bundles.
 - "Blocked by policy" (finding 7), naming the rule and its file.
 - claude.ai connectors (finding 9), from a cache only, never a new `mcp list`.
 

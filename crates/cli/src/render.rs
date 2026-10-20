@@ -47,6 +47,10 @@ pub enum Outcome {
     ProjectServer,
     /// A plugin's server: Klefki does not check those (decision 008).
     Plugin,
+    /// A server the organisation sets: Klefki does not check those (decision 009).
+    Organisation,
+    /// Claude Code loads it nowhere, for this reason (decision 009): another server answers to its name.
+    NotLoaded(String),
     /// Asked, but no answer came in time.
     NoAnswer,
 }
@@ -57,7 +61,12 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.status != Status::Connected,
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => false,
+            Outcome::Off
+            | Outcome::Rejected
+            | Outcome::ProjectServer
+            | Outcome::Plugin
+            | Outcome::Organisation
+            | Outcome::NotLoaded(_) => false,
         }
     }
 
@@ -66,7 +75,12 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.failed(),
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => false,
+            Outcome::Off
+            | Outcome::Rejected
+            | Outcome::ProjectServer
+            | Outcome::Plugin
+            | Outcome::Organisation
+            | Outcome::NotLoaded(_) => false,
         }
     }
 
@@ -77,8 +91,12 @@ impl Outcome {
 
 /// Why `status` leaves this row out, if it does. Named servers are checked unless Claude Code would not run them.
 pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
-    if row.scope == Scope::Plugin {
+    if let Some(why) = &row.not_loaded {
+        Some(Outcome::NotLoaded(why.clone()))
+    } else if row.scope == Scope::Plugin {
         Some(Outcome::Plugin)
+    } else if row.scope == Scope::Managed {
+        Some(Outcome::Organisation)
     } else if !row.enabled {
         Some(Outcome::Off)
     } else if row.approval == Some(Approval::Rejected) {
@@ -126,14 +144,21 @@ fn by_chunks(x: &[(bool, String)], y: &[(bool, String)]) -> Ordering {
     x.len().cmp(&y.len())
 }
 
-/// The rows to show, in the order they are shown: user servers, then per project its local and project servers;
-/// by name within a group.
+/// The rows to show, in the order they are shown: the organisation's servers, the user's, then per project its local
+/// and project servers, then the plugins'; by name within a group.
 pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
     // Each name is split once, not at every comparison.
     let mut keyed: Vec<(&ServerRow, Vec<(bool, String)>)> =
         rows.into_iter().map(|r| (r, chunks(&r.name))).collect();
     keyed.sort_by(|(a, x), (b, y)| {
-        let group = |r: &'a ServerRow| (r.scope != Scope::User, &r.project, r.scope);
+        let group = |r: &'a ServerRow| {
+            (
+                r.scope != Scope::Managed,
+                r.scope != Scope::User,
+                &r.project,
+                r.scope,
+            )
+        };
         group(a)
             .cmp(&group(b))
             .then_with(|| by_chunks(x, y))
@@ -221,8 +246,15 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         Some(Approval::Rejected) => notes.push("rejected".to_owned()),
         Some(Approval::Approved) | None => {}
     }
-    // A plugin's server, like a user server, is one row for every project.
-    let everywhere = matches!(row.scope, Scope::User | Scope::Plugin);
+    // The state column says "not loaded"; the note says why.
+    if let Some(why) = &row.not_loaded {
+        notes.push(why.trim_end_matches('.').to_owned());
+    }
+    if let Some(file) = &row.managed {
+        notes.push(format!("set by your organisation in {file}"));
+    }
+    // A plugin's or the organisation's server, like a user server, is one row for every project.
+    let everywhere = row.scope.is_everywhere();
     if let Some(plugin) = &row.plugin {
         notes.push(format!("from the plugin {}", plugin.plugin));
         if !plugin.off_in.is_empty() {
@@ -238,7 +270,14 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
             row.disabled_in
         ));
     }
-    if let Some(same) = row.plugin.as_ref().and_then(|p| p.same_as.as_deref()) {
+    // Not loaded at all: what else it would leave out or be hidden by does not matter.
+    let loaded = row.not_loaded.is_none();
+    if let Some(same) = row
+        .plugin
+        .as_ref()
+        .and_then(|p| p.same_as.as_deref())
+        .filter(|_| loaded)
+    {
         notes.push(if row.shadowed {
             format!("left out: same as {same}")
         } else {
@@ -247,13 +286,13 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
                 row.shadowed_in.len()
             )
         });
-    } else if row.shadowed {
+    } else if loaded && row.shadowed {
         notes.push(if row.scope == Scope::User {
             "shadowed in every project".to_owned()
         } else {
             "shadowed by a local server".to_owned()
         });
-    } else if !row.shadowed_in.is_empty() {
+    } else if loaded && !row.shadowed_in.is_empty() {
         notes.push(format!(
             "shadowed in {} of {project_count} projects",
             row.shadowed_in.len()
@@ -262,7 +301,7 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if row.casing_collision {
         notes.push("another server's name differs only in case".to_owned());
     }
-    if row.scope == Scope::User && !row.relative_paths.is_empty() {
+    if row.scope == Scope::User && !row.relative_paths.is_empty() && loaded {
         notes.push(format!(
             "relative to each session's folder: {}",
             row.relative_paths.join(", ")
@@ -274,6 +313,23 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     notes
 }
 
+/// The state column: on, off, or not loaded wherever it is on.
+fn state(row: &ServerRow, project_count: usize) -> &'static str {
+    // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
+    let plugin_off = project_count > 0
+        && row
+            .plugin
+            .as_ref()
+            .is_some_and(|p| p.off_in.len() == project_count);
+    if !row.enabled || plugin_off {
+        "off"
+    } else if row.not_loaded.is_some() {
+        "not loaded"
+    } else {
+        "on"
+    }
+}
+
 pub const NOTHING: &str = "No MCP servers are configured.\n";
 
 pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -> String {
@@ -282,25 +338,12 @@ pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -
     }
     let name_w = width(rows.iter().map(|r| r.name.as_str()));
     let kind_w = width(rows.iter().map(|r| r.transport.label()));
+    let state_w = width(rows.iter().map(|r| state(r, snapshot.project_count)));
     let mut out = String::new();
     grouped(&mut out, rows, home, |out, row| {
         pad(out, &row.name, name_w);
         out.push_str("  ");
-        // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
-        let plugin_off = snapshot.project_count > 0
-            && row
-                .plugin
-                .as_ref()
-                .is_some_and(|p| p.off_in.len() == snapshot.project_count);
-        pad(
-            out,
-            if row.enabled && !plugin_off {
-                "on"
-            } else {
-                "off"
-            },
-            3,
-        );
+        pad(out, state(row, snapshot.project_count), state_w);
         out.push_str("  ");
         pad(out, row.transport.label(), kind_w);
         out.push_str("  ");
@@ -320,6 +363,7 @@ fn scope_key(scope: Scope) -> &'static str {
         Scope::Local => "local",
         Scope::Project => "project",
         Scope::Plugin => "plugin",
+        Scope::Managed => "organisation",
     }
 }
 
@@ -362,7 +406,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     o.insert("transport".into(), json!(transport_key(row.transport)));
     o.insert("target".into(), json!(row.target));
     o.insert("enabled".into(), json!(row.enabled));
-    if matches!(row.scope, Scope::User | Scope::Plugin) {
+    if row.scope.is_everywhere() {
         o.insert("disabled_in".into(), json!(row.disabled_in));
         o.insert("project_count".into(), json!(project_count));
     }
@@ -379,6 +423,10 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
             json!({"name": plugin.plugin, "marketplace": plugin.marketplace, "same_as": plugin.same_as, "written_target": plugin.written_target, "off_in": plugin.off_in}),
         );
     }
+    if row.managed.is_some() {
+        o.insert("managed".into(), json!(row.managed));
+    }
+    o.insert("not_loaded".into(), json!(row.not_loaded));
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
     o
@@ -462,6 +510,12 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
             NOT_CHECKED.to_owned(),
             "not checked: it comes from a plugin; Claude Code's /mcp shows its status".to_owned(),
         ),
+        Outcome::Organisation => (
+            NOT_CHECKED.to_owned(),
+            "not checked: your organisation sets it; Claude Code's /mcp shows its status"
+                .to_owned(),
+        ),
+        Outcome::NotLoaded(why) => ("Not loaded".to_owned(), format!("not checked: {why}")),
         Outcome::ProjectServer => {
             let label = match row.status {
                 Status::Unknown | Status::Checking => NOT_CHECKED,
@@ -545,7 +599,12 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
                 Status::Checking | Status::Unknown => "check failed",
             },
             Outcome::NoAnswer => "no answer",
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => {
+            Outcome::Off
+            | Outcome::Rejected
+            | Outcome::ProjectServer
+            | Outcome::Plugin
+            | Outcome::Organisation
+            | Outcome::NotLoaded(_) => {
                 skipped += 1;
                 continue;
             }
@@ -586,6 +645,8 @@ pub fn status_json(
                 Outcome::Rejected => Some("rejected"),
                 Outcome::ProjectServer => Some("project_server"),
                 Outcome::Plugin => Some("plugin"),
+                Outcome::Organisation => Some("organisation"),
+                Outcome::NotLoaded(_) => Some("not_loaded"),
                 Outcome::Checked(_) | Outcome::NoAnswer => None,
             };
             let (status, detail, hint) = match outcome {
@@ -601,9 +662,12 @@ pub fn status_json(
                     c.hint.as_ref(),
                 ),
                 Outcome::NoAnswer => (Some("no_answer"), Some(NO_ANSWER.to_owned()), None),
-                Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => {
-                    (None, None, None)
-                }
+                Outcome::Off
+                | Outcome::Rejected
+                | Outcome::ProjectServer
+                | Outcome::Plugin
+                | Outcome::Organisation
+                | Outcome::NotLoaded(_) => (None, None, None),
             };
             o.insert("checked".into(), json!(outcome.was_checked()));
             o.insert("skipped".into(), json!(skipped));
@@ -628,6 +692,7 @@ pub fn status_json(
         "claude_version": claude_version,
         "servers": servers,
         "warnings": snapshot.warnings,
+        "organisation_notes": snapshot.organisation_notes,
     }))
 }
 
@@ -637,7 +702,7 @@ mod tests {
     use klefki_core::api::fixture_snapshot;
 
     #[test]
-    fn groups_come_user_first_then_each_project_local_before_project() {
+    fn groups_come_organisation_and_user_first_then_each_project_local_before_project() {
         let s = fixture_snapshot();
         let rows = ordered(&s.servers);
         let heads: Vec<String> = rows.iter().map(|r| heading(r, None)).collect();
@@ -648,7 +713,7 @@ mod tests {
                 seen.push(h);
             }
         }
-        assert_eq!(seen[0], "User");
+        assert_eq!(seen[..2], ["Organisation", "User"]);
         for (i, h) in seen.iter().enumerate() {
             if let Some(project) = h.strip_prefix("Project in ") {
                 let local = format!("Local in {project}");
@@ -716,6 +781,21 @@ mod tests {
             notes(&rel, 2)
         );
         assert!(!notes(&in_repo, 2).iter().any(|n| n.contains("relative")));
+        // Not where Claude Code does not load it at all: that is what to say.
+        let replaced = ServerRow {
+            not_loaded: Some("Your organisation sets a server of the same name.".into()),
+            ..rel.clone()
+        };
+        let said = notes(&replaced, 2);
+        assert_eq!(said[0], "Your organisation sets a server of the same name");
+        // Nor what a server Claude Code does not load would leave out or be hidden by (cross-review of #47).
+        let hidden_too = ServerRow {
+            shadowed: true,
+            shadowed_in: vec!["a".into(), "b".into()],
+            ..replaced.clone()
+        };
+        assert_eq!(notes(&hidden_too, 2), said);
+        assert!(!said.iter().any(|n| n.contains("relative")), "{said:?}");
         assert_eq!(
             row_json(&rel, 2)["relative_paths"],
             json!(["build/index.js", "./c.json (in CFG)"])
@@ -790,8 +870,12 @@ mod tests {
         let rows = ordered(&s.servers);
         let heads: Vec<String> = rows.iter().map(|r| heading(r, None)).collect();
         let first_plugin = heads.iter().position(|h| h == "Plugin").unwrap();
+        let organisation = heads.iter().take_while(|h| *h == "Organisation").count();
+        assert!(organisation > 0, "{heads:?}");
         assert!(
-            heads[..first_plugin].iter().all(|h| h == "User"),
+            heads[organisation..first_plugin]
+                .iter()
+                .all(|h| h == "User"),
             "{heads:?}"
         );
         let text = list_text(&s, &rows, None);

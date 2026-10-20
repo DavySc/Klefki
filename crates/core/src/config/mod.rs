@@ -5,6 +5,7 @@ pub(crate) mod entry;
 pub(crate) mod fsx;
 pub(crate) mod inventory;
 pub(crate) mod jsonspan;
+pub(crate) mod managed;
 #[cfg(windows)]
 pub(crate) mod owner_only;
 pub(crate) mod plugins;
@@ -20,6 +21,9 @@ pub struct ConfigPaths {
     pub claude_json: PathBuf,
     /// The directory with the health and needs-auth caches.
     pub claude_dir: PathBuf,
+    /// The folder with the organisation's settings (`managed-mcp.json`, `managed-settings.json`), which Claude Code
+    /// reads whatever `CLAUDE_CONFIG_DIR` says. `None`: not looked at.
+    pub managed_dir: Option<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -29,12 +33,14 @@ impl ConfigPaths {
             return Some(Self {
                 claude_json: dir.join(".claude.json"),
                 claude_dir: dir,
+                managed_dir: managed_dir(),
             });
         }
         let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
         Some(Self {
             claude_json: home.join(".claude.json"),
             claude_dir: home.join(".claude"),
+            managed_dir: managed_dir(),
         })
     }
 
@@ -44,6 +50,17 @@ impl ConfigPaths {
         Self {
             claude_json: dir.join(".claude.json"),
             claude_dir: dir,
+            managed_dir: None,
         }
+    }
+}
+
+/// The system's folder for an organisation's settings, or the one `KLEFKI_MANAGED_DIR` names (empty: none), so a
+/// test or a try-out never depends on what the machine has.
+fn managed_dir() -> Option<PathBuf> {
+    match std::env::var_os("KLEFKI_MANAGED_DIR") {
+        Some(dir) if dir.is_empty() => None,
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => managed::system_dir(),
     }
 }
