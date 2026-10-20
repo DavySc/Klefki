@@ -14,7 +14,7 @@ marketplace and from a plugin with a git source; each result was read back with 
 |---|---|---|
 | 1 | A plugin's server is named `plugin:<plugin>:<server>`. The plugin's name is the part of its `enabledPlugins` key before `@`; the marketplace is not in the name. Names with spaces or `!` are accepted. | `mcp list` |
 | 2 | **It can be turned off like any other server:** its full name in `projects[<key>].disabledMcpServers` shows "Disabled for this project". The bare server name, or `<plugin>:<server>`, does nothing. | `mcp list`, `mcp get` |
-| 3 | A plugin is on when the merged `enabledPlugins` (user `settings.json`, then the project's `.claude/settings.json` and `.claude/settings.local.json`) has `"<plugin>@<marketplace>": true`. `claude plugin disable` writes `false`; `--scope local` writes the project's file, which wins there. | `settings.json` after each command |
+| 3 | A plugin is on when the merged `enabledPlugins` (user `settings.json`, then the project's `.claude/settings.json` and `.claude/settings.local.json`) has `"<plugin>@<marketplace>": true`. `claude plugin disable` writes `false`; `--scope local` writes the project's file, which wins there. Merged as settings are: a plugin keeps the place its key first has (the user's file, then the project's), with the last value; that order is the order plugins are compared in (finding 6). | `settings.json` after each command; `mcp list` in two projects (slice 3) |
 | 4 | Where its files are read from: `plugins/installed_plugins.json` (`plugins["p@m"][].installPath`) for a remote source; for a plugin with a `./` source in a `directory` marketplace, the marketplace's folder itself (`known_marketplaces.json` `installLocation` plus the source), not the copy in `plugins/cache`. | Editing one copy, then the other |
 | 5 | Its servers are those of the plugin's `.mcp.json` and of `mcpServers` in `.claude-plugin/plugin.json` (an object, a `./` path to a file, or a list of both), together. A file may hold `{"mcpServers": {...}}` or the servers alone. A name both define takes the manifest's definition. `${CLAUDE_PLUGIN_ROOT}` in a definition is the plugin's folder (finding 4), written without `./`. | `mcp list` (review of #43) |
 | 6 | **Claude Code leaves a plugin's server out when a server configured by hand has the same command and arguments (environment not compared), or the same address** (scheme and host in lower case, default port and a trailing `/` dropped; path case and query kept; `http` and `sse` alike). A server that is off where Claude runs does not count. Between two plugins, the first one's server stays and the environment is compared too; an earlier plugin's server that is off in a project does not hide a later one there. Plugin servers are compared with `${CLAUDE_PLUGIN_ROOT}` expanded; servers configured by hand with their `${VAR}` expanded from Claude Code's environment. Nothing says so outside `--debug`. | `mcp list` with pairs of definitions, in two projects (review of #43) |
@@ -42,8 +42,14 @@ marketplace and from a plugin with a git source; each result was read back with 
 - All plugin files are untrusted: 1 MiB per file, 256 plugins, 500 servers per plugin, 16 manifest sources, paths
   from the files must stay inside the folder they are relative to, and an install path with `..` is not followed.
 
+- **Per project** (slice 3): a project's `.claude/settings.json` and `settings.local.json` switch plugins there
+  (finding 3). A row is listed when its plugin is on anywhere; where it is off, the row says so ("plugin off in
+  N/M"), and it neither loads nor leaves anything out there. These files are in the repository: read only for a
+  local absolute project path, size-limited, and only when some plugin is installed (with none, a project cannot
+  switch one on, and nothing more is read at refresh). Both are watched.
+- Turning off a server that a plugin's server repeats says, in the review, that the plugin's server loads instead.
+
 ## Not yet (next slices)
-- Plugins on only in a project's `.claude/settings.json` or `settings.local.json`, or off there (finding 3).
 - Organisation servers (`managed-mcp.json`, `managedMcpServers`), plugins from managed settings, and `.mcpb` bundles.
 - "Blocked by policy" (finding 7), naming the rule and its file.
 - claude.ai connectors (finding 9), from a cache only, never a new `mcp list`.

@@ -227,6 +227,9 @@ pub struct PluginInfo {
     /// The target as the plugin's files write it, when Claude Code runs it otherwise (`${CLAUDE_PLUGIN_ROOT}` in it).
     /// [`ServerRow::target`] is the target as run.
     pub written_target: Option<String>,
+    /// The projects (as shown) where its plugin is off, by the project's own `.claude/settings.json` or
+    /// `settings.local.json` or, with nothing there, the user's `settings.json`. Claude Code does not load it there.
+    pub off_in: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

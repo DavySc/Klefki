@@ -89,10 +89,12 @@
       "name": "plugin:docs-search:search",
       "scope": "plugin",
       "transport": "stdio",
-      "target": "${CLAUDE_PLUGIN_ROOT}/bin/search --stdio",
+      "target": "C:/Users/me/.claude/plugins/cache/team-plugins/docs-search/1.2.0/bin/search --stdio",
       "status": "unknown",
       "enabled": true,
-      "plugin": "docs-search@team-plugins"
+      "plugin": "docs-search@team-plugins",
+      "written_target": "${CLAUDE_PLUGIN_ROOT}/bin/search --stdio",
+      "plugin_off_in": ["C:/Repos/Gateway"]
     },
     {
       "name": "plugin:events:stream",

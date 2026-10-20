@@ -451,6 +451,39 @@ fn set_enabled(
     keys: &FileKeys,
     out: &mut Resolved,
 ) -> Result<(), String> {
+    switch(id, enabled, snapshot, keys, out)?;
+    if !enabled && let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) {
+        loads_instead(row, snapshot, out);
+    }
+    Ok(())
+}
+
+/// Where Claude Code leaves a plugin's server out because `row` has the same command or address, turning `row` off
+/// lets that one load instead: said, so the review states what the change does, not only what it writes.
+fn loads_instead(row: &ServerRow, snapshot: &Snapshot, out: &mut Resolved) {
+    for other in &snapshot.servers {
+        let repeats = other
+            .plugin
+            .as_ref()
+            .and_then(|p| p.same_as.as_deref())
+            .is_some_and(|same| same == row.name);
+        if repeats && (other.shadowed || !other.shadowed_in.is_empty()) {
+            out.warnings.push(format!(
+                "{} has the same command or address as {}, so Claude Code leaves it out. Where {} is off, Claude \
+                 Code loads {} instead.",
+                other.name, row.name, row.name, other.name
+            ));
+        }
+    }
+}
+
+fn switch(
+    id: &ServerId,
+    enabled: bool,
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<(), String> {
     // A plugin's server: switched like a user server, by the name Claude Code gives it (decision 008, finding 2).
     // Only `.claude.json` changes, never the plugin's files.
     if let Some(row) = snapshot
@@ -1601,6 +1634,50 @@ mod tests {
         .err()
         .unwrap();
         assert!(why.contains("no projects"), "{why}");
+    }
+
+    #[test]
+    fn turning_off_a_server_a_plugins_repeats_says_that_one_loads_instead() {
+        use crate::engine::Change;
+        let dir = tempfile::tempdir().unwrap();
+        // The plugin's server `s` runs `x`, as the user's `man` does: Claude Code leaves it out.
+        let inv = plugin_inventory(
+            dir.path(),
+            json!({"mcpServers": {"man": {"command": "x"}, "other": {"command": "y"}}, "projects": {"/q": {}}}),
+        );
+        let row = |name: &str| {
+            inv.snapshot
+                .servers
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+        };
+        let off = |name: &str, enabled: bool| {
+            resolve(
+                &[Change::SetEnabled {
+                    id: row(name).id(),
+                    enabled,
+                }],
+                &inv.snapshot,
+                &inv.keys,
+            )
+            .unwrap()
+            .warnings
+        };
+        let warnings = off("man", false);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("plugin:p:s") && w.contains("instead")),
+            "{warnings:?}"
+        );
+        // Turning it on, or off a server nothing repeats, says nothing of the kind.
+        for warnings in [off("man", true), off("other", false)] {
+            assert!(
+                !warnings.iter().any(|w| w.contains("instead")),
+                "{warnings:?}"
+            );
+        }
     }
 
     #[test]

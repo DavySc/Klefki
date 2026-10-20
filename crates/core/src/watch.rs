@@ -58,6 +58,7 @@ pub(crate) fn watched_files(paths: &ConfigPaths, snapshot: &Snapshot) -> Vec<Pat
             let dir = Path::new(project);
             files.push(dir.join(".mcp.json"));
             files.push(dir.join(".claude").join("settings.local.json"));
+            files.push(dir.join(".claude").join("settings.json"));
         }
     }
     files
@@ -278,13 +279,15 @@ mod tests {
         };
         let files = watched_files(&paths, &snapshot);
         assert!(files.contains(&dir.path().join(".mcp.json")));
+        // A project's own settings switch plugins there (decision 008).
+        assert!(files.contains(&dir.path().join(".claude").join("settings.json")));
         assert!(!files.iter().any(|f| f.to_string_lossy().contains("server")));
         assert!(
             !files
                 .iter()
                 .any(|f| f.to_string_lossy().contains("relative"))
         );
-        assert_eq!(files.len(), 6 + 2);
+        assert_eq!(files.len(), 6 + 3);
     }
 
     #[test]

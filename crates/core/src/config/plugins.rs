@@ -10,8 +10,9 @@
 //!
 //! Everything here is untrusted, like `.mcp.json`: sizes and counts are limited, and paths from the files must stay
 //! inside the folder they are relative to.
-use super::{ConfigPaths, fsx};
+use super::{ConfigPaths, fsx, inventory};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 /// Plugins looked at, at most. Each costs a few small reads at refresh.
@@ -68,54 +69,140 @@ fn expand(value: &mut Value, root: &str) {
 
 const ROOT_VAR: &str = "${CLAUDE_PLUGIN_ROOT}";
 
-/// The servers of every plugin that is on, in the order `enabledPlugins` lists the plugins. What could not be read
-/// is said in `warnings`, unsanitised: the caller cleans it.
-pub(crate) fn load(paths: &ConfigPaths, warnings: &mut Vec<String>) -> Vec<PluginServer> {
+/// The servers of the plugins that are on somewhere, and where.
+#[derive(Debug, Default)]
+pub(crate) struct Loaded {
+    pub servers: Vec<PluginServer>,
+    /// Per place, outside every project first and then each project asked for: the servers (indices into
+    /// `servers`) of the plugins on there, in the order Claude Code takes them.
+    pub on: Vec<Vec<usize>>,
+}
+
+/// The servers of every plugin that is on, outside every project (the user's `settings.json`) or in one of
+/// `projects` (raw paths, as `.claude.json` keys them), where the project's `.claude/settings.json` and then its
+/// `settings.local.json` change what the user's says. What could not be read is said in `warnings`, unsanitised:
+/// the caller cleans it.
+pub(crate) fn load(paths: &ConfigPaths, projects: &[&str], warnings: &mut Vec<String>) -> Loaded {
+    let places = 1 + projects.len();
+    let empty = || Loaded {
+        servers: Vec::new(),
+        on: vec![Vec::new(); places],
+    };
     let settings = paths.claude_dir.join("settings.json");
-    let enabled: Vec<(String, String)> = match read(&settings) {
-        Ok(Some(v)) => enabled_plugins(&v),
-        Ok(None) => return Vec::new(),
+    let user: Vec<(String, bool)> = match read(&settings) {
+        Ok(Some(v)) => switches(&v),
+        Ok(None) => Vec::new(),
         Err(e) => {
             warnings.push(format!(
                 "Could not read {} to find the plugins that are on: {e}",
                 settings.display()
             ));
-            return Vec::new();
+            Vec::new()
         }
     };
-    if enabled.is_empty() {
-        return Vec::new();
-    }
     let plugins_dir = paths.claude_dir.join("plugins");
     let installed = read(&plugins_dir.join("installed_plugins.json"))
         .ok()
         .flatten()
         .unwrap_or(Value::Null);
+    // A project can only switch on a plugin that is installed: with none, its files are not even opened.
+    let any_installed = installed
+        .pointer("/plugins")
+        .and_then(Value::as_object)
+        .is_some_and(|p| !p.is_empty());
+    if !any_installed && !user.iter().any(|(_, on)| *on) {
+        return empty();
+    }
+    // The plugins on in each place, by key, in order.
+    let mut on_by_place: Vec<Vec<String>> = vec![on_keys(&user)];
+    for project in projects {
+        let mut merged = user.clone();
+        if any_installed && inventory::is_safe_project_path(project) {
+            let dir = Path::new(project).join(".claude");
+            for file in ["settings.json", "settings.local.json"] {
+                let path = dir.join(file);
+                match read(&path) {
+                    Ok(Some(v)) => overlay(&mut merged, switches(&v)),
+                    Ok(None) => {}
+                    Err(e) => warnings.push(format!(
+                        "Ignored {} for the plugins that are on: {e}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+        on_by_place.push(on_keys(&merged));
+    }
+    let mut keys: Vec<&String> = Vec::new();
+    for key in on_by_place.iter().flatten() {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    if keys.is_empty() {
+        return empty();
+    }
     let marketplaces = read(&plugins_dir.join("known_marketplaces.json"))
         .ok()
         .flatten()
         .unwrap_or(Value::Null);
-    let mut out = Vec::new();
-    for (plugin, marketplace) in enabled.into_iter().take(MAX_PLUGINS) {
-        let key = format!("{plugin}@{marketplace}");
-        let Some(root) = plugin_root(&installed, &marketplaces, &plugin, &marketplace) else {
+    let mut servers = Vec::new();
+    // Each plugin's servers, as a range of `servers`.
+    let mut ranges: HashMap<&String, std::ops::Range<usize>> = HashMap::new();
+    for key in keys.into_iter().take(MAX_PLUGINS) {
+        let Some((plugin, marketplace)) = key.split_once('@') else {
+            continue;
+        };
+        let start = servers.len();
+        let Some(root) = plugin_root(&installed, &marketplaces, plugin, marketplace) else {
             warnings.push(format!(
                 "The plugin {key} is on, but its files were not found; its servers are not listed."
             ));
             continue;
         };
         match servers_of(&root) {
-            Ok(servers) => out.extend(servers.into_iter().map(|(server, entry)| PluginServer {
-                plugin: plugin.clone(),
-                marketplace: marketplace.clone(),
+            Ok(found) => servers.extend(found.into_iter().map(|(server, entry)| PluginServer {
+                plugin: plugin.to_owned(),
+                marketplace: marketplace.to_owned(),
                 server,
                 entry,
                 root: root.clone(),
             })),
             Err(e) => warnings.push(format!("Ignored the servers of the plugin {key}: {e}")),
         }
+        ranges.insert(key, start..servers.len());
     }
-    out
+    let on = on_by_place
+        .iter()
+        .map(|place| {
+            place
+                .iter()
+                .filter_map(|key| ranges.get(key))
+                .flat_map(Clone::clone)
+                .collect()
+        })
+        .collect();
+    Loaded { servers, on }
+}
+
+/// The keys switched on, in order.
+fn on_keys(switches: &[(String, bool)]) -> Vec<String> {
+    switches
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// `later` over `switches`, as Claude Code merges settings: a key already there keeps its place and takes the new
+/// value; a new one goes at the end.
+fn overlay(switches: &mut Vec<(String, bool)>, later: Vec<(String, bool)>) {
+    for (key, on) in later {
+        match switches.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, was)) => *was = on,
+            None => switches.push((key, on)),
+        }
+    }
 }
 
 fn read(path: &Path) -> Result<Option<Value>, String> {
@@ -127,18 +214,19 @@ fn read(path: &Path) -> Result<Option<Value>, String> {
         .map_err(|e| format!("invalid JSON ({e})"))
 }
 
-/// `(plugin, marketplace)` of each `"<plugin>@<marketplace>": true` in `enabledPlugins`, in file order.
-fn enabled_plugins(settings: &Value) -> Vec<(String, String)> {
+/// Each `"<plugin>@<marketplace>": true` or `false` in `enabledPlugins`, in file order. Other values are not a
+/// switch and are left out.
+fn switches(settings: &Value) -> Vec<(String, bool)> {
     let Some(map) = settings.get("enabledPlugins").and_then(Value::as_object) else {
         return Vec::new();
     };
     map.iter()
-        .filter(|(_, on)| on.as_bool() == Some(true))
-        .filter_map(|(key, _)| {
+        .filter_map(|(key, on)| {
             let (plugin, marketplace) = key.split_once('@')?;
-            (!plugin.is_empty() && !marketplace.is_empty())
-                .then(|| (plugin.to_owned(), marketplace.to_owned()))
+            let on = on.as_bool()?;
+            (!plugin.is_empty() && !marketplace.is_empty()).then(|| (key.clone(), on))
         })
+        .take(MAX_PLUGINS * 4)
         .collect()
 }
 
@@ -336,8 +424,39 @@ mod tests {
         }
         fn load(&self) -> (Vec<PluginServer>, Vec<String>) {
             let mut warnings = Vec::new();
-            let servers = load(&ConfigPaths::in_dir(self.dir.path()), &mut warnings);
-            (servers, warnings)
+            let loaded = load(&ConfigPaths::in_dir(self.dir.path()), &[], &mut warnings);
+            (loaded.servers, warnings)
+        }
+        /// With these projects: the servers, and per place (outside every project, then each project) the full
+        /// names of those loaded there, in order.
+        fn load_in(&self, projects: &[&str]) -> (Vec<String>, Vec<Vec<String>>, Vec<String>) {
+            let mut warnings = Vec::new();
+            let loaded = load(
+                &ConfigPaths::in_dir(self.dir.path()),
+                projects,
+                &mut warnings,
+            );
+            let on = loaded
+                .on
+                .iter()
+                .map(|place| {
+                    place
+                        .iter()
+                        .map(|&i| loaded.servers[i].full_name())
+                        .collect()
+                })
+                .collect();
+            (names(&loaded.servers), on, warnings)
+        }
+        /// A project folder; `settings` and `local` are its `.claude/settings.json` and `settings.local.json`.
+        fn project(&self, name: &str, settings: Option<Value>, local: Option<Value>) -> String {
+            for (file, v) in [("settings.json", settings), ("settings.local.json", local)] {
+                if let Some(v) = v {
+                    self.write(&format!("{name}/.claude/{file}"), &v);
+                }
+            }
+            std::fs::create_dir_all(self.path(name)).unwrap();
+            self.path(name).to_string_lossy().into_owned()
         }
         /// A plugin installed from a remote marketplace: its files are in the install folder.
         fn install(&self, key: &str, root: &str) {
@@ -394,6 +513,77 @@ mod tests {
         );
         assert_eq!(servers[0].marketplace, "mkt");
         assert_eq!(servers[0].entry, json!({"command": "node"}));
+    }
+
+    #[test]
+    fn a_projects_own_settings_switch_plugins_there_and_the_local_file_wins() {
+        let e = Env::new();
+        for p in ["p1", "p2", "p3"] {
+            e.install(&format!("{p}@m"), p);
+            e.write(&format!("{p}/.mcp.json"), &json!({"s": {"command": p}}));
+        }
+        e.enable(&[("p1@m", true), ("p2@m", false)]);
+        let a = e.project(
+            "a",
+            Some(json!({"enabledPlugins": {"p2@m": true}})),
+            Some(json!({"enabledPlugins": {"p3@m": true}})),
+        );
+        let b = e.project(
+            "b",
+            Some(json!({"enabledPlugins": {"p2@m": true}})),
+            Some(json!({"enabledPlugins": {"p1@m": false, "p2@m": false}})),
+        );
+        let (servers, on, warnings) = e.load_in(&[&a, &b, "relative/c"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(servers, ["plugin:p1:s", "plugin:p2:s", "plugin:p3:s"]);
+        assert_eq!(
+            on,
+            [
+                vec!["plugin:p1:s"],
+                vec!["plugin:p1:s", "plugin:p2:s", "plugin:p3:s"],
+                vec![],
+                // A project that is not a local absolute path: its files are not read.
+                vec!["plugin:p1:s"],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plugin_keeps_the_place_it_first_has_in_the_merged_settings() {
+        // As Claude Code merges them: a key the user's file has stays where it is there, with the project's value.
+        let e = Env::new();
+        for p in ["p1", "p2"] {
+            e.install(&format!("{p}@m"), p);
+            e.write(&format!("{p}/.mcp.json"), &json!({"s": {"command": p}}));
+        }
+        e.enable(&[("p1@m", false), ("p2@m", true)]);
+        let a = e.project("a", Some(json!({"enabledPlugins": {"p1@m": true}})), None);
+        let (_, on, _) = e.load_in(&[&a]);
+        assert_eq!(on[1], ["plugin:p1:s", "plugin:p2:s"]);
+        // A key the user's file does not have comes after its keys.
+        e.enable(&[("p2@m", true)]);
+        let (_, on, _) = e.load_in(&[&a]);
+        assert_eq!(on[1], ["plugin:p2:s", "plugin:p1:s"]);
+    }
+
+    #[test]
+    fn a_projects_settings_are_read_only_when_a_plugin_is_installed() {
+        let e = Env::new();
+        let a = e.project("a", None, None);
+        std::fs::create_dir_all(e.path("a/.claude")).unwrap();
+        std::fs::write(e.path("a/.claude/settings.json"), "{broken").unwrap();
+        // Nothing installed: nothing a project could switch on, so nothing read and nothing to say.
+        assert_eq!(e.load_in(&[&a]), (vec![], vec![vec![], vec![]], vec![]));
+
+        // Installed: the broken file is named, and the project goes by the user's settings.
+        e.install("p1@m", "p1");
+        e.write("p1/.mcp.json", &json!({"s": {"command": "x"}}));
+        e.enable(&[("p1@m", true)]);
+        let (servers, on, warnings) = e.load_in(&[&a]);
+        assert_eq!(servers, ["plugin:p1:s"]);
+        assert_eq!(on, [vec!["plugin:p1:s"], vec!["plugin:p1:s"]]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("settings.json"), "{warnings:?}");
     }
 
     #[test]
