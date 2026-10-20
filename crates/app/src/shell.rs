@@ -4388,6 +4388,8 @@ impl ShellApp {
                                 "disabled in {} of {} projects",
                                 s.disabled_in, self.snapshot.project_count
                             )
+                        } else if plugin_off_everywhere(s, self.snapshot.project_count) {
+                            "yes, but its plugin is off in every project".to_owned()
                         } else if s.enabled {
                             "yes".to_owned()
                         } else {
@@ -7732,7 +7734,12 @@ struct Badge {
 
 fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     let pal = theme::palette(ui.ctx());
-    let color = if s.enabled { pal.text } else { pal.disabled };
+    // Like a user server off in every project: a plugin's server whose plugin is.
+    let color = if s.enabled && !plugin_off_everywhere(s, project_count) {
+        pal.text
+    } else {
+        pal.disabled
+    };
     ui.add(egui::Label::new(RichText::new(short_name(s)).color(color)).truncate());
     let loud = |text: &str, fill: Color32, hover: Option<&str>| Badge {
         text: text.to_owned(),
@@ -8058,6 +8065,14 @@ fn plugin_read_only(p: &klefki_core::api::PluginInfo) -> String {
          plugin, or turn the plugin off in Claude Code (/plugin).",
         p.plugin
     )
+}
+
+/// A plugin's server whose plugin is off in every project Claude Code knows: it loads in none of them.
+fn plugin_off_everywhere(s: &ServerRow, project_count: usize) -> bool {
+    project_count > 0
+        && s.plugin
+            .as_ref()
+            .is_some_and(|p| p.off_in.len() == project_count)
 }
 
 /// Where a plugin's server's plugin is on, naming where it is off by folder, at most a few.
@@ -11445,6 +11460,28 @@ mod tests {
         h.run();
         h.get_by_label("Plugin on");
         h.get_by_label("in 1 of 3 projects; off in app, web");
+        h.get_by_label("yes");
+    }
+
+    #[test]
+    fn a_plugin_off_in_every_project_reads_so() {
+        // Cross-review of #46: it read "Enabled: yes" like a server that loads.
+        let (mut h, engine) = live_harness();
+        let mut p = plugin_row("plugin:docs:search", None);
+        p.plugin.as_mut().unwrap().off_in = vec!["/home/me/work/app".into(), "/home/me/web".into()];
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![p],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.get_by_label("plugin off in 2/2");
+        h.get_by_label("search").click();
+        h.run();
+        h.get_by_label("yes, but its plugin is off in every project");
     }
 
     #[test]

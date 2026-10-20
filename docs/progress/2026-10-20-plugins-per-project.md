@@ -32,6 +32,16 @@ Goal: roadmap item 2. Claude Code merges `enabledPlugins` from the user's `setti
   plugin:p1:dup".
 - Full verify on main `f207f5e` + this change: exit 0; 349 + 20 + 25 + 761 passed, 0 failed; deny ok.
 
+## Cross-review fixes
+- Blocking: a server left out only outside every project read "left out in 0 of 2 projects: same as …". The other
+  server is now named only where the row counts it (projects, or outside them when Claude Code knows none).
+  Reproducer and variant: inventory `a_server_left_out_only_outside_every_project_names_nothing`.
+- A plugin's server whose plugin is off in every project is dimmed, reads "Enabled: yes, but its plugin is off in
+  every project", and `klefki-cli list` shows `off` (JSON `enabled` stays the switch). App
+  `a_plugin_off_in_every_project_reads_so`; CLI render test.
+- Turning such a server on says where its plugin keeps it off: ops
+  `turning_on_a_server_whose_plugin_is_off_in_a_project_says_it_stays_off_there`.
+
 ## Open
 - A plugin on only in a project but not installed: not listed, with the warning "its files were not found" (Claude Code
   offers to install it; not tried).

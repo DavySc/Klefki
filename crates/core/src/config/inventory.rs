@@ -378,6 +378,9 @@ fn add_plugin_servers(
     let mut by_hand_name: Vec<Option<&str>> = vec![None; servers.len()];
     let mut by_plugin: Vec<Option<&str>> = vec![None; servers.len()];
     for (i, place) in places.iter().enumerate() {
+        // Where the row says it is left out: in projects, or outside every project when Claude Code knows none. Only
+        // there is the other server named, so the count and the name never disagree.
+        let shown = (i == 0) == (snap.project_count == 0);
         // The plugin servers loaded here so far, by definition: the first one stays.
         let mut loaded_here: HashMap<&str, &str> = HashMap::new();
         for &s in &loaded.on[i] {
@@ -391,10 +394,14 @@ fn add_plugin_servers(
                 .as_deref()
                 .and_then(|k| loaded_here.get(k).copied());
             if let Some(m) = hand {
-                by_hand_name[s].get_or_insert(&m.name);
+                if shown {
+                    by_hand_name[s].get_or_insert(&m.name);
+                }
                 hidden[s][i] = true;
             } else if let Some(earlier) = earlier {
-                by_plugin[s].get_or_insert(earlier);
+                if shown {
+                    by_plugin[s].get_or_insert(earlier);
+                }
                 hidden[s][i] = true;
             } else if let Some(k) = &plugin_keys[s]
                 && !off[i].is_some_and(|d| d.contains(&names[s]))
@@ -2819,6 +2826,44 @@ mod tests {
             p3.shadowed_in.is_empty() && plugin_info(p3).same_as.is_none(),
             "{p3:#?}"
         );
+    }
+
+    #[test]
+    fn a_server_left_out_only_outside_every_project_names_nothing() {
+        // Cross-review of #46: "left out in 0 of 2 projects: same as plugin:p1:s" contradicted itself.
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        let shown = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        e.plugin("p1", json!({"s": {"command": "same"}}));
+        e.plugin("p2", json!({"t": {"command": "same"}}));
+        // p1 comes first, but is off in both projects: there p2's server loads.
+        for p in ["a", "b"] {
+            e.write(
+                &format!("projects/{p}/.claude/settings.json"),
+                &json!({"enabledPlugins": {"p1@mkt": false}}),
+            );
+        }
+        e.write(
+            ".claude.json",
+            &json!({"projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}}),
+        );
+        let s = e.load();
+        let t = find(&s, Scope::Plugin, "plugin:p2:t");
+        assert!(
+            !t.shadowed && t.shadowed_in.is_empty() && plugin_info(t).same_as.is_none(),
+            "{t:#?}"
+        );
+
+        // Variant: on again in a, so left out there, and named.
+        e.write(
+            "projects/a/.claude/settings.json",
+            &json!({"enabledPlugins": {"p1@mkt": true}}),
+        );
+        let s = e.load();
+        let t = find(&s, Scope::Plugin, "plugin:p2:t");
+        assert!(!t.shadowed, "{t:#?}");
+        assert_eq!(t.shadowed_in, [shown(&a)]);
+        assert_eq!(plugin_info(t).same_as.as_deref(), Some("plugin:p1:s"));
     }
 
     #[test]

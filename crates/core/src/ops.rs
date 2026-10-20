@@ -452,10 +452,42 @@ fn set_enabled(
     out: &mut Resolved,
 ) -> Result<(), String> {
     switch(id, enabled, snapshot, keys, out)?;
-    if !enabled && let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) {
-        loads_instead(row, snapshot, out);
+    if let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) {
+        if enabled {
+            stays_off(row, out);
+        } else {
+            loads_instead(row, snapshot, out);
+        }
     }
     Ok(())
+}
+
+/// At most this many projects are named in a warning; the rest are counted.
+const PROJECTS_NAMED: usize = 5;
+
+/// Where `row`'s plugin is off, turning the server on changes nothing: said, so the review states the real outcome.
+fn stays_off(row: &ServerRow, out: &mut Resolved) {
+    let Some(off) = row
+        .plugin
+        .as_ref()
+        .map(|p| &p.off_in)
+        .filter(|o| !o.is_empty())
+    else {
+        return;
+    };
+    let mut named: Vec<String> = off
+        .iter()
+        .take(PROJECTS_NAMED)
+        .map(|p| sanitize(&folder_name(p)))
+        .collect();
+    if off.len() > PROJECTS_NAMED {
+        named.push(count(off.len() - PROJECTS_NAMED, "more project"));
+    }
+    out.warnings.push(format!(
+        "Its plugin is off in {}, so Claude Code still does not load {} there.",
+        named.join(", "),
+        row.name
+    ));
 }
 
 /// Where Claude Code leaves a plugin's server out because `row` has the same command or address, turning `row` off
@@ -1634,6 +1666,54 @@ mod tests {
         .err()
         .unwrap();
         assert!(why.contains("no projects"), "{why}");
+    }
+
+    #[test]
+    fn turning_on_a_server_whose_plugin_is_off_in_a_project_says_it_stays_off_there() {
+        // Cross-review of #46: the review said it was switched on everywhere.
+        use crate::engine::Change;
+        let dir = tempfile::tempdir().unwrap();
+        let (app, web) = (dir.path().join("app"), dir.path().join("web"));
+        for p in [&app, &web] {
+            std::fs::create_dir_all(p.join(".claude")).unwrap();
+        }
+        std::fs::write(
+            app.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"p@m":false}}"#,
+        )
+        .unwrap();
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir_all(cfg.join("plugins")).unwrap();
+        let inv = plugin_inventory(
+            &cfg,
+            json!({"projects": {app.to_string_lossy(): {}, web.to_string_lossy(): {}}}),
+        );
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Plugin)
+            .unwrap();
+        let warnings = |enabled: bool| {
+            resolve(
+                &[Change::SetEnabled {
+                    id: row.id(),
+                    enabled,
+                }],
+                &inv.snapshot,
+                &inv.keys,
+            )
+            .unwrap()
+            .warnings
+        };
+        let on = warnings(true);
+        assert!(
+            on.iter().any(|w| w
+                == "Its plugin is off in app, so Claude Code still does not load plugin:p:s there."),
+            "{on:?}"
+        );
+        // Turning it off: nothing to say about that.
+        assert!(!warnings(false).iter().any(|w| w.contains("Its plugin")));
     }
 
     #[test]

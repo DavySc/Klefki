@@ -286,7 +286,21 @@ pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -
     grouped(&mut out, rows, home, |out, row| {
         pad(out, &row.name, name_w);
         out.push_str("  ");
-        pad(out, if row.enabled { "on" } else { "off" }, 3);
+        // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
+        let plugin_off = snapshot.project_count > 0
+            && row
+                .plugin
+                .as_ref()
+                .is_some_and(|p| p.off_in.len() == snapshot.project_count);
+        pad(
+            out,
+            if row.enabled && !plugin_off {
+                "on"
+            } else {
+                "off"
+            },
+            3,
+        );
         out.push_str("  ");
         pad(out, row.transport.label(), kind_w);
         out.push_str("  ");
@@ -811,6 +825,18 @@ mod tests {
             })
         );
         assert_eq!(row["disabled_in"], 0);
+
+        // Cross-review of #46: off in every project reads "off", not "on".
+        let mut everywhere = plugin.clone();
+        everywhere.plugin.as_mut().unwrap().off_in = vec!["/a".into(), "/b".into()];
+        let two = Snapshot {
+            project_count: 2,
+            ..(*s).clone()
+        };
+        let line = list_text(&two, &[&everywhere], None);
+        assert!(line.contains(" off "), "{line}");
+        assert!(!line.contains(" on "), "{line}");
+        assert!(list_text(&s, &[plugin], None).contains(" on "));
     }
 
     #[test]
