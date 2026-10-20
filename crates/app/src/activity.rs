@@ -329,7 +329,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Also drawn by the look tests (`shell/look.rs`).
+    /// Also drawn by the look tests (`shell/tests/look.rs`).
     pub(crate) fn sample() -> Activity {
         Activity {
             entries: vec![

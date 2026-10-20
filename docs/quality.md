@@ -16,13 +16,24 @@ must leave every test, golden file and baseline as it was.
   - `crates/cli/tests/golden/`: every `klefki-cli` command's stdout, stderr and exit code.
   - A difference fails with a diff. When a change is meant, run the tests with `UPDATE_EXPECT=1` and review the
     golden files in the pull request. **In a refactor, a golden file that changes means behaviour changed: stop.**
-- Look tests (`crates/app/src/shell/look.rs`, Linux only): every page, dialog, detail tab, the four themes and a
-  small window, drawn with wgpu on Mesa's OpenGL software renderer and compared pixel for pixel (threshold 0) with
-  the pictures in `crates/app/src/shell/look/`. A one-step colour change or a 1 px spacing change fails them. A
-  failure leaves `<name>.new.png` and `<name>.diff.png` beside the picture; CI uploads them as `look-changes`. When a
-  change to the look is meant, run `UPDATE_SNAPSHOTS=1 cargo test -p klefki look` and show the pictures in the pull
-  request. **In a refactor, a picture that changes means the look changed: stop.** Linux only because each system's
-  graphics stack draws edges a little differently; the pictures were made on Ubuntu 24.04's Mesa, as CI uses.
+- Look tests (`crates/app/src/shell/tests/look.rs`, Linux only): 58 pictures in `crates/app/src/shell/tests/look/`,
+  compared pixel for pixel (threshold 0). Pages, detail tabs, statuses (checking, failed, a diagnosis), empty and
+  error states and the update in the top bar at 1100×800; every dialog (Add in each mode, Import, Duplicate, Move,
+  Export, casing, profiles, sign-in, the reviews including Delete and "nothing to do", and the outcome messages) at
+  the smallest window, 800×480; the list in the four themes, and the dialogs with colours of their own (review,
+  outcome, sign-in) in light too. Drawn with wgpu on Mesa's OpenGL software renderer (pinned in the test, so Vulkan
+  drivers do not change it). A one-step colour change or a 1 px spacing change fails them.
+  - A failure leaves `<name>.new.png` and `<name>.diff.png` beside the picture (ignored by git); CI uploads them as
+    the `look-changes` artifact.
+  - When a change to the look is meant: `UPDATE_SNAPSHOTS=1 cargo test -p klefki look`, and show the pictures in
+    the pull request. **In a refactor, a picture that changes means the look changed: stop.**
+  - A new screen, dialog or state gets a picture in the same pull request.
+  - Mesa drift: the pictures match Ubuntu 24.04's Mesa (25.2.8), as on CI's `ubuntu-latest`. If the runner image
+    moves to another Mesa, every look test fails at once on unrelated pull requests, with differences scattered over
+    edges and text rather than in one place. Then fix it in its own pull request: take the pictures from that run's
+    `look-changes` artifact (the `.new.png` files, renamed), look at them side by side with the old ones, and say
+    which Mesa they come from. Never run `UPDATE_SNAPSHOTS=1` on a machine whose Mesa differs from CI's; the cloud
+    sessions' container has the same one.
 
 ## By hand or weekly (the `quality` workflow, Linux only)
 macOS minutes cost ten times as much, so heavy checks run on Linux, weekly on main, or from Actions > quality > Run

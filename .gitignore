@@ -9,7 +9,7 @@ docs/decisions/spikes/*/target/
 docs/decisions/spikes/*/Cargo.lock
 __pycache__/
 
-# Left by a look test that failed (crates/app/src/shell/look.rs)
+# Left by a look test that failed (crates/app/src/shell/tests/look.rs)
 *.new.png
 *.diff.png
 *.old.png
