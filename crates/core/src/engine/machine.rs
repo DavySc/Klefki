@@ -534,6 +534,8 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             desktop: crate::desktop::DesktopRoots::default(),
             releases: Arc::new(crate::update::Offline),
             release_key: None,
+            install: crate::install::InstallKind::Manual("Updated by hand in tests.".into()),
+            updates_dir: None,
         },
         || {},
     );

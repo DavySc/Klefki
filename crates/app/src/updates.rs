@@ -1,8 +1,8 @@
 //! Klefki's own updates as the user sees them (decision 009): a check in the background once a day, never while
-//! Klefki starts, and what it found. The engine does the checking; this only decides when to ask and remembers the
-//! answer between runs.
+//! Klefki starts, what it found, and the download of it. The engine does the checking and downloading; this only
+//! decides when to ask and remembers the answer between runs.
 
-use klefki_core::api::{UpdateCheck, Version};
+use klefki_core::api::{UpdateCheck, UpdateDownload, Version};
 
 const AUTO_KEY: &str = "updates.auto";
 const LAST_KEY: &str = "updates.last_checked";
@@ -25,6 +25,9 @@ pub struct Updates {
     pub checking: bool,
     /// The automatic check of this run was considered (run or not), so it is not considered again.
     considered: bool,
+    /// What the download of the found release did, this run.
+    pub download: Option<UpdateDownload>,
+    pub downloading: bool,
 }
 
 impl Default for Updates {
@@ -36,6 +39,8 @@ impl Default for Updates {
             found: None,
             checking: false,
             considered: false,
+            download: None,
+            downloading: false,
         }
     }
 }
@@ -72,10 +77,12 @@ impl Updates {
             return false;
         }
         self.considered = true;
-        // A last check in the future means the clock was changed: check rather than wait.
-        let recent = self
-            .last_checked
-            .is_some_and(|at| at <= now && now - at < EVERY);
+        // A last check in the future means the clock was changed: check rather than wait. A release found earlier is
+        // looked up again at once, so it can be downloaded this run.
+        let recent = self.available.is_none()
+            && self
+                .last_checked
+                .is_some_and(|at| at <= now && now - at < EVERY);
         if recent {
             return false;
         }
@@ -92,6 +99,9 @@ impl Updates {
         self.checking = false;
         match &found {
             UpdateCheck::Available { version, .. } => {
+                if self.ready() != Some(*version) {
+                    self.download = None;
+                }
                 self.available = Some(*version);
                 self.last_checked = Some(now);
             }
@@ -103,6 +113,37 @@ impl Updates {
             UpdateCheck::Failed(_) | UpdateCheck::NoKey => {}
         }
         self.found = Some(found);
+    }
+
+    /// The download should start now: a release was found and [`Updates::auto`] is on, and this run has not tried yet.
+    pub fn download_due(&self) -> bool {
+        self.auto && self.available.is_some() && self.download.is_none() && !self.downloading
+    }
+
+    /// The download was asked for.
+    pub fn downloading(&mut self) {
+        self.downloading = true;
+    }
+
+    pub fn downloaded(&mut self, done: UpdateDownload) {
+        self.downloading = false;
+        self.download = Some(done);
+    }
+
+    /// A version downloaded and checked this run, ready to install.
+    pub fn ready(&self) -> Option<Version> {
+        match self.download {
+            Some(UpdateDownload::Ready(version)) => Some(version),
+            _ => None,
+        }
+    }
+
+    /// The download failed; why.
+    pub fn download_failed(&self) -> Option<&str> {
+        match &self.download {
+            Some(UpdateDownload::Failed(why)) => Some(why),
+            _ => None,
+        }
     }
 
     /// A newer release, found this run or by an earlier one.
@@ -291,6 +332,59 @@ mod tests {
         updates.answered(UpdateCheck::NoRelease, NOW);
         assert!(!updates.checking);
         assert!(updates.up_to_date(NOW).is_some());
+    }
+
+    #[test]
+    fn a_release_found_earlier_is_looked_up_again_at_once_to_download_it() {
+        let mut storage = MemoryStorage::default();
+        let mut first = Updates::default();
+        first.answered(
+            UpdateCheck::Available {
+                version: newer(),
+                page: String::new(),
+            },
+            NOW,
+        );
+        first.save(&mut storage);
+        assert!(Updates::load(Some(&storage)).due(START_DELAY, NOW + 60));
+    }
+
+    #[test]
+    fn a_found_release_is_downloaded_once_when_automatic() {
+        let mut updates = Updates::default();
+        assert!(!updates.download_due(), "nothing found yet");
+        let found = UpdateCheck::Available {
+            version: newer(),
+            page: String::new(),
+        };
+        updates.answered(found.clone(), NOW);
+        assert!(updates.download_due());
+        updates.downloading();
+        assert!(!updates.download_due(), "not twice at once");
+        updates.downloaded(UpdateDownload::Failed("no connection".into()));
+        assert!(
+            !updates.download_due(),
+            "not again by itself after a failure"
+        );
+        assert_eq!(updates.download_failed(), Some("no connection"));
+        updates.downloaded(UpdateDownload::Ready(newer()));
+        assert_eq!(updates.ready(), Some(newer()));
+        // The same release found again keeps the download.
+        updates.answered(found, NOW + 1);
+        assert_eq!(updates.ready(), Some(newer()));
+
+        let mut manual = Updates {
+            auto: false,
+            ..Updates::default()
+        };
+        manual.answered(
+            UpdateCheck::Available {
+                version: newer(),
+                page: String::new(),
+            },
+            NOW,
+        );
+        assert!(!manual.download_due(), "only when automatic");
     }
 
     #[test]

@@ -54,7 +54,31 @@ Each check is two downloads from GitHub: GitHub sees the user's IP address, the 
 User-Agent, as with any download. Nothing about the user's servers or settings is sent. Settings says so next to the
 switch.
 
-## Next (slice 6b)
-Download the right package, check it against the signed `SHA256SUMS`, and install it: the per-user Windows
-installer silently, the macOS app and the AppImage by replacing them, each then restarted on request or when Klefki
-closes. MSI, zip and `.deb` installs keep the notice: they are managed by an administrator or need sudo.
+## Installing (slice 6b)
+- **Which installs update themselves.** Worked out at start from where Klefki runs (`crates/core/src/install.rs`):
+  the per-user Windows setup (its `uninstall.exe` is next to `klefki.exe`, wherever the user installed it), a macOS
+  `Klefki.app`, and an AppImage (the `APPIMAGE` variable its runtime sets, naming a file that exists). The MSI (an
+  administrator's), the zip (unpacked by hand) and the `.deb` (apt, with sudo) keep the notice and the release page,
+  with a sentence saying why.
+- **What is downloaded.** Only the one file that install needs, from
+  `https://github.com/DavySc/Klefki/releases/download/v<version>/`: `…-windows-x64-setup.exe`,
+  `…-macos-universal.app.zip` (new: the signed app, zipped with `ditto` so its signature survives) or
+  `…-linux-x86_64.AppImage`. Only a file named in the signed `SHA256SUMS` of the release the check accepted is asked
+  for; it streams to an owner-only folder in Klefki's data folder (`updates/`), at most 256 MB, hashed as it is
+  written. A file whose SHA-256 differs is deleted and never run.
+- **When.** With "Check for updates automatically" on, a found release downloads in the background at once; off, on
+  a click ("Update: 1.2.3" in the top bar, Download in Settings). A release found on an earlier day is looked up again
+  at start, so it can be downloaded. The top bar then offers "Restart to update", disabled while a change is open
+  (restarting would lose it). Otherwise the update installs when Klefki closes (`eframe::App::on_exit`).
+- **How it is installed.**
+  - Windows: the setup runs with `/P /R` (progress, no questions, start Klefki again) on restart, `/S` (silent) on
+    close. The setup closes a running Klefki itself.
+  - macOS: `/usr/bin/ditto -x -k` unpacks the app into a folder next to the old one; the old app is moved aside,
+    the new one into its place (the old one is put back if that fails), then the old one deleted. Restart is
+    `/usr/bin/open -n`.
+  - AppImage: copied next to the old one, made executable, and renamed over it; restart runs the new file.
+  - A folder Klefki cannot write (for example `/Applications` for a user who is not an administrator) leaves the old
+    version as it was and says to download the new one by hand.
+- **Not verified until the first signed release:** each install path on its real system (the tests replace bundles
+  and AppImages in temporary folders, and the setup's flags are cargo-packager's documented ones), and whether macOS
+  asks again for an app Klefki replaced itself (the download carries no quarantine flag, so it should not).
