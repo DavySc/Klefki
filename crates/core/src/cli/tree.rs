@@ -19,7 +19,7 @@ pub(crate) fn spawn(cmd: &mut Command, end_leftovers: bool) -> io::Result<(Child
             live::watch();
         }
         // A signal that comes in before the group is listed waits until it is, or the child would outlive Klefki.
-        let starting = end_leftovers.then(live::Starting::begin);
+        let starting = end_leftovers.then(live::Starting::begin).transpose()?;
         let child = cmd.spawn()?;
         #[cfg(test)]
         if let Some(hook) = AFTER_SPAWN.get() {
@@ -183,6 +183,7 @@ pub(crate) fn has_ended(child: &mut Child) -> io::Result<bool> {
 /// allocation. A group that finds no free slot is still ended by its caller, only not when Klefki ends.
 #[cfg(unix)]
 mod live {
+    use std::io;
     use std::sync::Once;
     use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
@@ -201,29 +202,54 @@ mod live {
     pub(super) struct Starting(());
 
     impl Starting {
-        pub(super) fn begin() -> Self {
-            STARTING.fetch_add(1, Ordering::SeqCst);
-            Self(())
+        /// Refused while a signal is held, so that new starts cannot keep putting off ending Klefki.
+        pub(super) fn begin() -> io::Result<Self> {
+            update(begun)
+                .map(|_| Self(()))
+                .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))
         }
     }
 
     impl Drop for Starting {
         fn drop(&mut self) {
-            let mut before = STARTING.load(Ordering::SeqCst);
-            loop {
-                let after = if before & IN_FLIGHT == 1 {
-                    0
-                } else {
-                    before - 1
-                };
-                match STARTING.compare_exchange(before, after, Ordering::SeqCst, Ordering::SeqCst) {
-                    Ok(_) => break,
-                    Err(now) => before = now,
-                }
+            if let Ok(before) = update(|word| Some(finished(word).0))
+                && let (_, Some(signal)) = finished(before)
+            {
+                end_as(signal);
             }
-            let held = before >> SIGNAL_SHIFT;
-            if before & IN_FLIGHT == 1 && held != 0 {
-                end_as(held.cast_signed());
+        }
+    }
+
+    /// The word after a start begins, or `None` (refused) while a signal is held, or when the count is full.
+    fn begun(word: u32) -> Option<u32> {
+        (word >> SIGNAL_SHIFT == 0 && word & IN_FLIGHT < IN_FLIGHT).then(|| word + 1)
+    }
+
+    /// The word after `signal` came in, or `None` if no start is in flight and so the signal is acted on now. A
+    /// signal already held gives way to the newer one.
+    fn hold(word: u32, signal: libc::c_int) -> Option<u32> {
+        (word & IN_FLIGHT != 0)
+            .then(|| (word & IN_FLIGHT) | (signal.cast_unsigned() << SIGNAL_SHIFT))
+    }
+
+    /// The word after a start ends, and the signal it must act on: the held one, if it was the last start.
+    fn finished(word: u32) -> (u32, Option<libc::c_int>) {
+        let held = word >> SIGNAL_SHIFT;
+        match word & IN_FLIGHT {
+            1 => (0, (held != 0).then(|| held.cast_signed())),
+            _ => (word.saturating_sub(1), None),
+        }
+    }
+
+    /// Changes [`STARTING`] by `change` in one step, unless it returns `None`. Returns the word it changed, or the
+    /// one it left alone. Only atomics, so a signal handler may call it.
+    fn update(change: impl Fn(u32) -> Option<u32>) -> Result<u32, u32> {
+        let mut word = STARTING.load(Ordering::SeqCst);
+        loop {
+            let after = change(word).ok_or(word)?;
+            match STARTING.compare_exchange(word, after, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(before) => return Ok(before),
+                Err(now) => word = now,
             }
         }
     }
@@ -262,23 +288,17 @@ mod live {
 
     extern "C" fn on_signal(signal: libc::c_int) {
         // While a group is being started, the start that finishes last acts on the signal instead.
-        let mut now = STARTING.load(Ordering::SeqCst);
-        while now & IN_FLIGHT != 0 {
-            let held = (now & IN_FLIGHT) | (signal.cast_unsigned() << SIGNAL_SHIFT);
-            match STARTING.compare_exchange(now, held, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return,
-                Err(changed) => now = changed,
-            }
+        if update(|word| hold(word, signal)).is_err() {
+            end_as(signal);
         }
-        end_as(signal);
     }
 
     /// Ends the listed groups, then Klefki as `signal` would have: the shell sees that Klefki was interrupted.
     /// Only calls that are safe in a signal handler.
     fn end_as(signal: libc::c_int) {
         end_all();
-        // SAFETY: both calls are safe in a signal handler; in one, the signal stays blocked until the handler
-        // returns.
+        // SAFETY: both calls are safe in a signal handler. From the handler, the signal stays blocked until it returns;
+        // from a finishing start, it is delivered before `raise` returns.
         unsafe {
             libc::signal(signal, libc::SIG_DFL);
             libc::raise(signal);
@@ -313,6 +333,48 @@ mod live {
                 }
             }
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const INT: libc::c_int = libc::SIGINT;
+        const TERM: libc::c_int = libc::SIGTERM;
+
+        #[test]
+        fn only_the_last_start_to_finish_acts_on_a_held_signal() {
+            let two = begun(begun(0).unwrap()).unwrap();
+            let held = hold(two, INT).unwrap();
+            // Regression variant: the first start to finish must leave the signal to the other, whose group is not
+            // listed yet.
+            let (one, act) = finished(held);
+            assert_eq!(act, None);
+            assert_eq!(one & IN_FLIGHT, 1);
+            assert_eq!(finished(one), (0, Some(INT)));
+        }
+
+        #[test]
+        fn a_signal_with_no_start_in_flight_is_acted_on_at_once() {
+            assert_eq!(hold(0, INT), None);
+            let (idle, act) = finished(begun(0).unwrap());
+            assert_eq!((idle, act), (0, None));
+            assert_eq!(hold(idle, TERM), None);
+        }
+
+        #[test]
+        fn a_newer_signal_replaces_the_held_one() {
+            let one = begun(0).unwrap();
+            let held = hold(hold(one, INT).unwrap(), TERM).unwrap();
+            assert_eq!(finished(held), (0, Some(TERM)));
+        }
+
+        #[test]
+        fn no_start_begins_while_a_signal_is_held() {
+            let held = hold(begun(0).unwrap(), INT).unwrap();
+            assert_eq!(begun(held), None);
+            assert_eq!(begun(IN_FLIGHT), None, "a full count is refused too");
+        }
     }
 }
 

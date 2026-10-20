@@ -24,10 +24,19 @@ check, which leads a group of its own and so never sees the terminal's Ctrl+C, r
   Without the fix it fails every time ("SIGINT (signal: 2 (SIGINT)): [...] still ran").
 
 ## Checks
-- Full verify (fmt, clippy -D warnings, test --workspace, deny): exit 0.
+- Full verify (fmt, clippy -D warnings, test --workspace, deny): exit 0 (after round 1 and main: 937 + 420 + 34 + 25).
 - New test with the fix disabled (start not counted): fails, twice tried. With the fix: passes, 5 of 5.
 - Stress, `status_ended_early_leaves_no_check_running`, 80 runs 16 at a time on 4 cores: main 3 of 80 failed (twice);
-  with the fix 0 of 80, four rounds (320 runs).
+  with the fix 0 of 80, four rounds (320 runs); after round 1, 0 of 160.
+
+## Review round 1 (folded in)
+- The word's three transitions are pure functions (`begun`, `hold`, `finished`) around one CAS helper `update`;
+  unit tests in `cli::tree::live::tests` cover two starts (only the last to finish acts), no start in flight, a newer
+  signal replacing the held one, and a refused start. Mutations checked: letting any finishing start act fails
+  `only_the_last_start_to_finish_acts_on_a_held_signal`; letting starts begin while a signal is held fails
+  `no_start_begins_while_a_signal_is_held`.
+- A start that would begin while a signal is held is refused (`Interrupted`), so new starts cannot keep putting off
+  the end. Clearer SAFETY wording in `end_as`. Main (#65) merged in.
 
 ## Open
 - Not covered: `exit` (the `atexit` path) while another thread is starting a check; the check started in that
