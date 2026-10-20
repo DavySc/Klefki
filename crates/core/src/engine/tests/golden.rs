@@ -191,6 +191,33 @@ fn golden_delete_a_local_server() {
     );
 }
 
+/// Secrets typed into a stdio server's arguments, in the three ways they turn up. The review shows a server's
+/// arguments in full, these too (the owner's decision of 2026-10-19: the user's own server, shown to the user),
+/// while `klefki-cli list` hides them; the golden file pins this, so a change either way shows up.
+#[test]
+fn golden_duplicate_a_server_with_secrets_in_its_arguments() {
+    let env = quiet_env(&serde_json::json!({}));
+    let mut config = two_projects("end");
+    config["mcpServers"]["args"] = serde_json::json!({
+        "command": "npx",
+        "args": ["-y", "args-mcp", "--api-key", "sk-live-ARGSECRET123456", "--token=tok-SECRET-98765", "ghp_abcdefghijklmnop1234"]
+    });
+    write_config(&env, &config);
+    let core = env.start();
+    let duplicate = Change::Duplicate {
+        id: user_id("args"),
+        name: "args-copy".to_owned(),
+        targets: vec![Target::User],
+        adjust: crate::adjust::Adjust::default(),
+    };
+    check(
+        &env,
+        &core,
+        vec![duplicate],
+        expect_file!["golden/duplicate-secret-arguments.txt"],
+    );
+}
+
 #[test]
 fn golden_edit_a_server_keeping_a_hidden_value() {
     let (env, core) = two_projects_env();
@@ -377,7 +404,9 @@ fn golden_add_a_server_that_signs_in_with_oauth() {
             "  {}{}\n",
             argv.join(" "),
             match secret {
-                Some(_) => " (client secret in MCP_CLIENT_SECRET)",
+                Some(hash) if hash == sha256(CLIENT_SECRET) =>
+                    " (the client secret, in MCP_CLIENT_SECRET)",
+                Some(_) => " (another secret, in MCP_CLIENT_SECRET)",
                 None => "",
             }
         ));

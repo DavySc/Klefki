@@ -26,7 +26,7 @@ diff .claude.json:
   + }
 button: Add
 == Claude Code ran
-  mcp add-json -s user --client-secret -- sso2 {"type":"http","url":"https://sso.example.com/mcp","headers":{"X-Team":"${TEAM}"},"oauth":{"clientId":"client-7","callbackPort":8123}} (client secret in MCP_CLIENT_SECRET)
+  mcp add-json -s user --client-secret -- sso2 {"type":"http","url":"https://sso.example.com/mcp","headers":{"X-Team":"${TEAM}"},"oauth":{"clientId":"client-7","callbackPort":8123}} (the client secret, in MCP_CLIENT_SECRET)
 == files after
 --- cfg/.claude.json
 {
