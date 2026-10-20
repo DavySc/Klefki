@@ -658,6 +658,9 @@ pub(crate) struct EngineConfig {
     pub install: crate::install::InstallKind,
     /// Where downloaded updates wait to be installed; `None` turns downloading off.
     pub updates_dir: Option<PathBuf>,
+    /// The version this copy of Klefki is, which a release must be newer than. Tests fix it, so their signed test
+    /// release stays newer whatever the workspace's version is.
+    pub version: crate::update::Version,
 }
 
 /// Opens an https link in the user's browser.
@@ -1234,7 +1237,7 @@ fn engine_main(
                     }
                     let (found, release) = crate::update::check_release(
                         shared.config.releases.as_ref(),
-                        crate::update::Version::current(),
+                        shared.config.version,
                         shared.config.release_key.as_deref(),
                     );
                     if let Some(release) = release {
@@ -3434,6 +3437,8 @@ mod tests {
                 release_key: None,
                 install: crate::install::InstallKind::Manual("Updated by hand in tests.".into()),
                 updates_dir: Some(self.dir.path().join("updates")),
+                // The release before the test release (0.2.0).
+                version: crate::update::Version::parse("0.1.0").unwrap(),
             }
         }
 

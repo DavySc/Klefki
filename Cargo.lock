@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "fake-claude"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "klefki"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "klefki-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "klefki-core",
  "serde_json",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "klefki-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "apple-native-keyring-store",
  "directories",
