@@ -598,6 +598,7 @@ mod tests {
             status: crate::api::Status::Unknown,
             enabled: true,
             disabled_in: 0,
+            disabled_projects: Vec::new(),
             approval: None,
             shadowed: false,
             shadowed_in: Vec::new(),
@@ -613,6 +614,7 @@ mod tests {
             managed: None,
             not_loaded: None,
             blocked: None,
+            may_not_load: None,
         }
     }
 

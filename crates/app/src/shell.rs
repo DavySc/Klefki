@@ -2220,9 +2220,15 @@ impl ShellApp {
                     s.name
                 )
             }
+            Some(s) if s.scope == Scope::ClaudeAi => {
+                format!(
+                    "{} is a claude.ai connector and is changed on claude.ai",
+                    s.name
+                )
+            }
             Some(s) => format!("{} comes from a plugin and is changed there", s.name),
             None => {
-                "the selected servers come from plugins or your organisation and are changed there"
+                "the selected servers come from plugins, your organisation or claude.ai and are changed there"
                     .to_owned()
             }
         })
@@ -2238,7 +2244,7 @@ impl ShellApp {
             .selected
             .iter()
             .filter_map(|&i| self.snapshot.servers.get(i))
-            .any(|s| s.scope == Scope::Managed);
+            .any(|s| matches!(s.scope, Scope::Managed | Scope::ClaudeAi));
         let text = if changed > 0 && !organisation {
             match left_out {
                 1 => "Left out 1 plugin server: a plugin's server is changed in its plugin."
@@ -2254,7 +2260,15 @@ impl ShellApp {
             };
             format!(
                 "Left out {what} Klefki only switches on and off: a plugin's server is changed in its plugin, your \
-                 organisation's by an administrator."
+                 organisation's by an administrator, a claude.ai connector on claude.ai."
+            )
+        } else if let Some(s) = self
+            .single_selected()
+            .filter(|s| s.scope == Scope::ClaudeAi)
+        {
+            format!(
+                "{} is a connector of your claude.ai account. Change it on claude.ai; Klefki switches it on and off.",
+                s.name
             )
         } else if let Some(s) = self.single_selected().filter(|s| s.scope == Scope::Managed) {
             format!(
@@ -2270,7 +2284,8 @@ impl ShellApp {
             )
         } else {
             if organisation {
-                "The selected servers come from plugins or your organisation. Klefki only switches them on and off."
+                "The selected servers come from plugins, your organisation or claude.ai. Klefki only switches them on \
+                 and off."
                     .to_owned()
             } else {
                 "The selected servers come from plugins. Change them in their plugins, or turn the plugins off in \
@@ -4737,10 +4752,21 @@ impl ShellApp {
                             target.on_hover_text(format!("The plugin writes: {written}"));
                         }
                         let enabled = if s.scope.is_everywhere() && s.enabled && s.disabled_in > 0 {
-                            format!(
-                                "disabled in {} of {} projects",
-                                s.disabled_in, self.snapshot.project_count
-                            )
+                            if s.disabled_projects.is_empty() {
+                                format!(
+                                    "disabled in {} of {} projects",
+                                    s.disabled_in, self.snapshot.project_count
+                                )
+                            } else {
+                                format!(
+                                    "disabled {}",
+                                    in_projects_text(
+                                        &s.disabled_projects,
+                                        self.snapshot.project_count,
+                                        false
+                                    )
+                                )
+                            }
                         } else if plugin_off_everywhere(s, self.snapshot.project_count) {
                             "yes, but its plugin is off in every project".to_owned()
                         } else if s.enabled {
@@ -4748,7 +4774,10 @@ impl ShellApp {
                         } else {
                             "no".to_owned()
                         };
-                        kv("Enabled", enabled);
+                        let enabled = kv("Enabled", enabled);
+                        if !s.disabled_projects.is_empty() {
+                            enabled.on_hover_text(projects_paths(&s.disabled_projects));
+                        }
                         if let Some(approval) = s.approval {
                             kv("Approval", approval.label().to_owned());
                         }
@@ -4779,7 +4808,11 @@ impl ShellApp {
                         if let Some(b) = s.blocked.as_ref().filter(|_| s.not_loaded.is_none()) {
                             let count = self.snapshot.project_count;
                             kv(
-                                "Blocked",
+                                if b.policy {
+                                    "Blocked"
+                                } else {
+                                    "Connectors off"
+                                },
                                 format!(
                                     "{}. {}",
                                     in_projects_text(&b.projects, count, false),
@@ -4788,7 +4821,28 @@ impl ShellApp {
                             )
                             .on_hover_text(projects_paths(&b.projects));
                         }
+                        // What Klefki cannot check: said, as a note.
+                        if let Some(why) = &s.may_not_load {
+                            kv("May not load", why.clone());
+                        }
                     });
+                if s.scope == Scope::ClaudeAi {
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(CONNECTOR_READ_ONLY).color(pal.text_muted))
+                            .wrap(),
+                    );
+                    egui::CollapsingHeader::new("About claude.ai connectors")
+                        .id_salt("about-connectors")
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(ABOUT_CONNECTORS).color(pal.text_muted),
+                                )
+                                .wrap(),
+                            );
+                        });
+                }
                 if s.casing_collision && self.core.is_some() {
                     ui.add_space(8.0);
                     ui.add(
@@ -8173,8 +8227,29 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
             ),
         ));
     }
-    // The toggle is per project: a user server can be off in some and on in others.
-    if s.scope.is_everywhere() && s.enabled && s.disabled_in > 0 {
+    // Switched off in some projects and held back in others: one badge with where it does load, so the state is
+    // in view rather than behind a "+".
+    let held_back = s.blocked.as_ref().filter(|_| s.not_loaded.is_none());
+    let switched_off = s.scope.is_everywhere() && s.enabled && s.disabled_in > 0;
+    if let (true, Some(b)) = (switched_off, held_back) {
+        let loads = project_count.saturating_sub(s.disabled_in + b.projects.len());
+        let what = if b.policy {
+            "Claude Code's policy keeps it from loading"
+        } else {
+            "settings turn connectors from claude.ai off"
+        };
+        badges.push(loud(
+            &format!("loads in {loads}/{project_count}"),
+            pal.warn,
+            Some(&format!(
+                "Switched off in {} of {project_count} projects. In {} more, {what}: {} The details name the \
+                 projects.",
+                s.disabled_in,
+                b.projects.len(),
+                b.why
+            )),
+        ));
+    } else if switched_off {
         badges.push(loud(
             &format!("off in {}/{}", s.disabled_in, project_count),
             pal.warn,
@@ -8194,16 +8269,36 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         });
     }
     // Policy in some projects only: often deliberate, so quiet; everywhere is the status's to say.
-    if let Some(b) = s.blocked.as_ref().filter(|_| s.not_loaded.is_none()) {
+    if let (false, Some(b)) = (switched_off, held_back) {
+        let (text, what) = if b.policy {
+            (
+                "blocked",
+                "Claude Code's policy keeps this server from loading",
+            )
+        } else {
+            (
+                "connectors off",
+                "settings turn connectors from claude.ai off",
+            )
+        };
         badges.push(Badge {
-            text: format!("blocked in {}/{}", b.projects.len(), project_count),
+            text: format!("{text} in {}/{}", b.projects.len(), project_count),
             fill: pal.border,
             color: pal.text,
             hover: Some(format!(
-                "In {} of {project_count} projects, Claude Code's policy keeps this server from loading. {}",
+                "In {} of {project_count} projects, {what}. {}",
                 b.projects.len(),
                 b.why
             )),
+        });
+    }
+    // What Klefki cannot check: a note, not a warning.
+    if let Some(why) = &s.may_not_load {
+        badges.push(Badge {
+            text: "may not load".to_owned(),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(why.clone()),
         });
     }
     if let (false, false, Some(same)) = (s.shadowed, s.shadowed_in.is_empty(), same_as) {
@@ -8312,10 +8407,10 @@ fn status_cell(
     // Before the switch: on or off, Claude Code runs another server in its place, or policy keeps it out. Policy
     // says so: Claude Code itself drops such a server without a word.
     if let Some(why) = not_checked(s).filter(|_| s.not_loaded.is_some()) {
-        let text = if s.blocked.is_some() {
-            BLOCKED_BY_POLICY
-        } else {
-            NOT_LOADED
+        let text = match &s.blocked {
+            Some(b) if b.policy => BLOCKED_BY_POLICY,
+            Some(_) => TURNED_OFF,
+            None => NOT_LOADED,
         };
         ui.label(RichText::new(text).color(pal.text_muted))
             .on_hover_text(why);
@@ -8394,6 +8489,8 @@ const PLUGIN_STATUS: &str = "See /mcp";
 const PLUGIN_NOT_CHECKED: &str =
     "Klefki does not check a plugin's servers. In Claude Code, /mcp shows their status.";
 /// Why Klefki has no status for the organisation's server, and where it is.
+const CONNECTOR_NOT_CHECKED: &str =
+    "Klefki does not check claude.ai connectors. In Claude Code, /mcp shows their status.";
 const ORGANISATION_NOT_CHECKED: &str = "Klefki does not check the servers your organisation sets. In Claude Code, /mcp shows their status.";
 /// The servers of `org`'s name, configured by hand, that Claude Code does not load because the organisation sets it.
 fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<String> {
@@ -8418,6 +8515,8 @@ fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<Strin
 const NOT_LOADED: &str = "Not loaded";
 /// The status of a server Claude Code's policy keeps out wherever it would load (decision 010).
 const BLOCKED_BY_POLICY: &str = "Blocked by policy";
+/// The status of a claude.ai connector the user's own settings turn off wherever it would load (decision 011).
+const TURNED_OFF: &str = "Connectors off";
 
 /// Why Klefki never checks `s`, if it doesn't: Claude Code does not load it, or it is not one Klefki passes to Claude
 /// Code (decisions 008 and 009).
@@ -8428,6 +8527,7 @@ fn not_checked(s: &ServerRow) -> Option<String> {
     match s.scope {
         Scope::Plugin => Some(PLUGIN_NOT_CHECKED.to_owned()),
         Scope::Managed => Some(ORGANISATION_NOT_CHECKED.to_owned()),
+        Scope::ClaudeAi => Some(CONNECTOR_NOT_CHECKED.to_owned()),
         _ => None,
     }
 }
@@ -8491,9 +8591,17 @@ fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::text::Layout
     job
 }
 
-/// The name the list shows: a plugin's server without the `plugin:<plugin>:` its group header already says. The
-/// details show the whole name, which is the one Claude Code's `/mcp` shows.
+/// The name the list shows: a plugin's server without the `plugin:<plugin>:` its group header already says, a
+/// connector without `claude.ai `. The details show the whole name, which is the one Claude Code's `/mcp` shows.
 fn short_name(s: &ServerRow) -> &str {
+    // A claude.ai connector under the claude.ai group: the name it has there.
+    if s.scope == Scope::ClaudeAi {
+        return s
+            .name
+            .strip_prefix("claude.ai ")
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(&s.name);
+    }
     s.plugin
         .as_ref()
         .and_then(|p| {
@@ -8505,6 +8613,15 @@ fn short_name(s: &ServerRow) -> &str {
         .filter(|rest| !rest.is_empty())
         .unwrap_or(&s.name)
 }
+
+/// What the details say under a claude.ai connector (decision 011).
+const CONNECTOR_READ_ONLY: &str =
+    "A connector of your claude.ai account. Change it on claude.ai; Klefki switches it on and off.";
+/// More on claude.ai connectors, on request.
+const ABOUT_CONNECTORS: &str = "Claude Code fetches your connectors from claude.ai each session. Klefki lists the \
+     ones Claude Code has connected before, so one you have since removed on claude.ai may still be here, and one you \
+     have never used is not. A server you add yourself at the same address takes the connector's place; Klefki cannot \
+     see a connector's address, so it cannot say when that happens.";
 
 /// What the details say under a plugin's server.
 fn managed_read_only(file: &str) -> String {
@@ -8631,6 +8748,7 @@ fn transport_name(t: TransportKind) -> &'static str {
         TransportKind::Http => "HTTP",
         TransportKind::Sse => "SSE (older servers)",
         TransportKind::Ws => "WebSocket",
+        TransportKind::ClaudeAi => "claude.ai",
         TransportKind::Invalid => "Unknown",
     }
 }
@@ -8890,6 +9008,7 @@ mod tests {
             status: Status::Connected,
             enabled: true,
             disabled_in: 0,
+            disabled_projects: Vec::new(),
             approval: None,
             shadowed: false,
             shadowed_in: Vec::new(),
@@ -8901,6 +9020,7 @@ mod tests {
             managed: None,
             not_loaded: None,
             blocked: None,
+            may_not_load: None,
         };
         let mut h = harness_with(Snapshot {
             servers: vec![row("REMOTE_1"), row("REMOTE_2")],
@@ -9021,6 +9141,7 @@ mod tests {
             status: Status::Unknown,
             enabled: true,
             disabled_in: 0,
+            disabled_projects: Vec::new(),
             approval: None,
             shadowed: false,
             shadowed_in: Vec::new(),
@@ -9032,6 +9153,7 @@ mod tests {
             managed: None,
             not_loaded: None,
             blocked: None,
+            may_not_load: None,
         }
     }
 
@@ -11977,6 +12099,109 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_ai_connector_is_read_only_says_where_it_comes_from_and_switches() {
+        let (mut h, engine) = live_harness();
+        let slack = ServerRow {
+            transport: TransportKind::ClaudeAi,
+            target: "on claude.ai".into(),
+            ..live_row("claude.ai Slack", Scope::ClaudeAi, None)
+        };
+        engine.events.send(snapshot_of(vec![slack])).unwrap();
+        h.run();
+        h.get_by_label(PLUGIN_STATUS);
+        // Under the claude.ai group, without the prefix it already says.
+        assert!(h.query_by_label("claude.ai Slack").is_none());
+        h.get_by_label("Slack").click();
+        h.run();
+        h.get_by_label_contains("A connector of your claude.ai account");
+        h.get_by_label("About claude.ai connectors");
+        assert!(
+            h.get_by_label(icon::PENCIL_SIMPLE)
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(h.get_by_label(icon::TRASH).accesskit_node().is_disabled());
+        drain(&engine);
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        let sent = drain(&engine);
+        assert!(
+            matches!(sent.as_slice(), [Command::Prepare(changes)] if matches!(
+                changes.as_slice(),
+                [Change::SetEnabled { enabled: false, .. }]
+            )),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_connector_says_its_own_state_names_where_it_is_off_and_what_klefki_cannot_know() {
+        let (mut h, engine) = live_harness();
+        let gmail = ServerRow {
+            transport: TransportKind::ClaudeAi,
+            target: "on claude.ai".into(),
+            disabled_in: 1,
+            disabled_projects: vec!["/home/me/p1".into()],
+            blocked: Some(klefki_core::api::Blocked {
+                why: "Your settings turn off connectors from claude.ai with disableClaudeAiConnectors, in \
+                      .claude/settings.local.json. Remove disableClaudeAiConnectors there to let them load."
+                    .into(),
+                projects: vec!["/home/me/p2".into()],
+                policy: false,
+            }),
+            ..live_row("claude.ai Gmail", Scope::ClaudeAi, None)
+        };
+        let drive = ServerRow {
+            may_not_load: Some("Your allowed list lets servers load by their address.".into()),
+            ..live_row("claude.ai Drive", Scope::ClaudeAi, None)
+        };
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![gmail, drive],
+                project_count: 3,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        // The user's own setting, not policy; and both badges in view, not behind a "+".
+        h.get_by_label("loads in 1/3");
+        assert!(h.query_by_label("+1").is_none() && h.query_by_label("+2").is_none());
+        assert!(h.query_by_label_contains("blocked in").is_none());
+        h.get_by_label("may not load");
+        h.get_by_label("Gmail").click();
+        h.run();
+        h.get_by_label("Connectors off");
+        h.get_by_label("disabled in 1 of 3 projects: p1");
+        // The type is "claude.ai" (as are the scope and the group), not a guessed "http".
+        assert!(h.query_by_label("http").is_none());
+        assert!(h.query_all_by_label("on claude.ai").count() >= 2);
+        h.get_by_label("Drive").click();
+        h.run();
+        h.get_by_label("May not load");
+    }
+
+    #[test]
+    fn a_connector_turned_off_wherever_it_would_load_says_so_in_its_status() {
+        let (mut h, engine) = live_harness();
+        let why = "Your settings turn off connectors from claude.ai with disableClaudeAiConnectors, in \
+                   ~/.claude/settings.json. Remove disableClaudeAiConnectors there to let them load.";
+        let slack = ServerRow {
+            not_loaded: Some(why.into()),
+            blocked: Some(klefki_core::api::Blocked {
+                why: why.into(),
+                projects: Vec::new(),
+                policy: false,
+            }),
+            ..live_row("claude.ai Slack", Scope::ClaudeAi, None)
+        };
+        engine.events.send(snapshot_of(vec![slack])).unwrap();
+        h.run();
+        h.get_by_label(TURNED_OFF);
+        assert!(h.query_by_label(BLOCKED_BY_POLICY).is_none());
+    }
+
+    #[test]
     fn an_organisations_server_is_read_only_and_switches() {
         let (mut h, engine) = live_harness();
         engine
@@ -12021,6 +12246,7 @@ mod tests {
             blocked: Some(klefki_core::api::Blocked {
                 why: why.into(),
                 projects: vec!["/home/me/p".into()],
+                policy: true,
             }),
             ..live_row("mine", Scope::User, None)
         };
@@ -12051,6 +12277,7 @@ mod tests {
             blocked: Some(klefki_core::api::Blocked {
                 why: why.into(),
                 projects: vec!["/home/me/p".into()],
+                policy: true,
             }),
             ..live_row("x", Scope::Local, Some("/home/me/p"))
         };

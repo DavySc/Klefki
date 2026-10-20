@@ -236,6 +236,79 @@ struct FileRules {
     allowed: Option<Vec<Rule>>,
     /// `allowManagedMcpServersOnly: true`, which counts only in the organisation's files.
     only_organisation: bool,
+    /// What turns claude.ai connectors off in this file (decision 011).
+    connectors_off: Vec<Off>,
+}
+
+/// What in a settings file turns every claude.ai connector off, in the order Claude Code checks (decision 011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Off {
+    /// `disableClaudeAiConnectors: true`, which counts in any file.
+    Setting,
+    /// `ENABLE_CLAUDEAI_MCP_SERVERS` set to a "no" in `env`.
+    Switch,
+    /// A `CLAUDE_CODE_USE_…` provider other than Anthropic, set in `env`: that variable.
+    Provider(&'static str),
+    /// Signing in with an API key or token rather than the claude.ai account: `apiKeyHelper`, or that variable in
+    /// `env`.
+    Key(&'static str),
+}
+
+impl Off {
+    /// Claude Code says the first of these that applies.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Setting | Self::Switch => 0,
+            Self::Provider(_) => 1,
+            Self::Key(_) => 2,
+        }
+    }
+}
+
+/// The variables that make Claude Code use a provider other than Anthropic's own.
+const PROVIDERS: [&str; 6] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+];
+/// The variables that sign Claude Code in with a key or token, ahead of the claude.ai account.
+const KEYS: [&str; 2] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+
+/// What in the settings `doc` of `source` turns claude.ai connectors off. A project's `env` sets a provider but not
+/// the switch or a key; everything else counts in every file (checked with Claude Code 2.1.304).
+fn connectors_off(doc: &Value, source: Source) -> Vec<Off> {
+    let mut off = Vec::new();
+    let env = |key: &str| doc.get("env")?.get(key)?.as_str().map(str::trim);
+    let is = |v: &str, words: [&str; 4]| words.contains(&v.to_lowercase().as_str());
+    let whole_env = matches!(source, Source::User | Source::Organisation);
+    if doc.get("disableClaudeAiConnectors") == Some(&Value::Bool(true)) {
+        off.push(Off::Setting);
+    }
+    if whole_env
+        && env("ENABLE_CLAUDEAI_MCP_SERVERS").is_some_and(|v| is(v, ["0", "false", "no", "off"]))
+    {
+        off.push(Off::Switch);
+    }
+    if let Some(var) = PROVIDERS
+        .into_iter()
+        .find(|var| env(var).is_some_and(|v| is(v, ["1", "true", "yes", "on"])))
+    {
+        off.push(Off::Provider(var));
+    }
+    if let Some(var) = KEYS
+        .into_iter()
+        .find(|var| whole_env && env(var).is_some_and(|v| !v.is_empty()))
+    {
+        off.push(Off::Key(var));
+    }
+    let helper = doc.get("apiKeyHelper").and_then(Value::as_str);
+    if helper.is_some_and(|h| !h.trim().is_empty()) {
+        off.push(Off::Key("apiKeyHelper"));
+    }
+    off
 }
 
 fn read_rules(path: &Path, source: Source, warnings: &mut Vec<String>) -> FileRules {
@@ -273,6 +346,7 @@ fn read_rules(path: &Path, source: Source, warnings: &mut Vec<String>) -> FileRu
         denied: list("deniedMcpServers", false).unwrap_or_default(),
         allowed: list("allowedMcpServers", true),
         only_organisation: doc.get("allowManagedMcpServersOnly") == Some(&Value::Bool(true)),
+        connectors_off: connectors_off(&doc, source),
     }
 }
 
@@ -284,11 +358,33 @@ pub(crate) struct Rules {
     allowed: Option<Vec<Rule>>,
     /// The files with an allowed list that counts, and whose they are, for a message.
     allowed_files: Vec<(PathBuf, Source)>,
+    /// What turns claude.ai connectors off, in which file and whose, in the order the files are read.
+    connectors_off: Vec<(Off, PathBuf, Source)>,
+}
+
+/// Whether Claude Code loads a claude.ai connector (decision 011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForConnector {
+    Loads,
+    /// It loads only if its address, which Klefki does not know, is on the allowed list: a note, not a warning.
+    MayNot(String),
+    /// It does not load: why, in plain words with what to do. `policy`: a rule on which servers load, rather than a
+    /// setting that turns connectors off (whoever's it is).
+    Held {
+        why: String,
+        policy: bool,
+    },
 }
 
 impl Rules {
     fn add(&mut self, file: &Path, source: Source, rules: &FileRules, allow_counts: bool) {
         self.denied.extend(rules.denied.iter().cloned());
+        self.connectors_off.extend(
+            rules
+                .connectors_off
+                .iter()
+                .map(|&off| (off, file.to_path_buf(), source)),
+        );
         if let (true, Some(allowed)) = (allow_counts, &rules.allowed) {
             self.allowed
                 .get_or_insert_with(Vec::new)
@@ -356,12 +452,7 @@ impl Rules {
             Some(Match::Command(_)) => " The list lets local servers load by their command only.",
             _ => "",
         };
-        let own_files: Vec<String> = self
-            .allowed_files
-            .iter()
-            .filter(|(_, s)| *s != Source::Organisation)
-            .map(|(f, s)| shown(f, *s))
-            .collect();
+        let (own_files, theirs) = self.allowed_lists();
         let next = if own_files.is_empty() {
             "Your administrator can change this.".to_owned()
         } else {
@@ -370,19 +461,129 @@ impl Rules {
                 own_files.join(" or ")
             )
         };
-        // The organisation's lists, which the next step does not name.
-        let theirs: Vec<String> = self
-            .allowed_files
-            .iter()
-            .filter(|(_, s)| *s == Source::Organisation)
-            .map(|(f, s)| shown(f, *s))
-            .collect();
         let mut why =
             format!("This server is not on the list of servers allowed to load.{kind} {next}");
         if !theirs.is_empty() {
             let _ = write!(why, " (allowedMcpServers in {})", theirs.join(", "));
         }
         Some(why)
+    }
+
+    /// The files with an allowed list that counts, as shown: the ones the user can change, then the organisation's.
+    fn allowed_lists(&self) -> (Vec<String>, Vec<String>) {
+        let files = |theirs: bool| {
+            self.allowed_files
+                .iter()
+                .filter(|(_, s)| (*s == Source::Organisation) == theirs)
+                .map(|(f, s)| shown(f, *s))
+                .collect()
+        };
+        (files(false), files(true))
+    }
+}
+
+impl Rules {
+    /// Whether Claude Code loads the claude.ai connector `name` (decision 011). Klefki does not know a connector's
+    /// address, so what needs it is said as unknown: an allowed list with address rules.
+    pub(crate) fn for_connector(&self, name: &str) -> ForConnector {
+        let first_off = self
+            .connectors_off
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, (off, ..))| (off.rank(), *i));
+        if let Some((_, (off, file, source))) = first_off {
+            return ForConnector::Held {
+                why: connectors_off_why(*off, file, *source),
+                policy: false,
+            };
+        }
+        let unknown = serde_json::json!({"type": "claudeai-proxy"});
+        if self.denied.iter().any(|r| r.matches(name, &unknown)) {
+            let why = self.blocks(name, &unknown, false).unwrap_or_default();
+            return ForConnector::Held { why, policy: true };
+        }
+        let Some(allowed) = &self.allowed else {
+            return ForConnector::Loads;
+        };
+        let (own_files, theirs) = self.allowed_lists();
+        if allowed.iter().any(|r| matches!(r.what, Match::Url(_))) {
+            let mut why = "Your allowed list lets servers load by their address, and Klefki cannot see a \
+                           connector's address: Claude Code loads it only if a serverUrl rule matches the address \
+                           claude.ai shows for it."
+                .to_owned();
+            let files: Vec<String> = own_files.into_iter().chain(theirs).collect();
+            let _ = write!(why, " (allowedMcpServers in {})", files.join(", "));
+            return ForConnector::MayNot(why);
+        }
+        // A connector's name, with its space, cannot be allowed: only its address can.
+        let next = if own_files.is_empty() {
+            "Your administrator can change this.".to_owned()
+        } else {
+            format!(
+                "To let it load, add a serverUrl rule with the address claude.ai shows for it to allowedMcpServers in \
+                 {}.",
+                own_files.join(" or ")
+            )
+        };
+        let mut why = format!(
+            "This connector is not on the list of servers allowed to load, which takes a connector by its address \
+             only. {next}"
+        );
+        if !theirs.is_empty() {
+            let _ = write!(why, " (allowedMcpServers in {})", theirs.join(", "));
+        }
+        ForConnector::Held { why, policy: true }
+    }
+}
+
+/// Why `off`, in `file` of `source`, keeps every claude.ai connector from loading, with what to do.
+fn connectors_off_why(off: Off, file: &Path, source: Source) -> String {
+    let file = shown(file, source);
+    let (whose, theirs) = match source {
+        Source::User => ("Your settings", false),
+        Source::Project => ("The project's settings", false),
+        Source::ProjectLocal => ("The project's local settings", false),
+        Source::Organisation => ("Your organisation's settings", true),
+    };
+    let (what, setting) = match off {
+        Off::Setting => (
+            format!(
+                "{whose} turn off connectors from claude.ai with disableClaudeAiConnectors, in {file}."
+            ),
+            "disableClaudeAiConnectors",
+        ),
+        Off::Switch => (
+            format!(
+                "{whose} turn off connectors from claude.ai with ENABLE_CLAUDEAI_MCP_SERVERS in env, in {file}."
+            ),
+            "ENABLE_CLAUDEAI_MCP_SERVERS",
+        ),
+        Off::Provider(var) => (
+            format!(
+                "{whose} make Claude Code use another provider than Anthropic, with {var} in env, in {file}. \
+                 Connectors from claude.ai load only with your claude.ai account."
+            ),
+            var,
+        ),
+        Off::Key(var) => {
+            let place = if var == "apiKeyHelper" {
+                format!("from apiKeyHelper, in {file}")
+            } else {
+                format!("from {var} in env, in {file}")
+            };
+            (
+                format!(
+                    "{whose} sign Claude Code in with a key {place}, ahead of your claude.ai account. Connectors \
+                     from claude.ai load only with that account."
+                ),
+                var,
+            )
+        }
+    };
+    if theirs {
+        format!("{what} Your administrator can change this.")
+    } else {
+        format!("{what} Remove {setting} there to let them load.")
     }
 }
 

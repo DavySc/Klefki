@@ -95,6 +95,14 @@
       "managed": "C:/Program Files/ClaudeCode/managed-settings.json"
     },
     {
+      "name": "claude.ai Linear",
+      "scope": "claudeai",
+      "transport": "http",
+      "target": "claude.ai connector",
+      "status": "needs_auth",
+      "enabled": true
+    },
+    {
       "name": "plugin:docs-search:search",
       "scope": "plugin",
       "transport": "stdio",
