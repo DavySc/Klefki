@@ -18,11 +18,18 @@ pub(crate) fn spawn(cmd: &mut Command, end_leftovers: bool) -> io::Result<(Child
         if end_leftovers {
             live::watch();
         }
+        // A signal that comes in before the group is listed waits until it is, or the child would outlive Klefki.
+        let starting = end_leftovers.then(live::Starting::begin);
         let child = cmd.spawn()?;
+        #[cfg(test)]
+        if let Some(hook) = AFTER_SPAWN.get() {
+            hook();
+        }
         let mut tree = Tree::led_by(child.id());
         if end_leftovers && let Some(group) = tree.group {
             tree.listed = live::add(group);
         }
+        drop(starting);
         Ok((child, tree))
     }
     #[cfg(windows)]
@@ -45,6 +52,10 @@ pub(crate) fn spawn(cmd: &mut Command, end_leftovers: bool) -> io::Result<(Child
         Ok((child, tree))
     }
 }
+
+/// Run by [`spawn`] on Unix once the process runs, before its group is listed: lets a test send a signal there.
+#[cfg(all(test, unix))]
+pub(crate) static AFTER_SPAWN: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// A started process and everything it starts.
 pub(crate) struct Tree {
@@ -173,11 +184,49 @@ pub(crate) fn has_ended(child: &mut Child) -> io::Result<bool> {
 #[cfg(unix)]
 mod live {
     use std::sync::Once;
-    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
     const SLOTS: usize = 64;
     static GROUPS: [AtomicI32; SLOTS] = [const { AtomicI32::new(0) }; SLOTS];
     const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// The starts in flight (the low bits) and a signal that came in during one (the bits above them). One word,
+    /// so that the signal handler and the last start to finish cannot both leave the signal to the other.
+    static STARTING: AtomicU32 = AtomicU32::new(0);
+    const IN_FLIGHT: u32 = 0xFFFF;
+    const SIGNAL_SHIFT: u32 = 16;
+
+    /// A start whose group is not on the list yet. A signal that would end Klefki meanwhile is held until the last
+    /// such start ends (dropped once its group is listed, or once it failed), and then acted on.
+    pub(super) struct Starting(());
+
+    impl Starting {
+        pub(super) fn begin() -> Self {
+            STARTING.fetch_add(1, Ordering::SeqCst);
+            Self(())
+        }
+    }
+
+    impl Drop for Starting {
+        fn drop(&mut self) {
+            let mut before = STARTING.load(Ordering::SeqCst);
+            loop {
+                let after = if before & IN_FLIGHT == 1 {
+                    0
+                } else {
+                    before - 1
+                };
+                match STARTING.compare_exchange(before, after, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(now) => before = now,
+                }
+            }
+            let held = before >> SIGNAL_SHIFT;
+            if before & IN_FLIGHT == 1 && held != 0 {
+                end_as(held.cast_signed());
+            }
+        }
+    }
 
     pub(super) fn add(group: libc::pid_t) -> bool {
         GROUPS.iter().any(|slot| {
@@ -212,9 +261,24 @@ mod live {
     }
 
     extern "C" fn on_signal(signal: libc::c_int) {
+        // While a group is being started, the start that finishes last acts on the signal instead.
+        let mut now = STARTING.load(Ordering::SeqCst);
+        while now & IN_FLIGHT != 0 {
+            let held = (now & IN_FLIGHT) | (signal.cast_unsigned() << SIGNAL_SHIFT);
+            match STARTING.compare_exchange(now, held, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return,
+                Err(changed) => now = changed,
+            }
+        }
+        end_as(signal);
+    }
+
+    /// Ends the listed groups, then Klefki as `signal` would have: the shell sees that Klefki was interrupted.
+    /// Only calls that are safe in a signal handler.
+    fn end_as(signal: libc::c_int) {
         end_all();
-        // Then end as the signal would have: the shell sees that Klefki was interrupted.
-        // SAFETY: both calls are safe in a signal handler; the signal stays blocked until the handler returns.
+        // SAFETY: both calls are safe in a signal handler; in one, the signal stays blocked until the handler
+        // returns.
         unsafe {
             libc::signal(signal, libc::SIG_DFL);
             libc::raise(signal);
@@ -243,6 +307,8 @@ mod live {
                     new.sa_sigaction =
                         on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
                     libc::sigemptyset(&mut new.sa_mask);
+                    // A held signal returns from the handler: calls it interrupted go on.
+                    new.sa_flags = libc::SA_RESTART;
                     libc::sigaction(signal, &new, std::ptr::null_mut());
                 }
             }

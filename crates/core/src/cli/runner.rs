@@ -481,8 +481,53 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_while_a_check_starts_ends_the_check_and_what_it_started() {
+        // Regression: the check's process group was listed for ending only after it had started, so Ctrl+C in
+        // between ended klefki-cli and left the check and its server running. Here the signal comes exactly then.
+        for signal in ["SIGINT", "SIGTERM", "SIGHUP"] {
+            let dir = tempfile::tempdir().unwrap();
+            let pids = dir.path().join("pids");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::runner::tests::ends_during_a_check",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(END_DURING_CHECK, format!("{signal} while it starts"))
+                .env("KLEFKI_TEST_END_PIDS", &pids)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .status()
+                .unwrap();
+            let found = tree_pids(&pids, 2);
+            let left: Vec<u32> = found.into_iter().filter(|&p| !gone_soon(p)).collect();
+            for &pid in &left {
+                end_pid(pid);
+            }
+            assert!(left.is_empty(), "{signal} ({status}): {left:?} still ran");
+            use std::os::unix::process::ExitStatusExt;
+            // Ended by the signal once the check was listed, as the shell expects.
+            assert!(status.signal().is_some(), "{signal}: {status}");
+        }
+    }
+
+    /// The signal [`ends_during_a_check`] is told to end itself with.
+    #[cfg(unix)]
+    fn signal_named(way: &str) -> Option<libc::c_int> {
+        match way.split(' ').next() {
+            Some("SIGINT") => Some(libc::SIGINT),
+            Some("SIGTERM") => Some(libc::SIGTERM),
+            Some("SIGHUP") => Some(libc::SIGHUP),
+            _ => None,
+        }
+    }
+
     /// Does nothing in a normal test run. Run by `klefki_ending_during_a_check_ends_the_check_and_what_it_started`,
-    /// it starts a check of a process tree and, once the tree runs, ends itself the way it is told to.
+    /// it starts a check of a process tree and, once the tree runs, ends itself the way it is told to. Told to do
+    /// so "while it starts", it does so once the tree runs but before its start has returned.
     #[test]
     fn ends_during_a_check() {
         let Ok(way) = std::env::var(END_DURING_CHECK) else {
@@ -490,17 +535,28 @@ mod tests {
         };
         let pids = std::path::PathBuf::from(std::env::var_os("KLEFKI_TEST_END_PIDS").unwrap());
         let (program, args, env) = process_tree(&pids, 1);
+        #[cfg(unix)]
+        if way.ends_with(" while it starts") {
+            tree::AFTER_SPAWN
+                .set(|| {
+                    let way = std::env::var(END_DURING_CHECK).unwrap();
+                    let pids = std::env::var_os("KLEFKI_TEST_END_PIDS").unwrap();
+                    tree_pids(Path::new(&pids), 2);
+                    // SAFETY: a plain system call that sends a signal to this thread.
+                    unsafe {
+                        libc::raise(signal_named(&way).unwrap());
+                    }
+                })
+                .unwrap();
+            run_tree(&program, &args, &env, true, SECS * 3);
+            std::thread::sleep(Duration::from_secs(5));
+            std::process::exit(0);
+        }
         std::thread::spawn(move || run_tree(&program, &args, &env, true, SECS * 3));
         tree_pids(&pids, 2);
         #[cfg(unix)]
         {
-            let signal = match way.as_str() {
-                "SIGINT" => Some(libc::SIGINT),
-                "SIGTERM" => Some(libc::SIGTERM),
-                "SIGHUP" => Some(libc::SIGHUP),
-                _ => None,
-            };
-            if let Some(signal) = signal {
+            if let Some(signal) = signal_named(&way) {
                 // SAFETY: a plain system call that sends a signal to this process.
                 unsafe {
                     libc::raise(signal);
