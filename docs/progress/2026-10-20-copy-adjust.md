@@ -32,9 +32,25 @@ only there.
   the Auth tab shows Klefki's copy. `add-json` also takes `"oauth": {}`. Screenshots:
   `/mnt/project-files/reviews/2026-10-20-copy-adjust/` (04-06 are from before errors waited for leaving a field).
 
+## Cross-review of 85b2db7 (fixed)
+- Merged main (conflict in the `api` import list of `shell.rs`, from #50).
+- A base followed by more of the address may not end in `/` or hold `?` or `#` (`…/v2//mcp`, `…/v2?x=1/mcp`); the
+  dialog drops a trailing `/` when the field is left and says so otherwise; the core refuses it too
+  (`a_base_ending_in_a_slash_or_holding_a_query_is_refused_where_more_follows`, variants `?` and `#`).
+- An address is rebased only when the base ends where a part of it does (one rule, `ends_part`, for the write, the
+  dialog and `shared_base`): a metadata address on `acme.com.evil.example` or `acme.com:9443` is kept
+  (`an_address_on_another_host_or_port_is_not_rebased_by_a_base_it_merely_starts_with`). Both failed first.
+- The review warns first, naming the host, when a copy's new host gets the original's header or environment values,
+  or its client secret (to where it signs in); not for another path on the same host, nor with another client.
+- Model test: `CopyAdjusted` also sets a callback port for odd addresses; `PROPTEST_CASES=1500` passed.
+- Full verify after the fixes and the merge: exit 0 (387 + 24 + 26 + 871 passed; deny ok).
+
 ## Open
 - The summary line ("Duplicate sso as sso_eu for the user") does not name the changes; the diff under it shows them.
 - Not changeable here: scopes and headers (the edit form does those after the copy).
+- From the cross-review, left for later: a Back button from the review to the filled dialog (the secret is taken out of
+  the field on Review); "untick it there" in the 800x480 footer could name the place; no model coverage of plain-server
+  copies with a new base (the model's plain servers are programs).
 
 ## Next
 Cross-review, then merge.

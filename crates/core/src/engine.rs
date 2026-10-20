@@ -1491,6 +1491,93 @@ fn changer(shared: &Shared) -> Option<Arc<dyn swap::Claude>> {
     }))
 }
 
+/// For each copy given another host, what of the original's it sends there: its header or environment values to
+/// the server, its client secret (unless it signs in as another client) to where it signs in. A one-letter slip in
+/// the host would hand them to a stranger, and the review shows them only as `<hidden>`.
+fn new_hosts(
+    changes: &[Change],
+    text: &str,
+    keys: &crate::config::inventory::FileKeys,
+) -> Vec<String> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return Vec::new();
+    };
+    let host = |entry: &serde_json::Value, pointer: &str| {
+        let url = url::Url::parse(entry.pointer(pointer)?.as_str()?).ok()?;
+        let host = url.host_str()?.to_owned();
+        Some(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        })
+    };
+    let mut out = Vec::new();
+    for change in changes {
+        let Change::Duplicate {
+            id, name, adjust, ..
+        } = change
+        else {
+            continue;
+        };
+        if adjust.base.is_none() {
+            continue;
+        }
+        let Some(key) = keys.get(&id.connection) else {
+            continue;
+        };
+        let list = match &key.project {
+            None => root.get("mcpServers"),
+            Some(p) => root
+                .get("projects")
+                .and_then(|projects| projects.get(p))
+                .and_then(|project| project.get("mcpServers")),
+        };
+        let Some(entry) = list.and_then(|l| l.get(&key.name)) else {
+            continue;
+        };
+        let Ok(new) = adjust.apply(entry, &key.name) else {
+            continue;
+        };
+        let filled = |k: &str| {
+            entry
+                .get(k)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|values| !values.is_empty())
+        };
+        let mut sent: Vec<(&str, String)> = Vec::new();
+        if (filled("headers") || filled("env"))
+            && host(entry, "/url") != host(&new, "/url")
+            && let Some(to) = host(&new, "/url")
+        {
+            sent.push(("header values", to));
+        }
+        if entry.get("oauth").is_some() && adjust.client.is_none() {
+            let signs_in_at = if entry.pointer("/oauth/authServerMetadataUrl").is_some() {
+                "/oauth/authServerMetadataUrl"
+            } else {
+                "/url"
+            };
+            if host(entry, signs_in_at) != host(&new, signs_in_at)
+                && let Some(to) = host(&new, signs_in_at)
+            {
+                sent.push(("client secret", to));
+            }
+        }
+        let what = match sent.as_slice() {
+            [] => continue,
+            [(what, to)] => format!("{what} to {to}"),
+            [(a, to_a), (b, to_b)] if to_a == to_b => format!("{a} and {b} to {to_a}"),
+            [(a, to_a), (b, to_b), ..] => format!("{a} to {to_a} and its {b} to {to_b}"),
+        };
+        out.push(format!(
+            "{} sends the original's {}. Check the address before you go on.",
+            sanitize(name),
+            sanitize(&what)
+        ));
+    }
+    out
+}
+
 /// For each server moved or copied into a project whose entry switches that name off: it arrives switched off there.
 fn stays_off(changes: &[Change], text: &str) -> Vec<String> {
     let arrivals: Vec<(&str, &str)> = changes
@@ -1606,6 +1693,10 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         }
         if let Ok(Some((text, _))) = &read {
             resolved.warnings.extend(stays_off(changes, text));
+            // A mistyped host would get the original's credentials: said before anything else.
+            resolved
+                .warnings
+                .splice(0..0, new_hosts(changes, text, &fresh.keys));
         }
         // What a swap does to other servers' sign-ins depends on what else is in the file.
         let root: serde_json::Value = if resolved.swaps.is_empty() {
@@ -9555,10 +9646,41 @@ mod tests {
                 },
             }],
         );
+        // The new host gets the original's header values, and the review says so first.
+        assert_eq!(
+            plan.warnings.first().map(String::as_str),
+            Some(
+                "gw_eu sends the original's header values to eu.acme.com. Check the address before you go on."
+            ),
+            "{:?}",
+            plan.warnings
+        );
         // The review shows the new address, never the header's value.
         let shown = format!("{plan:?}");
         assert!(shown.contains("https://eu.acme.com/v2/mcp"), "{shown}");
         assert!(!shown.contains("s3cret-value"), "{shown}");
+        // The variant: another path on the same host is nothing to check.
+        let same_host = plan_for(
+            &core,
+            vec![Change::Duplicate {
+                id: user_id("gw"),
+                name: "gw_v2".into(),
+                targets: vec![Target::User],
+                adjust: crate::adjust::Adjust {
+                    base: Some(rebase("https://mcp.acme.com/v1", "https://mcp.acme.com/v2")),
+                    ..Default::default()
+                },
+            }],
+        );
+        assert!(
+            !same_host
+                .warnings
+                .iter()
+                .any(|w| w.contains("sends the original's")),
+            "{:?}",
+            same_host.warnings
+        );
+        core.send(Command::Discard(same_host.id));
         apply_and_wait(&core, &plan);
         let now = config_json(&env);
         assert_eq!(now["mcpServers"]["gw"], gw);
@@ -9690,6 +9812,14 @@ mod tests {
         let shown = format!("{plan:?}");
         assert!(shown.contains("https://eu.example.com/mcp"), "{shown}");
         assert!(shown.contains("9123"), "{shown}");
+        // Klefki's copy of the original's client secret goes to the new host.
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "sso_eu sends the original's client secret to eu.example.com. Check the address before you go on."),
+            "{:?}",
+            plan.warnings
+        );
         let added = apply_copy(&env, &core, &plan);
         assert_eq!(
             added,
@@ -9716,6 +9846,10 @@ mod tests {
     fn a_copy_that_signs_in_as_another_client_hands_over_that_clients_secret_only() {
         const OTHER: &str = "Other-Client-S3cret";
         let (env, store, plan, core) = copy_sso(crate::adjust::Adjust {
+            base: Some(rebase(
+                "https://sso.example.com/mcp",
+                "https://eu.example.com/mcp",
+            )),
             client: Some(crate::adjust::Client {
                 id: Some("client-8".into()),
                 secret: Some(crate::secrets::Secret::new(OTHER.to_owned())),
@@ -9724,6 +9858,15 @@ mod tests {
         });
         let shown = format!("{plan:?}");
         assert!(shown.contains("client-8"), "{shown}");
+        // Another client brings its own secret: nothing of the original's goes anywhere new.
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("sends the original's")),
+            "{:?}",
+            plan.warnings
+        );
         assert!(
             !shown.contains(OTHER) && !shown.contains(CLIENT_SECRET),
             "{shown}"

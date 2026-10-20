@@ -81,14 +81,16 @@ and local scope, and PLAN's model-based test as the acceptance bar.
   deleted or renamed by a later one as it ended, so the add does not bring it back under its old name.
 - **A copy can change what overlapping servers differ in** (2026-10-20): the Duplicate dialog takes a new base
   address (the start the server's address and its sign-in metadata address share, up to a `/` and never less than
-  the host; both are rewritten, a metadata address on another host is kept), callback port and client id
+  the host; both are rewritten, a metadata address on another host or port is kept, and a base followed by more of
+  the address may not end in `/` or hold `?` or `#`), callback port and client id
   (`adjust::Adjust`). The addresses come from the definition in the file (`Command::Inspect`), not from the list, which
   leaves out a query string. A copy with **another client id never gets the original's client secret**: it takes the
   one typed for the new client, or none (Claude Code then keeps none, and Klefki deletes a stale copy at the new
   place). With the same client it keeps the original's, as before. A plain server's copy is still one docstore write
   (`Op::CopyServer { base }`, rebased when expanded); one that signs in is still added by `add-json`. Checked against
   Claude Code 2.1.304: it takes the rewritten definition, `"oauth": {}` included, and keeps the new client's secret
-  under the copy's own sign-in key.
+  under the copy's own sign-in key. When the new host gets the original's header values or client secret, the review
+  warns first, naming the host: a slip in it would hand them to a stranger.
 - **Docstore keeps its OAuth refusal.** Only `Purpose::Preview` (diff for the review, never applied) may name OAuth
   entries.
 

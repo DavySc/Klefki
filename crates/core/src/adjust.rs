@@ -52,14 +52,17 @@ impl Adjust {
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("{name} has no address to change"))?;
-            let rest = url.strip_prefix(from.as_str()).ok_or_else(|| {
+            let rest = rest_after(url, from).ok_or_else(|| {
                 format!("the address of {name} has changed since; review the copy again")
             })?;
+            if let Some(why) = base_problem(to, rest.is_empty()) {
+                return Err(why.to_owned());
+            }
             out["url"] = Value::String(format!("{to}{rest}"));
+            // Only an address on the same host and port: `https://acme.com` does not start
+            // `https://acme.com.example` or `https://acme.com:9443`.
             if let Some(metadata) = out.pointer_mut("/oauth/authServerMetadataUrl")
-                && let Some(rest) = metadata
-                    .as_str()
-                    .and_then(|m| m.strip_prefix(from.as_str()))
+                && let Some(rest) = metadata.as_str().and_then(|m| rest_after(m, from))
             {
                 *metadata = Value::String(format!("{to}{rest}"));
             }
@@ -109,6 +112,33 @@ impl Adjust {
     }
 }
 
+/// Whether `s` has a part end at `i`: its end, or a `/`, `?` or `#` there.
+fn ends_part(s: &str, i: usize) -> bool {
+    i == s.len() || s[i..].starts_with(['/', '?', '#'])
+}
+
+/// What follows `from` in `address`, when `from` starts it and ends where a part of it does.
+fn rest_after<'a>(address: &'a str, from: &str) -> Option<&'a str> {
+    let rest = address.strip_prefix(from)?;
+    ends_part(address, from.len()).then_some(rest)
+}
+
+/// Why `to` cannot replace a base followed by more of the address (`whole` is false), if it cannot: the rest starts
+/// with its own `/`, `?` or `#`, so a base ending in `/`, or holding a query or fragment, would make an address that
+/// is not the one meant (`…/v2//mcp`, `…/v2?x=1/mcp`).
+pub(crate) fn base_problem(to: &str, whole: bool) -> Option<&'static str> {
+    if whole {
+        return None;
+    }
+    if to.contains(['?', '#']) {
+        return Some("the base address ends before any ? or #");
+    }
+    if to.ends_with('/') {
+        return Some("the base address ends without a /: the rest of each address starts with one");
+    }
+    None
+}
+
 /// The start the addresses `url` and `metadata` (a sign-in metadata address) share, so both can be changed in one
 /// go: as far as both run the same up to a `/` (or the end), and never less than the scheme and host. Without
 /// `metadata`, or when it is on another host, that is `url` itself.
@@ -129,7 +159,6 @@ pub fn shared_base<'a>(url: &'a str, metadata: Option<&str>) -> &'a str {
         .take_while(|((_, a), b)| a == b)
         .last()
         .map_or(0, |((i, a), _)| i + a.len_utf8());
-    let ends_part = |s: &str, i: usize| i == s.len() || s[i..].starts_with(['/', '?', '#']);
     (host_end..=common)
         .rev()
         .find(|&i| url.is_char_boundary(i) && ends_part(url, i) && ends_part(metadata, i))
@@ -193,10 +222,18 @@ impl CopyFields {
     }
 
     /// Puts `https://` before a base typed without a scheme (`eu.acme.com/v1`), as a browser does.
+    /// A trailing `/` is dropped when more of the address follows the base, which starts with its own.
     pub fn complete_base(&mut self) {
         let base = self.base.trim();
         if !base.is_empty() && !base.contains("://") && !base.contains(char::is_whitespace) {
             self.base = format!("https://{base}");
+        }
+        if !self.base_is_whole_address() {
+            let base = self.base.trim();
+            let kept = base.trim_end_matches('/');
+            if kept.contains("://") && !kept.ends_with(':') && kept.len() < base.len() {
+                self.base = kept.to_owned();
+            }
         }
     }
 
@@ -210,9 +247,7 @@ impl CopyFields {
     pub fn addresses(&self) -> (String, Option<(String, bool)>) {
         let base = self.base.trim();
         let moved = |address: &str| {
-            address
-                .strip_prefix(self.from_base.as_str())
-                .map(|rest| format!("{base}{rest}"))
+            rest_after(address, &self.from_base).map(|rest| format!("{base}{rest}"))
         };
         let url = moved(&self.url).unwrap_or_else(|| self.url.clone());
         let metadata = self.metadata.as_ref().map(|m| match moved(m) {
@@ -255,6 +290,10 @@ impl CopyFields {
             .into_iter()
             .filter(|(part, _)| *part != Part::Definition)
             .collect();
+        if let Some(why) = base_problem(self.base.trim(), self.base_is_whole_address()) {
+            problems.retain(|(part, _)| !matches!(part, Part::Address | Part::MetadataUrl));
+            problems.insert(0, (Part::Address, crate::form::sentence(why)));
+        }
         if self.base.trim().is_empty() {
             // Nor is the metadata address that follows from it: one thing to fix, said once.
             problems.retain(|(part, _)| !matches!(part, Part::Address | Part::MetadataUrl));
@@ -352,6 +391,23 @@ mod tests {
                 secret: Some(Secret::new("s2".into()))
             })
         );
+        // A trailing slash is dropped when left; one typed, or a query or fragment, is said to be wrong.
+        fields.base = "https://eu.acme.com/v2/".into();
+        let parts: Vec<Part> = fields.problems().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(parts, [Part::Address]);
+        fields.complete_base();
+        assert_eq!(fields.base, "https://eu.acme.com/v2");
+        for base in ["https://eu.acme.com/v2?x=1", "https://eu.acme.com#f"] {
+            fields.base = base.into();
+            fields.complete_base();
+            let problems = fields.problems();
+            assert!(
+                problems
+                    .iter()
+                    .any(|(p, why)| *p == Part::Address && why.contains("? or #")),
+                "{base}: {problems:?}"
+            );
+        }
         // Typed without its scheme, it gets one when left.
         fields.base = "eu.acme.com".into();
         fields.complete_base();
@@ -499,6 +555,77 @@ mod tests {
         moved["url"] = json!("https://other.example/mcp");
         let refused = adjust.apply(&moved, "acme").unwrap_err();
         assert!(refused.contains("changed since"), "{refused}");
+    }
+
+    #[test]
+    fn a_base_ending_in_a_slash_or_holding_a_query_is_refused_where_more_follows() {
+        // Cross-review of 85b2db7: `…/v2/` made `…/v2//mcp`, and `…/v2?x=1` made `…/v2?x=1/mcp`.
+        let entry = oauth_entry();
+        for to in [
+            "https://eu.acme.com/v2/",
+            "https://eu.acme.com/v2?x=1",
+            "https://eu.acme.com/v2#f",
+        ] {
+            let adjust = Adjust {
+                base: Some(Rebase {
+                    from: "https://mcp.acme.com/v1".into(),
+                    to: to.into(),
+                }),
+                ..Adjust::default()
+            };
+            let refused = adjust.apply(&entry, "acme").unwrap_err();
+            assert!(refused.contains("base address ends"), "{to}: {refused}");
+        }
+        // The whole address may end in a slash or carry a query: nothing follows it.
+        let plain = json!({"type": "http", "url": "https://h.example/mcp"});
+        let whole = Adjust {
+            base: Some(Rebase {
+                from: "https://h.example/mcp".into(),
+                to: "https://h.example/mcp/?team=7".into(),
+            }),
+            ..Adjust::default()
+        };
+        assert_eq!(
+            whole.apply(&plain, "plain").unwrap()["url"],
+            "https://h.example/mcp/?team=7"
+        );
+    }
+
+    #[test]
+    fn an_address_on_another_host_or_port_is_not_rebased_by_a_base_it_merely_starts_with() {
+        // Cross-review of 85b2db7: with an address without a path, `https://acme.com` was taken as the start of
+        // `https://acme.com.evil.example/…` and `https://acme.com:9443/…`.
+        for elsewhere in [
+            "https://acme.com.evil.example/meta",
+            "https://acme.com:9443/meta",
+            "https://acme.community/meta",
+        ] {
+            let entry = json!({"type": "http", "url": "https://acme.com", "oauth": {"authServerMetadataUrl": elsewhere}});
+            let adjust = Adjust {
+                base: Some(Rebase {
+                    from: "https://acme.com".into(),
+                    to: "https://eu.acme.com".into(),
+                }),
+                ..Adjust::default()
+            };
+            let adjusted = adjust.apply(&entry, "acme").unwrap();
+            assert_eq!(adjusted["url"], "https://eu.acme.com");
+            assert_eq!(adjusted["oauth"]["authServerMetadataUrl"], elsewhere);
+            // The dialog says the same.
+            let mut fields = CopyFields::from_definition(&entry.to_string()).unwrap();
+            fields.base = "https://eu.acme.com".into();
+            assert_eq!(fields.addresses().1, Some((elsewhere.to_owned(), false)));
+        }
+        // And a server address that only starts like the base is not this server's.
+        let entry = json!({"type": "http", "url": "https://acme.com.evil.example/mcp"});
+        let adjust = Adjust {
+            base: Some(Rebase {
+                from: "https://acme.com".into(),
+                to: "https://eu.acme.com".into(),
+            }),
+            ..Adjust::default()
+        };
+        assert!(adjust.apply(&entry, "acme").is_err());
     }
 
     #[test]

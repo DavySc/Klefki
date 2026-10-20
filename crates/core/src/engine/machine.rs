@@ -326,8 +326,8 @@ enum Step {
     Forget {
         pick: usize,
     },
-    /// A copy of a server that signs in, under another name, with another address and, when `client` is given,
-    /// another client and its secret (a client without a secret for an odd number).
+    /// A copy of a server that signs in, under another name, with another address (and, for an odd one, a fixed
+    /// callback port) and, when `client` is given, another client and its secret (none for an odd number).
     CopyAdjusted {
         pick: usize,
         to: usize,
@@ -967,6 +967,11 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                 let from = original["url"].as_str().unwrap().to_owned();
                 let mut entry = original.clone();
                 entry["url"] = json!(format!("https://h{url}.example/mcp"));
+                // An odd address also gets a fixed callback port.
+                let port = (url % 2 == 1).then(|| 9000 + u16::from(*url));
+                if let Some(port) = port {
+                    entry["oauth"]["callbackPort"] = json!(port);
+                }
                 let client = client.map(|c| crate::adjust::Client {
                     id: Some(format!("c{c}")),
                     secret: (c % 2 == 0).then(|| crate::secrets::Secret::new(format!("sec-k{c}"))),
@@ -1004,7 +1009,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                             from,
                             to: format!("https://h{url}.example/mcp"),
                         }),
-                        callback_port: None,
+                        callback_port: port.map(Some),
                         client,
                     },
                 }]
