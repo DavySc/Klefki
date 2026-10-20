@@ -154,12 +154,13 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
 3. **M2**: add wizard (metadata, scope picker, free-port check), PTY login and re-authorize, move/copy, transactional upsert with rollback. Spike early: how `--no-browser` handles the callback port (paste-back input as fallback).
 4. **M3**: drift watcher and refresh scopes, export/import, legacy secret import, orphaned-secrets view, optional `klefki-cli` CLI.
 5. **M4**: cargo-packager in a GitHub Actions matrix:
-   - Windows: msi, NSIS and portable exe, signed with Authenticode.
-   - macOS: universal .app/.dmg, Developer ID + notarisation.
-   - Linux: deb and AppImage, with checksums and minisign.
-   - Build provenance attestation and an SBOM.
+   - Signing uses only options that cost nothing (owner's decision, 2026-10-20).
+   - Windows: msi, NSIS and portable exe, signed with Authenticode through SignPath Foundation (free for open-source projects) once it accepts Klefki.
+   - macOS: universal .app/.dmg with an ad-hoc signature. No Developer ID or notarisation: they need the paid Apple Developer Program, so Gatekeeper asks users to allow Klefki once.
+   - Linux: deb and AppImage.
+   - Every release: checksums signed with minisign, build provenance attestation and an SBOM.
    - Auto-update only from an org-owned, signature-verified source.
-   - Slices, in order: (1) unsigned release builds from a `v*` tag, with checksums and the MIT OR Apache-2.0 licence (`docs/RELEASING.md`); (2) provenance attestation and SBOM; (3) minisign; (4) Authenticode; (5) Developer ID and notarisation; (6) update check. Slices 3 to 5 need the owner's keys or accounts.
+   - Slices, in order: (1) unsigned release builds from a `v*` tag, with checksums and the MIT OR Apache-2.0 licence (`docs/RELEASING.md`); (2) provenance attestation and SBOM; (3) minisign; (4) macOS ad-hoc signature; (5) Authenticode through SignPath Foundation, which signs only projects that have already released, so it follows the first release; (6) update check. Slices 3 and 5 need the owner's key or account.
 
 ## Nice to have (after M4)
 Ideas from an outside brainstorm, compared with this plan and checked on a real machine in `docs/decisions/003-brainstorm-comparison.md`. None of them blocks M0 to M4, and they are in rough order of value.

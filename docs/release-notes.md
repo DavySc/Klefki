@@ -1,6 +1,6 @@
 ## Install
 
-Klefki needs [Claude Code](https://code.claude.com/docs) installed. **These builds are not code-signed yet**, so Windows and macOS warn the first time you open Klefki; the steps below get you past that once.
+Klefki needs [Claude Code](https://code.claude.com/docs) installed. **Windows and macOS warn the first time you open Klefki**: the Windows build is not code-signed yet, and the macOS build is not notarised by Apple (that needs a paid account, and Klefki is free). The steps below get you past the warning once. To be sure a file is genuine, see *Check a download* below.
 
 ### Windows 10 and 11
 
@@ -11,6 +11,8 @@ Klefki needs [Claude Code](https://code.claude.com/docs) installed. **These buil
 | `klefki-{version}-windows-x64.zip` | No install: unzip anywhere and run `klefki.exe`. |
 
 If SmartScreen says "Windows protected your PC", choose **More info**, then **Run anyway**.
+
+If Windows says Smart App Control blocked Klefki, there is no way to allow a single app: Smart App Control blocks unsigned programs it does not know. Klefki will run there once its Windows build is signed.
 
 The command-line tool is installed next to the app, in `%LOCALAPPDATA%\Klefki` (the MSI uses `C:\Program Files\Klefki`). It is not on your `PATH`; run it in PowerShell with:
 
