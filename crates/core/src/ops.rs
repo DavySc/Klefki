@@ -792,15 +792,21 @@ fn use_profile(
         });
     }
     // Only what is really turned off: not a server that shares its name with a member.
-    let turned_off: BTreeSet<String> = turned_off
+    let turned_off: Vec<(String, String, String)> = turned_off
         .into_iter()
         .filter(|(_, place, name)| {
             switches
                 .iter()
                 .any(|((p, n), off)| *off && p == place && n == name)
         })
-        .map(|(shown, ..)| shown)
         .collect();
+    // In every project: in how many something goes off, since the names alone do not say where.
+    let off_places = turned_off
+        .iter()
+        .map(|(_, place, _)| place)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let turned_off: BTreeSet<String> = turned_off.into_iter().map(|(shown, ..)| shown).collect();
     let missing: Vec<String> = members
         .iter()
         .filter(|m| !found.contains(m))
@@ -861,8 +867,14 @@ fn use_profile(
     if !turned_off.is_empty() {
         let names: Vec<String> = turned_off.into_iter().collect();
         out.warnings.push(format!(
-            "This also turns off {}, which {} not in {shown_profile}.",
-            some_of(&names),
+            "This also turns off {}{}, which {} not in {shown_profile}.",
+            // Every one: what goes off is read before agreeing, and "and 3 more" hides which.
+            and_list(&names),
+            if project.is_none() {
+                format!(" (in {})", count(off_places, "project"))
+            } else {
+                String::new()
+            },
             if names.len() == 1 { "is" } else { "are" }
         ));
     }
@@ -3249,6 +3261,50 @@ mod profile_review_regressions {
         assert!(alone(json!({})).is_empty());
         assert!(alone(json!({"disabledMcpjsonServers": ["repo"]})).is_empty());
         assert_eq!(alone(json!({"enabledMcpjsonServers": ["repo"]})).len(), 1);
+    }
+
+    /// Cross-review of #62: with "only" ticked at first, what goes off is read before agreeing, so every server is
+    /// named (not "and 2 more"), and in every project, how many projects.
+    #[test]
+    fn using_a_profile_alone_names_every_server_it_turns_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let servers: serde_json::Map<String, serde_json::Value> =
+            ["a", "b", "c", "d", "e", "f", "g", "h"]
+                .iter()
+                .map(|n| ((*n).to_owned(), json!({"command": n})))
+                .collect();
+        let inv = inv(
+            dir.path(),
+            json!({"mcpServers": servers, "projects": {"/q": {}, "/r": {"disabledMcpServers": ["b", "c", "d", "e", "f", "g", "h"]}}}),
+        );
+        let a = vec![crate::model::ConnectionId::new(Scope::User, None, "a")];
+        let out = use_profile(&inv, a.clone(), true);
+        assert!(
+            out.warnings.contains(
+                &"This also turns off b, c, d, e, f, g and h, which are not in Work.".to_owned()
+            ),
+            "{:?}",
+            out.warnings
+        );
+        // Every project: only q has them on.
+        let everywhere = resolve(
+            &[crate::engine::Change::UseProfile {
+                name: "Work".into(),
+                members: a,
+                project: None,
+                only: true,
+            }],
+            &inv.snapshot,
+            &inv.keys,
+        )
+        .unwrap();
+        assert!(
+            everywhere.warnings.contains(
+                &"This also turns off b, c, d, e, f, g and h (in 1 project), which are not in Work.".to_owned()
+            ),
+            "{:?}",
+            everywhere.warnings
+        );
     }
 
     /// A member that policy blocks stays off whatever disabledMcpServers says.
