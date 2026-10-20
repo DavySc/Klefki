@@ -268,52 +268,41 @@ impl ThemeChoice {
     }
 }
 
-/// One entry of the theme dropdown: everything the user can set, in one list.
-/// `System` follows the operating system and keeps the chosen greys; the others fix both.
+/// One entry of the theme dropdown: a mode and a family of greys, the two things that can be set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThemeOption {
-    System,
-    Fixed(ThemeChoice, Tone),
+pub struct ThemeOption {
+    pub choice: ThemeChoice,
+    pub tone: Tone,
 }
 
 impl ThemeOption {
-    pub const ALL: [Self; 5] = [
-        Self::System,
-        Self::Fixed(ThemeChoice::Dark, Tone::Cool),
-        Self::Fixed(ThemeChoice::Light, Tone::Cool),
-        Self::Fixed(ThemeChoice::Dark, Tone::Warm),
-        Self::Fixed(ThemeChoice::Light, Tone::Warm),
+    /// One group per tone, each in the order of the Settings page.
+    pub const ALL: [Self; 6] = [
+        Self::new(ThemeChoice::System, Tone::Cool),
+        Self::new(ThemeChoice::Light, Tone::Cool),
+        Self::new(ThemeChoice::Dark, Tone::Cool),
+        Self::new(ThemeChoice::System, Tone::Warm),
+        Self::new(ThemeChoice::Light, Tone::Warm),
+        Self::new(ThemeChoice::Dark, Tone::Warm),
     ];
 
-    /// The entry showing `choice` and `tone`.
-    pub fn of(choice: ThemeChoice, tone: Tone) -> Self {
-        match choice {
-            ThemeChoice::System => Self::System,
-            c => Self::Fixed(c, tone),
-        }
-    }
-
-    /// The choice and, for a fixed theme, the tone this entry sets.
-    pub fn parts(self) -> (ThemeChoice, Option<Tone>) {
-        match self {
-            Self::System => (ThemeChoice::System, None),
-            Self::Fixed(c, t) => (c, Some(t)),
-        }
+    pub const fn new(choice: ThemeChoice, tone: Tone) -> Self {
+        Self { choice, tone }
     }
 
     /// A moon for dark, a sun for light; System has the desktop icon, as it is neither.
     pub fn icon(self) -> &'static str {
-        self.parts().0.icon()
+        self.choice.icon()
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::System => "System",
-            Self::Fixed(ThemeChoice::Dark, Tone::Cool) => "Dark (cool)",
-            Self::Fixed(ThemeChoice::Light, Tone::Cool) => "Light (cool)",
-            Self::Fixed(ThemeChoice::Dark, Tone::Warm) => "Dark (warm)",
-            Self::Fixed(ThemeChoice::Light, Tone::Warm) => "Light (warm)",
-            Self::Fixed(ThemeChoice::System, _) => "System",
+        match (self.choice, self.tone) {
+            (ThemeChoice::System, Tone::Cool) => "System (cool)",
+            (ThemeChoice::Light, Tone::Cool) => "Light (cool)",
+            (ThemeChoice::Dark, Tone::Cool) => "Dark (cool)",
+            (ThemeChoice::System, Tone::Warm) => "System (warm)",
+            (ThemeChoice::Light, Tone::Warm) => "Light (warm)",
+            (ThemeChoice::Dark, Tone::Warm) => "Dark (warm)",
         }
     }
 }
@@ -677,19 +666,20 @@ pub(crate) mod tests {
     #[test]
     fn dropdown_lists_every_theme_with_sun_or_moon() {
         use egui_phosphor::regular::{DESKTOP, MOON, SUN};
-        let tones: Vec<_> = Tone::ALL.into_iter().collect();
-        for choice in [ThemeChoice::Light, ThemeChoice::Dark] {
-            for &tone in &tones {
+        for choice in ThemeChoice::ALL {
+            for tone in Tone::ALL {
                 assert!(
-                    ThemeOption::ALL.contains(&ThemeOption::Fixed(choice, tone)),
+                    ThemeOption::ALL.contains(&ThemeOption::new(choice, tone)),
                     "{choice:?}/{tone:?} cannot be picked in the dropdown"
                 );
             }
         }
-        assert!(ThemeOption::ALL.contains(&ThemeOption::System));
-        assert_eq!(ThemeOption::ALL.len(), 1 + 2 * tones.len());
+        assert_eq!(
+            ThemeOption::ALL.len(),
+            ThemeChoice::ALL.len() * Tone::ALL.len()
+        );
         for o in ThemeOption::ALL {
-            let want = match o.parts().0 {
+            let want = match o.choice {
                 ThemeChoice::Dark => MOON,
                 ThemeChoice::Light => SUN,
                 ThemeChoice::System => DESKTOP,
@@ -702,16 +692,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_current_theme_maps_to_its_entry() {
-        for o in ThemeOption::ALL {
-            let (c, t) = o.parts();
-            assert_eq!(ThemeOption::of(c, t.unwrap_or_default()), o);
-        }
-        // System ignores the tone: one entry whichever greys are set.
-        assert_eq!(
-            ThemeOption::of(ThemeChoice::System, Tone::Warm),
-            ThemeOption::System
-        );
+    fn each_tone_is_one_group_in_the_order_of_settings() {
+        let modes: Vec<_> = ThemeOption::ALL.iter().map(|o| o.choice).collect();
+        assert_eq!(modes[..3], ThemeChoice::ALL);
+        assert_eq!(modes[3..], ThemeChoice::ALL);
+        let tones: Vec<_> = ThemeOption::ALL.iter().map(|o| o.tone).collect();
+        assert!(tones[..3].iter().all(|t| *t == tones[0]));
+        assert!(tones[3..].iter().all(|t| *t == tones[3]));
+        assert_ne!(tones[0], tones[3]);
     }
 
     #[test]
