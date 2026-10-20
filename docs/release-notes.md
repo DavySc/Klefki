@@ -1,8 +1,10 @@
 ## Install
 
-Klefki needs [Claude Code](https://code.claude.com/docs) installed. **These builds are not code-signed yet**, so Windows and macOS warn the first time you open Klefki; the steps below get you past that once.
+Klefki needs [Claude Code](https://code.claude.com/docs) installed. **Windows and macOS warn the first time you open Klefki**: the Windows build is not code-signed yet, and the macOS build is not notarised by Apple (that needs a paid account, and Klefki is free). The steps below get you past the warning once. To be sure a file is genuine, see *Check a download* below.
 
 ### Windows 10 and 11
+
+**If Windows says Smart App Control blocked Klefki** (or its installer): Smart App Control blocks unsigned programs it does not know and has no exception for a single app. Klefki will run there once its Windows build is signed; to hear when, follow the releases on GitHub (*Watch*, *Custom*, *Releases*). Or, if you decide to, turn Smart App Control off in Windows Security, *App & browser control*; that lowers your protection against other unknown programs too.
 
 | File | Use it for |
 |---|---|
@@ -25,7 +27,7 @@ Download **`klefki-{version}-macos-universal.dmg`**, open it and drag Klefki to 
 1. Open Klefki. macOS says it "cannot be opened" or "cannot verify" it; click **Done** or **OK**.
 2. Open **System Settings**, then **Privacy & Security**, and scroll down to **Security**.
 3. Click **Open Anyway** next to the message about Klefki. The button is there for about an hour after step 1.
-4. Confirm with your password or Touch ID. Klefki opens, and from then on it opens normally.
+4. Confirm with your password or Touch ID. Klefki opens, and from then on it opens normally. A new version you download by hand asks once more.
 
 On macOS 11 to 14 you can instead right-click Klefki in Applications, choose **Open**, then **Open** again.
 

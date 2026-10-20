@@ -6,8 +6,8 @@
     python3 scripts/check-release.py linux   dist/ 0.1.0
 
 It looks inside the files rather than trusting the build: the Windows app is a GUI program with the icon
-embedded and the CLI is a console program; the macOS app runs natively on Intel and Apple silicon and
-carries the release version; the Linux packages install both programs, the menu entry and the icon, and the
+embedded and the CLI is a console program; the macOS app runs natively on Intel and Apple silicon, carries
+the release version and has an ad-hoc signature sealing the whole bundle (checked with codesign on macOS); the Linux packages install both programs, the menu entry and the icon, and the
 SBOMs (made on the Linux job) describe both programs at this version. Exits 1 with every problem listed. Standard library only, so it runs on any CI runner.
 """
 
@@ -16,6 +16,7 @@ import io
 import json
 import plistlib
 import struct
+import subprocess
 import sys
 import tarfile
 import zipfile
@@ -119,6 +120,16 @@ def check_macos(dist, version, app, problems):
             continue
         if not {0x01000007, 0x0100000C} <= archs:
             problems.append(f"{exe} is not universal (Intel and Apple silicon): {sorted(map(hex, archs))}")
+    # Without a signature over the whole bundle, macOS on Apple silicon can call a downloaded app "damaged"
+    # and offer no way to open it. The ad-hoc signature costs nothing; Gatekeeper still asks once (no notarisation).
+    if not (app / "Contents" / "_CodeSignature" / "CodeResources").is_file():
+        problems.append(f"{app.name} is not signed as a bundle (no Contents/_CodeSignature/CodeResources)")
+    if sys.platform == "darwin":
+        verify = subprocess.run(
+            ["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, text=True
+        )
+        if verify.returncode != 0:
+            problems.append(f"codesign --verify failed: {verify.stderr.strip()}")
 
 
 def deb_files(data):
