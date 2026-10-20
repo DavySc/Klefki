@@ -110,7 +110,7 @@ impl Guard {
 }
 
 fn digest(entry: &Value) -> String {
-    format!("{:x}", Sha256::digest(entry.to_string().as_bytes()))
+    crate::hex::lower(&Sha256::digest(entry.to_string().as_bytes()))
 }
 
 pub(crate) fn resolve(

@@ -24,7 +24,7 @@ Reference: the v1.0.0 source, obtained by unpacking the portable exe (NSIS → `
 - drift intervals 0/60/360/720/1440 (default 360)
 
 ## Environment
-- MSVC is already installed. Install Rust with `winget install Rustlang.Rustup`, then use stable MSVC with edition 2024. Rust 1.88 or newer is required.
+- MSVC is already installed. Install Rust with `winget install Rustlang.Rustup`, then use stable MSVC with edition 2024. Rust 1.95 or newer is required (egui 0.36 needs it).
 - Claude is the native build at `~/.local/bin/claude.exe`.
 
 ## Workspace layout

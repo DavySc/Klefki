@@ -734,7 +734,7 @@ impl Docstore {
             Kind::ClaudeJson => "claude.json".to_owned(),
             Kind::ProjectSettings => {
                 let digest = Sha256::digest(self.path.to_string_lossy().as_bytes());
-                format!("settings.local-{:.12}", format!("{digest:x}"))
+                format!("settings.local-{:.12}", crate::hex::lower(&digest))
             }
         }
     }
@@ -873,7 +873,7 @@ impl Current {
             hasher.update(BOM.as_bytes());
         }
         hasher.update(self.text.as_bytes());
-        format!("{:x}", hasher.finalize())
+        crate::hex::lower(&hasher.finalize())
     }
 }
 
@@ -4638,7 +4638,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.base_hash,
-            format!("{:x}", Sha256::digest(text.as_bytes()))
+            crate::hex::lower(&Sha256::digest(text.as_bytes()))
         );
         f.store.apply(&plan).unwrap();
         doc["projects"]["C:/work/app"]["disabledMcpServers"] = json!(["old", "gateway"]);
