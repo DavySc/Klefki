@@ -117,6 +117,7 @@ impl Env {
             "claude"
         };
         std::fs::copy(fake_claude(), bin.join(exe)).unwrap();
+        runnable(&bin.join(exe));
         Self { dir }
     }
 
@@ -216,6 +217,35 @@ impl Env {
 
     fn any_run(&self) -> bool {
         self.root().join("log.jsonl").exists()
+    }
+}
+
+/// Waits until the just-copied program at `path` can be started. On Linux, a test on another thread that starts a
+/// process while this one writes the copy hands the open file to that child for a moment, and until the child has
+/// started its own program, starting the copy fails with "text file busy" (ETXTBSY). `klefki-cli` would then find
+/// no usable Claude CLI and exit 3.
+fn runnable(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match Command::new(path)
+            .arg("--version")
+            .env_remove("FAKE_CLAUDE_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} stays busy",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("cannot start {}: {e}", path.display()),
+            Ok(_) => return,
+        }
     }
 }
 

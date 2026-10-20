@@ -37,6 +37,17 @@ byte for byte, so a refactor that changes either fails. No product code changes.
 - The OAuth golden file checks the secret Claude Code received by its hash, not only that one was passed.
 - Left for later (reviewer): the edit diff that lists `+ TOKEN`, `+ MODE`, `- TOKEN` and hides `MODE=fast`.
 
+## Main's red Linux run (96f604d)
+- `status_finds_the_claude_cli_like_the_app_when_not_named` failed on main (exit 3), the flake first seen on #52.
+  Cause: `Env::new` copies the fake CLI and `klefki-cli` starts it at once; on Linux a process another test thread
+  starts while the copy is written holds the written file for a moment, and starting it fails with ETXTBSY ("text
+  file busy"), so no usable Claude CLI is found. Reproduced by running the CLI test binary 60 times with 16
+  threads (4 failures); `Env::new` now waits until the copy can be started; 80 runs after: 0 failures of it.
+- The same stress found another one, a product race, not fixed here: `status_ended_early_leaves_no_check_running`
+  failed 3 times in 80 (SIGINT). `tree::spawn` puts a check's process group on the list that the signal handler
+  ends only after `spawn` returns; a Ctrl+C in between leaves that check running. Needs its own slice (the
+  spawn code is unsafe and security-relevant).
+
 ## Next
 - Part 2: a manual and weekly Linux-only quality workflow (coverage, mutation testing of changed code, start-up
   and memory baseline), and the simplification plan for the owner.
