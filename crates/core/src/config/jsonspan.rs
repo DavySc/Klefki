@@ -37,7 +37,7 @@ pub(crate) fn object_at(text: &str, open: usize) -> Result<Object, String> {
     object_with(text, open, &mut |_, _| false)
 }
 
-/// Like [`object_at`], and also reads the members of nested objects for which `descend(level, key)` says so
+/// Like `object_at` (for tests), and also reads the members of nested objects for which `descend(level, key)` says so
 /// (`level` 0 for this object's members). Each byte is scanned once, however deep the caller looks: a nested object
 /// is read in place of being skipped.
 pub(crate) fn object_with(

@@ -104,7 +104,8 @@ pub(crate) fn check(fetch: &dyn Fetch, current: Version, key: Option<&str>) -> U
     check_release(fetch, current, key).0
 }
 
-/// [`check`], with the release when it is newer.
+/// Asks GitHub for the latest release and checks its signature with `key`, as `check` (for tests) does, and also
+/// returns the release when it is newer.
 pub(crate) fn check_release(
     fetch: &dyn Fetch,
     current: Version,
