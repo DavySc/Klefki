@@ -33,7 +33,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Linux GUI build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libfuse2
@@ -132,7 +132,7 @@ jobs:
             python3 scripts/check-release.py ${{ matrix.system }} dist "$VERSION"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.system }}
           path: dist/*
@@ -148,7 +148,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # A tag can point at any commit, also one whose workflow was changed and never reviewed. The tag ruleset and
@@ -161,7 +161,7 @@ jobs:
             echo "::error::$GITHUB_REF_NAME is $GITHUB_SHA, which is not on main. Releases are made from main only."
             exit 1
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: packages-*
@@ -178,7 +178,7 @@ jobs:
           scripts/sign-checksums.sh dist/SHA256SUMS "Klefki SHA256SUMS, $GITHUB_REF_NAME, commit $GITHUB_SHA"
           mkdir signature
           if [[ -f dist/SHA256SUMS.minisig ]]; then cp dist/SHA256SUMS.minisig signature/; fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: klefki-signature
           path: signature/
@@ -197,8 +197,8 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: packages-*
@@ -210,7 +210,7 @@ jobs:
           cat SHA256SUMS
       # The sign job's signature, when there is one. Checked against the committed key, so a signature that
       # does not match these exact checksums fails here.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.sign.result == 'success'
         with:
           name: klefki-signature
@@ -239,7 +239,7 @@ jobs:
             echo "attested: $file"
           done
       # A tag publishes these files in the release instead.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
         with:
           name: klefki-all

@@ -8909,7 +8909,7 @@ mod tests {
 
     fn sha256(text: &str) -> String {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(text.as_bytes()))
+        crate::hex::lower(&sha2::Sha256::digest(text.as_bytes()))
     }
 
     // ---- moving a server that signs in, through Claude Code's own commands

@@ -651,7 +651,7 @@ mod tests {
         assert_eq!(start["secret_set"], true);
         assert_eq!(
             start["secret_sha256"],
-            format!("{:x}", Sha256::digest(secret.as_bytes()))
+            crate::hex::lower(&Sha256::digest(secret.as_bytes()))
         );
         assert!(
             !start["argv"].to_string().contains(secret),

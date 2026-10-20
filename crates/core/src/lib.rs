@@ -11,6 +11,7 @@ mod export;
 mod export_file;
 mod fixtures;
 mod form;
+mod hex;
 mod import_file;
 mod install;
 mod model;
