@@ -3569,7 +3569,7 @@ mod tests {
             (slack.transport, slack.target.as_str()),
             (TransportKind::ClaudeAi, "on claude.ai")
         );
-        assert_eq!(slack.disabled_projects, [a.display().to_string()]);
+        assert_eq!(slack.disabled_projects, [shown_path(&a)]);
         assert_eq!(slack.status, Status::Unknown);
         find(&s, Scope::ClaudeAi, "claude.ai Drive");
         assert_eq!(
@@ -3723,8 +3723,16 @@ mod tests {
         );
         let s = e.load();
         let note = connector(&s, "Drive").may_not_load.clone().unwrap();
-        assert!(note.starts_with(&format!("In {}: ", b.display())), "{note}");
+        assert!(
+            note.starts_with(&format!("In {}: ", shown_path(&b))),
+            "{note}"
+        );
         assert!(note.contains(".claude/settings.json"), "{note}");
+    }
+
+    /// A project's path as rows show it: with `/`, also on Windows.
+    fn shown_path(p: &std::path::Path) -> String {
+        p.to_string_lossy().replace('\\', "/")
     }
 
     /// The claude.ai connector `name`'s row in `s`.
@@ -3840,7 +3848,7 @@ mod tests {
         let slack = connector(&s, "Slack");
         assert!(slack.not_loaded.is_none(), "{slack:#?}");
         let blocked = slack.blocked.as_ref().unwrap();
-        assert_eq!(blocked.projects, [a, c, d].map(|p| p.display().to_string()));
+        assert_eq!(blocked.projects, [a, c, d].map(|p| shown_path(&p)));
         assert!(
             blocked
                 .why
@@ -3904,9 +3912,12 @@ mod tests {
         // Each cause where it applies.
         for r in [connector(&s, "Gmail"), find(&s, Scope::User, "u")] {
             let why = blocked_why(r);
-            assert!(why.starts_with(&format!("In {}: ", b.display())), "{why}");
             assert!(
-                why.ends_with(&format!("In {}, it is off.", a.display())),
+                why.starts_with(&format!("In {}: ", shown_path(&b))),
+                "{why}"
+            );
+            assert!(
+                why.ends_with(&format!("In {}, it is off.", shown_path(&a))),
                 "{why}"
             );
             assert!(r.enabled, "{r:#?}");
