@@ -8276,7 +8276,10 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
                 "Claude Code's policy keeps this server from loading",
             )
         } else {
-            ("turned off", "settings turn connectors from claude.ai off")
+            (
+                "connectors off",
+                "settings turn connectors from claude.ai off",
+            )
         };
         badges.push(Badge {
             text: format!("{text} in {}/{}", b.projects.len(), project_count),

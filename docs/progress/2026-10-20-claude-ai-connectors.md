@@ -17,7 +17,7 @@ Goal: roadmap item 2. List the claude.ai connectors Claude Code loads, switch th
     "may not load" (`ServerRow::may_not_load`) instead of plainly on.
   - Off in some projects and held back in the rest: not loaded, each cause where it applies (user and organisation
     servers too). `ServerRow::disabled_projects` names where; the app's Enabled row and the CLI note name them.
-  - The user's own switch is not policy (`Blocked::policy`): "Connectors off" status, "turned off in n/m" badge;
+  - The user's own switch is not policy (`Blocked::policy`): "Connectors off" status and "connectors off in n/m" badge, the organisation's too;
     switched off in some projects and held back in others is one "loads in n/m" badge, not a "+1".
   - List names drop `claude.ai `; details lead with the state, then one line and an "About claude.ai connectors"
     section; type `claude.ai` (`TransportKind::ClaudeAi`), target "on claude.ai". Messages name the setting and file.
@@ -34,6 +34,8 @@ Goal: roadmap item 2. List the claude.ai connectors Claude Code loads, switch th
 - Review round, full verify: exit 0; 373 + 24 + 26 + 829 passed, 0 failed; deny ok. One earlier run had
   `status_ended_early_leaves_no_check_running` fail once (a check still running after the signal); it passed alone three
   times and in the next two full runs. This change does not touch how checks are started or ended.
+- Closing review (OK to merge at 62b3f7e), with main e8fb934 merged in and its three wording nits folded in: full verify
+  exit 0; 383 + 24 + 26 + 856 passed, 0 failed; deny ok.
 
 ## Open
 - Not verified live (needs a claude.ai account with a connector). Klefki cannot know a connector's address.

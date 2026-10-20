@@ -260,8 +260,8 @@ pub struct Blocked {
     pub why: String,
     /// The projects (as shown), in the inventory's order.
     pub projects: Vec<String>,
-    /// A rule on which servers load, or the organisation's setting: policy. `false`: the user's own setting, such as
-    /// one that turns claude.ai connectors off (decision 011).
+    /// A rule on which servers load: policy. `false`: a setting that turns claude.ai connectors off, the user's or
+    /// the organisation's (decision 011).
     pub policy: bool,
 }
 

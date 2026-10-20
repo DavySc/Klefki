@@ -24,8 +24,8 @@ for a project.
   under "About claude.ai connectors".
 - Not loaded, with why: `managed-mcp.json` without `allowAllClaudeAiMcps`; findings 4 and 4a, per place, naming the
   setting and the file, with what to do; a denied name; an allowed list with no address rules, which says to add a
-  `serverUrl` rule for the address claude.ai shows. Findings 4 and 4a in the user's or a project's files are the user's
-  own switch, not policy: `Blocked::policy` is false, and the app says "Connectors off", not "Blocked by policy".
+  `serverUrl` rule for the address claude.ai shows. Findings 4 and 4a are a switch, not policy, in whoever's file:
+  `Blocked::policy` is false, and the app and CLI say "Connectors off", not "Blocked by policy".
 - With address rules in an allowed list its address decides, which Klefki cannot see: `ServerRow::may_not_load` says
   so as a note ("may not load"), naming the projects when only some have such a list. A denied `serverUrl` or
   `serverCommand` is not compared.

@@ -368,8 +368,8 @@ pub(crate) enum ForConnector {
     Loads,
     /// It loads only if its address, which Klefki does not know, is on the allowed list: a note, not a warning.
     MayNot(String),
-    /// It does not load: why, in plain words with what to do. `policy`: a rule on which servers load, or the
-    /// organisation's setting, rather than the user's own choice.
+    /// It does not load: why, in plain words with what to do. `policy`: a rule on which servers load, rather than a
+    /// setting that turns connectors off (whoever's it is).
     Held {
         why: String,
         policy: bool,
@@ -494,7 +494,7 @@ impl Rules {
         if let Some((_, (off, file, source))) = first_off {
             return ForConnector::Held {
                 why: connectors_off_why(*off, file, *source),
-                policy: *source == Source::Organisation,
+                policy: false,
             };
         }
         let unknown = serde_json::json!({"type": "claudeai-proxy"});

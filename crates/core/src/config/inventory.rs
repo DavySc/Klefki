@@ -3859,7 +3859,8 @@ mod tests {
     }
 
     #[test]
-    fn the_organisation_turning_connectors_off_is_policy_only_an_administrator_changes() {
+    fn the_organisation_turning_connectors_off_is_said_as_connectors_off_only_an_administrator_changes()
+     {
         let e = Env::new();
         e.write(
             ".claude.json",
@@ -3877,7 +3878,8 @@ mod tests {
                 why.ends_with("Your administrator can change this."),
                 "{why}"
             );
-            assert!(slack.blocked.as_ref().unwrap().policy);
+            // The same words as the user's own switch: the effect is the same.
+            assert!(!slack.blocked.as_ref().unwrap().policy);
         }
         // A switch in a file first, ahead of a key: the order Claude Code checks them in.
         e.write(

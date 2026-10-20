@@ -294,7 +294,14 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         ));
     }
     if let Some(why) = &row.may_not_load {
-        notes.push(format!("may not load: {}", why.trim_end_matches('.')));
+        // Lower case after the colon, like the other notes.
+        let why = why.trim_end_matches('.');
+        let mut chars = why.chars();
+        let why: String = chars
+            .next()
+            .map(|c| c.to_lowercase().chain(chars).collect())
+            .unwrap_or_default();
+        notes.push(format!("may not load: {why}"));
     }
     // A plugin's or the organisation's server, like a user server, is one row for every project.
     let everywhere = row.scope.is_everywhere();
@@ -995,7 +1002,7 @@ mod tests {
         };
         assert_eq!(state(&unsure, 3), "on");
         assert!(notes(&unsure, 3).contains(
-            &"may not load: Your allowed list lets servers load by their address".to_owned()
+            &"may not load: your allowed list lets servers load by their address".to_owned()
         ));
         assert_eq!(
             row_json(&unsure, 3)["may_not_load"],
