@@ -46,7 +46,7 @@ To set it up (once, by the owner):
 
 1. `minisign -G -p minisign.pub -s klefki.key`, with a strong password. Keep `klefki.key` and the password backed up offline: losing them means users must move to a new key.
 2. Settings, Environments, **New environment** `release`. Under *Deployment branches and tags* choose *Selected branches and tags* and add the branch `main` and the tag pattern `v*`. Create it before the first run on main or a tag: otherwise GitHub creates it on that run with no rules.
-3. In that environment, add the secrets `MINISIGN_SECRET_KEY` (the whole content of `klefki.key`) and `MINISIGN_PASSWORD`. Do not add them as repository secrets.
+3. In that environment, add the secrets `MINISIGN_SECRET_KEY` (the whole content of `klefki.key`, or only its second line: the script adds the comment line back) and `MINISIGN_PASSWORD`. Do not add them as repository secrets.
 4. Commit `minisign.pub` through a pull request.
 5. Turn on the tag ruleset and the required reviewer above.
 6. Start the release workflow by hand on main, approve the `sign` job when it asks: it should print `Signature and comment signature verified`.
