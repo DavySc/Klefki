@@ -19,7 +19,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Connections,
-    Sets,
+    Profiles,
     Desktop,
     ScopeDrift,
     Secrets,
@@ -30,7 +30,7 @@ pub enum Page {
 impl Page {
     const ALL: [(Page, &'static str, &'static str); 7] = [
         (Page::Connections, icon::PLUGS_CONNECTED, "Connections"),
-        (Page::Sets, icon::STACK, "Server sets"),
+        (Page::Profiles, icon::STACK, "Profiles"),
         (Page::Desktop, icon::DESKTOP, "Claude Desktop"),
         (Page::ScopeDrift, icon::GIT_DIFF, "Scope drift"),
         (Page::Secrets, icon::KEY, "Secrets"),
@@ -57,7 +57,7 @@ impl Page {
         matches!(
             self,
             Page::Connections
-                | Page::Sets
+                | Page::Profiles
                 | Page::Desktop
                 | Page::Secrets
                 | Page::Settings
@@ -67,9 +67,11 @@ impl Page {
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections | Page::Sets | Page::Desktop | Page::Secrets | Page::ActivityLog => {
-                ""
-            }
+            Page::Connections
+            | Page::Profiles
+            | Page::Desktop
+            | Page::Secrets
+            | Page::ActivityLog => "",
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
             }
@@ -359,8 +361,10 @@ pub struct ShellApp {
     pub desktop: Option<crate::desktop::DesktopPage>,
     /// The Secrets page while it is shown; `None` on every other page, like the Activity log.
     pub secrets: Option<crate::secrets::SecretsPage>,
-    /// The Server sets page while it is shown; read when opened and let go when left, like the Activity log.
-    pub sets: Option<crate::sets::SetsPage>,
+    /// The Profiles page while it is shown; read when opened and let go when left, like the Activity log.
+    pub profiles: Option<crate::profiles::ProfilesPage>,
+    /// A profile being made or edited when the Profiles page was left, to carry on with when it is opened again.
+    profile_draft: Option<crate::profiles::Draft>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -433,7 +437,8 @@ impl ShellApp {
             activity: None,
             desktop: None,
             secrets: None,
-            sets: None,
+            profiles: None,
+            profile_draft: None,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -487,13 +492,15 @@ impl ShellApp {
         } else {
             self.secrets = None;
         }
-        if page == Page::Sets {
-            if self.sets.is_none() {
-                self.sets = Some(crate::sets::SetsPage::default());
-                self.send(Command::Sets);
+        if page == Page::Profiles {
+            if self.profiles.is_none() {
+                let draft = self.profile_draft.take();
+                self.profiles = Some(crate::profiles::ProfilesPage::with_draft(draft));
+                self.send(Command::Profiles);
             }
-        } else {
-            self.sets = None;
+        } else if let Some(mut left) = self.profiles.take() {
+            // A profile being made or edited is not lost by looking at another page.
+            self.profile_draft = left.draft();
         }
         self.page = page;
     }
@@ -597,13 +604,13 @@ impl ShellApp {
                     });
                 }
             }
-            Event::Sets(sets) => {
-                if let Some(page) = &mut self.sets {
-                    page.set(sets);
+            Event::Profiles(profiles) => {
+                if let Some(page) = &mut self.profiles {
+                    page.set(profiles);
                 }
             }
-            Event::SetRefused(why) => {
-                if let Some(page) = &mut self.sets {
+            Event::ProfileRefused(why) => {
+                if let Some(page) = &mut self.profiles {
                     page.refused(why);
                 }
             }
@@ -1310,27 +1317,27 @@ impl ShellApp {
                         None => {}
                     }
                 }
-                Page::Sets => {
+                Page::Profiles => {
                     let live = self.core.is_some();
                     let snapshot = Arc::clone(&self.snapshot);
                     let asked = self
-                        .sets
+                        .profiles
                         .as_mut()
                         .and_then(|page| page.show(ui, &snapshot, live));
                     match asked {
-                        Some(crate::sets::Asked::Save {
+                        Some(crate::profiles::Asked::Save {
                             name,
                             members,
                             replaces,
-                        }) => self.send(Command::SaveSet {
+                        }) => self.send(Command::SaveProfile {
                             name,
                             members,
                             replaces,
                         }),
-                        Some(crate::sets::Asked::Delete(name)) => {
-                            self.send(Command::DeleteSet(name));
+                        Some(crate::profiles::Asked::Delete(name)) => {
+                            self.send(Command::DeleteProfile(name));
                         }
-                        Some(crate::sets::Asked::Use(change)) => self.prepare(vec![*change]),
+                        Some(crate::profiles::Asked::Use(change)) => self.prepare(vec![*change]),
                         None => {}
                     }
                 }
@@ -1471,10 +1478,10 @@ impl ShellApp {
                         &mut page.filter,
                         format!("{} Filter servers", icon::MAGNIFYING_GLASS),
                     )
-                } else if let Some(page) = &mut self.sets {
+                } else if let Some(page) = &mut self.profiles {
                     (
                         &mut page.filter,
-                        format!("{} Filter sets", icon::MAGNIFYING_GLASS),
+                        format!("{} Filter profiles", icon::MAGNIFYING_GLASS),
                     )
                 } else {
                     (
@@ -3928,7 +3935,7 @@ impl ShellApp {
         } else {
             "Update Klefki automatically"
         };
-        ui.checkbox(&mut self.updates.auto, automatic);
+        theme::checkbox(ui, &mut self.updates.auto, automatic);
         ui.add(
             egui::Label::new(
                 RichText::new(
@@ -19040,17 +19047,19 @@ mod tests {
         assert!(!crate::updates::Updates::load(Some(&storage)).auto);
     }
 
-    // ---- server sets
+    // ---- profiles
 
-    fn sets_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+    fn profiles_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         let (mut h, engine) = live_harness();
         let a = live_row("alpha", Scope::User, None);
         let b = live_row("beta", Scope::User, None);
         let l = live_row("lint", Scope::Local, Some("/work/app"));
+        // Two servers of one name: the summary says which.
+        let la = live_row("alpha", Scope::Local, Some("/work/app"));
         engine
             .events
             .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
-                servers: vec![a, b, l],
+                servers: vec![a, b, l, la],
                 projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
                 project_count: 2,
                 ..Snapshot::default()
@@ -19069,9 +19078,9 @@ mod tests {
         std::iter::from_fn(|| engine.commands.try_recv().ok()).collect()
     }
 
-    fn work_set() -> klefki_core::api::Sets {
-        klefki_core::api::Sets {
-            sets: vec![klefki_core::api::ServerSet {
+    fn work_profile() -> klefki_core::api::Profiles {
+        klefki_core::api::Profiles {
+            profiles: vec![klefki_core::api::Profile {
                 name: "Work".to_owned(),
                 members: vec![
                     id_of("alpha", Scope::User, None),
@@ -19082,56 +19091,97 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_sets_page_is_read_when_opened_and_let_go_when_left() {
-        let (mut h, engine) = sets_harness();
-        h.get_by_label_contains("Server sets").click();
-        h.run();
-        assert_eq!(h.state().page, Page::Sets);
-        assert_eq!(sent(&engine), [Command::Sets]);
+    fn open_profiles(
+        h: &mut Harness<'static, ShellApp>,
+        engine: &klefki_core::api::Detached,
+        profiles: klefki_core::api::Profiles,
+    ) {
+        h.state_mut().go(Page::Profiles);
         engine
             .events
-            .send(klefki_core::api::Event::Sets(work_set()))
+            .send(klefki_core::api::Event::Profiles(profiles))
             .unwrap();
         h.run();
-        h.get_by_label("Work");
-        h.get_by_label_contains("alpha");
-        // A member that is no longer configured is still listed, and says so.
-        h.get_by_label_contains("gone (no longer configured)");
-        h.get_by_label_contains("Connections").click();
-        h.run();
-        assert!(h.state().sets.is_none());
+        while engine.commands.try_recv().is_ok() {}
     }
 
     #[test]
-    fn a_new_set_is_made_from_the_servers_ticked_in_it() {
-        use egui::accesskit::Role;
-        let (mut h, engine) = sets_harness();
-        h.state_mut().go(Page::Sets);
+    fn the_profiles_page_is_read_when_opened_and_let_go_when_left() {
+        let (mut h, engine) = profiles_harness();
+        h.get_by_label_contains("Profiles").click();
+        h.run();
+        assert_eq!(h.state().page, Page::Profiles);
+        assert_eq!(sent(&engine), [Command::Profiles]);
         engine
             .events
-            .send(klefki_core::api::Event::Sets(
-                klefki_core::api::Sets::default(),
-            ))
+            .send(klefki_core::api::Event::Profiles(work_profile()))
             .unwrap();
         h.run();
-        h.get_by_label_contains("No sets yet");
-        h.get_by_label_contains("New set").click();
+        h.get_by_label("Work");
+        // A name two servers share says which one it is.
+        h.get_by_label("1 server: alpha (User)");
+        // A server no longer configured is named once, apart from the rest.
+        h.get_by_label("1 no longer configured: gone.");
+        h.get_by_label_contains("Connections").click();
         h.run();
-        // Nothing to save until it has a name and a server.
-        assert!(h.get_by_label("Save set").accesskit_node().is_disabled());
+        assert!(h.state().profiles.is_none());
+    }
+
+    #[test]
+    fn a_long_profile_names_a_few_servers_and_counts_the_rest() {
+        let (mut h, engine) = live_harness();
+        let rows: Vec<ServerRow> = (0..8)
+            .map(|i| live_row(&format!("s{i}"), Scope::User, None))
+            .collect();
+        let members = rows.iter().map(|r| r.connection.clone()).collect();
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+        open_profiles(
+            &mut h,
+            &engine,
+            klefki_core::api::Profiles {
+                profiles: vec![klefki_core::api::Profile {
+                    name: "Big".to_owned(),
+                    members,
+                }],
+                problem: None,
+            },
+        );
+        h.get_by_label("8 servers: s0, s1, s2, s3, s4 and 3 more");
+    }
+
+    #[test]
+    fn a_new_profile_is_made_from_the_servers_ticked_in_it() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
+        h.get_by_label_contains("No profiles yet");
+        h.get_by_label_contains("New profile").click();
+        h.run();
         // The name is typed straight away.
-        assert!(h.get_by_label("Set name").accesskit_node().is_focused());
-        h.get_by_label("Set name").type_text("Writing");
+        assert!(h.get_by_label("Name").accesskit_node().is_focused());
+        // Save says what is missing, next to the name, rather than being greyed out.
+        h.get_by_label("Save profile").click();
+        h.run();
+        h.get_by_label_contains("Give the profile a name.");
+        assert!(sent(&engine).is_empty());
+        h.get_by_label("Name").focus();
+        h.get_by_label("Name").type_text("Writing");
+        h.run();
+        h.get_by_label("Save profile").click();
+        h.run();
+        h.get_by_label_contains("Tick at least one server.");
+        // Grouped as on the Connections page.
+        h.get_by_label("User");
+        h.get_by_label("Local · app");
         h.get_by_role_and_label(Role::CheckBox, "beta").click();
         h.get_by_role_and_label(Role::CheckBox, "lint").click();
         h.run();
-        while engine.commands.try_recv().is_ok() {}
-        h.get_by_label("Save set").click();
+        h.get_by_label("Save profile").click();
         h.run();
         assert_eq!(
             sent(&engine),
-            [Command::SaveSet {
+            [Command::SaveProfile {
                 name: "Writing".to_owned(),
                 members: vec![
                     id_of("beta", Scope::User, None),
@@ -19140,49 +19190,89 @@ mod tests {
                 replaces: None,
             }]
         );
-        // What the engine refuses is said where the set was being made.
+        // What the engine refuses is said where the profile was being made.
         engine
             .events
-            .send(klefki_core::api::Event::SetRefused(
-                "There is a set named Writing already.".to_owned(),
+            .send(klefki_core::api::Event::ProfileRefused(
+                "There is a profile named Writing already.".to_owned(),
             ))
             .unwrap();
         h.run();
-        h.get_by_label_contains("There is a set named Writing already.");
+        h.get_by_label_contains("There is a profile named Writing already.");
         // Kept, it closes the form.
+        h.get_by_label("Save profile").click();
+        h.run();
         engine
             .events
-            .send(klefki_core::api::Event::Sets(work_set()))
+            .send(klefki_core::api::Event::Profiles(work_profile()))
             .unwrap();
         h.run();
-        assert!(h.query_by_label("Save set").is_none());
+        assert!(h.query_by_label("Save profile").is_none());
     }
 
     #[test]
-    fn a_set_is_edited_with_its_servers_already_ticked() {
+    fn enter_saves_a_profile_and_escape_cancels_it() {
         use egui::accesskit::Role;
-        let (mut h, engine) = sets_harness();
-        h.state_mut().go(Page::Sets);
-        engine
-            .events
-            .send(klefki_core::api::Event::Sets(work_set()))
-            .unwrap();
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
+        h.get_by_label_contains("New profile").click();
         h.run();
-        h.get_by_label_contains("Edit").click();
-        h.run();
-        h.get_by_label("Set name").focus();
-        h.run();
-        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
-        h.get_by_label("Set name").type_text("Office");
         h.get_by_role_and_label(Role::CheckBox, "beta").click();
         h.run();
-        while engine.commands.try_recv().is_ok() {}
-        h.get_by_label("Save set").click();
+        h.get_by_label("Name").focus();
+        h.get_by_label("Name").type_text("Quick");
         h.run();
-        // A member no longer configured is kept: it may come back, and leaving it out is the user's call.
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(
+            matches!(&sent(&engine)[..], [Command::SaveProfile { name, .. }] if name == "Quick")
+        );
+        h.key_press(egui::Key::Escape);
+        h.run();
+        assert!(h.query_by_label("Save profile").is_none());
+        assert!(sent(&engine).is_empty());
+    }
+
+    #[test]
+    fn a_profile_being_made_is_kept_while_another_page_is_shown() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
+        h.get_by_label_contains("New profile").click();
+        h.run();
+        h.get_by_label("Name").type_text("Draft");
+        h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.run();
+        h.state_mut().go(Page::Connections);
+        h.run();
+        open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
+        assert_eq!(h.get_by_label("Name").value().as_deref(), Some("Draft"));
+        assert!(
+            h.get_by_role_and_label(Role::CheckBox, "beta")
+                .accesskit_node()
+                .toggled()
+                == Some(egui::accesskit::Toggled::True)
+        );
+    }
+
+    #[test]
+    fn a_profile_is_edited_with_its_servers_already_ticked() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label_contains("Edit").click();
+        h.run();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.get_by_label("Name").type_text("Office");
+        h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.run();
+        h.get_by_label("Save profile").click();
+        h.run();
+        // A server no longer configured is kept: it may come back, and leaving it out is the user's call.
         assert_eq!(
             sent(&engine),
-            [Command::SaveSet {
+            [Command::SaveProfile {
                 name: "Office".to_owned(),
                 members: vec![
                     id_of("alpha", Scope::User, None),
@@ -19195,32 +19285,45 @@ mod tests {
     }
 
     #[test]
-    fn using_a_set_is_reviewed_for_the_place_chosen() {
+    fn using_a_profile_is_reviewed_for_the_place_chosen() {
         use egui::accesskit::Role;
-        let (mut h, engine) = sets_harness();
-        h.state_mut().go(Page::Sets);
-        engine
-            .events
-            .send(klefki_core::api::Event::Sets(work_set()))
-            .unwrap();
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        // Nowhere chosen yet: pressing it says so, rather than nothing happening.
+        h.get_by_label("Use profile…").click();
         h.run();
-        // Nowhere is chosen for it yet.
-        assert!(h.get_by_label("Review…").accesskit_node().is_disabled());
+        h.get_by_label_contains("Choose a project to use it in first.");
+        assert!(sent(&engine).is_empty());
         h.get_by_role_and_label(Role::ComboBox, "Use in").click();
         h.run();
-        h.get_by_label("/work/app").click();
+        // By folder name, sorted, with Every project last.
+        let names: Vec<String> = h
+            .query_all_by_role(Role::Button)
+            .filter_map(|n| n.accesskit_node().label())
+            .filter(|l| l.starts_with("app") || l.starts_with("notes") || l == "Every project")
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(
+            names[0].starts_with("app") && names[1].starts_with("notes"),
+            "{names:?}"
+        );
+        assert_eq!(names[2], "Every project");
+        h.get_by_label_contains("app/work").click();
         h.run();
-        h.get_by_role_and_label(Role::CheckBox, "Turn off every other server there")
+        assert!(
+            h.query_by_label_contains("Choose a project to use it in first.")
+                .is_none()
+        );
+        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
             .click();
         h.run();
-        while engine.commands.try_recv().is_ok() {}
-        h.get_by_label("Review…").click();
+        h.get_by_label("Use profile…").click();
         h.run();
         assert_eq!(
             sent(&engine),
-            [Command::Prepare(vec![Change::UseSet {
+            [Command::Prepare(vec![Change::UseProfile {
                 name: "Work".to_owned(),
-                members: work_set().sets[0].members.clone(),
+                members: work_profile().profiles[0].members.clone(),
                 project: Some("/work/app".to_owned()),
                 only: true,
             }])]
@@ -19231,24 +19334,18 @@ mod tests {
         h.run();
         h.get_by_label("Every project").click();
         h.run();
-        h.get_by_label("Review…").click();
+        h.get_by_label("Use profile…").click();
         h.run();
         assert!(matches!(
             &sent(&engine)[..],
-            [Command::Prepare(c)] if matches!(&c[..], [Change::UseSet { project: None, only: true, .. }])
+            [Command::Prepare(c)] if matches!(&c[..], [Change::UseProfile { project: None, only: true, .. }])
         ));
     }
 
     #[test]
-    fn deleting_a_set_asks_first() {
-        let (mut h, engine) = sets_harness();
-        h.state_mut().go(Page::Sets);
-        engine
-            .events
-            .send(klefki_core::api::Event::Sets(work_set()))
-            .unwrap();
-        h.run();
-        while engine.commands.try_recv().is_ok() {}
+    fn deleting_a_profile_asks_first() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
         h.get_by_label_contains("Delete").click();
         h.run();
         assert!(sent(&engine).is_empty());
@@ -19258,48 +19355,52 @@ mod tests {
         assert!(sent(&engine).is_empty());
         h.get_by_label_contains("Delete").click();
         h.run();
-        h.get_by_label("Delete set").click();
+        h.get_by_label("Delete profile").click();
         h.run();
-        assert_eq!(sent(&engine), [Command::DeleteSet("Work".to_owned())]);
+        assert_eq!(sent(&engine), [Command::DeleteProfile("Work".to_owned())]);
     }
 
     #[test]
-    fn the_filter_box_filters_sets_by_name_or_server() {
-        let (mut h, engine) = sets_harness();
-        h.state_mut().go(Page::Sets);
-        let mut sets = work_set();
-        sets.sets.push(klefki_core::api::ServerSet {
+    fn the_filter_box_filters_profiles_by_name_or_server() {
+        let (mut h, engine) = profiles_harness();
+        let mut profiles = work_profile();
+        profiles.profiles.push(klefki_core::api::Profile {
             name: "Home".to_owned(),
             members: vec![id_of("beta", Scope::User, None)],
         });
-        engine
-            .events
-            .send(klefki_core::api::Event::Sets(sets))
-            .unwrap();
-        h.run();
+        open_profiles(&mut h, &engine, profiles);
         h.get_by_label("Home");
-        h.state_mut().sets.as_mut().unwrap().filter = "alp".to_owned();
+        h.state_mut().profiles.as_mut().unwrap().filter = "alp".to_owned();
         h.run();
         h.get_by_label("Work");
         assert!(h.query_by_label("Home").is_none());
-        h.state_mut().sets.as_mut().unwrap().filter = "zzz".to_owned();
+        h.state_mut().profiles.as_mut().unwrap().filter = "zzz".to_owned();
         h.run();
-        h.get_by_label_contains("No sets match");
+        h.get_by_label_contains("No profiles match");
     }
 
     #[test]
-    fn a_sets_file_read_in_part_says_so() {
-        let (mut h, engine) = sets_harness();
-        h.state_mut().go(Page::Sets);
-        let mut sets = work_set();
-        sets.problem =
-            Some("sets.json has 2 entries Klefki does not understand; they are left out.".into());
-        engine
-            .events
-            .send(klefki_core::api::Event::Sets(sets))
-            .unwrap();
-        h.run();
+    fn a_profiles_file_read_in_part_says_so() {
+        let (mut h, engine) = profiles_harness();
+        let mut profiles = work_profile();
+        profiles.problem = Some(
+            "profiles.json has 2 entries Klefki does not understand; they are left out.".into(),
+        );
+        open_profiles(&mut h, &engine, profiles);
         h.get_by_label_contains("2 entries Klefki does not understand");
         h.get_by_label("Work");
+    }
+
+    #[test]
+    fn the_editor_says_which_servers_will_not_load() {
+        let (mut h, engine) = live_harness();
+        let mut blocked = live_row("notion", Scope::User, None);
+        blocked.not_loaded = Some("Your organisation's policy denies it.".to_owned());
+        engine.events.send(snapshot_of(vec![blocked])).unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
+        h.get_by_label_contains("New profile").click();
+        h.run();
+        h.get_by_label("not loaded");
     }
 }

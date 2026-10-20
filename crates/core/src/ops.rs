@@ -134,7 +134,7 @@ pub(crate) fn resolve(
             Change::Move { .. } => "Move",
             Change::PutBack { .. } => "Put back",
             Change::ForgetKept { .. } => "Forget",
-            Change::UseSet { .. } => "Use set",
+            Change::UseProfile { .. } => "Use profile",
             Change::Restore { .. } => {
                 return Err("A restore is reviewed on its own.".to_owned());
             }
@@ -177,12 +177,12 @@ pub(crate) fn resolve(
                 );
             }
             Change::Restore { .. } => unreachable!("refused above"),
-            Change::UseSet {
+            Change::UseProfile {
                 name,
                 members,
                 project,
                 only,
-            } => use_set(name, members, project.as_deref(), *only, snapshot, &mut out)?,
+            } => use_profile(name, members, project.as_deref(), *only, snapshot, &mut out)?,
             Change::Add {
                 name,
                 json,
@@ -332,14 +332,14 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             return format!("Add {}{}", sanitize(name), places(targets));
         }
         Change::Restore { .. } => return "Restore a backup".to_owned(),
-        Change::UseSet {
+        Change::UseProfile {
             name,
             project,
             only,
             ..
         } => {
             let place = match project {
-                Some(p) => sanitize(&folder_name(p)),
+                Some(p) => project_label(p, snapshot),
                 None => format!(
                     "every project ({})",
                     count(snapshot.projects.len(), "project")
@@ -350,7 +350,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             } else {
                 ""
             };
-            return format!("Use the set {} in {place}{rest}", sanitize(name));
+            return format!("Use the profile {} in {place}{rest}", sanitize(name));
         }
         Change::Move { id, to } => {
             let to = match to {
@@ -646,10 +646,11 @@ fn switch_everywhere(
     Ok(())
 }
 
-/// Turns on the servers of a set in `project`, or in every project Claude Code knows, and with `only` turns off
+/// Turns on the servers of a profile in `project`, or in every project Claude Code knows, and with `only` turns off
 /// every other server there (decision 012). Each is switched by the name Claude Code gives it, like any toggle: only
-/// `disabledMcpServers` changes.
-fn use_set(
+/// `disabledMcpServers` changes. The review says where a member will still not load, and why, so it promises only
+/// what Claude Code will do.
+fn use_profile(
     name: &str,
     members: &[crate::model::ConnectionId],
     project: Option<&str>,
@@ -657,7 +658,7 @@ fn use_set(
     snapshot: &Snapshot,
     out: &mut Resolved,
 ) -> Result<(), String> {
-    let shown_set = sanitize(name);
+    let shown_profile = sanitize(name);
     let places: Vec<&String> = match project {
         Some(p) => vec![
             snapshot
@@ -670,7 +671,7 @@ fn use_set(
     };
     if places.is_empty() {
         return Err(format!(
-            "Claude Code knows no projects yet, so there is nowhere to use {shown_set}."
+            "Claude Code knows no projects yet, so there is nowhere to use {shown_profile}."
         ));
     }
     let mut found = Vec::new();
@@ -679,6 +680,8 @@ fn use_set(
     let mut turned_off = BTreeSet::new();
     // (project, name as the file spells it) and whether it goes off, in the order the servers are listed.
     let mut switches: Vec<((String, String), bool)> = Vec::new();
+    // A member that will still not load, and why → the places (folder names) where.
+    let mut held: Vec<((String, String), Vec<String>)> = Vec::new();
     for row in &snapshot.servers {
         // The scope, project and name as the files spell them.
         let Some((scope, own_project, file_name)) =
@@ -711,6 +714,14 @@ fn use_set(
             }
             if !member && only {
                 turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
+            }
+            if member && let Some(why) = held_back(row, place, snapshot) {
+                let at = project_label(place, snapshot);
+                let key = (row.name.clone(), why);
+                match held.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, at_places)) => at_places.push(at),
+                    None => held.push((key, vec![at])),
+                }
             }
         }
         if member && !here_any {
@@ -748,20 +759,33 @@ fn use_set(
         })
         .map(|(shown, ..)| shown)
         .collect();
-    let missing = members.iter().filter(|m| !found.contains(m)).count();
-    if missing > 0 {
+    let missing: Vec<String> = members
+        .iter()
+        .filter(|m| !found.contains(m))
+        .map(|m| m.shown_name())
+        .collect();
+    if !missing.is_empty() {
         out.notes.push(format!(
-            "{} of {shown_set} {} no longer configured, so nothing is switched for {}.",
-            count(missing, "server"),
-            if missing == 1 { "is" } else { "are" },
-            if missing == 1 { "it" } else { "them" }
+            "{} {} in {shown_profile} but no longer configured, so nothing is switched for {}.",
+            some_of(&missing),
+            if missing.len() == 1 { "is" } else { "are" },
+            if missing.len() == 1 { "it" } else { "them" }
         ));
     }
     if !elsewhere.is_empty() {
         out.notes.push(format!(
-            "In {shown_set}, these load only in a project of their own, so they stay as they are: {}.",
+            "In {shown_profile}, these load only in a project of their own, so they stay as they are: {}.",
             some_of(&elsewhere)
         ));
+    }
+    for ((server, why), at) in &held {
+        let at = if project.is_none() && at.len() == places.len() {
+            "any project".to_owned()
+        } else {
+            some_of(at)
+        };
+        out.warnings
+            .push(format!("{server} will still not load in {at}: {why}"));
     }
     if !unapproved.is_empty() {
         out.warnings.push(format!(
@@ -778,7 +802,7 @@ fn use_set(
     if !turned_off.is_empty() {
         let names: Vec<String> = turned_off.into_iter().collect();
         out.warnings.push(format!(
-            "This also turns off {}, which {} not in {shown_set}.",
+            "This also turns off {}, which {} not in {shown_profile}.",
             some_of(&names),
             if names.len() == 1 { "is" } else { "are" }
         ));
@@ -792,10 +816,72 @@ fn use_set(
     }
     if found.is_empty() {
         return Err(format!(
-            "None of the servers in {shown_set} is configured any more."
+            "None of the servers in {shown_profile} is configured any more."
         ));
     }
     Ok(())
+}
+
+/// A project by its folder's name, with the folder that holds it when another project's folder has that name too.
+fn project_label(path: &str, snapshot: &Snapshot) -> String {
+    let name = folder_name(path);
+    let shared = snapshot
+        .projects
+        .iter()
+        .filter(|p| folder_name(p) == name)
+        .count()
+        > 1;
+    let parent = path
+        .trim_end_matches(['/', '\\'])
+        .rsplit_once(['/', '\\'])
+        .map(|(parent, _)| folder_name(parent))
+        .unwrap_or_default();
+    if shared && !parent.is_empty() {
+        sanitize(&format!("{name} ({parent})"))
+    } else {
+        sanitize(&name)
+    }
+}
+
+/// Why Claude Code will not load `row` in `place` (a project as `.claude.json` spells it) even when it is on there,
+/// as the rest of a sentence; `None` when nothing holds it back.
+fn held_back(row: &ServerRow, place: &str, snapshot: &Snapshot) -> Option<String> {
+    let here = crate::sanitize::shown(place);
+    if let Some(why) = &row.not_loaded {
+        return Some(why.clone());
+    }
+    if let Some(b) = row.blocked.as_ref().filter(|b| b.projects.contains(&here)) {
+        return Some(b.why.clone());
+    }
+    if let Some(p) = &row.plugin {
+        if p.off_in.contains(&here) {
+            return Some(format!("its plugin {} is off there.", p.plugin));
+        }
+        if let Some(same) = p.same_as.as_deref()
+            && (row.shadowed || row.shadowed_in.contains(&here))
+        {
+            return Some(format!(
+                "it has the same command or address as {same}, so Claude Code leaves it out."
+            ));
+        }
+    }
+    if row.scope == Scope::User && row.shadowed_in.contains(&here) {
+        let file_name = crate::model::ConnectionId::parse(row.connection.as_str())?.2;
+        let other = snapshot.servers.iter().find(|r| {
+            matches!(r.scope, Scope::Local | Scope::Project)
+                && crate::model::ConnectionId::parse(r.connection.as_str())
+                    .is_some_and(|(_, p, n)| p.as_deref() == Some(place) && n == file_name)
+        });
+        let kind = match other.map(|r| r.scope) {
+            Some(Scope::Project) => "the project server",
+            _ => "the local server",
+        };
+        return Some(format!(
+            "{kind} {} has its name there, and Claude Code loads that one instead.",
+            row.name
+        ));
+    }
+    None
 }
 
 /// Where a user or local server lives, for an op, as the file spells it; project servers are refused (the
@@ -1790,11 +1876,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ------------------------------------------------------------ server sets (decision 012)
+    // ------------------------------------------------------------ profiles (decision 012)
 
     /// Users servers `a` and `b`, off in `/q`; a local server `l` in `/q` and `m` in `/r`; the connector
     /// `claude.ai Slack`.
-    fn sets_inventory(dir: &Path) -> inventory::Inventory {
+    fn profiles_inventory(dir: &Path) -> inventory::Inventory {
         std::fs::write(
             dir.join(".claude.json"),
             json!({
@@ -1821,7 +1907,7 @@ mod tests {
         project: Option<&str>,
         only: bool,
     ) -> Result<Resolved, String> {
-        let change = crate::engine::Change::UseSet {
+        let change = crate::engine::Change::UseProfile {
             name: "Work".into(),
             members: members.to_vec(),
             project: project.map(str::to_owned),
@@ -1839,9 +1925,9 @@ mod tests {
     }
 
     #[test]
-    fn using_a_set_in_a_project_turns_its_servers_on_there_and_nothing_else() {
+    fn using_a_profile_in_a_project_turns_its_servers_on_there_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
-        let inv = sets_inventory(dir.path());
+        let inv = profiles_inventory(dir.path());
         let members = [
             member(Scope::User, None, "a"),
             member(Scope::Local, Some("/q"), "l"),
@@ -1856,15 +1942,15 @@ mod tests {
                 off("/q", "claude.ai Slack", false)
             ]
         );
-        assert_eq!(out.summary, ["Use the set Work in q"]);
-        assert_eq!(out.action, "Use set");
+        assert_eq!(out.summary, ["Use the profile Work in q"]);
+        assert_eq!(out.action, "Use profile");
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 
     #[test]
-    fn using_a_set_alone_turns_off_every_other_server_there() {
+    fn using_a_profile_alone_turns_off_every_other_server_there() {
         let dir = tempfile::tempdir().unwrap();
-        let inv = sets_inventory(dir.path());
+        let inv = profiles_inventory(dir.path());
         let members = [member(Scope::User, None, "a")];
         let out = use_it(&inv, &members, Some("/q"), true).unwrap();
         assert_eq!(
@@ -1878,7 +1964,7 @@ mod tests {
         );
         assert_eq!(
             out.summary,
-            ["Use the set Work in q, and turn off every other server there"]
+            ["Use the profile Work in q, and turn off every other server there"]
         );
         // Said plainly in the review: what else goes off.
         assert!(
@@ -1891,9 +1977,9 @@ mod tests {
     }
 
     #[test]
-    fn using_a_set_everywhere_covers_each_project_and_a_local_server_only_in_its_own() {
+    fn using_a_profile_everywhere_covers_each_project_and_a_local_server_only_in_its_own() {
         let dir = tempfile::tempdir().unwrap();
-        let inv = sets_inventory(dir.path());
+        let inv = profiles_inventory(dir.path());
         let members = [
             member(Scope::User, None, "a"),
             member(Scope::Local, Some("/q"), "l"),
@@ -1925,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn using_a_set_alone_keeps_on_a_name_a_member_shares_with_another_server() {
+    fn using_a_profile_alone_keeps_on_a_name_a_member_shares_with_another_server() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".claude.json"),
@@ -1955,9 +2041,31 @@ mod tests {
     }
 
     #[test]
-    fn a_set_whose_servers_are_gone_says_so_and_one_with_none_left_is_refused() {
+    fn a_project_is_named_by_its_folder_and_the_one_above_when_two_share_a_name() {
         let dir = tempfile::tempdir().unwrap();
-        let inv = sets_inventory(dir.path());
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({"mcpServers": {"a": {"command": "a"}}, "projects": {"/work/app": {}, "/client/app": {}, "/q": {}}})
+                .to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        let out = use_it(
+            &inv,
+            &[member(Scope::User, None, "a")],
+            Some("/work/app"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.summary, ["Use the profile Work in app (work)"]);
+        let out = use_it(&inv, &[member(Scope::User, None, "a")], Some("/q"), false).unwrap();
+        assert_eq!(out.summary, ["Use the profile Work in q"]);
+    }
+
+    #[test]
+    fn a_profile_whose_servers_are_gone_says_so_and_one_with_none_left_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = profiles_inventory(dir.path());
         let gone = member(Scope::User, None, "removed");
         let out = use_it(
             &inv,
@@ -1969,7 +2077,7 @@ mod tests {
         assert!(
             out.notes
                 .iter()
-                .any(|n| n.starts_with("1 server of Work is no longer configured")),
+                .any(|n| n.starts_with("removed is in Work but no longer configured")),
             "{:?}",
             out.notes
         );
@@ -1990,7 +2098,7 @@ mod tests {
     }
 
     #[test]
-    fn a_set_with_an_unapproved_project_server_says_turning_it_on_does_not_approve_it() {
+    fn a_profile_with_an_unapproved_project_server_says_turning_it_on_does_not_approve_it() {
         let dir = tempfile::tempdir().unwrap();
         let q = dir.path().join("q");
         std::fs::create_dir_all(&q).unwrap();
@@ -2667,5 +2775,205 @@ mod tests {
         ] {
             assert_eq!(folder_name(path), want, "{path}");
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_review_regressions {
+    //! Found in review of PR #57: the review of using a profile must say what Claude Code will really do.
+    use super::*;
+    use serde_json::json;
+
+    fn inv(dir: &Path, claude: serde_json::Value) -> inventory::Inventory {
+        std::fs::write(dir.join(".claude.json"), claude.to_string()).unwrap();
+        inventory::load(&crate::config::ConfigPaths::in_dir(dir))
+    }
+
+    fn use_profile(
+        inv: &inventory::Inventory,
+        members: Vec<crate::model::ConnectionId>,
+        only: bool,
+    ) -> Resolved {
+        resolve(
+            &[crate::engine::Change::UseProfile {
+                name: "Work".into(),
+                members,
+                project: Some("/q".into()),
+                only,
+            }],
+            &inv.snapshot,
+            &inv.keys,
+        )
+        .unwrap()
+    }
+
+    /// The profile holds the user server `a`; in /q a local server `a` (another command) is what Claude Code loads.
+    #[test]
+    fn a_member_another_server_of_its_name_replaces_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = inv(
+            dir.path(),
+            json!({
+                "mcpServers": {"a": {"command": "user-a"}, "b": {"command": "b"}},
+                "projects": {"/q": {"mcpServers": {"a": {"command": "local-a"}}}, "/r": {}}
+            }),
+        );
+        let out = use_profile(
+            &inv,
+            vec![crate::model::ConnectionId::new(Scope::User, None, "a")],
+            true,
+        );
+        assert!(
+            out.warnings.contains(
+                &"a will still not load in q: the local server a has its name there, and Claude Code loads that \
+                  one instead."
+                    .to_owned()
+            ),
+            "{:?}",
+            out.warnings
+        );
+        // Not counted as turned off either: it stays on, under the member's name.
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.starts_with("This also turns off b,")),
+            "{:?}",
+            out.warnings
+        );
+        // In every project, only where it is replaced.
+        let everywhere = resolve(
+            &[crate::engine::Change::UseProfile {
+                name: "Work".into(),
+                members: vec![crate::model::ConnectionId::new(Scope::User, None, "a")],
+                project: None,
+                only: false,
+            }],
+            &inv.snapshot,
+            &inv.keys,
+        )
+        .unwrap();
+        assert!(
+            everywhere
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("a will still not load in q:")),
+            "{:?}",
+            everywhere.warnings
+        );
+    }
+
+    /// A member that policy blocks stays off whatever disabledMcpServers says.
+    #[test]
+    fn a_member_policy_blocks_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"deniedMcpServers":[{"serverName":"a"}]}"#,
+        )
+        .unwrap();
+        let inv = inv(
+            dir.path(),
+            json!({
+                "mcpServers": {"a": {"command": "a"}},
+                "projects": {"/q": {"disabledMcpServers": ["a"]}}
+            }),
+        );
+        let row = inv.snapshot.servers.iter().find(|r| r.name == "a").unwrap();
+        assert!(
+            row.blocked.is_some() || row.not_loaded.is_some(),
+            "fixture: a not seen as blocked: {row:?}"
+        );
+        let out = use_profile(&inv, vec![row.connection.clone()], false);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.starts_with("a will still not load in q: ")
+                    && w.contains("deniedMcpServers")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// The decision says gone members are named in the review.
+    #[test]
+    fn a_member_no_longer_configured_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = inv(
+            dir.path(),
+            json!({"mcpServers": {"a": {"command": "a"}}, "projects": {"/q": {}}}),
+        );
+        let out = use_profile(
+            &inv,
+            vec![
+                crate::model::ConnectionId::new(Scope::User, None, "a"),
+                crate::model::ConnectionId::new(Scope::User, None, "github"),
+            ],
+            false,
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.starts_with("github is in Work but no longer configured")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    /// A plugin's server whose plugin is off in the project does not load there, whatever its own switch says.
+    #[test]
+    fn a_member_whose_plugin_is_off_there_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugins/cache/p");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".mcp.json"), r#"{"s":{"command":"x"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("plugins/installed_plugins.json"),
+            json!({"plugins": {"p@m": [{"scope": "user", "installPath": root.to_string_lossy()}]}})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"enabledPlugins":{"p@m":true}}"#,
+        )
+        .unwrap();
+        // Its own project turns the plugin off.
+        let q = dir.path().join("q");
+        std::fs::create_dir_all(q.join(".claude")).unwrap();
+        std::fs::write(
+            q.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"p@m":false}}"#,
+        )
+        .unwrap();
+        let key = q.to_string_lossy().replace('\\', "/");
+        let inv = inv(dir.path(), json!({"projects": {&key: {}}}));
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Plugin)
+            .unwrap();
+        assert!(
+            row.plugin.as_ref().is_some_and(|p| !p.off_in.is_empty()),
+            "fixture: {row:?}"
+        );
+        let out = resolve(
+            &[crate::engine::Change::UseProfile {
+                name: "Work".into(),
+                members: vec![row.connection.clone()],
+                project: Some(inv.snapshot.projects[0].clone()),
+                only: false,
+            }],
+            &inv.snapshot,
+            &inv.keys,
+        )
+        .unwrap();
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("will still not load in q: its plugin p is off there.")),
+            "{:?}",
+            out.warnings
+        );
     }
 }

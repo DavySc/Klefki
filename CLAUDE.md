@@ -24,6 +24,7 @@ If a command can't run, report the work as **unverified**.
 ## Invariants (security first; flag changes here for human review)
 - `crates/app` performs no IO: no fs, process, net or URL opening. Only `klefki_core::api`.
 - All writes go Prepare → diff → Apply, through `config/docstore.rs`: re-read, hash check, backup, atomic persist; key order and unknown keys preserved.
+- One exception, approved by the owner (decision 012): Klefki's own `profiles.json`, beside the backups folder, is written whole and owner-only by `profiles.rs`, and only when it could be read in full. It holds server ids, never secrets; using a profile still goes through the plan above.
 - OAuth entries are written only via `claude mcp add-json --client-secret`. The secret is passed only in the `MCP_CLIENT_SECRET` env var, never in argv or logs.
 - Never create entries in `project` scope (`Target` is `User | Local` only). Project servers are toggled through `disabledMcpServers` in the project entry of `~/.claude.json`, like every other server. The repository's `.claude/settings.local.json` is written only to approve a project server (`enabledMcpjsonServers`), after showing its full command.
 - Secrets live in the OS keyring, keyed by `ConnectionId`. No plaintext fallback. Never read `~/.claude/.credentials.json`.

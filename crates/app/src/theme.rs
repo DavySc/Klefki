@@ -402,6 +402,26 @@ pub fn visuals(p: &Palette, dark: bool) -> Visuals {
     v
 }
 
+/// How round a tick box's corners are. Square-ish, unlike a radio button's circle: round reads as "pick one", square
+/// as "pick any". The widgets' rounding would make a box this small nearly round.
+pub const CHECKBOX_RADIUS: u8 = 2;
+
+/// A tick box, square whatever the widgets' rounding. Use it for every tick box.
+pub fn checkbox(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    ui.scope(|ui| {
+        let w = &mut ui.style_mut().visuals.widgets;
+        for ws in [&mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
+            ws.corner_radius = CornerRadius::same(CHECKBOX_RADIUS);
+        }
+        ui.checkbox(checked, text)
+    })
+    .inner
+}
+
 /// Sizes are generous on purpose: this is a desktop tool used with a mouse, not a dense data grid.
 pub fn style(style: &mut egui::Style) {
     use FontFamily::{Monospace, Proportional};
