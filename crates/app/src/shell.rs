@@ -19,6 +19,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Connections,
+    Sets,
     Desktop,
     ScopeDrift,
     Secrets,
@@ -27,8 +28,9 @@ pub enum Page {
 }
 
 impl Page {
-    const ALL: [(Page, &'static str, &'static str); 6] = [
+    const ALL: [(Page, &'static str, &'static str); 7] = [
         (Page::Connections, icon::PLUGS_CONNECTED, "Connections"),
+        (Page::Sets, icon::STACK, "Server sets"),
         (Page::Desktop, icon::DESKTOP, "Claude Desktop"),
         (Page::ScopeDrift, icon::GIT_DIFF, "Scope drift"),
         (Page::Secrets, icon::KEY, "Secrets"),
@@ -54,13 +56,20 @@ impl Page {
     fn ready(self) -> bool {
         matches!(
             self,
-            Page::Connections | Page::Desktop | Page::Secrets | Page::Settings | Page::ActivityLog
+            Page::Connections
+                | Page::Sets
+                | Page::Desktop
+                | Page::Secrets
+                | Page::Settings
+                | Page::ActivityLog
         )
     }
 
     fn promise(self) -> &'static str {
         match self {
-            Page::Connections | Page::Desktop | Page::Secrets | Page::ActivityLog => "",
+            Page::Connections | Page::Sets | Page::Desktop | Page::Secrets | Page::ActivityLog => {
+                ""
+            }
             Page::ScopeDrift => {
                 "Coming soon: servers whose definitions differ between scopes, side by side."
             }
@@ -350,6 +359,8 @@ pub struct ShellApp {
     pub desktop: Option<crate::desktop::DesktopPage>,
     /// The Secrets page while it is shown; `None` on every other page, like the Activity log.
     pub secrets: Option<crate::secrets::SecretsPage>,
+    /// The Server sets page while it is shown; read when opened and let go when left, like the Activity log.
+    pub sets: Option<crate::sets::SetsPage>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -422,6 +433,7 @@ impl ShellApp {
             activity: None,
             desktop: None,
             secrets: None,
+            sets: None,
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -474,6 +486,14 @@ impl ShellApp {
             }
         } else {
             self.secrets = None;
+        }
+        if page == Page::Sets {
+            if self.sets.is_none() {
+                self.sets = Some(crate::sets::SetsPage::default());
+                self.send(Command::Sets);
+            }
+        } else {
+            self.sets = None;
         }
         self.page = page;
     }
@@ -575,6 +595,16 @@ impl ShellApp {
                         Ok(()) => (format!("Forgot the client secret kept for {name}."), false),
                         Err(why) => (format!("Kept the client secret for {name}: {why}"), true),
                     });
+                }
+            }
+            Event::Sets(sets) => {
+                if let Some(page) = &mut self.sets {
+                    page.set(sets);
+                }
+            }
+            Event::SetRefused(why) => {
+                if let Some(page) = &mut self.sets {
+                    page.refused(why);
                 }
             }
             Event::Activity(log) => {
@@ -1280,6 +1310,30 @@ impl ShellApp {
                         None => {}
                     }
                 }
+                Page::Sets => {
+                    let live = self.core.is_some();
+                    let snapshot = Arc::clone(&self.snapshot);
+                    let asked = self
+                        .sets
+                        .as_mut()
+                        .and_then(|page| page.show(ui, &snapshot, live));
+                    match asked {
+                        Some(crate::sets::Asked::Save {
+                            name,
+                            members,
+                            replaces,
+                        }) => self.send(Command::SaveSet {
+                            name,
+                            members,
+                            replaces,
+                        }),
+                        Some(crate::sets::Asked::Delete(name)) => {
+                            self.send(Command::DeleteSet(name));
+                        }
+                        Some(crate::sets::Asked::Use(change)) => self.prepare(vec![*change]),
+                        None => {}
+                    }
+                }
                 Page::ActivityLog => {
                     let restore = self.activity.as_mut().and_then(|page| page.show(ui));
                     if let Some(backup) = restore {
@@ -1416,6 +1470,11 @@ impl ShellApp {
                     (
                         &mut page.filter,
                         format!("{} Filter servers", icon::MAGNIFYING_GLASS),
+                    )
+                } else if let Some(page) = &mut self.sets {
+                    (
+                        &mut page.filter,
+                        format!("{} Filter sets", icon::MAGNIFYING_GLASS),
                     )
                 } else {
                     (
@@ -18979,5 +19038,268 @@ mod tests {
         let mut storage = crate::theme::tests::MemoryStorage::default();
         eframe::App::save(h.state_mut(), &mut storage);
         assert!(!crate::updates::Updates::load(Some(&storage)).auto);
+    }
+
+    // ---- server sets
+
+    fn sets_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let a = live_row("alpha", Scope::User, None);
+        let b = live_row("beta", Scope::User, None);
+        let l = live_row("lint", Scope::Local, Some("/work/app"));
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, b, l],
+                projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        (h, engine)
+    }
+
+    fn id_of(name: &str, scope: Scope, project: Option<&str>) -> ConnectionId {
+        ConnectionId::new(scope, project, name)
+    }
+
+    fn sent(engine: &klefki_core::api::Detached) -> Vec<Command> {
+        std::iter::from_fn(|| engine.commands.try_recv().ok()).collect()
+    }
+
+    fn work_set() -> klefki_core::api::Sets {
+        klefki_core::api::Sets {
+            sets: vec![klefki_core::api::ServerSet {
+                name: "Work".to_owned(),
+                members: vec![
+                    id_of("alpha", Scope::User, None),
+                    id_of("gone", Scope::User, None),
+                ],
+            }],
+            problem: None,
+        }
+    }
+
+    #[test]
+    fn the_sets_page_is_read_when_opened_and_let_go_when_left() {
+        let (mut h, engine) = sets_harness();
+        h.get_by_label_contains("Server sets").click();
+        h.run();
+        assert_eq!(h.state().page, Page::Sets);
+        assert_eq!(sent(&engine), [Command::Sets]);
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(work_set()))
+            .unwrap();
+        h.run();
+        h.get_by_label("Work");
+        h.get_by_label_contains("alpha");
+        // A member that is no longer configured is still listed, and says so.
+        h.get_by_label_contains("gone (no longer configured)");
+        h.get_by_label_contains("Connections").click();
+        h.run();
+        assert!(h.state().sets.is_none());
+    }
+
+    #[test]
+    fn a_new_set_is_made_from_the_servers_ticked_in_it() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = sets_harness();
+        h.state_mut().go(Page::Sets);
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(
+                klefki_core::api::Sets::default(),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("No sets yet");
+        h.get_by_label_contains("New set").click();
+        h.run();
+        // Nothing to save until it has a name and a server.
+        assert!(h.get_by_label("Save set").accesskit_node().is_disabled());
+        // The name is typed straight away.
+        assert!(h.get_by_label("Set name").accesskit_node().is_focused());
+        h.get_by_label("Set name").type_text("Writing");
+        h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.get_by_role_and_label(Role::CheckBox, "lint").click();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        h.get_by_label("Save set").click();
+        h.run();
+        assert_eq!(
+            sent(&engine),
+            [Command::SaveSet {
+                name: "Writing".to_owned(),
+                members: vec![
+                    id_of("beta", Scope::User, None),
+                    id_of("lint", Scope::Local, Some("/work/app")),
+                ],
+                replaces: None,
+            }]
+        );
+        // What the engine refuses is said where the set was being made.
+        engine
+            .events
+            .send(klefki_core::api::Event::SetRefused(
+                "There is a set named Writing already.".to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("There is a set named Writing already.");
+        // Kept, it closes the form.
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(work_set()))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label("Save set").is_none());
+    }
+
+    #[test]
+    fn a_set_is_edited_with_its_servers_already_ticked() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = sets_harness();
+        h.state_mut().go(Page::Sets);
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(work_set()))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Edit").click();
+        h.run();
+        h.get_by_label("Set name").focus();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        h.get_by_label("Set name").type_text("Office");
+        h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        h.get_by_label("Save set").click();
+        h.run();
+        // A member no longer configured is kept: it may come back, and leaving it out is the user's call.
+        assert_eq!(
+            sent(&engine),
+            [Command::SaveSet {
+                name: "Office".to_owned(),
+                members: vec![
+                    id_of("alpha", Scope::User, None),
+                    id_of("gone", Scope::User, None),
+                    id_of("beta", Scope::User, None),
+                ],
+                replaces: Some("Work".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn using_a_set_is_reviewed_for_the_place_chosen() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = sets_harness();
+        h.state_mut().go(Page::Sets);
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(work_set()))
+            .unwrap();
+        h.run();
+        // Nowhere is chosen for it yet.
+        assert!(h.get_by_label("Review…").accesskit_node().is_disabled());
+        h.get_by_role_and_label(Role::ComboBox, "Use in").click();
+        h.run();
+        h.get_by_label("/work/app").click();
+        h.run();
+        h.get_by_role_and_label(Role::CheckBox, "Turn off every other server there")
+            .click();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        h.get_by_label("Review…").click();
+        h.run();
+        assert_eq!(
+            sent(&engine),
+            [Command::Prepare(vec![Change::UseSet {
+                name: "Work".to_owned(),
+                members: work_set().sets[0].members.clone(),
+                project: Some("/work/app".to_owned()),
+                only: true,
+            }])]
+        );
+        // Every project is a choice too.
+        h.state_mut().preparing = false;
+        h.get_by_role_and_label(Role::ComboBox, "Use in").click();
+        h.run();
+        h.get_by_label("Every project").click();
+        h.run();
+        h.get_by_label("Review…").click();
+        h.run();
+        assert!(matches!(
+            &sent(&engine)[..],
+            [Command::Prepare(c)] if matches!(&c[..], [Change::UseSet { project: None, only: true, .. }])
+        ));
+    }
+
+    #[test]
+    fn deleting_a_set_asks_first() {
+        let (mut h, engine) = sets_harness();
+        h.state_mut().go(Page::Sets);
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(work_set()))
+            .unwrap();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        h.get_by_label_contains("Delete").click();
+        h.run();
+        assert!(sent(&engine).is_empty());
+        h.get_by_label_contains("Its servers stay as they are");
+        h.get_by_label("Cancel").click();
+        h.run();
+        assert!(sent(&engine).is_empty());
+        h.get_by_label_contains("Delete").click();
+        h.run();
+        h.get_by_label("Delete set").click();
+        h.run();
+        assert_eq!(sent(&engine), [Command::DeleteSet("Work".to_owned())]);
+    }
+
+    #[test]
+    fn the_filter_box_filters_sets_by_name_or_server() {
+        let (mut h, engine) = sets_harness();
+        h.state_mut().go(Page::Sets);
+        let mut sets = work_set();
+        sets.sets.push(klefki_core::api::ServerSet {
+            name: "Home".to_owned(),
+            members: vec![id_of("beta", Scope::User, None)],
+        });
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(sets))
+            .unwrap();
+        h.run();
+        h.get_by_label("Home");
+        h.state_mut().sets.as_mut().unwrap().filter = "alp".to_owned();
+        h.run();
+        h.get_by_label("Work");
+        assert!(h.query_by_label("Home").is_none());
+        h.state_mut().sets.as_mut().unwrap().filter = "zzz".to_owned();
+        h.run();
+        h.get_by_label_contains("No sets match");
+    }
+
+    #[test]
+    fn a_sets_file_read_in_part_says_so() {
+        let (mut h, engine) = sets_harness();
+        h.state_mut().go(Page::Sets);
+        let mut sets = work_set();
+        sets.problem =
+            Some("sets.json has 2 entries Klefki does not understand; they are left out.".into());
+        engine
+            .events
+            .send(klefki_core::api::Event::Sets(sets))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("2 entries Klefki does not understand");
+        h.get_by_label("Work");
     }
 }

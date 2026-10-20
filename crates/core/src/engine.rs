@@ -118,6 +118,18 @@ pub enum Command {
     /// when a server, or a definition Klefki keeps to put back, uses it by now. Answers with
     /// [`Event::UnusedSecretForgotten`], then [`Event::Secrets`].
     ForgetUnusedSecret(crate::model::ConnectionId),
+    /// The server sets (see [`Event::Sets`], decision 012). Read only when asked: the Sets page asks each time it is
+    /// opened.
+    Sets,
+    /// Keep the set `name` with `members`, in place of the set `replaces` when given (to rename it or change its
+    /// servers). Answers with [`Event::Sets`], or [`Event::SetRefused`] saying why nothing was kept.
+    SaveSet {
+        name: String,
+        members: Vec<crate::model::ConnectionId>,
+        replaces: Option<String>,
+    },
+    /// Forget the set of this name. Answers like [`Command::SaveSet`].
+    DeleteSet(String),
     /// Look for a newer Klefki release (see [`Event::Update`]), on a thread of its own. Only the release's signed
     /// checksums are fetched, and only when this build has a release key.
     CheckForUpdates,
@@ -226,6 +238,15 @@ pub enum Change {
     /// since are left as they are, and the rest of the file (Claude Code's own settings and history) too. Reviewed
     /// on its own, not with other changes.
     Restore { backup: String },
+    /// Turn on the servers of the set `name`, `members` as [`crate::sets::ServerSet`] has them, in `project` (a
+    /// project as `.claude.json` spells it), or in every project Claude Code knows when `None` (decision 012). With
+    /// `only`, also turn off every other server there, so the set's servers are the only ones Claude Code loads.
+    UseSet {
+        name: String,
+        members: Vec<crate::model::ConnectionId>,
+        project: Option<String>,
+        only: bool,
+    },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -421,6 +442,10 @@ pub enum Event {
     },
     /// The activity log, after [`Command::Activity`].
     Activity(crate::activity::Activity),
+    /// The server sets, after [`Command::Sets`], [`Command::SaveSet`] or [`Command::DeleteSet`].
+    Sets(crate::sets::Sets),
+    /// A set was not kept or forgotten: why, as a sentence.
+    SetRefused(String),
     /// Claude Desktop's servers, after [`Command::Desktop`].
     Desktop(crate::desktop::Desktop),
     /// What the Secrets page shows, after [`Command::Secrets`].
@@ -1153,6 +1178,32 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
+            Command::Sets => shared.emitter.emit(Event::Sets(match backup_dir(&shared) {
+                Ok(dir) => crate::sets::load(&dir),
+                Err(problem) => crate::sets::Sets {
+                    problem: Some(problem),
+                    ..Default::default()
+                },
+            })),
+            Command::SaveSet {
+                name,
+                members,
+                replaces,
+            } => {
+                let saved = backup_dir(&shared)
+                    .and_then(|dir| crate::sets::save(&dir, &name, &members, replaces.as_deref()));
+                shared.emitter.emit(match saved {
+                    Ok(sets) => Event::Sets(sets),
+                    Err(why) => Event::SetRefused(why),
+                });
+            }
+            Command::DeleteSet(name) => {
+                let left = backup_dir(&shared).and_then(|dir| crate::sets::delete(&dir, &name));
+                shared.emitter.emit(match left {
+                    Ok(sets) => Event::Sets(sets),
+                    Err(why) => Event::SetRefused(why),
+                });
+            }
             Command::Desktop => shared
                 .emitter
                 .emit(Event::Desktop(crate::desktop::load(&shared.config.desktop))),

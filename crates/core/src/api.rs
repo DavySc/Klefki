@@ -20,6 +20,7 @@ pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
+pub use crate::sets::{ServerSet, Sets};
 pub use crate::update::{UpdateCheck, Version};
 
 /// Whether two project keys name the same folder, as the engine compares them: `c:\Repos\x\` is `C:/Repos/x`.

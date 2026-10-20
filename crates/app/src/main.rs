@@ -7,6 +7,7 @@ mod command;
 mod desktop;
 mod explain;
 mod secrets;
+mod sets;
 mod shell;
 mod sign_in;
 mod theme;

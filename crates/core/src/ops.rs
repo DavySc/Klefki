@@ -12,6 +12,7 @@ use crate::swap::{self, Spot, Swap};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
 /// A single shown value longer than this cannot be reviewed with care, so the approval is refused.
@@ -133,6 +134,7 @@ pub(crate) fn resolve(
             Change::Move { .. } => "Move",
             Change::PutBack { .. } => "Put back",
             Change::ForgetKept { .. } => "Forget",
+            Change::UseSet { .. } => "Use set",
             Change::Restore { .. } => {
                 return Err("A restore is reviewed on its own.".to_owned());
             }
@@ -175,6 +177,12 @@ pub(crate) fn resolve(
                 );
             }
             Change::Restore { .. } => unreachable!("refused above"),
+            Change::UseSet {
+                name,
+                members,
+                project,
+                only,
+            } => use_set(name, members, project.as_deref(), *only, snapshot, &mut out)?,
             Change::Add {
                 name,
                 json,
@@ -324,6 +332,26 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             return format!("Add {}{}", sanitize(name), places(targets));
         }
         Change::Restore { .. } => return "Restore a backup".to_owned(),
+        Change::UseSet {
+            name,
+            project,
+            only,
+            ..
+        } => {
+            let place = match project {
+                Some(p) => sanitize(&folder_name(p)),
+                None => format!(
+                    "every project ({})",
+                    count(snapshot.projects.len(), "project")
+                ),
+            };
+            let rest = if *only {
+                ", and turn off every other server there"
+            } else {
+                ""
+            };
+            return format!("Use the set {} in {place}{rest}", sanitize(name));
+        }
         Change::Move { id, to } => {
             let to = match to {
                 Target::User => "the user".to_owned(),
@@ -615,6 +643,158 @@ fn switch_everywhere(
         "{shown} is {what}, and Claude Code switches it per project. This changes the {} it knows today; a project it first opens later is not covered.",
         count(snapshot.projects.len(), "project")
     ));
+    Ok(())
+}
+
+/// Turns on the servers of a set in `project`, or in every project Claude Code knows, and with `only` turns off
+/// every other server there (decision 012). Each is switched by the name Claude Code gives it, like any toggle: only
+/// `disabledMcpServers` changes.
+fn use_set(
+    name: &str,
+    members: &[crate::model::ConnectionId],
+    project: Option<&str>,
+    only: bool,
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let shown_set = sanitize(name);
+    let places: Vec<&String> = match project {
+        Some(p) => vec![
+            snapshot
+                .projects
+                .iter()
+                .find(|known| *known == p)
+                .ok_or_else(|| format!("Claude Code does not know the project {}.", sanitize(p)))?,
+        ],
+        None => snapshot.projects.iter().collect(),
+    };
+    if places.is_empty() {
+        return Err(format!(
+            "Claude Code knows no projects yet, so there is nowhere to use {shown_set}."
+        ));
+    }
+    let mut found = Vec::new();
+    let mut elsewhere = Vec::new();
+    let mut unapproved = Vec::new();
+    let mut turned_off = BTreeSet::new();
+    // (project, name as the file spells it) and whether it goes off, in the order the servers are listed.
+    let mut switches: Vec<((String, String), bool)> = Vec::new();
+    for row in &snapshot.servers {
+        // The scope, project and name as the files spell them.
+        let Some((scope, own_project, file_name)) =
+            crate::model::ConnectionId::parse(row.connection.as_str())
+        else {
+            continue;
+        };
+        let member = members.contains(&row.connection);
+        if member {
+            found.push(&row.connection);
+        }
+        let mut here_any = false;
+        for place in &places {
+            // A local or project server loads in its own project only.
+            let here = match scope {
+                Scope::Local | Scope::Project => own_project.as_deref() == Some(place.as_str()),
+                _ => true,
+            };
+            if !here {
+                continue;
+            }
+            here_any = true;
+            if member || only {
+                // Claude Code switches by name: where a member and another server share one, the member wins.
+                let key = ((*place).clone(), file_name.clone());
+                match switches.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, off)) => *off &= !member,
+                    None => switches.push((key, !member)),
+                }
+            }
+            if !member && only {
+                turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
+            }
+        }
+        if member && !here_any {
+            elsewhere.push(format!(
+                "{} ({})",
+                row.name,
+                row.project
+                    .as_deref()
+                    .map(|p| sanitize(&folder_name(p)))
+                    .unwrap_or_default()
+            ));
+        }
+        if member
+            && here_any
+            && row.scope == Scope::Project
+            && row.approval != Some(Approval::Approved)
+        {
+            unapproved.push(row.name.clone());
+        }
+    }
+    for ((project, name), disabled) in &switches {
+        out.claude.push(Op::SetDisabled {
+            project: project.clone(),
+            name: name.clone(),
+            disabled: *disabled,
+        });
+    }
+    // Only what is really turned off: not a server that shares its name with a member.
+    let turned_off: BTreeSet<String> = turned_off
+        .into_iter()
+        .filter(|(_, place, name)| {
+            switches
+                .iter()
+                .any(|((p, n), off)| *off && p == place && n == name)
+        })
+        .map(|(shown, ..)| shown)
+        .collect();
+    let missing = members.iter().filter(|m| !found.contains(m)).count();
+    if missing > 0 {
+        out.notes.push(format!(
+            "{} of {shown_set} {} no longer configured, so nothing is switched for {}.",
+            count(missing, "server"),
+            if missing == 1 { "is" } else { "are" },
+            if missing == 1 { "it" } else { "them" }
+        ));
+    }
+    if !elsewhere.is_empty() {
+        out.notes.push(format!(
+            "In {shown_set}, these load only in a project of their own, so they stay as they are: {}.",
+            some_of(&elsewhere)
+        ));
+    }
+    if !unapproved.is_empty() {
+        out.warnings.push(format!(
+            "{} {} project server{} that you have not approved in Claude Code. Turning {} on does not approve {}, \
+             so Claude will still not run {}.",
+            and_list(&unapproved),
+            if unapproved.len() == 1 { "is a" } else { "are" },
+            if unapproved.len() == 1 { "" } else { "s" },
+            if unapproved.len() == 1 { "it" } else { "them" },
+            if unapproved.len() == 1 { "it" } else { "them" },
+            if unapproved.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    if !turned_off.is_empty() {
+        let names: Vec<String> = turned_off.into_iter().collect();
+        out.warnings.push(format!(
+            "This also turns off {}, which {} not in {shown_set}.",
+            some_of(&names),
+            if names.len() == 1 { "is" } else { "are" }
+        ));
+    }
+    if project.is_none() {
+        out.warnings.push(format!(
+            "Claude Code switches servers per project. This changes the {} it knows today; a project it first opens \
+             later is not covered.",
+            count(snapshot.projects.len(), "project")
+        ));
+    }
+    if found.is_empty() {
+        return Err(format!(
+            "None of the servers in {shown_set} is configured any more."
+        ));
+    }
     Ok(())
 }
 
@@ -1609,6 +1789,244 @@ fn ignored_by_git(project: &Path) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ------------------------------------------------------------ server sets (decision 012)
+
+    /// Users servers `a` and `b`, off in `/q`; a local server `l` in `/q` and `m` in `/r`; the connector
+    /// `claude.ai Slack`.
+    fn sets_inventory(dir: &Path) -> inventory::Inventory {
+        std::fs::write(
+            dir.join(".claude.json"),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "claudeAiMcpEverConnected": ["claude.ai Slack"],
+                "projects": {
+                    "/q": {"disabledMcpServers": ["a", "b"], "mcpServers": {"l": {"command": "l"}}},
+                    "/r": {"mcpServers": {"m": {"command": "m"}}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        inventory::load(&crate::config::ConfigPaths::in_dir(dir))
+    }
+
+    fn member(scope: Scope, project: Option<&str>, name: &str) -> crate::model::ConnectionId {
+        crate::model::ConnectionId::new(scope, project, name)
+    }
+
+    fn use_it(
+        inv: &inventory::Inventory,
+        members: &[crate::model::ConnectionId],
+        project: Option<&str>,
+        only: bool,
+    ) -> Result<Resolved, String> {
+        let change = crate::engine::Change::UseSet {
+            name: "Work".into(),
+            members: members.to_vec(),
+            project: project.map(str::to_owned),
+            only,
+        };
+        resolve(&[change], &inv.snapshot, &inv.keys)
+    }
+
+    fn off(project: &str, name: &str, disabled: bool) -> Op {
+        Op::SetDisabled {
+            project: project.into(),
+            name: name.into(),
+            disabled,
+        }
+    }
+
+    #[test]
+    fn using_a_set_in_a_project_turns_its_servers_on_there_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = sets_inventory(dir.path());
+        let members = [
+            member(Scope::User, None, "a"),
+            member(Scope::Local, Some("/q"), "l"),
+            member(Scope::ClaudeAi, None, "claude.ai Slack"),
+        ];
+        let out = use_it(&inv, &members, Some("/q"), false).unwrap();
+        assert_eq!(
+            out.claude,
+            [
+                off("/q", "a", false),
+                off("/q", "l", false),
+                off("/q", "claude.ai Slack", false)
+            ]
+        );
+        assert_eq!(out.summary, ["Use the set Work in q"]);
+        assert_eq!(out.action, "Use set");
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn using_a_set_alone_turns_off_every_other_server_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = sets_inventory(dir.path());
+        let members = [member(Scope::User, None, "a")];
+        let out = use_it(&inv, &members, Some("/q"), true).unwrap();
+        assert_eq!(
+            out.claude,
+            [
+                off("/q", "a", false),
+                off("/q", "b", true),
+                off("/q", "l", true),
+                off("/q", "claude.ai Slack", true)
+            ]
+        );
+        assert_eq!(
+            out.summary,
+            ["Use the set Work in q, and turn off every other server there"]
+        );
+        // Said plainly in the review: what else goes off.
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.starts_with("This also turns off b, claude.ai Slack and l")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn using_a_set_everywhere_covers_each_project_and_a_local_server_only_in_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = sets_inventory(dir.path());
+        let members = [
+            member(Scope::User, None, "a"),
+            member(Scope::Local, Some("/q"), "l"),
+        ];
+        let out = use_it(&inv, &members, None, false).unwrap();
+        assert_eq!(
+            out.claude,
+            [
+                off("/q", "a", false),
+                off("/r", "a", false),
+                off("/q", "l", false)
+            ]
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("first opens later")),
+            "{:?}",
+            out.warnings
+        );
+        // In another project, a local server of /q has nothing to switch: said, not dropped.
+        let out = use_it(&inv, &members, Some("/r"), false).unwrap();
+        assert_eq!(out.claude, [off("/r", "a", false)]);
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("stay as they are: l (q)")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn using_a_set_alone_keeps_on_a_name_a_member_shares_with_another_server() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {"/q": {"mcpServers": {"a": {"command": "local-a"}}}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        // Claude Code switches by name, so turning the local a off would turn the member off too.
+        for members in [
+            [member(Scope::User, None, "a")],
+            [member(Scope::Local, Some("/q"), "a")],
+        ] {
+            let out = use_it(&inv, &members, Some("/q"), true).unwrap();
+            assert_eq!(out.claude, [off("/q", "a", false), off("/q", "b", true)]);
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.starts_with("This also turns off b,")),
+                "{:?}",
+                out.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_set_whose_servers_are_gone_says_so_and_one_with_none_left_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = sets_inventory(dir.path());
+        let gone = member(Scope::User, None, "removed");
+        let out = use_it(
+            &inv,
+            &[member(Scope::User, None, "a"), gone.clone()],
+            Some("/q"),
+            false,
+        )
+        .unwrap();
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.starts_with("1 server of Work is no longer configured")),
+            "{:?}",
+            out.notes
+        );
+        let err = use_it(&inv, &[gone], Some("/q"), false).err().unwrap();
+        assert!(err.contains("None of the servers in Work"), "{err}");
+        let err = use_it(
+            &inv,
+            &[member(Scope::User, None, "a")],
+            Some("/elsewhere"),
+            false,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            err.contains("does not know the project /elsewhere"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_set_with_an_unapproved_project_server_says_turning_it_on_does_not_approve_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join("q");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(
+            q.join(".mcp.json"),
+            r#"{"mcpServers":{"repo":{"command":"r"}}}"#,
+        )
+        .unwrap();
+        let key = q.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({"projects": {&key: {}}}).to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Project)
+            .unwrap();
+        let out = use_it(
+            &inv,
+            std::slice::from_ref(&row.connection),
+            Some(&inv.snapshot.projects[0]),
+            false,
+        )
+        .unwrap();
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("repo is a project server that you have not approved")),
+            "{:?}",
+            out.warnings
+        );
+    }
 
     #[test]
     fn no_change_can_name_a_plugins_server() {

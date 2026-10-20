@@ -20,6 +20,7 @@ mod restore;
 mod sanitize;
 mod secret_uses;
 mod secrets;
+mod sets;
 mod swap;
 mod update;
 mod watch;
