@@ -158,6 +158,10 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             (key, names)
         })
         .collect();
+    snap.switched_off = disabled_by_project
+        .iter()
+        .map(|(key, names)| ((*key).clone(), names.clone()))
+        .collect();
     snap.legacy_disabled = projects
         .iter()
         .filter_map(|(key, project)| legacy_disabled(key, project, &disabled_by_project[key]))

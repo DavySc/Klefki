@@ -48,6 +48,9 @@ pub(crate) struct Resolved {
     /// Definitions Klefki kept, to add back ([`Change::PutBack`]) or to forget ([`Change::ForgetKept`]).
     pub put_back: Vec<String>,
     pub forget: Vec<String>,
+    /// What is already so, one sentence per change that can say it ("loc is already on in a."): shown instead of
+    /// the change when it would write nothing.
+    pub already: Vec<String>,
 }
 
 impl Resolved {
@@ -507,6 +510,15 @@ fn set_enabled(
 ) -> Result<(), String> {
     switch(id, enabled, snapshot, keys, out)?;
     if let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) {
+        let place = match (row.scope, row.project.as_deref()) {
+            (Scope::Local | Scope::Project, Some(p)) => project_label(p, snapshot),
+            _ => "every project Claude Code knows".to_owned(),
+        };
+        out.already.push(format!(
+            "{} is already {} in {place}.",
+            row.name,
+            if enabled { "on" } else { "off" }
+        ));
         if enabled {
             stays_off(row, out);
         } else {
@@ -675,6 +687,8 @@ fn use_profile(
         ));
     }
     let mut found = Vec::new();
+    // The members that load in a place it is used in, as shown, once each, by their place in the profile.
+    let mut here_names: Vec<(usize, String)> = Vec::new();
     let mut elsewhere = Vec::new();
     let mut unapproved = Vec::new();
     let mut turned_off = BTreeSet::new();
@@ -719,6 +733,12 @@ fn use_profile(
                 loaded_here.push((row, *place));
             }
         }
+        if let Some(at) = members.iter().position(|m| *m == row.connection)
+            && here_any
+            && !here_names.iter().any(|(_, n)| *n == row.name)
+        {
+            here_names.push((at, row.name.clone()));
+        }
         if member && !here_any {
             elsewhere.push(format!(
                 "{} ({})",
@@ -762,13 +782,17 @@ fn use_profile(
             disabled: *disabled,
         });
     }
-    // Only what is really turned off: not a server that shares its name with a member.
+    // Only what is really turned off: not a server that shares its name with a member, nor one off already.
     let turned_off: BTreeSet<String> = turned_off
         .into_iter()
         .filter(|(_, place, name)| {
             switches
                 .iter()
                 .any(|((p, n), off)| *off && p == place && n == name)
+                && !snapshot
+                    .switched_off
+                    .get(place)
+                    .is_some_and(|names| names.contains(name))
         })
         .map(|(shown, ..)| shown)
         .collect();
@@ -825,6 +849,31 @@ fn use_profile(
             "Claude Code switches servers per project. This changes the {} it knows today; a project it first opens \
              later is not covered.",
             count(snapshot.projects.len(), "project")
+        ));
+    }
+    if !here_names.is_empty() {
+        here_names.sort();
+        let here_names: Vec<String> = here_names.into_iter().map(|(_, n)| n).collect();
+        let one = here_names.len() == 1;
+        let place = match project {
+            Some(p) => project_label(p, snapshot),
+            None => "every project Claude Code knows".to_owned(),
+        };
+        out.already.push(format!(
+            "The {} of {shown_profile}, {}, {} already {} in {place}.{}",
+            if one { "server" } else { "servers" },
+            some_of(&here_names),
+            if one { "is" } else { "are" },
+            match (only, one) {
+                (true, true) => "the only one on",
+                (true, false) => "the only ones on",
+                (false, _) => "on",
+            },
+            if only {
+                ""
+            } else {
+                " Other servers there are left as they are."
+            }
         ));
     }
     if found.is_empty() {
@@ -1986,11 +2035,11 @@ mod tests {
             out.summary,
             ["Use the profile Work in q, and turn off every other server there"]
         );
-        // Said plainly in the review: what else goes off.
+        // Said plainly in the review: what else goes off. Not b, which is off in /q already.
         assert!(
             out.warnings
                 .iter()
-                .any(|w| w.starts_with("This also turns off b, claude.ai Slack and l")),
+                .any(|w| w.starts_with("This also turns off claude.ai Slack and l,")),
             "{:?}",
             out.warnings
         );
@@ -2880,6 +2929,53 @@ mod profile_review_regressions {
             "{:?}",
             everywhere.warnings
         );
+    }
+
+    /// Seen while fixing the owner's report: using a profile alone where the other servers were off already said
+    /// "This also turns off" them, on a change that turned nothing off.
+    #[test]
+    fn only_what_is_on_now_is_said_to_be_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = inv(
+            dir.path(),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}, "c": {"command": "c"}},
+                "projects": {"/q": {"disabledMcpServers": ["b"]}, "/r": {}}
+            }),
+        );
+        let a = crate::model::ConnectionId::new(Scope::User, None, "a");
+        let out = use_profile(&inv, vec![a.clone()], true);
+        let off: Vec<&String> = out
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("This also turns off"))
+            .collect();
+        assert_eq!(
+            off,
+            ["This also turns off c, which is not in Work."],
+            "{:?}",
+            out.warnings
+        );
+        // Every other server already off: nothing is said to go off.
+        let inv = inv_all_off(dir.path());
+        let out = use_profile(&inv, vec![a], true);
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.starts_with("This also turns off")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    fn inv_all_off(dir: &Path) -> inventory::Inventory {
+        inv(
+            dir,
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}, "c": {"command": "c"}},
+                "projects": {"/q": {"disabledMcpServers": ["b", "c"]}, "/r": {}}
+            }),
+        )
     }
 
     /// A member that policy blocks stays off whatever disabledMcpServers says.

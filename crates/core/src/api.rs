@@ -1,4 +1,5 @@
 //! The only surface the UI may use. The UI holds an immutable, sanitised [`Snapshot`].
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub use crate::activity::{Activity, ActivityEntry, Backup};
@@ -315,6 +316,9 @@ pub struct Snapshot {
     /// The same projects as paths, in one normal spelling.
     pub projects: Vec<String>,
     pub servers: Vec<ServerRow>,
+    /// The names switched off in each of [`Snapshot::projects`] (`disabledMcpServers`), as the file spells them: what a
+    /// change finds already off is not said to be turned off.
+    pub switched_off: BTreeMap<String, BTreeSet<String>>,
     /// Problems found while reading the configuration. Already sanitised.
     pub warnings: Vec<String>,
     /// Projects whose entry still has the switch-off list of older Claude Code versions.

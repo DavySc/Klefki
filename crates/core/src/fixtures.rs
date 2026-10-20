@@ -54,6 +54,7 @@ pub(crate) fn load() -> Snapshot {
         cli_version: raw.cli_version.map(|v| sanitize(&v)),
         project_count: raw.project_count,
         projects: Vec::new(),
+        switched_off: Default::default(),
         legacy_disabled: Vec::new(),
         kept: Vec::new(),
         organisation_only: None,
