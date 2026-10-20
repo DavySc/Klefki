@@ -175,6 +175,8 @@ impl Env {
             .env("CLAUDE_CONFIG_DIR", self.root().join("cfg"))
             // The organisation's folder, not the machine's: empty unless a test writes `org/…`.
             .env("KLEFKI_MANAGED_DIR", self.root().join("org"))
+            // Klefki's own folder (backups, profiles), not the machine's.
+            .env("KLEFKI_DATA_DIR", self.root().join("data"))
             // Redirects the home folder on Linux and macOS. Windows finds it through the registry; a changed
             // `USERPROFILE` only breaks that lookup (CI: every user server "not checked: no home folder").
             .env("HOME", self.root().join("home"))
@@ -1020,4 +1022,312 @@ fn export_output_refuses_claude_codes_own_files_and_a_missing_folder() {
         text(&out.stderr)
     );
     assert!(out.stdout.is_empty());
+}
+
+// ---- profiles (decision 012)
+
+/// A profile's server: its scope, whether it is the project's, and its name.
+type Member<'a> = (klefki_core::api::Scope, bool, &'a str);
+
+impl Env {
+    /// Saves the profiles as Klefki keeps them: `(name, servers)`.
+    fn profiles(&self, profiles: &[(&str, &[Member])]) {
+        let project = self.project();
+        let profiles: Vec<serde_json::Value> = profiles
+            .iter()
+            .map(|(name, members)| {
+                let members: Vec<String> = members
+                    .iter()
+                    .map(|(scope, local, server)| {
+                        let at = local.then_some(project.as_str());
+                        klefki_core::api::ConnectionId::new(*scope, at, server)
+                            .as_str()
+                            .to_owned()
+                    })
+                    .collect();
+                serde_json::json!({"name": name, "members": members})
+            })
+            .collect();
+        let dir = self.root().join("data");
+        std::fs::create_dir_all(dir.join("backups")).unwrap();
+        std::fs::write(
+            dir.join("profiles.json"),
+            serde_json::json!({"version": 1, "profiles": profiles}).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn claude_json(&self) -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(self.root().join("cfg").join(".claude.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn disabled_in_project(&self) -> Vec<String> {
+        let config = self.claude_json();
+        let mut off: Vec<String> = config["projects"][self.project()]["disabledMcpServers"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_owned()).collect())
+            .unwrap_or_default();
+        off.sort();
+        off
+    }
+
+    fn work(&self) {
+        use klefki_core::api::Scope;
+        self.profiles(&[(
+            "Work",
+            &[
+                (Scope::User, false, "alpha"),
+                (Scope::Local, true, "gamma"),
+                (Scope::User, false, "gone"),
+            ],
+        )]);
+    }
+}
+
+#[test]
+fn profiles_lists_each_profile_with_its_servers() {
+    let env = Env::new();
+    let out = env.run(&["profiles"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("No profiles yet"),
+        "{}",
+        text(&out.stdout)
+    );
+
+    env.work();
+    let out = env.run(&["profiles"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.starts_with("Work  3 servers\n"), "{stdout}");
+    assert!(line_of(&stdout, "alpha").contains("User"), "{stdout}");
+    assert!(line_of(&stdout, "gamma").contains("Local in"), "{stdout}");
+    assert!(
+        line_of(&stdout, "gone").contains("no longer configured"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("Only these servers"), "{stdout}");
+    assert!(!env.any_run(), "listing profiles runs nothing");
+
+    let out = env.run(&["profiles", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["schema"], 1);
+    let work = &json["profiles"][0];
+    assert_eq!(work["name"], "Work");
+    assert_eq!(work["servers"][0]["name"], "alpha");
+    assert_eq!(work["servers"][0]["scope"], "user");
+    assert_eq!(work["servers"][1]["project"], env.project());
+    assert_eq!(work["servers"][2]["configured"], false);
+    assert_eq!(work["alone_in"], serde_json::json!([]));
+}
+
+#[test]
+fn use_shows_the_change_and_saves_it_only_when_told_to() {
+    let env = Env::new();
+    env.work();
+    let before = std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap();
+    let project = env.project();
+    // Nobody at a terminal to ask: the change is shown, and nothing is saved.
+    let out = env.run(&["use", "Work", "--project", &project, "--only"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("Use the profile Work in Repo, and turn off every other server there"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("This also turns off beta, docs and remote"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("gone is in Work but no longer configured"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(".claude.json"),
+        "the file and its changes: {stdout}"
+    );
+    assert!(text(&out.stderr).contains("--yes"), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap(),
+        before
+    );
+
+    let out = env.run(&["use", "Work", "--project", &project, "--only", "--yes"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Saved."),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(
+        env.disabled_in_project(),
+        ["beta", "delta", "docs", "remote"]
+    );
+    let backups = std::fs::read_dir(env.root().join("data").join("backups"))
+        .unwrap()
+        .count();
+    assert!(backups > 0, "a backup is kept before the change");
+    // The engine asks Claude Code its version when it starts, as in the app; nothing else is run.
+    let log = std::fs::read_to_string(env.root().join("log.jsonl")).unwrap_or_default();
+    assert!(
+        log.lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .all(|l| l["argv"] == serde_json::json!(["--version"])),
+        "using a profile runs no Claude Code command: {log}"
+    );
+
+    // Now on alone there, as the files say.
+    let out = env.run(&["profiles"]);
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "Only these servers are on in {}.",
+            env.shown_project(env.home().as_deref())
+        )),
+        "{stdout}"
+    );
+    // Again: nothing to change, nothing written.
+    let after = std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap();
+    let out = env.run(&["use", "Work", "--project", &project, "--only", "--yes"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Nothing to change"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(
+        std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap(),
+        after
+    );
+}
+
+#[test]
+fn use_without_a_project_uses_the_current_folders() {
+    let env = Env::new();
+    // Turned on where it was off: delta is in no profile, so a profile with it turns it on.
+    use klefki_core::api::Scope;
+    env.profiles(&[("Delta", &[(Scope::User, false, "delta")])]);
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(env.root().join("Repo"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        env.disabled_in_project().is_empty(),
+        "{:?}",
+        env.disabled_in_project()
+    );
+    // A folder Claude Code does not know as a project: said, nothing changed.
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(env.root().join("home"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("Claude Code does not know"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn use_names_a_profile_that_is_not_there_and_suggests_one() {
+    let env = Env::new();
+    env.work();
+    let out = env.run(&["use", "wrok", "--all", "-y"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("no profile is named \"wrok\"; did you mean \"Work\"?"),
+        "{stderr}"
+    );
+    // The case aside, a name is the profile's.
+    let out = env.run(&["use", "work", "--all", "-y"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+#[test]
+fn use_never_prints_a_secret_from_the_configuration() {
+    let env = Env::new();
+    env.work();
+    let project = env.project();
+    let out = env.run(&["use", "Work", "--project", &project, "--only"]);
+    let all = format!("{}{}", text(&out.stdout), text(&out.stderr));
+    for secret in [API_KEY, "tok-SECRET-98765", GHP, "hdr-SECRET-abcdef123"] {
+        assert!(!all.contains(secret), "{secret} printed:\n{all}");
+    }
+}
+
+/// Found in review of PR #59: in a folder inside a git repository, Claude Code uses the repository's project, and so
+/// does `use`. A folder in a project that is not a git repository is a project of its own, unknown until Claude Code
+/// starts there.
+#[test]
+fn use_in_a_folder_of_a_git_repository_uses_the_repositorys_project() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    env.profiles(&[("Delta", &[(Scope::User, false, "delta")])]);
+    let sub = env.root().join("Repo").join("src").join("deep");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Not yet a git repository: refused, nothing changed.
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(env.disabled_in_project(), ["delta"]);
+    std::fs::create_dir_all(env.root().join("Repo").join(".git")).unwrap();
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Use the profile Delta in Repo"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        env.disabled_in_project().is_empty(),
+        "{:?}",
+        env.disabled_in_project()
+    );
+    // Named with --project, the same.
+    let sub_path = sub.to_string_lossy().into_owned();
+    let out = env.run(&["use", "Delta", "--project", &sub_path, "-y"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+/// Found in review of PR #59: the question names what is being decided, and a usage error shows `use`'s own usage.
+#[test]
+fn use_says_what_it_asks_about_and_its_own_usage() {
+    let env = Env::new();
+    env.work();
+    let out = env.run(&["use", "Work", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("Usage: klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]"),
+        "{stderr}"
+    );
+    let out = env.run(&["use", "wrok", "--all"]);
+    assert!(
+        text(&out.stderr).contains("Usage: klefki-cli use PROFILE"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = env.run(&["list", "--frob"]);
+    assert!(
+        !text(&out.stderr).contains("use PROFILE"),
+        "{}",
+        text(&out.stderr)
+    );
 }

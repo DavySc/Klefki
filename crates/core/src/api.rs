@@ -377,8 +377,7 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
         releases,
         release_key: crate::update::RELEASE_KEY.map(str::to_owned),
         install: crate::install::this_install(),
-        updates_dir: directories::ProjectDirs::from("dev", "klefki", "klefki")
-            .map(|d| d.data_local_dir().join("updates")),
+        updates_dir: data_dir().map(|d| d.join("updates")),
         ..real_config(None)
     };
     crate::engine::start_with(config, wake)
@@ -479,8 +478,31 @@ fn open_https(link: &str) -> std::io::Result<()> {
 /// so they stay on this machine: on Windows the local, not the roaming, application data folder (which a company
 /// may sync to a server or redirect to a network share).
 fn default_backup_dir() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "klefki", "klefki")
-        .map(|d| d.data_local_dir().join("backups"))
+    data_dir().map(|d| d.join("backups"))
+}
+
+/// Klefki's own folder for what it keeps (backups, profiles, the Activity log, updates), or the one
+/// `KLEFKI_DATA_DIR` names, so a test or a try-out never touches the machine's. Empty: the machine's.
+fn data_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("KLEFKI_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => Some(std::path::PathBuf::from(dir)),
+        _ => directories::ProjectDirs::from("dev", "klefki", "klefki")
+            .map(|d| d.data_local_dir().to_path_buf()),
+    }
+}
+
+/// The profiles (decision 012) for a command-line run, read as the app reads them. Writes nothing.
+pub fn load_profiles() -> Profiles {
+    match default_backup_dir() {
+        Some(dir) => crate::profiles::load(&dir),
+        None => Profiles {
+            problem: Some(
+                "There is no private folder for Klefki's data, so no profiles can be read."
+                    .to_owned(),
+            ),
+            ..Profiles::default()
+        },
+    }
 }
 
 /// Reads the real Claude Code configuration (read-only), once, without live checks.

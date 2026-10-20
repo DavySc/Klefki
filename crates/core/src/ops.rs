@@ -712,7 +712,8 @@ fn use_profile(
                     None => switches.push((key, !member)),
                 }
             }
-            if !member && only {
+            // Said only when it is on there now: one already off is not turned off by this.
+            if !member && only && !off_now(row, scope, place) {
                 turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
             }
             if member {
@@ -861,23 +862,19 @@ pub fn profile_alone_in(
         .projects
         .iter()
         .filter(|place| {
-            let here = crate::sanitize::shown(place);
+            let here = crate::sanitize::shown(place.as_str());
             let mut on: BTreeSet<&str> = BTreeSet::new();
             let mut off: BTreeSet<&str> = BTreeSet::new();
             let mut wanted: BTreeSet<&str> = BTreeSet::new();
             let mut members_here: Vec<&ServerRow> = Vec::new();
             for (row, scope, project, name, member) in &rows {
-                let off_here = match scope {
-                    // A local or project server loads in its own project only, where its switch is its own.
-                    Scope::Local | Scope::Project => {
-                        if project.as_deref() != Some(place.as_str()) {
-                            continue;
-                        }
-                        !row.enabled
-                    }
-                    _ => row.disabled_projects.contains(&here),
-                };
-                if off_here {
+                // A local or project server loads in its own project only.
+                if matches!(scope, Scope::Local | Scope::Project)
+                    && project.as_deref() != Some(place.as_str())
+                {
+                    continue;
+                }
+                if off_in(row, *scope, &here) {
                     off.insert(name);
                 } else {
                     on.insert(name);
@@ -889,9 +886,9 @@ pub fn profile_alone_in(
                 }
             }
             // As things are: nothing changes, so a server is off where its switch is off now.
-            let off_now = |_: &str, name: &str| off.contains(name);
+            let switched_off = |_: &str, name: &str| off.contains(name);
             let loads = |row: &ServerRow| {
-                held_back(row, place, snapshot, &off_now).is_none()
+                held_back(row, place, snapshot, &switched_off).is_none()
                     && (row.scope != Scope::Project
                         || (row.approval == Some(Approval::Approved) && !row.shadowed))
             };
@@ -902,6 +899,20 @@ pub fn profile_alone_in(
         })
         .cloned()
         .collect()
+}
+
+/// Whether `row` is switched off in `place` (a project as `.claude.json` spells it), where it loads, now.
+fn off_now(row: &ServerRow, scope: Scope, place: &str) -> bool {
+    off_in(row, scope, &crate::sanitize::shown(place))
+}
+
+/// [`off_now`], with the project as shown (what `disabled_projects` holds).
+fn off_in(row: &ServerRow, scope: Scope, shown_place: &str) -> bool {
+    match scope {
+        // Its own switch, in its own project.
+        Scope::Local | Scope::Project => !row.enabled,
+        _ => row.disabled_projects.iter().any(|p| p == shown_place),
+    }
 }
 
 /// A project by its folder's name, with the folder that holds it when another project's folder has that name too.
@@ -2055,11 +2066,47 @@ mod tests {
             out.summary,
             ["Use the profile Work in q, and turn off every other server there"]
         );
-        // Said plainly in the review: what else goes off.
+        // Said plainly in the review: what else goes off. Not b, which is off in /q already (this said b too until
+        // `using_a_profile_alone_names_only_what_it_really_turns_off`).
         assert!(
             out.warnings
                 .iter()
-                .any(|w| w.starts_with("This also turns off b, claude.ai Slack and l")),
+                .any(|w| w.starts_with("This also turns off claude.ai Slack and l")),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// Found trying `klefki-cli use`: a server already off there was said to be turned off too.
+    #[test]
+    fn using_a_profile_alone_names_only_what_it_really_turns_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let inv = profiles_inventory(dir.path());
+        // b is off in /q already; l and the connector are on.
+        let out = use_it(&inv, &[member(Scope::User, None, "a")], Some("/q"), true).unwrap();
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w == "This also turns off claude.ai Slack and l, which are not in Work."),
+            "{:?}",
+            out.warnings
+        );
+        // Everything else off already: nothing is said to go off.
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {"/q": {"disabledMcpServers": ["b"]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        let out = use_it(&inv, &[member(Scope::User, None, "a")], Some("/q"), true).unwrap();
+        assert!(
+            !out.warnings
+                .iter()
+                .any(|w| w.starts_with("This also turns off")),
             "{:?}",
             out.warnings
         );
@@ -3084,7 +3131,7 @@ mod profile_review_regressions {
         );
     }
 
-    /// Found in review of PR #58: "Only its servers are on in q" was said while policy kept the only member from
+    /// Found in review of PR #58: "Only these servers are on in q" was said while policy kept the only member from
     /// loading there, so Claude Code loaded nothing.
     #[test]
     fn a_profile_is_not_on_alone_where_policy_keeps_a_member_from_loading() {
