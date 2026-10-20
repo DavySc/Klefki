@@ -486,6 +486,7 @@ fn server(
                     remove: true,
                     to: spot.clone(),
                     edited: Some(entry.clone()),
+                    adjust: Default::default(),
                 });
             } else {
                 out.claude.push(Op::ReplaceServer {
@@ -784,6 +785,7 @@ mod tests {
                     name: "sso".into()
                 },
                 edited: Some(sso()),
+                adjust: Default::default(),
             }]
         );
         let added: Vec<(&str, Option<&str>, bool)> = out

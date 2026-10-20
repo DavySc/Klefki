@@ -352,7 +352,7 @@ fn address_problem(entry: &Map<String, Value>) -> Result<(), String> {
     entry::validate(&Value::Object(entry.clone())).map_err(|why| sentence(&why))
 }
 
-fn sentence(why: &str) -> String {
+pub(crate) fn sentence(why: &str) -> String {
     let mut c = why.chars();
     let mut out: String = c
         .next()

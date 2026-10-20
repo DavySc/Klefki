@@ -326,6 +326,14 @@ enum Step {
     Forget {
         pick: usize,
     },
+    /// A copy of a server that signs in, under another name, with another address (and, for an odd one, a fixed
+    /// callback port) and, when `client` is given, another client and its secret (none for an odd number).
+    CopyAdjusted {
+        pick: usize,
+        to: usize,
+        url: u8,
+        client: Option<u8>,
+    },
     /// Switches the plugin's server on or off.
     TogglePlugin {
         on: bool,
@@ -361,9 +369,12 @@ fn step() -> impl Strategy<Value = Step> {
         1 => (pick.clone(), any::<bool>()).prop_map(|(pick, on)| Step::Toggle { pick, on }),
         2 => pick.clone().prop_map(|pick| Step::PutBack { pick }),
         1 => (pick.clone(), 0usize..3).prop_map(|(pick, kept)| Step::CopyToKept { pick, kept }),
-        1 => pick.prop_map(|pick| Step::Forget { pick }),
+        1 => pick.clone().prop_map(|pick| Step::Forget { pick }),
         1 => any::<bool>().prop_map(|on| Step::TogglePlugin { on }),
         1 => (0u8..5).prop_map(|kind| Step::ChangePlugin { kind }),
+        1 => (pick, 0usize..3, 0u8..3, proptest::option::of(0u8..4)).prop_map(
+            |(pick, to, url, client)| Step::CopyAdjusted { pick, to, url, client }
+        ),
     ]
 }
 
@@ -931,6 +942,76 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                     id: rig.id(&key),
                     name,
                     targets: vec![target],
+                    adjust: Default::default(),
+                }]
+            }
+            Step::CopyAdjusted {
+                pick,
+                to,
+                url,
+                client,
+            } => {
+                let key = picked(*pick);
+                let original = &before.servers[&key];
+                if !entry_signs_in(original) {
+                    continue;
+                }
+                let target = rig.place(*to);
+                let project = match &target {
+                    Target::User => None,
+                    Target::Local(p) => Some(p.clone()),
+                };
+                let name = format!("{}_adj", key.1);
+                let copy = (project, name.clone());
+                arrives = Some(copy.clone());
+                let from = original["url"].as_str().unwrap().to_owned();
+                let mut entry = original.clone();
+                entry["url"] = json!(format!("https://h{url}.example/mcp"));
+                // An odd address also gets a fixed callback port.
+                let port = (url % 2 == 1).then(|| 9000 + u16::from(*url));
+                if let Some(port) = port {
+                    entry["oauth"]["callbackPort"] = json!(port);
+                }
+                let client = client.map(|c| crate::adjust::Client {
+                    id: Some(format!("c{c}")),
+                    secret: (c % 2 == 0).then(|| crate::secrets::Secret::new(format!("sec-k{c}"))),
+                });
+                match &client {
+                    Some(client) => {
+                        entry["oauth"]["clientId"] = json!(client.id.clone().unwrap());
+                        let to = connection(&copy);
+                        match (&client.secret, store_fault) {
+                            (Some(secret), StoreFault::Works | StoreFault::DeleteFails) => {
+                                expected.klefki.insert(to, secret.expose().to_owned());
+                            }
+                            (_, StoreFault::DeleteFails) => {}
+                            _ => {
+                                expected.klefki.remove(&to);
+                            }
+                        }
+                    }
+                    None => copy_secret(
+                        &mut expected.klefki,
+                        &before.klefki,
+                        &key,
+                        &copy,
+                        false,
+                        *store_fault,
+                    ),
+                }
+                expected.servers.insert(copy, entry);
+                vec![Change::Duplicate {
+                    id: rig.id(&key),
+                    name,
+                    targets: vec![target],
+                    adjust: crate::adjust::Adjust {
+                        base: Some(crate::adjust::Rebase {
+                            from,
+                            to: format!("https://h{url}.example/mcp"),
+                        }),
+                        callback_port: port.map(Some),
+                        client,
+                    },
                 }]
             }
             Step::Rename { pick } => {
@@ -987,6 +1068,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                         None => Target::User,
                         Some(p) => Target::Local(p.clone()),
                     }],
+                    adjust: Default::default(),
                 }]
             }
             Step::TogglePlugin { on } => {
@@ -1016,6 +1098,7 @@ fn check(cases: &[(Step, Vec<Fault>, StoreFault)]) -> Result<(), TestCaseError> 
                         id,
                         name: "copied".into(),
                         targets: vec![Target::User],
+                        adjust: Default::default(),
                     },
                     _ => Change::Move {
                         id,
@@ -1351,6 +1434,7 @@ fn a_kept_definition_says_which_server_lost_its_shared_sign_in_and_putting_it_ba
         id: rig.id(&a),
         name: "a".into(),
         targets: vec![Target::Local(pa.clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let shared = sign_in_key("a", &rig.world().servers[&copy]);
@@ -1381,6 +1465,7 @@ fn a_failed_move_to_pa(rig: &Rig) -> (Key, Key) {
         id: rig.id(&(None, "a".to_owned())),
         name: "a".into(),
         targets: vec![Target::Local(pb.clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let (from, to) = (
@@ -1408,6 +1493,7 @@ fn a_kept_definition_is_not_offered_once_a_copy_puts_it_where_its_move_was_going
         id: rig.id(&(None, "a".to_owned())),
         name: "a".into(),
         targets: vec![Target::Local(rig.projects[0].clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let world = rig.world();
@@ -1445,6 +1531,7 @@ fn a_kept_definition_stays_offered_when_a_copy_without_its_secret_puts_it_where_
         id: rig.id(&a),
         name: "a".into(),
         targets: vec![Target::Local(rig.projects[0].clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let world = rig.world();
@@ -1479,6 +1566,7 @@ fn a_kept_definition_stays_offered_when_a_copy_puts_another_definition_where_its
         id: rig.id(&a),
         name: "a".into(),
         targets: vec![Target::Local(rig.projects[0].clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let kept = rig.world().kept.into_keys().next().expect("still kept");
@@ -1513,6 +1601,7 @@ fn a_server_that_signs_in_lands_under_the_projects_own_spelling() {
         id: rig.id(&a),
         name: "a".into(),
         targets: vec![Target::Local(pa.clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     assert_eq!(projects(&rig), before);
@@ -1595,6 +1684,7 @@ fn an_earlier_deletes_check_does_not_undo_a_move_back_into_its_place() {
         id: rig.id(&p),
         name: "p".into(),
         targets: vec![Target::Local(pa.clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let in_pa = (Some(pa.clone()), "p".to_owned());
@@ -1666,6 +1756,7 @@ fn an_earlier_deletes_check_does_not_undo_a_copy_back_into_its_place() {
             id: rig.id(&p),
             name: "p".into(),
             targets: vec![Target::Local(pa.clone())],
+            adjust: Default::default(),
         },
         Change::Delete { id: rig.id(&in_pa) },
     ] {
@@ -1676,6 +1767,7 @@ fn an_earlier_deletes_check_does_not_undo_a_copy_back_into_its_place() {
         id: rig.id(&p),
         name: "p".into(),
         targets: vec![Target::Local(pa.clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     quiet_for(&rig, Duration::from_millis(1200));
@@ -1791,6 +1883,7 @@ fn a_copy_left_behind_is_not_deleted_when_a_server_is_put_back_there_meanwhile()
         id: rig.id(&(None, "a".to_owned())),
         name: "a".into(),
         targets: vec![Target::Local(rig.projects[0].clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     assert!(lock(&rig.store.on_get).is_none(), "the listing read it");
@@ -1850,6 +1943,7 @@ fn a_copy_into_the_place_a_kept_definition_came_from_is_refused_and_its_secret_k
             id: rig.id(&a),
             name: "a".into(),
             targets: vec![Target::Local(rig.projects[1].clone())],
+            adjust: Default::default(),
         }],
     );
 }
@@ -1869,6 +1963,7 @@ fn a_copy_without_a_secret_into_the_place_a_kept_definition_came_from_is_refused
             id: rig.id(&a),
             name: "a".into(),
             targets: vec![Target::Local(rig.projects[1].clone())],
+            adjust: Default::default(),
         }],
     );
 }
@@ -1919,6 +2014,7 @@ fn a_plain_copy_into_the_place_a_kept_definition_came_from_is_refused() {
             id: rig.id(&(None, "p".to_owned())),
             name: "a".into(),
             targets: vec![Target::Local(rig.projects[1].clone())],
+            adjust: Default::default(),
         }],
     );
 }
@@ -1948,6 +2044,7 @@ fn a_copy_reviewed_before_a_definition_was_kept_in_its_place_is_refused_when_app
         id: rig.id(&a),
         name: "a".into(),
         targets: vec![Target::Local(pb.clone())],
+        adjust: Default::default(),
     }]));
     let plan = loop {
         match rig.next() {
@@ -1961,6 +2058,7 @@ fn a_copy_reviewed_before_a_definition_was_kept_in_its_place_is_refused_when_app
         id: rig.id(&a),
         name: "a".into(),
         targets: vec![Target::Local(pb.clone())],
+        adjust: Default::default(),
     }]);
     assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
     let from = (Some(pb), "a".to_owned());
@@ -2011,6 +2109,7 @@ fn an_earlier_renames_check_does_not_fail_on_a_copy_under_the_old_name() {
             id: rig.id(&p),
             name: "q".into(),
             targets: vec![Target::Local(pa.clone())],
+            adjust: Default::default(),
         },
     ] {
         let outcome = rig.run(vec![change]);
@@ -2146,6 +2245,7 @@ fn an_earlier_edits_check_does_not_land_on_a_copy_under_the_name_it_was_renamed_
             id: rig.id(&(None, "p".to_owned())),
             name: "q".into(),
             targets: vec![Target::Local(rig.projects[0].clone())],
+            adjust: Default::default(),
         },
     );
 }
@@ -2161,6 +2261,7 @@ fn an_earlier_edits_check_does_not_land_on_a_server_moved_in_under_the_name_it_w
                 id: rig.id(&user_p()),
                 name: "p".into(),
                 targets: vec![Target::Local(rig.projects[0].clone())],
+                adjust: Default::default(),
             }]
         },
         "p",
@@ -2205,6 +2306,7 @@ fn an_earlier_switch_offs_check_does_not_turn_off_a_copy_under_the_name_it_was_r
         id: rig.id(&(None, "p".to_owned())),
         name: "q".into(),
         targets: vec![Target::Local(rig.projects[0].clone())],
+        adjust: Default::default(),
     });
 }
 
@@ -2216,6 +2318,7 @@ fn an_earlier_switch_offs_check_does_not_turn_off_a_server_moved_in_under_the_na
         id: rig.id(&(None, "p".to_owned())),
         name: "q".into(),
         targets: vec![Target::User],
+        adjust: Default::default(),
     };
     switch_off_rename_then_arrive(move |rig| {
         let outcome = rig.run(vec![rig_copy(rig)]);

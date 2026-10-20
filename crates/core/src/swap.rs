@@ -131,9 +131,26 @@ pub(crate) struct Swap {
     pub to: Spot,
     /// The new definition as edited, where `<hidden>` keeps the old value. `None` keeps the old definition.
     pub edited: Option<Value>,
+    /// What a copy changes from the original, after `edited`: its address, and how it signs in. A new client
+    /// brings its own client secret instead of Klefki's copy of the original's.
+    pub adjust: crate::adjust::Adjust,
 }
 
 impl Swap {
+    /// The definition Claude Code is to add, from `old`, the one there now.
+    fn new_entry(&self, old: &Value) -> Result<Value, String> {
+        let edited = match &self.edited {
+            Some(edited) => entry::unmasked(edited, old)?,
+            None => old.clone(),
+        };
+        self.adjust.apply(&edited, &self.from.name)
+    }
+
+    /// The client secret handed to Claude Code with the add: the new client's, when the copy has one.
+    fn new_client_secret(&self) -> Option<Option<&Secret>> {
+        self.adjust.client.as_ref().map(|c| c.secret.as_ref())
+    }
+
     fn verb(&self) -> &'static str {
         match (
             self.remove,
@@ -287,11 +304,9 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
     let old = read_entry(ctx.claude_json, &swap.from)?.ok_or_else(|| {
         format!("{shown} is no longer in the configuration. Refresh and try again.")
     })?;
-    let new = match &swap.edited {
-        Some(edited) => entry::unmasked(edited, &old)
-            .map_err(|why| format!("{shown} was not {verb}: {why}."))?,
-        None => old.clone(),
-    };
+    let new = swap
+        .new_entry(&old)
+        .map_err(|why| format!("{shown} was not {verb}: {why}."))?;
     let checked = if signs_in(&new) {
         entry::validate_new(&new)
     } else {
@@ -332,7 +347,10 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
         ));
     }
     // Klefki's copy of the client secret: handed back to Claude Code with the add, since its remove forgets its own.
-    let secret = if signs_in(&old) || signs_in(&new) {
+    // A copy that signs in as another client takes that client's secret instead.
+    let secret = if let Some(given) = swap.new_client_secret() {
+        given.cloned()
+    } else if signs_in(&old) || signs_in(&new) {
         let store = ctx.store.ok_or_else(|| {
             format!("{shown} was not {verb}: Klefki can't use your system's secret store.")
         })?;
@@ -509,10 +527,30 @@ pub(crate) fn review(root: &Value, swap: &Swap, has_copy: bool) -> Result<Said, 
         // Applying reports it is gone.
         return Ok(said);
     };
-    let new = match &swap.edited {
-        Some(edited) => entry::unmasked(edited, &old).unwrap_or_else(|_| edited.clone()),
-        None => old.clone(),
+    let new = match swap.new_entry(&old) {
+        Ok(new) => new,
+        // Said now, before anything runs: the copy's address or client does not fit.
+        Err(why) if !swap.adjust.is_empty() => {
+            return Err(format!(
+                "{} cannot be copied that way: {why}.",
+                sanitize(&swap.from.name)
+            ));
+        }
+        Err(_) => swap.edited.clone().unwrap_or_else(|| old.clone()),
     };
+    if !swap.adjust.is_empty() {
+        let checked = if signs_in(&new) {
+            entry::validate_new(&new)
+        } else {
+            entry::validate(&new)
+        };
+        checked.map_err(|why| {
+            format!(
+                "The copy of {} is not usable: {why}.",
+                sanitize(&swap.from.name)
+            )
+        })?;
+    }
     let name = sanitize(&swap.from.name);
     if swap.remove && swap.from.same_place(&swap.to) && swap.from.name == swap.to.name && new == old
     {
@@ -594,7 +632,7 @@ pub(crate) fn review(root: &Value, swap: &Swap, has_copy: bool) -> Result<Said, 
             ));
         }
     }
-    if signs_in(&new) && !has_copy {
+    if signs_in(&new) && !has_copy && swap.adjust.client.is_none() {
         let shared = !swap.remove
             && swap.to.name == swap.from.name
             && signs_in(&old)
@@ -619,7 +657,14 @@ pub(crate) fn preview(root: &Value, swap: &Swap) -> Vec<Op> {
     let Some(old) = entry_in(root, &swap.from) else {
         return Vec::new();
     };
-    let new = as_claude_writes(swap.edited.as_ref().unwrap_or(&old));
+    // As edited (`<hidden>` stays hidden), with the copy's changes.
+    let edited = swap.edited.clone().unwrap_or_else(|| old.clone());
+    let new = as_claude_writes(
+        &swap
+            .adjust
+            .apply(&edited, &swap.from.name)
+            .unwrap_or(edited),
+    );
     if swap.remove && swap.from.same_place(&swap.to) && swap.from.name == swap.to.name {
         return vec![Op::ReplaceServer {
             project: swap.from.project.clone(),

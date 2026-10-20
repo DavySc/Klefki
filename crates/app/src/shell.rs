@@ -8,10 +8,10 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Exported,
-    FileChoice, Hint, ImportFile, LegacyDisabled, Part, Pasted, PastedServer, PlanView, SaveError,
-    Scope, Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status, Target,
-    TransportKind, UpdateCheck, UpdateDownload, same_project, secret_reference,
+    Approval, Change, Command, ConnectionId, CopyFields, Core, Definition, Diagnosis, Event,
+    Exported, FileChoice, Hint, ImportFile, LegacyDisabled, Part, Pasted, PastedServer, PlanView,
+    SaveError, Scope, Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status,
+    Target, TransportKind, UpdateCheck, UpdateDownload, same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -819,6 +819,16 @@ impl ShellApp {
                 });
             }
             Event::Entry { id, json, editable } => {
+                if let Some(form) = &mut self.duplicate
+                    && form.source == id
+                    && form.copy == CopyRead::Reading
+                {
+                    form.copy = match &json {
+                        Ok(text) => CopyFields::from_definition(text)
+                            .map_or(CopyRead::NoAddress, |f| CopyRead::Ready(Box::new(f))),
+                        Err(why) => CopyRead::Failed(why.clone()),
+                    };
+                }
                 // Brought into view for the server shown on a tab with the form; one looked at later opens as it is.
                 let shown = matches!(self.tab, DetailTab::General | DetailTab::HeadersEnv)
                     && self.single_selected().is_some_and(|s| s.is(&id));
@@ -949,6 +959,12 @@ impl ShellApp {
             }
             Event::CallbackPort { port, warning } => {
                 if let Some(form) = &mut self.add {
+                    if form.port_pending == Some(port) {
+                        form.port_pending = None;
+                    }
+                    form.port_checked = Some((port, warning.clone()));
+                }
+                if let Some(form) = &mut self.duplicate {
                     if form.port_pending == Some(port) {
                         form.port_pending = None;
                     }
@@ -2304,13 +2320,30 @@ impl ShellApp {
         let mut places = Places::new(&self.snapshot.projects, row.project.as_deref());
         places.user = row.scope == Scope::User;
         places.tick_here();
+        // A copy's address and sign-in can be changed: read from the definition in the file, which has the whole
+        // address (the list leaves out a query string).
+        let remote = matches!(row.transport, TransportKind::Http | TransportKind::Sse);
+        let source = row.id();
         self.duplicate = Some(DuplicateForm {
-            source: row.id(),
+            source: source.clone(),
             about: format!("{} \u{b7} {}", row.transport.label(), row.target),
             name: format!("{}_copy", row.name),
             places,
             focus: true,
+            copy: if remote {
+                CopyRead::Reading
+            } else {
+                CopyRead::NoAddress
+            },
+            show_secret: false,
+            left: BTreeSet::new(),
+            port_wanted: None,
+            port_pending: None,
+            port_checked: None,
         });
+        if remote {
+            self.send(Command::Inspect(source));
+        }
     }
 
     /// Opens the Move dialog for the selected server, with nowhere chosen yet: where it is now cannot be chosen.
@@ -2931,11 +2964,25 @@ impl ShellApp {
         let problem = name_problem(&form.name);
         let taken = form.places.taken(&form.name, &self.snapshot.servers);
         let places = form.places.in_words();
-        let ready = problem.is_none() && taken.is_none() && places.is_some();
+        let changes_ok = match &form.copy {
+            CopyRead::Ready(fields) => fields.problems().is_empty(),
+            // A moment: what the copy may change is not known yet.
+            CopyRead::Reading => false,
+            CopyRead::NoAddress | CopyRead::Failed(_) => true,
+        };
+        let ready = problem.is_none() && taken.is_none() && places.is_some() && changes_ok;
         let mut review = ready && ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut cancel = false;
         // The list of projects gets what the window has left once the rest of the dialog is laid out.
-        let list_height = (ctx.content_rect().height() - 500.0).clamp(96.0, 320.0);
+        let fields_height = match &form.copy {
+            CopyRead::Ready(f) if f.client_changed() => 250.0,
+            CopyRead::Ready(f) if f.oauth => 190.0,
+            CopyRead::Ready(_) => 80.0,
+            _ => 0.0,
+        };
+        let list_height = (ctx.content_rect().height() - 500.0 - fields_height).clamp(96.0, 320.0);
+        // What the window leaves for the dialog's body, below its title and above its buttons.
+        let body_height = (ctx.content_rect().height() - 260.0).max(120.0);
         let modal = egui::Modal::new(egui::Id::new("duplicate_dialog")).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.heading(format!("Duplicate {}", form.source.name));
@@ -2943,21 +2990,29 @@ impl ShellApp {
                 egui::Label::new(RichText::new(&form.about).small().color(pal.text_muted))
                     .truncate(),
             );
-            ui.add_space(12.0);
-            ui.label(RichText::new("Name").color(pal.text_muted));
-            let field =
-                ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(f32::INFINITY));
-            if std::mem::take(&mut form.focus) {
-                field.request_focus();
-            }
-            if let Some(problem) = &problem {
-                ui.label(RichText::new(problem).small().color(pal.danger));
-            }
-            ui.add_space(12.0);
-            ui.label(RichText::new("Add it").color(pal.text_muted));
-            form.places.ui(ui, list_height, Some("where it is now"));
+            // On a short window the body scrolls; the title and the buttons stay in view.
+            egui::ScrollArea::vertical()
+                .max_height(body_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Name").color(pal.text_muted));
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut form.name).desired_width(f32::INFINITY),
+                    );
+                    if std::mem::take(&mut form.focus) {
+                        field.request_focus();
+                    }
+                    if let Some(problem) = &problem {
+                        ui.label(RichText::new(problem).small().color(pal.danger));
+                    }
+                    copy_fields(ui, pal, form);
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Add it").color(pal.text_muted));
+                    form.places.ui(ui, list_height, Some("where it is now"));
+                });
+            // Outside the scrolled body: what Review will lead to, or why it cannot yet, stays by the button.
             ui.add_space(10.0);
-            // What Review will lead to, or why it cannot yet.
             if let Some(taken) = &taken {
                 ui.add(
                     egui::Label::new(
@@ -2976,11 +3031,8 @@ impl ShellApp {
             } else {
                 ui.label(RichText::new("Tick at least one place.").color(pal.text_muted));
             }
-            ui.label(
-                RichText::new("The copy keeps the original's environment and header values.")
-                    .small()
-                    .color(pal.text_muted),
-            );
+            let keeps = form.copy.keeps();
+            ui.add(egui::Label::new(RichText::new(keeps).small().color(pal.text_muted)).wrap());
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let confirm =
@@ -2990,7 +3042,7 @@ impl ShellApp {
                 review |= ui
                     .add_enabled(ready, confirm)
                     .on_hover_text("Enter")
-                    .on_disabled_hover_text("Give it a usable name and tick a place")
+                    .on_disabled_hover_text("Fix what is marked, and tick a place")
                     .clicked();
                 cancel |= ui
                     .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 34.0)))
@@ -2998,11 +3050,23 @@ impl ShellApp {
                     .clicked();
             });
         });
+        if let Some(port) = form.port_wanted.take() {
+            form.port_pending = Some(port);
+            self.send(Command::CheckCallbackPort(port));
+        }
+        let Some(form) = &mut self.duplicate else {
+            return;
+        };
         if review {
+            let adjust = match &mut form.copy {
+                CopyRead::Ready(fields) => fields.adjust().unwrap_or_default(),
+                _ => Default::default(),
+            };
             let change = Change::Duplicate {
                 id: form.source.clone(),
                 name: form.name.clone(),
                 targets: form.places.targets(),
+                adjust,
             };
             // A copy that signs in has no sign-in of its own yet.
             let signs_in = self
@@ -7579,7 +7643,166 @@ fn names_in_a_line(names: &[&str]) -> String {
     }
 }
 
-/// What the Duplicate dialog holds: the copy's name and where it goes.
+/// Width of the labels of the Duplicate dialog's address and sign-in fields.
+const COPY_LABEL_WIDTH: f32 = 124.0;
+
+/// The Duplicate dialog's address and sign-in fields, filled in from the original: what overlapping servers differ
+/// in, so a copy can be made and changed in one step. The addresses the copy gets are shown as they are typed.
+fn copy_fields(ui: &mut Ui, pal: &Palette, form: &mut DuplicateForm) {
+    let fields = match &mut form.copy {
+        CopyRead::NoAddress => return,
+        CopyRead::Reading => {
+            // A local file read takes milliseconds: a spinner would only flicker, and keep the window repainting.
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Reading its address…")
+                    .small()
+                    .color(pal.text_muted),
+            );
+            return;
+        }
+        CopyRead::Failed(why) => {
+            ui.add_space(8.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Its address can't be changed here: {why}. The copy is made as it is."
+                    ))
+                    .small()
+                    .color(pal.text_muted),
+                )
+                .wrap(),
+            );
+            return;
+        }
+        CopyRead::Ready(fields) => fields,
+    };
+    let problems = fields.problems();
+    // Said once the field is left, not while it is typed in: a half-typed address is not wrong yet. From then on
+    // it is said as it is, so it goes as soon as it is fixed.
+    let left = &mut form.left;
+    let problem = |part: Part, left: &BTreeSet<Part>| {
+        problems
+            .iter()
+            .find(|(p, _)| *p == part && left.contains(p))
+            .map(|(_, why)| why.clone())
+    };
+    let wide = (ui.available_width() - COPY_LABEL_WIDTH - 8.0).max(120.0);
+    ui.add_space(10.0);
+    let label = if fields.base_is_whole_address() {
+        "Address"
+    } else {
+        "Base address"
+    };
+    let base = field_row(ui, pal, label, COPY_LABEL_WIDTH, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.base)
+                .id(egui::Id::new("copy_base"))
+                .hint_text("https://…")
+                .desired_width(wide),
+        )
+    });
+    if base.lost_focus() {
+        fields.complete_base();
+        left.extend([Part::Address, Part::MetadataUrl]);
+    }
+    // What the base makes of each address, under it: the part kept is the original's.
+    let (url, metadata) = fields.addresses();
+    let mut shown = Vec::new();
+    if !fields.base_is_whole_address() {
+        shown.push(format!("Server: {url}"));
+    }
+    match metadata {
+        Some((m, true)) => shown.push(format!("Sign-in metadata: {m}")),
+        Some((m, false)) => shown.push(format!("Sign-in metadata: {m} (another host, kept)")),
+        None => {}
+    }
+    // The addresses stay in view with a problem, which is said under them.
+    field_note(ui, pal, COPY_LABEL_WIDTH, None, &shown.join("\n"));
+    let address_problem = problem(Part::Address, left).or_else(|| problem(Part::MetadataUrl, left));
+    field_note(ui, pal, COPY_LABEL_WIDTH, address_problem.as_deref(), "");
+    if !fields.oauth {
+        return;
+    }
+    let half = wide.min(260.0);
+    let client = field_row(ui, pal, "Client ID", COPY_LABEL_WIDTH, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.client_id)
+                .id(egui::Id::new("copy_client_id"))
+                .hint_text("none: Claude Code registers itself")
+                .desired_width(half),
+        )
+    });
+    if client.lost_focus() {
+        left.insert(Part::ClientId);
+    }
+    field_note(
+        ui,
+        pal,
+        COPY_LABEL_WIDTH,
+        problem(Part::ClientId, left).as_deref(),
+        "",
+    );
+    // Another client has its own secret; the original's is not handed to it.
+    if fields.client_changed() {
+        let show = &mut form.show_secret;
+        let secret = &mut fields.secret;
+        field_row(ui, pal, "Client secret", COPY_LABEL_WIDTH, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(secret.edit())
+                    .id(egui::Id::new("copy_client_secret"))
+                    .password(!*show)
+                    .hint_text("optional")
+                    .desired_width(half),
+            );
+            let (glyph, word) = if *show {
+                (icon::EYE_SLASH, "Hide")
+            } else {
+                (icon::EYE, "Show")
+            };
+            let label = format!("{word} the client secret");
+            let response = ui
+                .small_button(format!("{glyph} {word}"))
+                .on_hover_text(&label);
+            response
+                .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+            if response.clicked() {
+                *show = !*show;
+            }
+        });
+        field_note(
+            ui,
+            pal,
+            COPY_LABEL_WIDTH,
+            None,
+            "For the new client ID; the original's is not used. Leave it empty if the client has none.",
+        );
+    }
+    let port = field_row(ui, pal, "Callback port", COPY_LABEL_WIDTH, |ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut fields.callback_port)
+                .id(egui::Id::new("copy_callback_port"))
+                .hint_text("any")
+                .desired_width(96.0),
+        )
+    });
+    let typed = fields.typed_port();
+    if port.lost_focus() {
+        left.insert(Part::CallbackPort);
+    }
+    let port_problem = problem(Part::CallbackPort, left);
+    field_note(ui, pal, COPY_LABEL_WIDTH, port_problem.as_deref(), "");
+    if port.lost_focus() && typed.is_some() && typed != form.port_pending {
+        form.port_wanted = typed;
+    }
+    if port_problem.is_none()
+        && let Some(warning) = form.port_warning()
+    {
+        field_warning(ui, pal, COPY_LABEL_WIDTH, warning);
+    }
+}
+
+/// What the Duplicate dialog holds: the copy's name, where it goes, and what it changes.
 struct DuplicateForm {
     source: ServerId,
     /// What is being copied, under the title: `http · https://…`.
@@ -7588,6 +7811,60 @@ struct DuplicateForm {
     places: Places,
     /// Give the name field the keyboard on the first frame.
     focus: bool,
+    /// The copy's address and sign-in settings.
+    copy: CopyRead,
+    /// The new client's secret is shown while it is checked.
+    show_secret: bool,
+    /// The fields the keyboard has left: what is wrong with them is said from then on.
+    left: BTreeSet<Part>,
+    /// The callback port to check, sent to the engine after this frame: when the field is left.
+    port_wanted: Option<u16>,
+    /// The callback port sent to be checked, until its answer comes: it is asked once.
+    port_pending: Option<u16>,
+    /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`]).
+    port_checked: Option<(u16, Option<String>)>,
+}
+
+/// The Duplicate dialog's address and sign-in fields, from the original's definition.
+#[derive(Debug, PartialEq)]
+enum CopyRead {
+    /// Asked for ([`Command::Inspect`]); it comes in a moment.
+    Reading,
+    Ready(Box<CopyFields>),
+    /// A program: nothing to change but its name and place.
+    NoAddress,
+    /// The definition could not be read; the copy is made as it is.
+    Failed(String),
+}
+
+impl CopyRead {
+    /// What the copy takes from the original, said under the places.
+    fn keeps(&self) -> &'static str {
+        match self {
+            CopyRead::Ready(f) if f.client_changed() => {
+                "The copy keeps the original's environment and header values, and signs in as \
+                 the client above."
+            }
+            CopyRead::Ready(f) if f.oauth => {
+                "The copy keeps the original's environment and header values, and its client \
+                 secret."
+            }
+            _ => "The copy keeps the original's environment and header values.",
+        }
+    }
+}
+
+impl DuplicateForm {
+    /// Why a sign-in could not come back to the callback port, as last checked: only while it is still the one typed.
+    fn port_warning(&self) -> Option<&str> {
+        let CopyRead::Ready(fields) = &self.copy else {
+            return None;
+        };
+        let (port, warning) = self.port_checked.as_ref()?;
+        (fields.oauth && fields.typed_port() == Some(*port))
+            .then_some(warning.as_deref())
+            .flatten()
+    }
 }
 
 /// The toolbar's buttons: icon and hover text. Only what works today: a button that can never be pressed is noise.
@@ -13565,8 +13842,228 @@ mod tests {
                 id: h.state().snapshot.servers[1].id(),
                 name: "beta_copy".into(),
                 targets: vec![Target::Local("C:/Repos/WebApp".into())],
+                adjust: Default::default(),
             }]
         );
+    }
+
+    const SSO_DEFINITION: &str = r#"{
+  "type": "http",
+  "url": "https://mcp.acme.com/v1/mcp?tenant=7",
+  "headers": {"X-Team": "<hidden>"},
+  "oauth": {"clientId": "acme-1", "callbackPort": 8123, "authServerMetadataUrl": "https://mcp.acme.com/v1/.well-known/oauth-authorization-server"}
+}"#;
+
+    /// The Duplicate dialog for a user server that signs in, its definition read.
+    fn duplicate_sso() -> (
+        Harness<'static, ShellApp>,
+        klefki_core::api::Detached,
+        ServerRow,
+    ) {
+        let (mut h, engine) = live_harness();
+        let mut sso = live_row("sso", Scope::User, None);
+        sso.transport = TransportKind::Http;
+        sso.target = "https://mcp.acme.com/v1/mcp".into();
+        sso.oauth = Some(klefki_core::api::OAuthInfo {
+            client_id: Some("acme-1".into()),
+            scopes: Vec::new(),
+        });
+        engine.events.send(snapshot_of(vec![sso.clone()])).unwrap();
+        h.run();
+        h.get_by_label("sso").click();
+        h.run();
+        drain(&engine);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run();
+        // Its address is read from the file (the list leaves out the query); Review waits for it.
+        assert_eq!(drain(&engine), vec![Command::Inspect(sso.id())]);
+        h.get_by_label_contains("Reading its address");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        engine
+            .events
+            .send(entry_event(&sso, SSO_DEFINITION, true))
+            .unwrap();
+        h.run();
+        (h, engine, sso)
+    }
+
+    fn copy_fields_of<'a>(h: &'a mut Harness<'static, ShellApp>) -> &'a mut CopyFields {
+        match &mut h.state_mut().duplicate.as_mut().unwrap().copy {
+            CopyRead::Ready(fields) => fields,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_changes_the_base_address_port_and_client_of_a_server_that_signs_in() {
+        let (mut h, engine, sso) = duplicate_sso();
+        // Filled in from the original, with what the base makes of each address.
+        h.get_by_label("Base address");
+        h.get_by_label("Client ID");
+        h.get_by_label("Callback port");
+        assert!(h.query_by_label("Client secret").is_none());
+        h.get_by_label_contains("Server: https://mcp.acme.com/v1/mcp?tenant=7");
+        h.get_by_label_contains("its client secret");
+        let f = copy_fields_of(&mut h);
+        f.base = "https://eu.acme.com/v2".into();
+        f.callback_port = "9001".into();
+        f.client_id = "acme-2".into();
+        h.run();
+        h.get_by_label_contains("Server: https://eu.acme.com/v2/mcp?tenant=7");
+        h.get_by_label_contains(
+            "Sign-in metadata: https://eu.acme.com/v2/.well-known/oauth-authorization-server",
+        );
+        // Another client: its own secret, asked for here.
+        h.get_by_label("Client secret");
+        h.get_by_label_contains("signs in as the client above");
+        copy_fields_of(&mut h).secret.edit().push_str("new-s3cret");
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Duplicate {
+                id: sso.id(),
+                name: "sso_copy".into(),
+                targets: vec![Target::User],
+                adjust: klefki_core::api::Adjust {
+                    base: Some(klefki_core::api::Rebase {
+                        from: "https://mcp.acme.com/v1".into(),
+                        to: "https://eu.acme.com/v2".into(),
+                    }),
+                    callback_port: Some(Some(9001)),
+                    client: Some(klefki_core::api::Client {
+                        id: Some("acme-2".into()),
+                        secret: Some(Secret::new("new-s3cret".into())),
+                    }),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_says_what_is_wrong_with_a_change_and_waits_for_it() {
+        let (mut h, engine, sso) = duplicate_sso();
+        let focus = |h: &mut Harness<'static, ShellApp>, id: &str| {
+            h.ctx.memory_mut(|m| m.request_focus(egui::Id::new(id)));
+            h.run();
+        };
+        focus(&mut h, "copy_callback_port");
+        copy_fields_of(&mut h).callback_port = "70000".into();
+        h.run();
+        // Still typing: not said yet, but Review waits.
+        assert!(h.query_by_label_contains("from 1 to 65535").is_none());
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.get_by_label_contains("from 1 to 65535");
+        // Said as it is from then on: fixed, it goes.
+        copy_fields_of(&mut h).callback_port = "8123".into();
+        h.run();
+        assert!(h.query_by_label_contains("from 1 to 65535").is_none());
+        focus(&mut h, "copy_base");
+        copy_fields_of(&mut h).base = String::new();
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        h.get_by_label_contains("Type the address");
+        // The addresses stay in view.
+        h.get_by_label_contains("Sign-in metadata:");
+        assert!(h.get_by_label("Review").accesskit_node().is_disabled());
+        // Typed without its scheme, the base gets one when left.
+        let base = egui::Id::new("copy_base");
+        h.ctx.memory_mut(|m| m.request_focus(base));
+        h.run();
+        copy_fields_of(&mut h).base = "mcp.acme.com/v1".into();
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert_eq!(copy_fields_of(&mut h).base, "https://mcp.acme.com/v1");
+        // Untouched, the copy changes nothing.
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(
+            duplicate_requested(&engine),
+            vec![Change::Duplicate {
+                id: sso.id(),
+                name: "sso_copy".into(),
+                targets: vec![Target::User],
+                adjust: Default::default(),
+            }]
+        );
+    }
+
+    #[test]
+    fn duplicate_warns_about_a_callback_port_another_program_holds_once_left() {
+        let (mut h, engine, _) = duplicate_sso();
+        let port = egui::Id::new("copy_callback_port");
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        copy_fields_of(&mut h).callback_port = "8766".into();
+        h.run();
+        assert!(drain(&engine).is_empty(), "not while it is typed");
+        h.key_press(egui::Key::Tab);
+        h.run();
+        assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8766)]);
+        engine
+            .events
+            .send(Event::CallbackPort {
+                port: 8766,
+                warning: Some("Port 8766 is in use by another program.".into()),
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Port 8766 is in use");
+        // A warning, not a stop.
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        copy_fields_of(&mut h).callback_port = "8767".into();
+        h.run();
+        assert!(h.query_by_label_contains("Port 8766 is in use").is_none());
+    }
+
+    #[test]
+    fn duplicate_of_a_server_whose_definition_cannot_be_read_copies_it_as_it_is() {
+        let (mut h, engine) = live_harness();
+        let mut web = live_row("web", Scope::User, None);
+        web.transport = TransportKind::Http;
+        web.target = "https://h.example/mcp".into();
+        engine.events.send(snapshot_of(vec![web.clone()])).unwrap();
+        h.run();
+        h.get_by_label("web").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run();
+        engine
+            .events
+            .send(Event::Entry {
+                id: web.id(),
+                json: Err("the server is no longer in the configuration".into()),
+                editable: true,
+            })
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("can't be changed here");
+        assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
+        // A plain address: one field, the whole of it, and nothing about signing in.
+        let (mut h, engine) = live_harness();
+        engine.events.send(snapshot_of(vec![web.clone()])).unwrap();
+        h.run();
+        h.get_by_label("web").click();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
+        h.run();
+        engine
+            .events
+            .send(entry_event(
+                &web,
+                r#"{"type": "http", "url": "https://h.example/mcp"}"#,
+                true,
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label("Address");
+        assert!(h.query_by_label("Client ID").is_none());
+        assert!(h.query_by_label_contains("Server:").is_none());
     }
 
     #[test]
@@ -13594,6 +14091,7 @@ mod tests {
                     Target::Local("C:/Repos/WebApp".into()),
                     Target::Local("/home/me/notes".into()),
                 ],
+                adjust: Default::default(),
             }]
         );
     }
@@ -15492,6 +15990,7 @@ mod tests {
                     Target::Local("C:/Repos/WebApp".into()),
                     Target::Local("/home/me/notes".into()),
                 ],
+                adjust: Default::default(),
             }]
         );
     }

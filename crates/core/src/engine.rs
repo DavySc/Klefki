@@ -187,12 +187,14 @@ pub enum Change {
     /// Give a user or local server another name, in the place it is in: the same definition, secrets included, and
     /// still off where it was off. For servers whose names differ only in case.
     Rename { id: ServerId, name: String },
-    /// Copy a user or local server, definition and secrets included, to each of `targets` as `name`. One that signs
-    /// in with OAuth is copied by Claude Code's own `claude mcp add-json`, with Klefki's copy of its client secret.
+    /// Copy a user or local server, definition and secrets included, to each of `targets` as `name`, changed as
+    /// `adjust` says (its address, and how it signs in). One that signs in with OAuth is copied by Claude Code's own
+    /// `claude mcp add-json`, with Klefki's copy of its client secret, or the new client's secret.
     Duplicate {
         id: ServerId,
         name: String,
         targets: Vec<crate::model::Target>,
+        adjust: crate::adjust::Adjust,
     },
     /// Move a user or local server, under its own name, to `to`: another project, or from a project to the user or
     /// back. One that signs in with OAuth is removed and added again by Claude Code's own commands, and put back as it
@@ -1489,6 +1491,93 @@ fn changer(shared: &Shared) -> Option<Arc<dyn swap::Claude>> {
     }))
 }
 
+/// For each copy given another host, what of the original's it sends there: its header or environment values to
+/// the server, its client secret (unless it signs in as another client) to where it signs in. A one-letter slip in
+/// the host would hand them to a stranger, and the review shows them only as `<hidden>`.
+fn new_hosts(
+    changes: &[Change],
+    text: &str,
+    keys: &crate::config::inventory::FileKeys,
+) -> Vec<String> {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text.trim_start_matches('\u{feff}'))
+    else {
+        return Vec::new();
+    };
+    let host = |entry: &serde_json::Value, pointer: &str| {
+        let url = url::Url::parse(entry.pointer(pointer)?.as_str()?).ok()?;
+        let host = url.host_str()?.to_owned();
+        Some(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host,
+        })
+    };
+    let mut out = Vec::new();
+    for change in changes {
+        let Change::Duplicate {
+            id, name, adjust, ..
+        } = change
+        else {
+            continue;
+        };
+        if adjust.base.is_none() {
+            continue;
+        }
+        let Some(key) = keys.get(&id.connection) else {
+            continue;
+        };
+        let list = match &key.project {
+            None => root.get("mcpServers"),
+            Some(p) => root
+                .get("projects")
+                .and_then(|projects| projects.get(p))
+                .and_then(|project| project.get("mcpServers")),
+        };
+        let Some(entry) = list.and_then(|l| l.get(&key.name)) else {
+            continue;
+        };
+        let Ok(new) = adjust.apply(entry, &key.name) else {
+            continue;
+        };
+        let filled = |k: &str| {
+            entry
+                .get(k)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|values| !values.is_empty())
+        };
+        let mut sent: Vec<(&str, String)> = Vec::new();
+        if (filled("headers") || filled("env"))
+            && host(entry, "/url") != host(&new, "/url")
+            && let Some(to) = host(&new, "/url")
+        {
+            sent.push(("header values", to));
+        }
+        if entry.get("oauth").is_some() && adjust.client.is_none() {
+            let signs_in_at = if entry.pointer("/oauth/authServerMetadataUrl").is_some() {
+                "/oauth/authServerMetadataUrl"
+            } else {
+                "/url"
+            };
+            if host(entry, signs_in_at) != host(&new, signs_in_at)
+                && let Some(to) = host(&new, signs_in_at)
+            {
+                sent.push(("client secret", to));
+            }
+        }
+        let what = match sent.as_slice() {
+            [] => continue,
+            [(what, to)] => format!("{what} to {to}"),
+            [(a, to_a), (b, to_b)] if to_a == to_b => format!("{a} and {b} to {to_a}"),
+            [(a, to_a), (b, to_b), ..] => format!("{a} to {to_a} and its {b} to {to_b}"),
+        };
+        out.push(format!(
+            "{} sends the original's {}. Check the address before you go on.",
+            sanitize(name),
+            sanitize(&what)
+        ));
+    }
+    out
+}
+
 /// For each server moved or copied into a project whose entry switches that name off: it arrives switched off there.
 fn stays_off(changes: &[Change], text: &str) -> Vec<String> {
     let arrivals: Vec<(&str, &str)> = changes
@@ -1604,6 +1693,10 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         }
         if let Ok(Some((text, _))) = &read {
             resolved.warnings.extend(stays_off(changes, text));
+            // A mistyped host would get the original's credentials: said before anything else.
+            resolved
+                .warnings
+                .splice(0..0, new_hosts(changes, text, &fresh.keys));
         }
         // What a swap does to other servers' sign-ins depends on what else is in the file.
         let root: serde_json::Value = if resolved.swaps.is_empty() {
@@ -1698,6 +1791,18 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     kept.push(s);
                 }
                 resolved.warnings.splice(0..0, first);
+                // A copy's new callback port, like an added server's (below): said once, however many places.
+                let mut ports: Vec<(&str, u16)> = Vec::new();
+                for s in &kept {
+                    if let Some(Some(port)) = s.adjust.callback_port
+                        && !ports.contains(&(s.to.name.as_str(), port))
+                    {
+                        ports.push((s.to.name.as_str(), port));
+                        if let Some(warning) = crate::form::callback_port_warning(port) {
+                            resolved.warnings.push(format!("{}: {warning}", s.to.name));
+                        }
+                    }
+                }
                 resolved.swaps = kept;
                 Some(store)
             } else if resolved.cli.iter().any(|a| a.secret.is_some()) {
@@ -7523,6 +7628,7 @@ mod tests {
             id,
             name: name.to_owned(),
             targets,
+            adjust: Default::default(),
         }
     }
 
@@ -8548,6 +8654,7 @@ mod tests {
                 id: user_id("gw"),
                 name: "ab".into(),
                 targets: vec![Target::User],
+                adjust: Default::default(),
             }],
         );
         assert!(!plan.nothing_to_do);
@@ -8558,6 +8665,7 @@ mod tests {
                 id: user_id("gw"),
                 name: "x".into(),
                 targets: vec![Target::Local(long)],
+                adjust: Default::default(),
             }],
         );
         // Said before anything is read (the write would refuse it too, less plainly).
@@ -9401,6 +9509,7 @@ mod tests {
                 id: user_id("gw"),
                 name: "gw".into(),
                 targets: vec![Target::Local("/work/b".into())],
+                adjust: Default::default(),
             }],
         );
         assert!(
@@ -9509,6 +9618,323 @@ mod tests {
         assert_eq!(config["tail"], 1);
         assert!(config["mcpServers"].get("sso").is_none());
         verify_passes(&core);
+    }
+
+    // ---- a copy made with another address, callback port or client
+
+    fn rebase(from: &str, to: &str) -> crate::adjust::Rebase {
+        crate::adjust::Rebase {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_copy_with_another_base_address_keeps_its_header_values_and_the_original() {
+        let gw = serde_json::json!({"type": "http", "url": "https://mcp.acme.com/v1/mcp", "headers": {"Authorization": "Bearer s3cret-value"}});
+        let env = quiet_env(&serde_json::json!({"mcpServers": {"gw": gw.clone()}, "projects": {}}));
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![Change::Duplicate {
+                id: user_id("gw"),
+                name: "gw_eu".into(),
+                targets: vec![Target::User],
+                adjust: crate::adjust::Adjust {
+                    base: Some(rebase("https://mcp.acme.com/v1", "https://eu.acme.com/v2")),
+                    ..Default::default()
+                },
+            }],
+        );
+        // The new host gets the original's header values, and the review says so first.
+        assert_eq!(
+            plan.warnings.first().map(String::as_str),
+            Some(
+                "gw_eu sends the original's header values to eu.acme.com. Check the address before you go on."
+            ),
+            "{:?}",
+            plan.warnings
+        );
+        // The review shows the new address, never the header's value.
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("https://eu.acme.com/v2/mcp"), "{shown}");
+        assert!(!shown.contains("s3cret-value"), "{shown}");
+        // The variant: another path on the same host is nothing to check.
+        let same_host = plan_for(
+            &core,
+            vec![Change::Duplicate {
+                id: user_id("gw"),
+                name: "gw_v2".into(),
+                targets: vec![Target::User],
+                adjust: crate::adjust::Adjust {
+                    base: Some(rebase("https://mcp.acme.com/v1", "https://mcp.acme.com/v2")),
+                    ..Default::default()
+                },
+            }],
+        );
+        assert!(
+            !same_host
+                .warnings
+                .iter()
+                .any(|w| w.contains("sends the original's")),
+            "{:?}",
+            same_host.warnings
+        );
+        core.send(Command::Discard(same_host.id));
+        apply_and_wait(&core, &plan);
+        let now = config_json(&env);
+        assert_eq!(now["mcpServers"]["gw"], gw);
+        let mut copy = gw.clone();
+        copy["url"] = serde_json::json!("https://eu.acme.com/v2/mcp");
+        assert_eq!(now["mcpServers"]["gw_eu"], copy);
+        verify_passes(&core);
+    }
+
+    #[test]
+    fn a_copy_whose_address_does_not_fit_is_refused_before_anything_changes() {
+        let gw = serde_json::json!({"type": "http", "url": "https://mcp.acme.com/mcp"});
+        let env = quiet_env(
+            &serde_json::json!({"mcpServers": {"gw": gw, "st": {"command": "node"}}, "projects": {}}),
+        );
+        let core = env.start();
+        let before = config_json(&env);
+        let copy = |id: ServerId, adjust| Change::Duplicate {
+            id,
+            name: "c".into(),
+            targets: vec![Target::User],
+            adjust,
+        };
+        for (change, said) in [
+            // Not an address Claude Code takes.
+            (
+                copy(
+                    user_id("gw"),
+                    crate::adjust::Adjust {
+                        base: Some(rebase("https://mcp.acme.com", "ftp://x")),
+                        ..Default::default()
+                    },
+                ),
+                "http",
+            ),
+            // The address changed since the dialog read it.
+            (
+                copy(
+                    user_id("gw"),
+                    crate::adjust::Adjust {
+                        base: Some(rebase("https://old.acme.com", "https://new.acme.com")),
+                        ..Default::default()
+                    },
+                ),
+                "changed since",
+            ),
+            // A program has no address, and nothing signs in without OAuth.
+            (
+                copy(
+                    user_id("st"),
+                    crate::adjust::Adjust {
+                        base: Some(rebase("a", "https://x")),
+                        ..Default::default()
+                    },
+                ),
+                "no address",
+            ),
+            (
+                copy(
+                    user_id("gw"),
+                    crate::adjust::Adjust {
+                        callback_port: Some(Some(9001)),
+                        ..Default::default()
+                    },
+                ),
+                "does not sign in",
+            ),
+        ] {
+            let refused = plan_failure(&core, vec![change]);
+            assert!(refused.contains(said), "{said}: {refused}");
+        }
+        assert_eq!(config_json(&env), before);
+    }
+
+    /// Copies sso (signing in, with Klefki's copy of its client secret) for the user as `sso_eu`, adjusted; Claude
+    /// Code's add works. Returns the add's argv, the hash of the secret it was handed, and the core.
+    fn copy_sso(
+        adjust: crate::adjust::Adjust,
+    ) -> (Env, Arc<crate::secrets::MemoryStore>, PlanView, Core) {
+        let (env, store, _, _) = oauth_move_env(
+            r#"{"rules":[{"args":["mcp","add-json"],"delay_ms":800,"stdout_file":"added.txt"}]}"#,
+        );
+        let core = with_store(&env, Arc::clone(&store));
+        collect(&core, |e| !snapshots(e).is_empty());
+        let plan = plan_for(
+            &core,
+            vec![Change::Duplicate {
+                id: user_id("sso"),
+                name: "sso_eu".into(),
+                targets: vec![Target::User],
+                adjust,
+            }],
+        );
+        (env, store, plan, core)
+    }
+
+    /// Applies `plan`, playing Claude Code's part: it writes what it was asked to add.
+    fn apply_copy(env: &Env, core: &Core, plan: &PlanView) -> serde_json::Value {
+        core.send(Command::Apply(plan.id));
+        env.wait_for_run(1);
+        let run = &env.changes_run()[0];
+        let json: serde_json::Value = serde_json::from_str(run.0.last().unwrap()).unwrap();
+        let mut config = config_json(env);
+        config["mcpServers"]["sso_eu"] = json.clone();
+        write_config(env, &config);
+        let events = collect(core, |e| {
+            e.iter()
+                .any(|x| matches!(x, Event::Applied { .. } | Event::ApplyFailed { .. }))
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Applied { changed: true, .. })),
+            "{events:#?}"
+        );
+        json
+    }
+
+    #[test]
+    fn a_copy_that_signs_in_gets_its_new_address_and_port_and_keeps_the_client_secret() {
+        let (env, store, plan, core) = copy_sso(crate::adjust::Adjust {
+            base: Some(rebase(
+                "https://sso.example.com/mcp",
+                "https://eu.example.com/mcp",
+            )),
+            callback_port: Some(Some(9123)),
+            ..Default::default()
+        });
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("https://eu.example.com/mcp"), "{shown}");
+        assert!(shown.contains("9123"), "{shown}");
+        // Klefki's copy of the original's client secret goes to the new host.
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w == "sso_eu sends the original's client secret to eu.example.com. Check the address before you go on."),
+            "{:?}",
+            plan.warnings
+        );
+        let added = apply_copy(&env, &core, &plan);
+        assert_eq!(
+            added,
+            serde_json::json!({"type": "http", "url": "https://eu.example.com/mcp", "oauth": {"clientId": "client-7", "callbackPort": 9123}})
+        );
+        let runs = env.changes_run();
+        assert_eq!(runs.len(), 1, "only an add: {runs:?}");
+        assert_eq!(runs[0].2.as_deref(), Some(sha256(CLIENT_SECRET).as_str()));
+        // The original is as it was; Klefki keeps the same secret for the copy.
+        let config = config_json(&env);
+        assert_eq!(
+            config["mcpServers"]["sso"],
+            serde_json::from_str::<serde_json::Value>(SSO_ENTRY).unwrap()
+        );
+        let values = store.values.lock().unwrap().clone();
+        let copy = crate::model::ConnectionId::new(Scope::User, None, "sso_eu");
+        assert_eq!(
+            values.get(&crate::secrets::user_for(&copy)),
+            Some(&CLIENT_SECRET.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_copy_that_signs_in_as_another_client_hands_over_that_clients_secret_only() {
+        const OTHER: &str = "Other-Client-S3cret";
+        let (env, store, plan, core) = copy_sso(crate::adjust::Adjust {
+            base: Some(rebase(
+                "https://sso.example.com/mcp",
+                "https://eu.example.com/mcp",
+            )),
+            client: Some(crate::adjust::Client {
+                id: Some("client-8".into()),
+                secret: Some(crate::secrets::Secret::new(OTHER.to_owned())),
+            }),
+            ..Default::default()
+        });
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("client-8"), "{shown}");
+        // Another client brings its own secret: nothing of the original's goes anywhere new.
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("sends the original's")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            !shown.contains(OTHER) && !shown.contains(CLIENT_SECRET),
+            "{shown}"
+        );
+        let added = apply_copy(&env, &core, &plan);
+        assert_eq!(added["oauth"]["clientId"], "client-8");
+        let runs = env.changes_run();
+        assert_eq!(runs[0].2.as_deref(), Some(sha256(OTHER).as_str()));
+        let log = std::fs::read_to_string(&env.log).unwrap();
+        assert!(!log.contains(OTHER), "{log}");
+        let values = store.values.lock().unwrap().clone();
+        let copy = crate::model::ConnectionId::new(Scope::User, None, "sso_eu");
+        let original = crate::model::ConnectionId::new(Scope::User, None, "sso");
+        assert_eq!(
+            values.get(&crate::secrets::user_for(&copy)),
+            Some(&OTHER.to_owned())
+        );
+        assert_eq!(
+            values.get(&crate::secrets::user_for(&original)),
+            Some(&CLIENT_SECRET.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_copy_that_signs_in_as_a_client_without_a_secret_gets_none() {
+        // The variant: no client id at all, so Claude Code registers itself; and no secret to hand over.
+        let (env, store, plan, core) = copy_sso(crate::adjust::Adjust {
+            callback_port: Some(None),
+            client: Some(crate::adjust::Client {
+                id: None,
+                secret: None,
+            }),
+            ..Default::default()
+        });
+        // Not the note about Klefki lacking the original's secret: the copy is meant to have none.
+        assert!(
+            !plan.notes.iter().any(|n| n.contains("no copy")),
+            "{:?}",
+            plan.notes
+        );
+        let added = apply_copy(&env, &core, &plan);
+        assert_eq!(added["oauth"], serde_json::json!({}));
+        let runs = env.changes_run();
+        assert_eq!(runs[0].2, None, "no secret: {runs:?}");
+        assert!(
+            !runs[0].0.iter().any(|a| a == "--client-secret"),
+            "{runs:?}"
+        );
+        let values = store.values.lock().unwrap().clone();
+        let copy = crate::model::ConnectionId::new(Scope::User, None, "sso_eu");
+        assert_eq!(values.get(&crate::secrets::user_for(&copy)), None);
+    }
+
+    #[test]
+    fn a_copy_whose_new_callback_port_is_taken_is_warned_about() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let (_env, _store, plan, _core) = copy_sso(crate::adjust::Adjust {
+            callback_port: Some(Some(port)),
+            ..Default::default()
+        });
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.starts_with("sso_eu: ") && w.contains(&port.to_string())),
+            "{:?}",
+            plan.warnings
+        );
     }
 
     #[test]

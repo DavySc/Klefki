@@ -1,5 +1,6 @@
 //! All IO lives here. The UI crate may only use [`api`].
 mod activity;
+mod adjust;
 pub mod api;
 mod cli;
 mod config;
