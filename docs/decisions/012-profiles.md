@@ -65,6 +65,13 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   both began. One another profile also set the same way stays, and is named. A server renamed through Klefki, or a
   renamed profile, keeps its switches; one gone, or a project Claude Code no longer knows, is skipped and said. A
   use saved before this was built is not recorded: stopping it says so and points to Restore.
+- A switch another change writes through Klefki (a toggle, a Restore, a migration) is the user's choice from then on:
+  every profile forgets it, and that change's review says which profile will no longer put it back. Only a change
+  made outside Klefki (`/mcp`, by hand) that ends where the profile left the switch goes unnoticed.
+- A profile saved new, or renamed, under a name that still has a record (left by a failed forget, an older Klefki, or
+  `profiles.json` changed by hand) drops that record first: the profile never takes over switches it did not make,
+  and the file never holds a name twice. A record that cannot be forgotten or carried over is said on the page.
+- In use in more than one project, "Stop using in…" asks where: one project, or all of them.
 
 ## Not yet
 - Which profiles a project is on alone in, shown on the Connections page too.

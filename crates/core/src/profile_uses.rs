@@ -12,6 +12,7 @@
 use crate::config::fsx;
 use crate::sanitize::sanitize_line;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// At most this many switches per profile: every project Claude Code knows, times its servers, fits.
@@ -138,16 +139,15 @@ pub(crate) fn load(backup_dir: &Path) -> ProfileUses {
         }
         skipped += used.switches.len().saturating_sub(MAX_SWITCHES);
         let mut switches: Vec<Switch> = Vec::new();
+        // Read with every snapshot: each switch is looked up once, not against all before it.
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         for s in used.switches.into_iter().take(MAX_SWITCHES) {
             skipped += s.other.len();
             if !plain(&s.project) || !plain(&s.name) {
                 skipped += 1;
                 continue;
             }
-            if switches
-                .iter()
-                .any(|k| k.project == s.project && k.name == s.name)
-            {
+            if !seen.insert((s.project.clone(), s.name.clone())) {
                 skipped += 1;
                 continue;
             }
@@ -231,30 +231,42 @@ pub(crate) fn record(
             uses.uses.len() - 1
         }
     };
-    let mine = &mut uses.uses[at].switches;
+    // In order, with a hole where a switch is forgotten; each found by its place, not by a search.
+    let mut mine: Vec<Option<Switch>> = std::mem::take(&mut uses.uses[at].switches)
+        .into_iter()
+        .map(Some)
+        .collect();
+    let mut at_key: HashMap<(String, String), usize> = mine
+        .iter()
+        .enumerate()
+        .filter_map(|(i, k)| k.as_ref().map(|k| ((k.project.clone(), k.name.clone()), i)))
+        .collect();
     for s in flipped {
-        match mine
-            .iter()
-            .position(|k| k.project == s.project && k.name == s.name)
-        {
+        let key = (s.project.clone(), s.name.clone());
+        match at_key.get(&key).copied() {
             // Set its way again after something else changed it: the state before is still the one it found first.
-            Some(i) if mine[i].off == s.off => {}
+            Some(i) if mine[i].as_ref().is_some_and(|k| k.off == s.off) => {}
             // Back to what its first use found: nothing of its doing is left there.
             Some(i) => {
-                mine.remove(i);
+                mine[i] = None;
+                at_key.remove(&key);
             }
-            None => mine.push(s.clone()),
+            None => {
+                at_key.insert(key, mine.len());
+                mine.push(Some(s.clone()));
+            }
         }
     }
     for s in shared {
-        if shares(&s)
-            && !mine
-                .iter()
-                .any(|k| k.project == s.project && k.name == s.name)
-        {
-            mine.push(s.clone());
+        let key = (s.project.clone(), s.name.clone());
+        if shares(&s) && !at_key.contains_key(&key) {
+            at_key.insert(key, mine.len());
+            mine.push(Some(s.clone()));
         }
     }
+    let mine: Vec<Switch> = mine.into_iter().flatten().collect();
+    uses.uses[at].switches = mine;
+    let mine = &uses.uses[at].switches;
     if mine.len() > MAX_SWITCHES {
         return Err(format!(
             "Klefki remembers at most {MAX_SWITCHES} switches per profile."
@@ -288,17 +300,59 @@ pub(crate) fn stop(
     write(backup_dir, &uses.uses)
 }
 
-/// The profile `old` is now called `new`. Nothing to do when it was never used.
-pub(crate) fn rename_profile(backup_dir: &Path, old: &str, new: &str) -> Result<bool, String> {
-    if old == new || load(backup_dir).of(old).is_empty() {
+/// A profile was saved as `new`, renamed from `old` when given. A record left under `new` (by a forget that failed,
+/// an older Klefki, or `profiles.json` changed by hand) belongs to no profile that was used: it is dropped, so the
+/// profile does not take over switches it never made and the file never holds a name twice. Then `old`'s record is
+/// `new`'s. Nothing to do when neither has one.
+pub(crate) fn claim_name(backup_dir: &Path, old: Option<&str>, new: &str) -> Result<bool, String> {
+    let renamed = old.filter(|old| *old != new);
+    let read = load(backup_dir);
+    let leftover = old != Some(new)
+        && read.uses.iter().any(|u| {
+            crate::profiles::same_name(&u.profile, new) && Some(u.profile.as_str()) != old
+        });
+    let moves = renamed.is_some_and(|old| !read.of(old).is_empty());
+    if !leftover && !moves {
+        return Ok(false);
+    }
+    let mut uses = writable(backup_dir)?;
+    uses.uses.retain(|u| {
+        !crate::profiles::same_name(&u.profile, new) || Some(u.profile.as_str()) == old
+    });
+    for used in &mut uses.uses {
+        if Some(used.profile.as_str()) == renamed {
+            new.clone_into(&mut used.profile);
+        }
+    }
+    write(backup_dir, &uses.uses).map(|()| true)
+}
+
+/// A change other than a profile's switched each of `switched` (project, name), through Klefki: that is the user's
+/// choice now, so no profile puts it back. Projects are compared in any spelling.
+pub(crate) fn forget_switches(
+    backup_dir: &Path,
+    switched: &[(String, String)],
+) -> Result<bool, String> {
+    if switched.is_empty() {
+        return Ok(false);
+    }
+    let hit = |s: &Switch| {
+        switched
+            .iter()
+            .any(|(p, n)| *n == s.name && crate::api::same_project(p, &s.project))
+    };
+    if !load(backup_dir)
+        .uses
+        .iter()
+        .any(|u| u.switches.iter().any(hit))
+    {
         return Ok(false);
     }
     let mut uses = writable(backup_dir)?;
     for used in &mut uses.uses {
-        if used.profile == old {
-            new.clone_into(&mut used.profile);
-        }
+        used.switches.retain(|s| !hit(s));
     }
+    uses.uses.retain(|u| !u.switches.is_empty());
     write(backup_dir, &uses.uses).map(|()| true)
 }
 
@@ -437,7 +491,7 @@ mod tests {
         assert!(load(&backups).of("Research").is_empty());
         record(&backups, "Research", &[], &[sw("/d", "memory", true)]).unwrap();
         assert_eq!(load(&backups).of("Research"), [sw("/d", "memory", true)]);
-        rename_profile(&backups, "Research", "Reading").unwrap();
+        claim_name(&backups, Some("Research"), "Reading").unwrap();
         assert_eq!(load(&backups).of("Reading"), [sw("/d", "memory", true)]);
         forget(&backups, "Reading").unwrap();
         assert!(load(&backups).of("Reading").is_empty());
@@ -468,6 +522,50 @@ mod tests {
         assert!(read.of("Research").is_empty());
         stop(&backups, "Writing", None, &[]).unwrap();
         assert_eq!(load(&backups), ProfileUses::default());
+    }
+
+    /// A record left under a name (Delete only's forget failed, say) is not taken over by a profile saved under that
+    /// name later, and a rename onto it never writes the name twice, which would lock the file (found in review, PR
+    /// #63).
+    #[test]
+    fn a_leftover_record_is_dropped_when_its_name_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        record(&backups, "B", &[sw("/a", "x", true)], &[]).unwrap();
+        record(&backups, "A", &[sw("/a", "y", true)], &[]).unwrap();
+        // A renamed onto B, whose record is left over.
+        assert!(claim_name(&backups, Some("A"), "B").unwrap());
+        let read = load(&backups);
+        assert_eq!(read.problem, None);
+        assert_eq!(read.of("B"), [sw("/a", "y", true)]);
+        assert!(read.of("A").is_empty());
+        // Variant: a new profile under a leftover name, in another case, starts with nothing.
+        record(&backups, "C", &[sw("/a", "z", true)], &[]).unwrap();
+        assert!(claim_name(&backups, None, "c").unwrap());
+        assert!(load(&backups).of("C").is_empty());
+        // Saved again as it was, or never used: nothing is written.
+        assert!(!claim_name(&backups, Some("B"), "B").unwrap());
+        assert!(!claim_name(&backups, Some("D"), "E").unwrap());
+        assert_eq!(load(&backups).of("B"), [sw("/a", "y", true)]);
+    }
+
+    #[test]
+    fn a_switch_set_by_another_change_is_forgotten_by_every_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        record(
+            &backups,
+            "A",
+            &[sw("/a", "x", true), sw("/b", "x", true)],
+            &[],
+        )
+        .unwrap();
+        record(&backups, "B", &[], &[sw("/a", "x", true)]).unwrap();
+        assert!(forget_switches(&backups, &[("/a/".into(), "x".into())]).unwrap());
+        let read = load(&backups);
+        assert_eq!(read.of("A"), [sw("/b", "x", true)]);
+        assert!(read.of("B").is_empty());
+        assert!(!forget_switches(&backups, &[("/a".into(), "y".into())]).unwrap());
     }
 
     #[test]

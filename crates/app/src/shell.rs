@@ -19777,7 +19777,12 @@ mod tests {
             .unwrap();
         h.run();
         open_profiles(&mut h, &engine, work_profile());
-        h.get_by_label_contains("In use in notes.");
+        // On alone there too: said once, not twice.
+        h.get_by_label_contains("In use in notes, where only these servers are on.");
+        assert!(
+            h.query_by_label_contains("Only these servers are on in")
+                .is_none()
+        );
         h.get_by_label("Stop using in notes…").click();
         h.run();
         assert_eq!(
@@ -19815,6 +19820,57 @@ mod tests {
             .unwrap();
         h.run();
         assert!(h.query_by_label_contains("In use in").is_none());
+    }
+
+    /// In use in more than one project, Stop asks where: one of them, or all (cross-review of PR #63).
+    #[test]
+    fn a_profile_in_use_in_several_projects_stops_in_the_one_chosen() {
+        let (mut h, engine) = profiles_harness();
+        let klefki_core::api::Event::Snapshot(snapshot) = snapshot_with_work_in_use_in_notes()
+        else {
+            unreachable!()
+        };
+        let mut snapshot = (*snapshot).clone();
+        for row in &mut snapshot.servers {
+            if row.name == "beta" {
+                row.disabled_projects.push("/work/app".to_owned());
+                row.disabled_in = 2;
+            }
+        }
+        snapshot.profile_uses.uses[0]
+            .switches
+            .push(klefki_core::api::Switch {
+                project: "/work/app".to_owned(),
+                name: "beta".to_owned(),
+                off: true,
+            });
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(snapshot)))
+            .unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label("Stop using in…").click();
+        h.run();
+        h.get_by_label("notes").click();
+        h.run();
+        assert_eq!(
+            sent(&engine),
+            [Command::Prepare(vec![Change::StopProfile {
+                name: "Work".to_owned(),
+                project: Some("/home/notes".to_owned()),
+                delete: false,
+            }])]
+        );
+        h.state_mut().preparing = false;
+        h.get_by_label("Stop using in…").click();
+        h.run();
+        h.get_by_label("All 2 projects").click();
+        h.run();
+        assert!(matches!(
+            &sent(&engine)[..],
+            [Command::Prepare(c)] if matches!(&c[..], [Change::StopProfile { project: None, delete: false, .. }])
+        ));
     }
 
     #[test]

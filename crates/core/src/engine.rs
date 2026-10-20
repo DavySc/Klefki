@@ -5,7 +5,7 @@ use crate::cli::locate;
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::ConfigPaths;
-use crate::config::docstore::{Docstore, Plan, StoreError};
+use crate::config::docstore::{Docstore, Op, Plan, StoreError};
 use crate::config::entry;
 use crate::config::fsx;
 use crate::config::inventory::{self, FileKey, FileKeys};
@@ -1212,23 +1212,24 @@ fn engine_main(
             } => {
                 let saved = backup_dir(&shared).and_then(|dir| {
                     let saved = crate::profiles::save(&dir, &name, &members, replaces.as_deref())?;
-                    // A renamed profile keeps what its uses switched. Not kept, stopping it under its new name puts
-                    // nothing back; the profile itself is saved either way.
-                    let renamed = match &replaces {
-                        Some(old) => crate::profile_uses::rename_profile(
-                            &dir,
-                            old,
-                            saved_name(&saved, &name),
-                        ),
-                        None => Ok(false),
-                    };
-                    Ok((saved, renamed))
+                    // A renamed profile keeps what its uses switched, and a record left under its name is not its own.
+                    // The profile itself is saved either way; a record not kept is said.
+                    let claimed = crate::profile_uses::claim_name(
+                        &dir,
+                        replaces.as_deref(),
+                        saved_name(&saved, &name),
+                    );
+                    Ok((saved, claimed))
                 });
                 match saved {
-                    Ok((profiles, renamed)) => {
+                    Ok((profiles, claimed)) => {
                         shared.emitter.emit(Event::Profiles(profiles));
-                        if renamed != Ok(false) {
-                            profiles_changed(&shared, &mut state);
+                        match claimed {
+                            Ok(false) => {}
+                            Ok(true) => profiles_changed(&shared, &mut state),
+                            Err(why) => shared.emitter.emit(Event::ProfileRefused(format!(
+                                "The profile is saved, but what its uses switched could not be kept with it: {why}"
+                            ))),
                         }
                     }
                     Err(why) => shared.emitter.emit(Event::ProfileRefused(why)),
@@ -1243,8 +1244,13 @@ fn engine_main(
                 match left {
                     Ok((profiles, forgot)) => {
                         shared.emitter.emit(Event::Profiles(profiles));
-                        if forgot != Ok(false) {
-                            profiles_changed(&shared, &mut state);
+                        match forgot {
+                            Ok(false) => {}
+                            Ok(true) => profiles_changed(&shared, &mut state),
+                            // A profile saved under this name later does not take the record over (claim_name).
+                            Err(why) => shared.emitter.emit(Event::ProfileRefused(format!(
+                                "The profile is deleted, but what its uses switched is still remembered: {why}"
+                            ))),
                         }
                     }
                     Err(why) => shared.emitter.emit(Event::ProfileRefused(why)),
@@ -1549,6 +1555,8 @@ struct Stored {
     profiles_used: Vec<ops::UsedProfile>,
     /// A profile stopped, forgotten (and deleted when asked) once it is applied.
     profile_stopped: Option<ops::StoppedProfile>,
+    /// Switches another change writes: no profile puts them back once it is applied.
+    switched: Vec<(String, String)>,
 }
 
 /// What Claude Code does with its own commands: servers it adds, servers it removes and adds again (or copies), and
@@ -1809,6 +1817,37 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             }
             _ => ops::resolve(changes, &fresh.snapshot, &fresh.keys)?,
         };
+        // Switches a change other than a profile's writes: the user's choice from now on, which no profile puts back.
+        if resolved.profiles_used.is_empty() && resolved.profile_stopped.is_none() {
+            let mut switched = Vec::new();
+            for op in &resolved.claude {
+                match op {
+                    Op::SetDisabled { project, name, .. } => {
+                        switched.push((project.clone(), name.clone()));
+                    }
+                    Op::MigrateLegacyDisabled { project } => {
+                        for legacy in fresh
+                            .snapshot
+                            .legacy_disabled
+                            .iter()
+                            .filter(|l| l.project == *project)
+                        {
+                            switched.extend(
+                                legacy
+                                    .turns_off
+                                    .iter()
+                                    .map(|n| (project.clone(), n.clone())),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            resolved
+                .notes
+                .extend(ops::no_longer_put_back(&switched, &fresh.snapshot));
+            resolved.switched = switched;
+        }
         // A kept definition whose removal also took another server's client secret is put back, not forgotten.
         for id in &resolved.forget {
             let kept = swap::Recovery::find(&backup_dir(shared)?, id)?;
@@ -2014,6 +2053,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 others_on,
                 profiles_used,
                 profile_stopped,
+                switched,
                 ..
             } = resolved;
             let mut notes = notes;
@@ -2078,6 +2118,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     follow,
                     profiles_used,
                     profile_stopped,
+                    switched,
                 },
             );
             shared.emitter.emit(Event::PlanReady(view));
@@ -2127,6 +2168,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         follow,
         profiles_used,
         profile_stopped,
+        switched,
     }) = plans.stored.remove(&id)
     else {
         return fail("This change was already applied or discarded. Prepare it again.".to_owned());
@@ -2250,6 +2292,12 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                 )),
             }
         }
+        match crate::profile_uses::forget_switches(&dir, &switched) {
+            Ok(forgot) => uses_changed |= forgot,
+            Err(why) => notes.push(format!(
+                "A profile may still put back what this switched: {why}"
+            )),
+        }
         for used in &profiles_used {
             match crate::profile_uses::record(&dir, &used.profile, &used.flipped, &used.already) {
                 Ok(recorded) => uses_changed |= recorded,
@@ -2268,6 +2316,8 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
                 stopped.project.as_deref(),
                 &stopped.handed,
             )?;
+            // Forgotten already, so the snapshot is read again whether or not the delete goes through.
+            uses_changed = true;
             if stopped.delete {
                 shared.emitter.emit(Event::Profiles(crate::profiles::delete(
                     &dir,
@@ -2276,9 +2326,8 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
             }
             Ok(())
         });
-        match done {
-            Ok(()) => uses_changed = true,
-            Err(why) => notes.push(sanitize(&why)),
+        if let Err(why) = done {
+            notes.push(sanitize(&why));
         }
     }
     if !written.is_empty() || forgot {
@@ -8828,15 +8877,12 @@ mod tests {
             off_in(&env, "/work/designs"),
             serde_json::json!(["memory", "db"])
         );
-        // memory is turned back on in the meantime, by a switch of its own.
-        let plan = plan_for(
-            &core,
-            vec![Change::SetEnabled {
-                id: user_id("memory"),
-                enabled: true,
-            }],
-        );
-        apply_and_wait(&core, &plan);
+        // memory is turned back on by hand (or by Claude Code's /mcp) in the meantime, once Klefki's check of its
+        // own write is done.
+        verify_passes(&core);
+        let mut now = config_json(&env);
+        now["projects"]["/work/designs"]["disabledMcpServers"] = serde_json::json!(["db"]);
+        write_config(&env, &now);
         let plan = plan_for(
             &core,
             vec![stop_profile("Writing", Some("/work/designs"), false)],
@@ -8874,6 +8920,137 @@ mod tests {
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         apply_and_wait(&core, &plan);
         assert_eq!(off_in(&env, "/work/designs"), serde_json::json!([]));
+    }
+
+    /// A switch the user changed through Klefki after a use is theirs: turned on and off again, it is not put back on
+    /// by Stop, and the change that switches it says so (found in review, PR #63).
+    #[test]
+    fn a_switch_changed_through_klefki_since_is_no_longer_the_profiles() {
+        let env = quiet_env(&designs_config());
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![use_profile("Writing", &["gw"], Some("/work/designs"), true)],
+        );
+        apply_and_wait(&core, &plan);
+        let switch = |on: bool| Change::SetEnabled {
+            id: user_id("memory"),
+            enabled: on,
+        };
+        let plan = plan_for(&core, vec![switch(true)]);
+        assert!(
+            plan.notes.iter().any(|n| n
+                == "Writing switched memory in designs; after this, stopping Writing leaves it as you set it."),
+            "{:?}",
+            plan.notes
+        );
+        apply_and_wait(&core, &plan);
+        let plan = plan_for(&core, vec![switch(false)]);
+        apply_and_wait(&core, &plan);
+        let plan = plan_for(&core, vec![stop_profile("Writing", None, false)]);
+        assert!(
+            !plan.notes.iter().any(|n| n.starts_with("memory")),
+            "{:?}",
+            plan.notes
+        );
+        apply_and_wait(&core, &plan);
+        // db goes back on; memory stays off as the user last set it.
+        assert_eq!(off_in(&env, "/work/designs"), serde_json::json!(["memory"]));
+    }
+
+    /// Variant: a Restore that lands on the profile's state is the user's choice too.
+    #[test]
+    fn a_restore_since_a_profile_was_used_is_not_put_back() {
+        let env = quiet_env(&designs_config());
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![use_profile("Writing", &["gw"], Some("/work/designs"), true)],
+        );
+        apply_and_wait(&core, &plan);
+        // Another change keeps a backup with memory and db off, as the profile left them.
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        applied(&core, &plan);
+        let backup = newest_backup(&core);
+        verify_passes(&core);
+        // memory on by hand, then the backup restored: memory is off again, by the restore.
+        let mut now = config_json(&env);
+        now["projects"]["/work/designs"]["disabledMcpServers"] = serde_json::json!(["db", "gw"]);
+        write_config(&env, &now);
+        let plan = plan_for(&core, vec![Change::Restore { backup }]);
+        apply_and_wait(&core, &plan);
+        assert_eq!(
+            off_in(&env, "/work/designs"),
+            serde_json::json!(["db", "memory"])
+        );
+        let plan = plan_for(&core, vec![stop_profile("Writing", None, false)]);
+        apply_and_wait(&core, &plan);
+        assert_eq!(off_in(&env, "/work/designs"), serde_json::json!(["memory"]));
+    }
+
+    /// A record left under a profile name (a failed forget, an older Klefki, `profiles.json` changed by hand) is
+    /// dropped when a profile is renamed onto that name, so the file stays readable and the profile keeps its own
+    /// record; a new profile under that name starts with none (found in review, PR #63).
+    #[test]
+    fn a_profile_saved_under_a_leftover_name_does_not_lock_or_take_over_its_record() {
+        let env = quiet_env(&designs_config());
+        let backups = env.dir.path().join("backups");
+        crate::profiles::save(&backups, "A", &[user_id("gw").connection], None).unwrap();
+        crate::profile_uses::record(
+            &backups,
+            "B",
+            &[crate::profile_uses::Switch {
+                project: "/work/notes".into(),
+                name: "db".into(),
+                off: true,
+            }],
+            &[],
+        )
+        .unwrap();
+        let core = env.start();
+        let plan = plan_for(
+            &core,
+            vec![use_profile("A", &["gw"], Some("/work/designs"), true)],
+        );
+        apply_and_wait(&core, &plan);
+        core.send(Command::SaveProfile {
+            name: "B".to_owned(),
+            members: vec![user_id("gw").connection],
+            replaces: Some("A".to_owned()),
+        });
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        let uses = &last_snapshot(&events).profile_uses;
+        assert_eq!(uses.problem, None);
+        assert_eq!(uses.of("B").len(), 2, "{uses:?}");
+        assert!(
+            uses.of("B").iter().all(|s| s.project == "/work/designs"),
+            "{uses:?}"
+        );
+        // Variant: a new profile under a name with a leftover record starts with none.
+        crate::profile_uses::record(
+            &backups,
+            "C",
+            &[crate::profile_uses::Switch {
+                project: "/work/notes".into(),
+                name: "db".into(),
+                off: true,
+            }],
+            &[],
+        )
+        .unwrap();
+        core.send(Command::SaveProfile {
+            name: "C".to_owned(),
+            members: vec![user_id("gw").connection],
+            replaces: None,
+        });
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert!(last_snapshot(&events).profile_uses.of("C").is_empty());
     }
 
     /// Two profiles one after another in one project end as before both, stopped in either order.

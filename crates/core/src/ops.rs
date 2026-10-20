@@ -58,6 +58,8 @@ pub(crate) struct Resolved {
     pub profiles_used: Vec<UsedProfile>,
     /// A profile stopped: what is forgotten (and whether the profile is deleted) once it is saved.
     pub profile_stopped: Option<StoppedProfile>,
+    /// Switches (project, name) a change other than a profile's writes: no profile puts them back once it is saved.
+    pub switched: Vec<(String, String)>,
 }
 
 /// A use of a profile, as [`crate::profile_uses::record`] takes it.
@@ -1140,6 +1142,49 @@ pub fn profile_in_use(name: &str, snapshot: &Snapshot) -> Vec<String> {
                 .any(|s| s.project == **place && now.off(place, &s.name) == Some(s.off))
         })
         .cloned()
+        .collect()
+}
+
+/// What a change other than a profile's means for the profiles that switched the same servers: each `switched`
+/// (project, name) becomes the user's choice, which stopping those profiles leaves as it is. One sentence per profile
+/// and project.
+pub(crate) fn no_longer_put_back(
+    switched: &[(String, String)],
+    snapshot: &Snapshot,
+) -> Vec<String> {
+    let mut said: Vec<((String, String), Vec<String>)> = Vec::new();
+    for used in &snapshot.profile_uses.uses {
+        for s in &used.switches {
+            if !switched
+                .iter()
+                .any(|(p, n)| *n == s.name && crate::api::same_project(p, &s.project))
+            {
+                continue;
+            }
+            let key = (used.profile.clone(), s.project.clone());
+            let server = sanitize(&s.name);
+            match said.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, servers)) if !servers.contains(&server) => servers.push(server),
+                Some(_) => {}
+                None => said.push((key, vec![server])),
+            }
+        }
+    }
+    said.into_iter()
+        .map(|((profile, place), servers)| {
+            let profile = sanitize(&profile);
+            let at = if snapshot.projects.contains(&place) {
+                project_label(&place, snapshot)
+            } else {
+                sanitize(&folder_name(&place))
+            };
+            format!(
+                "{profile} switched {} in {at}; after this, stopping {profile} leaves {} as you set {}.",
+                and_list(&servers),
+                if servers.len() == 1 { "it" } else { "them" },
+                if servers.len() == 1 { "it" } else { "them" }
+            )
+        })
         .collect()
 }
 
