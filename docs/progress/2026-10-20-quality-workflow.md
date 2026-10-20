@@ -19,6 +19,15 @@ simplification plan for the owner to approve. No product code changes beyond thr
 - `docs/proposals/simplification-plan.md`: what we adopt from ripgrep and rust-analyzer and what does not fit
   (cited), the measured baselines, and the ranked plan, each item with risk and guards. Waiting for the owner.
 
+- Review of #67 (Opus cross-review): the app's "window mapped" time could not see configuration loading (a 1.5 s
+  sleep in `inventory::build` left it at 161 ms). Core now writes the file named by `KLEFKI_STARTUP_MARK` once the
+  first snapshot is sent (`engine_main`, after the first `refresh`); the script times it as "app first snapshot",
+  samples memory at a fixed uptime (two seconds, or one second after window and snapshot if later; memory falls over
+  the first two seconds, so a moving sample point moved private dirty from 41 to 54 MB), and starts Xvfb with
+  `-displayfd` instead of a fixed `:97` and a sleep. Also folded in: coverage caveat for test-heavy files, casts in
+  product code (26: app 14, core 11, cli 1), mutants for pure moves in the slice routine, B4 out of the order, core
+  932 tests.
+
 ## Checks
 - Coverage on main 96f604d: 96.6% of lines (test modules included); below 90%: `update.rs`, `api.rs`,
   `install.rs`, `swap.rs`, `fsx.rs`, `engine/sign_in.rs`, `cli/tree.rs`, `cli/main.rs`, `cli/profile.rs`.
@@ -29,6 +38,9 @@ simplification plan for the owner to approve. No product code changes beyond thr
   2 unviable, 7 missed; six equivalent (fast path), one real gap (an unclosed object in `jsonspan::value_end`).
   The first attempt with `cargo test` reported caught mutants as 300 s timeouts (engine tests wait 60 s each).
 - Full verify plus the doc build (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace`): exit 0; app 420, core 932, cli 25 and 34, deny ok.
+- After review: `scripts/perf-baseline.py --runs 7`: first snapshot 115 / 135 ms, window 171 / 188 ms, private
+  dirty 40.8 / 43.9 MB. Against the build before the change the script stops with "never reported its first
+  snapshot" (seen); with a 1.5 s sleep in `inventory::build` first snapshot read 1,630 / 1,615 ms, window 216 / 183.
 - The `quality` workflow itself runs only once merged (GitHub offers "Run workflow" for workflows on the default branch): unverified until then.
 
 ## Next

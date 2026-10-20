@@ -11,12 +11,17 @@ Markdown table; `--json FILE` also writes the numbers.
 What it measures, per configuration size:
   - cli list: wall time and peak RSS of `klefki-cli list` (reads and prints the whole configuration).
   - app window: time from start until Klefki's window is mapped (xdotool), under the X server in DISPLAY or a private
-    Xvfb when there is none.
+    Xvfb when there is none. The window appears before the configuration is read, so this does not include loading.
+  - app first snapshot: time from start until the engine has sent the UI its first snapshot of the configuration
+    (Klefki then writes the file named by KLEFKI_STARTUP_MARK). This is the one that includes loading.
   - app memory: RSS, peak RSS and private dirty memory (what Klefki itself holds, without shared libraries) two
-    seconds after the window appears.
+    seconds after start, or one second after the window and the first snapshot if that is later, so the list has
+    been drawn. The update check starts at three seconds, so this sample comes before it while both arrive within
+    two seconds.
 
-Software OpenGL (Mesa llvmpipe) is most of the app's RSS on a machine without a GPU, so compare numbers from the same
-machine only. Needs: python3, xdotool, Xvfb (when DISPLAY is unset).
+Each run has a fresh HOME, so Mesa's shader cache is always cold: the same every time, but slower than a user's second
+start. Software OpenGL (Mesa llvmpipe) is most of the app's RSS on a machine without a GPU, so compare numbers from the
+same machine only. Needs: python3, xdotool, Xvfb (when DISPLAY is unset).
 """
 
 import argparse
@@ -94,24 +99,37 @@ def memory(pid):
     return fields["VmRSS"], fields["VmHWM"], fields["Private_Dirty"]
 
 
-def app_start(binary, env, timeout=30):
+def app_start(binary, env, root, timeout=30):
+    mark = os.path.join(root, "first-snapshot")
     start = time.perf_counter()
-    proc = subprocess.Popen([binary], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log = os.path.join(root, "klefki.stderr")
+    with open(log, "wb") as err:
+        proc = subprocess.Popen([binary], env={**env, "KLEFKI_STARTUP_MARK": mark}, stdout=subprocess.DEVNULL,
+                                stderr=err)
     try:
-        while True:
-            found = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(proc.pid)],
-                                   env=env, capture_output=True, text=True)
-            if found.stdout.strip():
-                window = (time.perf_counter() - start) * 1000
-                break
+        window = loaded = None
+        while window is None or loaded is None:
+            now = (time.perf_counter() - start) * 1000
+            if loaded is None and os.path.exists(mark):
+                loaded = now
+            if window is None:
+                found = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(proc.pid)],
+                                       env=env, capture_output=True, text=True)
+                if found.stdout.strip():
+                    window = (time.perf_counter() - start) * 1000
             if proc.poll() is not None:
-                sys.exit(f"klefki exited with {proc.returncode} before showing a window")
-            if time.perf_counter() - start > timeout:
-                sys.exit("klefki showed no window")
+                sys.exit(f"klefki exited with {proc.returncode} before showing a window and its first snapshot:\n"
+                         + open(log, errors="replace").read()[-2000:])
+            if now > timeout * 1000:
+                sys.exit("klefki showed no window" if window is None else
+                         "klefki never reported its first snapshot (a build without KLEFKI_STARTUP_MARK?)")
             time.sleep(0.005)
-        time.sleep(2)
+        # Memory settles over the first two seconds (Mesa frees its start-up buffers), so sample at the same uptime
+        # every run: two seconds, or one after the later of the two if that is later.
+        sample_at = max(2, max(window, loaded) / 1000 + 1)
+        time.sleep(max(sample_at - (time.perf_counter() - start), 0))
         rss, peak, private = memory(proc.pid)
-        return window, rss, peak, private
+        return window, loaded, rss, peak, private
     finally:
         proc.terminate()
         try:
@@ -142,16 +160,22 @@ def main():
     if not args.no_app and "DISPLAY" not in os.environ:
         if not shutil.which("Xvfb"):
             sys.exit("no DISPLAY and no Xvfb: install Xvfb or pass --no-app")
-        xvfb = subprocess.Popen(["Xvfb", ":97", "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        os.environ["DISPLAY"] = ":97"
-        time.sleep(1)
+        # Xvfb picks a free display and writes its number once it accepts connections.
+        read, write = os.pipe()
+        xvfb = subprocess.Popen(["Xvfb", "-displayfd", str(write), "-screen", "0", "1280x800x24", "-nolisten", "tcp"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, pass_fds=(write,))
+        os.close(write)
+        with os.fdopen(read) as f:
+            display = f.readline().strip()
+        if not display:
+            sys.exit("Xvfb did not start")
+        os.environ["DISPLAY"] = f":{display}"
 
     results = {}
     try:
         for label, rows in SIZES:
-            measured = {"cli_ms": [], "cli_rss_mb": [], "window_ms": [], "rss_mb": [], "peak_mb": [],
-                        "private_dirty_mb": []}
+            measured = {"cli_ms": [], "cli_rss_mb": [], "window_ms": [], "loaded_ms": [], "rss_mb": [],
+                        "peak_mb": [], "private_dirty_mb": []}
             for _ in range(args.runs):
                 with tempfile.TemporaryDirectory() as root:
                     env = environment(root, rows)
@@ -159,8 +183,9 @@ def main():
                     measured["cli_ms"].append(ms)
                     measured["cli_rss_mb"].append(rss)
                     if not args.no_app:
-                        window, rss, peak, private = app_start(app, env)
+                        window, loaded, rss, peak, private = app_start(app, env, root)
                         measured["window_ms"].append(window)
+                        measured["loaded_ms"].append(loaded)
                         measured["rss_mb"].append(rss)
                         measured["peak_mb"].append(peak)
                         measured["private_dirty_mb"].append(private)
@@ -170,6 +195,7 @@ def main():
             xvfb.terminate()
 
     names = {"cli_ms": "cli list, ms", "cli_rss_mb": "cli list peak RSS, MB", "window_ms": "app window, ms",
+             "loaded_ms": "app first snapshot, ms",
              "rss_mb": "app RSS, MB", "peak_mb": "app peak RSS, MB", "private_dirty_mb": "app private dirty, MB"}
     print(f"{args.runs} runs each; median (min to max)\n")
     print("| Measure | " + " | ".join(results) + " |")

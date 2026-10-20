@@ -47,13 +47,17 @@ and [architecture](https://github.com/rust-lang/rust-analyzer/blob/master/docs/b
 
 ## 2. What guards a refactor now
 See `docs/quality.md`.
-- Every pull request: fmt, clippy `-D warnings` with the UI's `disallowed-methods`, deny, 1,410 tests on three
-  systems (app 420, core 931, cli 25 + 34), including the model test and the golden files from #65.
+- Every pull request: fmt, clippy `-D warnings` with the UI's `disallowed-methods`, deny, 1,411 tests on three
+  systems (app 420, core 932, cli 25 + 34), including the model test and the golden files from #65.
 - Baselines measured on main 96f604d (Linux container, 4 cores, Mesa llvmpipe):
   - Coverage (lines, `cargo llvm-cov`, test modules included): 96.6% overall. Below 90%: `update.rs` 80%,
     `api.rs` 79% (the real start paths), `install.rs` 89%, `swap.rs` 90% (OAuth remove and add-back), `fsx.rs` 88%
     (the file-access allow list), `engine/sign_in.rs` 88%, `cli/tree.rs` 87%, `cli/main.rs` and `cli/profile.rs`
     84%, `config/mod.rs` 74%, `app/main.rs` 37%.
+    These numbers count the test modules inside each file, which always run. In test-heavy files (`engine.rs` has
+    3,540 lines of code and 8,500 of tests, `shell.rs` 9,350 and 10,900) that inflates the figure a lot, so the
+    overall 96.6% says little. The list above is still right as far as it goes: a file under 90% even with its
+    tests counted is weaker still without them. Before a slice, read the file's uncovered lines, not its percentage.
   - Mutation testing, a sample (`sanitize.rs` and `config/jsonspan.rs`, the untrusted-text cleaner and the
     byte-level JSON reader under every write; 135 mutants, 88 minutes): 117 caught, 9 hung (counted as caught: a
     test would hang), 2 did not compile, 7 missed. Six of the missed are in `sanitize`'s fast path for plain text
@@ -72,9 +76,15 @@ See `docs/quality.md`.
     |---|---|---|
     | `klefki-cli list`, ms | 3.8 (2.6 to 20.9) | 13.6 (12.5 to 16.1) |
     | `klefki-cli list` peak RSS, MB | 14.0 | 14.5 |
-    | app, start to window mapped, ms | 184 (174 to 2,934, the first run cold) | 184 (159 to 204) |
+    | app, start to window mapped (before loading), ms | 184 (174 to 2,934, the first run cold) | 184 (159 to 204) |
+    | app, start to first snapshot (includes loading), ms | 115 (85 to 132) | 135 (124 to 147) |
     | app RSS after 2 s, MB | 126.5 | 129.6 |
     | app private dirty memory, MB | 40.9 | 43.9 |
+
+    The first-snapshot row was added in review, measured later on the same machine (window 171 / 188 ms, memory
+    the same then). The window appears before the configuration is read, so only the first-snapshot time sees a
+    slower load: with a 1.5 s pause put into `inventory::build` it went from about 100 to 1,615 ms while the window
+    time did not move.
 
     These match the 2026-10-19 performance review (123 to 133 MB RSS, 39 MB private dirty, first frame 110 to
     230 ms): Klefki's own share is small; Mesa's software OpenGL is most of the RSS.
@@ -96,7 +106,7 @@ duplicate, move, export, import, plan review, detail, server list, top bar), eac
 **A2. Split `core/src/engine.rs`** (3,540 lines of code plus 8,500 of tests in the same file): the command loop,
 the check queue and workers, prepare and apply, diagnose. Tests move next to what they test.
 - Risk: low to medium (the queue's locking must move as a whole).
-- Guards: the 931 core tests, the model test, the 16 plan golden files, the CLI golden files.
+- Guards: the 932 core tests, the model test, the 16 plan golden files, the CLI golden files.
 
 **A3. One set of wording helpers.** "a, b and 3 more" is written eight times (`shell.rs` four, `profiles.rs`,
 `cli/render.rs`, `ops.rs`, `paste.rs`), next to `list_in_words`, `names_in_a_line`, `some_names` (app) and
@@ -127,8 +137,8 @@ only, each seen failing against a mutant.
 `clippy::pedantic` gives about 700 warnings, nearly all style (139 emptiness checks spelled another way, 89 long
 literals, 41 `must_use`); not worth turning on whole, and rust-analyzer does not either. Worth it, each in its
 own slice:
-- `clippy::cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap`: 60 casts (core 29, app 24) that
-  can silently change a number. Each becomes `try_from` with a fallback, or a checked cast with a comment. This is
+- `clippy::cast_possible_truncation`, `cast_sign_loss`, `cast_possible_wrap`: 63 casts with the tests, 26 in
+  product code (app 14, core 11, cli 1) that can silently change a number; the robustness argument is about those 26. Each becomes `try_from` with a fallback, or a checked cast with a comment. This is
   a robustness gain, not only style.
 - `unreachable_pub`: 128 items marked `pub` that nothing outside their crate can use (app 95, cli 29, core 4).
   Turning them into `pub(crate)` shows the real API (core's `api`) at a glance.
@@ -153,6 +163,6 @@ font (about 460 KiB less), store theme and window size through core instead of e
 
 ## 4. Order
 1. #65 (golden files) and the `quality` workflow with this plan (part 2) merged.
-2. B2 for the files A4 touches, B1, B4, B3.
+2. B2 for the files A4 touches, B1, B3.
 3. A3, then A2, then A1 module by module, then A4 file by file.
 4. C1 items one at a time if the owner wants them.

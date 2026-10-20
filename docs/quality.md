@@ -25,7 +25,9 @@ workflow on a branch.
   --summary-only`. The numbers include the test modules in each file, so a file's own code is covered a little
   less than shown.
 - **baseline**: `scripts/perf-baseline.py`: start-up time and memory of the release app and `klefki-cli list` on a
-  70-row and a 950-row configuration. Compare a branch with main on the same machine only; software OpenGL is most
+  70-row and a 950-row configuration. For the app it times both the window appearing (which happens before the
+  configuration is read) and the engine sending the UI its first snapshot (which includes loading; the app writes
+  the file named by `KLEFKI_STARTUP_MARK` at that point). Compare a branch with main on the same machine only; software OpenGL is most
   of the app's memory on a machine without a GPU.
 - **mutants** (by hand only): `cargo-mutants` changes the code one small edit at a time (a condition flipped, a
   function returning a default) and checks that some test fails. A *missed* mutant is code no test really checks.
@@ -39,6 +41,9 @@ workflow on a branch.
 1. One area per branch; behaviour unchanged.
 2. Before: for the files the slice changes, read coverage and run mutants on them. Missed mutants in code the
    slice moves or rewrites get a test first, in its own commit, seen failing against a mutant.
-3. After: the full verify (CLAUDE.md), no golden file changed, the `quality` workflow with `mutants: diff` on the
-   branch shows no new missed mutants, and, for anything on the start-up path (engine start, configuration
+3. After: the full verify (CLAUDE.md), no golden file changed, no new missed mutants, and, for anything on the start-up path (engine start, configuration
    loading, the app's first frame), `scripts/perf-baseline.py` on main and on the branch, both in the pull request.
+   For mutants: a slice that changes code runs the `quality` workflow with `mutants: diff`. A slice that only moves
+   code (A1, A2) would mutate every moved line, hours beyond the job's limit: instead compare the missed mutants of
+   the moved code's file before (on main) and after (the new file), with `mutants:` set to each file, or, for a
+   pure move with no changed line, rely on the unchanged tests and golden files.

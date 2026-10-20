@@ -1072,6 +1072,10 @@ fn engine_main(
     };
     let mut plans = Plans::default();
     refresh(&shared, &mut state, false);
+    // scripts/perf-baseline.py times start-up to here, when the UI has the configuration to show: this file appears.
+    if let Some(mark) = std::env::var_os("KLEFKI_STARTUP_MARK") {
+        let _ = std::fs::write(mark, "first snapshot sent\n");
+    }
     while let Ok(input) = inputs.recv() {
         let command = match input {
             Input::Ui(command) => command,
