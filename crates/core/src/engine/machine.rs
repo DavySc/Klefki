@@ -547,6 +547,7 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             release_key: None,
             install: crate::install::InstallKind::Manual("Updated by hand in tests.".into()),
             updates_dir: None,
+            version: crate::update::Version::current(),
         },
         || {},
     );

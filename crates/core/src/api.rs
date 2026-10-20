@@ -424,6 +424,7 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
             "The command-line tool does not update Klefki.".into(),
         ),
         updates_dir: None,
+        version: crate::update::Version::current(),
     }
 }
 
