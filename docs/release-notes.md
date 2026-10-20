@@ -58,10 +58,10 @@ AppImages need FUSE 2. If it does not start, install it: `sudo apt install libfu
 
 ### Updates
 
-Once a day, a few seconds after it opens, Klefki asks GitHub whether a newer version is out. It uses a release only if the release is signed with Klefki's key, and a downloaded file only if the file matches that signature. GitHub sees your IP address and Klefki's version, as with any download. Nothing about your servers or settings is sent. You can turn this off in Settings, under *Updates*.
+Once a day, a few seconds after it opens, Klefki asks GitHub whether a newer version is out. It uses a release only if the release is signed with Klefki's key, and a downloaded file only if the file matches the checksum in that signed release. GitHub sees your IP address and Klefki's version, as with any download. Nothing about your servers or settings is sent. To stop the daily check, turn off *Update Klefki automatically* in Settings (*Check for updates automatically* for the MSI, zip and `.deb`); *Check now* still works.
 
-- **Windows installer, macOS app, AppImage:** Klefki downloads the update by itself. It installs when you close Klefki, or straight away with *Restart to update*.
-- **MSI, zip, `.deb`:** Klefki shows that an update is out and opens its page. Install it the way you installed Klefki (for the `.deb`, with `sudo apt install` as above).
+- **Windows installer, macOS app, AppImage:** Klefki downloads the update by itself. It installs when you close Klefki, or straight away with *Restart to update*. If Klefki cannot replace itself where it is, it says so and opens the release page instead; on macOS, move Klefki to Applications first.
+- **MSI, zip, `.deb`:** Klefki shows that an update is out and opens its page. Install it the way you installed Klefki (for the `.deb`, download the new `.deb` and install it with `sudo apt install` as above).
 
 ### Check a download
 
