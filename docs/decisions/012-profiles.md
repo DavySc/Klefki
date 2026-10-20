@@ -41,7 +41,7 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   names what is already so rather than only "the configuration already looks like this". "This also turns off" names
   only servers that are on now.
 - Using a profile records nothing as "active": Klefki shows what is on from the files, so nothing can disagree with
-  them. A profile's card names the projects where it is on alone: of the servers Claude Code switches there, its
+  them. (What a use switched is recorded, below, but believed only where the files still agree.) A profile's card names the projects where it is on alone: of the servers Claude Code switches there, its
   members are on and every other one is off, so using it there with "Only these servers there" would change nothing,
   and each member there loads (none held back by policy, another server of its name, its plugin, as a duplicate, or as
   a project server not approved there). It is worked out again for each new snapshot.
@@ -51,9 +51,24 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   page with where to use it taking the keyboard. Each snapshot names the profiles, read with it like the list of
   kept definitions, so opening the palette reads nothing; a save or delete updates the names at once.
 
+- Stop using (owner, 2026-10-20, `docs/proposals/profile-put-back.md`): leaving a profile puts back what it
+  switched, as people expect of a profile. Each saved use records the `disabledMcpServers` switches it flipped (project
+  and name as the file spells them, and the state it set) in `profile-uses.json` beside `profiles.json`, under the
+  same rules (owner-approved new write target; CLAUDE.md records it). A switch it found already set its way by another
+  profile is shared with that profile. A use that sets a switch back to what its first use found forgets it.
+- A profile's card says "In use in …" where one of its switches is still as it left it, worked out from the files with
+  each snapshot, and offers "Stop using in …". Delete asks "Stop using and delete…" or "Delete only" when it is in
+  use; Delete only forgets the switches and leaves them. Stopping is a change like any other
+  (`Change::StopProfile`): Prepare → diff → Apply, review, backup, Activity log.
+- A switch goes back only while it is still as the profile left it. One switched since is left and named. One another
+  profile set later is left as that profile has it, and that profile's switch is forgotten, since it now ends where
+  both began. One another profile also set the same way stays, and is named. A server renamed through Klefki, or a
+  renamed profile, keeps its switches; one gone, or a project Claude Code no longer knows, is skipped and said. A
+  use saved before this was built is not recorded: stopping it says so and points to Restore.
+
 ## Not yet
 - Which profiles a project is on alone in, shown on the Connections page too.
-- Undo after using a profile (Restore in the Activity log puts it back), and a backup of `profiles.json` before a
-  profile is deleted.
+- `klefki-cli` showing where a profile is in use, and stopping it.
+- A backup of `profiles.json` before a profile is deleted.
 - A rename or move made outside Klefki (by Claude Code's own commands, or by hand) leaves the profile naming the old
   server, shown as no longer configured.

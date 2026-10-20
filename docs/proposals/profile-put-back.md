@@ -1,6 +1,7 @@
 # Proposal: deleting a profile puts its servers back (2026-10-20)
 
-Status: proposal, waiting for the owner's choice. Nothing is built. Touches decision 012.
+Status: the owner chose option C on 2026-10-20, with the wording "In use in" / "Stop using" (a profile is something
+you leave, so leaving it puts things back), and approved `profile-uses.json`. Built; decision 012 records it.
 
 ## The ask
 The owner made a profile with one server off in the project Designs. That server was on everywhere before. Deleting

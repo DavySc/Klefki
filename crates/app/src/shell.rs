@@ -19745,6 +19745,78 @@ mod tests {
         assert_eq!(sent(&engine), [Command::DeleteProfile("Work".to_owned())]);
     }
 
+    /// The profiles harness with beta off in notes, as Work's use there left it.
+    fn snapshot_with_work_in_use_in_notes() -> klefki_core::api::Event {
+        let klefki_core::api::Event::Snapshot(snapshot) = snapshot_with_beta_off_in_notes(true)
+        else {
+            unreachable!()
+        };
+        let mut snapshot = (*snapshot).clone();
+        snapshot.profile_uses = klefki_core::api::ProfileUses {
+            uses: vec![klefki_core::api::ProfileUse {
+                profile: "Work".to_owned(),
+                switches: vec![klefki_core::api::Switch {
+                    project: "/home/notes".to_owned(),
+                    name: "beta".to_owned(),
+                    off: true,
+                }],
+            }],
+            problem: None,
+        };
+        klefki_core::api::Event::Snapshot(Arc::new(snapshot))
+    }
+
+    /// The owner's ask (2026-10-20): a profile in use says where, and stopping it, or deleting it, puts back what it
+    /// switched, after the usual review. Delete only keeps things as they are.
+    #[test]
+    fn a_profile_in_use_says_where_and_stops_or_deletes() {
+        let (mut h, engine) = profiles_harness();
+        engine
+            .events
+            .send(snapshot_with_work_in_use_in_notes())
+            .unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label_contains("In use in notes.");
+        h.get_by_label("Stop using in notes…").click();
+        h.run();
+        assert_eq!(
+            sent(&engine),
+            [Command::Prepare(vec![Change::StopProfile {
+                name: "Work".to_owned(),
+                project: None,
+                delete: false,
+            }])]
+        );
+        h.state_mut().preparing = false;
+        h.get_by_label_contains("Delete").click();
+        h.run();
+        h.get_by_label_contains("It is in use in notes.");
+        h.get_by_label("Stop using and delete…").click();
+        h.run();
+        assert_eq!(
+            sent(&engine),
+            [Command::Prepare(vec![Change::StopProfile {
+                name: "Work".to_owned(),
+                project: None,
+                delete: true,
+            }])]
+        );
+        h.state_mut().preparing = false;
+        h.get_by_label_contains("Delete").click();
+        h.run();
+        h.get_by_label("Delete only").click();
+        h.run();
+        assert_eq!(sent(&engine), [Command::DeleteProfile("Work".to_owned())]);
+        // Switched since (beta back on): no longer in use, and Delete asks as before.
+        engine
+            .events
+            .send(snapshot_with_beta_off_in_notes(false))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("In use in").is_none());
+    }
+
     #[test]
     fn the_filter_box_filters_profiles_by_name_or_server() {
         let (mut h, engine) = profiles_harness();
