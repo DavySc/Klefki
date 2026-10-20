@@ -3,7 +3,7 @@
 use crate::command::{self, CommandPalette, Entry, shortcut};
 use crate::explain::Explanation;
 use crate::sign_in::{self, SignInView};
-use crate::theme::{self, Palette, ThemeChoice, Tone};
+use crate::theme::{self, Palette, ThemeChoice, ThemeOption, Tone};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
@@ -1346,21 +1346,48 @@ impl ShellApp {
                     self.updates.updated = None;
                     self.send(Command::OpenReleasePage(version));
                 }
-                let mut changed = false;
+                let current = ThemeOption::new(self.theme, self.tone);
+                let mut picked = None;
                 egui::ComboBox::from_id_salt("theme")
-                    .selected_text(format!("{} {}", self.theme.icon(), self.theme.label()))
-                    .width(120.0)
+                    .selected_text(format!("{} {}", current.icon(), current.label()))
+                    .width(140.0)
+                    // All six and the separator fit without a scroll bar (the default is 200 px).
+                    .height(320.0)
                     .show_ui(ui, |ui| {
                         flat_items(ui);
-                        for choice in ThemeChoice::ALL {
-                            let text = format!("{} {}", choice.icon(), choice.label());
-                            changed |= ui.selectable_value(&mut self.theme, choice, text).changed();
+                        let focus = pal.focus;
+                        for (i, option) in ThemeOption::ALL.into_iter().enumerate() {
+                            if i > 0 && option.tone != ThemeOption::ALL[i - 1].tone {
+                                ui.separator();
+                            }
+                            let mut text = format!("{} {}", option.icon(), option.label());
+                            if option == current {
+                                // The fill alone is too faint to tell the current entry (WCAG 1.4.11).
+                                text = format!("{text}  {}", icon::CHECK);
+                            }
+                            let response = ui.selectable_label(option == current, text);
+                            if response.has_focus() {
+                                // Focus must not look like the current entry's fill (WCAG 2.4.7).
+                                ui.painter().rect_stroke(
+                                    response.rect,
+                                    ui.visuals().widgets.active.corner_radius,
+                                    egui::Stroke::new(1.5, focus),
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            if response.clicked() {
+                                picked = Some(option);
+                                ui.close();
+                            }
                         }
                     })
                     .response
                     .on_hover_text("Theme");
-                if changed {
-                    theme::set_choice(ui.ctx(), self.theme);
+                if let Some(option) = picked {
+                    self.theme = option.choice;
+                    self.tone = option.tone;
+                    theme::set_choice(ui.ctx(), option.choice);
+                    theme::set_tone(ui.ctx(), option.tone);
                 }
                 if ui
                     .button(
@@ -9317,40 +9344,83 @@ mod tests {
     }
 
     #[test]
-    fn theme_dropdown_offers_all_three_and_switches_the_palette() {
+    fn theme_dropdown_offers_every_theme_and_switches_the_palette() {
         use ThemeChoice::{Dark, Light, System};
-        let shown = |c: ThemeChoice| format!("{} {}", c.icon(), c.label());
+        let shown = |o: ThemeOption| format!("{} {}", o.icon(), o.label());
         let mut h = harness();
         h.run();
         assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
+        let cool_dark = ThemeOption::new(Dark, Tone::Cool);
 
-        // Closed, the dropdown shows the current choice only.
-        h.get_by_value(&shown(Dark));
+        // Closed, the dropdown shows the current theme only.
+        h.get_by_value(&shown(cool_dark));
         assert!(h.query_by_label_contains("Light").is_none());
         assert!(h.query_by_label_contains("System").is_none());
 
-        // Open, all three are offered.
-        h.get_by_value(&shown(Dark)).click();
+        // Open, every theme is offered, each with its own icon, and the pick closes the list.
+        h.get_by_value(&shown(cool_dark)).click();
         h.run();
-        h.get_by_label_contains("System");
-        h.get_by_label_contains("Dark");
-        h.get_by_label_contains("Light").click();
+        for o in ThemeOption::ALL {
+            h.query_by_label_contains(&shown(o))
+                .unwrap_or_else(|| panic!("{} is not offered", o.label()));
+        }
+        h.get_by_label(&shown(ThemeOption::new(Light, Tone::Cool)))
+            .click();
         h.run();
         assert_eq!(h.state().theme, Light);
         assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
+        assert!(
+            h.query_by_label_contains("Dark (warm)").is_none(),
+            "the list stays open after a pick"
+        );
 
-        h.get_by_value(&shown(Light)).click();
+        // A warm one sets the greys too.
+        let warm_light = ThemeOption::new(Light, Tone::Warm);
+        h.get_by_value(&shown(ThemeOption::new(Light, Tone::Cool)))
+            .click();
         h.run();
-        h.get_by_label_contains("System").click();
+        h.get_by_label_contains(&shown(warm_light)).click();
         h.run();
-        assert_eq!(h.state().theme, System);
+        assert_eq!((h.state().theme, h.state().tone), (Light, Tone::Warm));
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
 
-        h.get_by_value(&shown(System)).click();
+        // System with warm greys is one pick, and the closed dropdown says so.
+        h.get_by_value(&shown(warm_light)).click();
         h.run();
-        h.get_by_label_contains("Dark").click();
+        let system_warm = ThemeOption::new(System, Tone::Warm);
+        h.get_by_label_contains(&shown(system_warm)).click();
         h.run();
-        assert_eq!(h.state().theme, Dark);
-        assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
+        assert_eq!((h.state().theme, h.state().tone), (System, Tone::Warm));
+        h.get_by_value(&shown(system_warm));
+
+        // ... and back to cool greys in one pick.
+        h.get_by_value(&shown(system_warm)).click();
+        h.run();
+        h.get_by_label_contains(&shown(ThemeOption::new(System, Tone::Cool)))
+            .click();
+        h.run();
+        assert_eq!((h.state().theme, h.state().tone), (System, Tone::Cool));
+    }
+
+    #[test]
+    fn only_the_current_theme_has_a_check_mark() {
+        let current = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
+        let mut h = harness();
+        h.run();
+        h.get_by_value(&format!("{} {}", current.icon(), current.label()))
+            .click();
+        h.run();
+        let checked = format!("{} {}  {}", current.icon(), current.label(), icon::CHECK);
+        h.get_by_label(&checked);
+        assert_eq!(
+            ThemeOption::ALL
+                .iter()
+                .filter(|o| h
+                    .query_by_label_contains(&format!("{}  {}", o.label(), icon::CHECK))
+                    .is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -9391,12 +9461,13 @@ mod tests {
 
     #[test]
     fn dropdown_options_do_not_change_size_on_hover() {
-        let shown = format!("{} {}", ThemeChoice::Dark.icon(), ThemeChoice::Dark.label());
+        let dark = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
+        let shown = format!("{} {}", dark.icon(), dark.label());
         let mut h = harness();
         h.run();
         h.get_by_value(&shown).click();
         h.run();
-        for option in ["System", "Light"] {
+        for option in ["System (cool)", "Light (cool)", "Dark (warm)"] {
             let before = h.get_by_label_contains(option).rect();
             h.get_by_label_contains(option).hover();
             h.run();

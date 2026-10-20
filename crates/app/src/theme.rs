@@ -268,6 +268,45 @@ impl ThemeChoice {
     }
 }
 
+/// One entry of the theme dropdown: a mode and a family of greys, the two things that can be set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeOption {
+    pub choice: ThemeChoice,
+    pub tone: Tone,
+}
+
+impl ThemeOption {
+    /// One group per tone, each in the order of the Settings page.
+    pub const ALL: [Self; 6] = [
+        Self::new(ThemeChoice::System, Tone::Cool),
+        Self::new(ThemeChoice::Light, Tone::Cool),
+        Self::new(ThemeChoice::Dark, Tone::Cool),
+        Self::new(ThemeChoice::System, Tone::Warm),
+        Self::new(ThemeChoice::Light, Tone::Warm),
+        Self::new(ThemeChoice::Dark, Tone::Warm),
+    ];
+
+    pub const fn new(choice: ThemeChoice, tone: Tone) -> Self {
+        Self { choice, tone }
+    }
+
+    /// A moon for dark, a sun for light; System has the desktop icon, as it is neither.
+    pub fn icon(self) -> &'static str {
+        self.choice.icon()
+    }
+
+    pub fn label(self) -> &'static str {
+        match (self.choice, self.tone) {
+            (ThemeChoice::System, Tone::Cool) => "System (cool)",
+            (ThemeChoice::Light, Tone::Cool) => "Light (cool)",
+            (ThemeChoice::Dark, Tone::Cool) => "Dark (cool)",
+            (ThemeChoice::System, Tone::Warm) => "System (warm)",
+            (ThemeChoice::Light, Tone::Warm) => "Light (warm)",
+            (ThemeChoice::Dark, Tone::Warm) => "Dark (warm)",
+        }
+    }
+}
+
 const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
 
@@ -622,6 +661,45 @@ pub(crate) mod tests {
             None,
             "stored values are lower case"
         );
+    }
+
+    #[test]
+    fn dropdown_lists_every_theme_with_sun_or_moon() {
+        use egui_phosphor::regular::{DESKTOP, MOON, SUN};
+        for choice in ThemeChoice::ALL {
+            for tone in Tone::ALL {
+                assert!(
+                    ThemeOption::ALL.contains(&ThemeOption::new(choice, tone)),
+                    "{choice:?}/{tone:?} cannot be picked in the dropdown"
+                );
+            }
+        }
+        assert_eq!(
+            ThemeOption::ALL.len(),
+            ThemeChoice::ALL.len() * Tone::ALL.len()
+        );
+        for o in ThemeOption::ALL {
+            let want = match o.choice {
+                ThemeChoice::Dark => MOON,
+                ThemeChoice::Light => SUN,
+                ThemeChoice::System => DESKTOP,
+            };
+            assert_eq!(o.icon(), want, "{o:?}");
+        }
+        let labels: std::collections::BTreeSet<_> =
+            ThemeOption::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels.len(), ThemeOption::ALL.len());
+    }
+
+    #[test]
+    fn each_tone_is_one_group_in_the_order_of_settings() {
+        let modes: Vec<_> = ThemeOption::ALL.iter().map(|o| o.choice).collect();
+        assert_eq!(modes[..3], ThemeChoice::ALL);
+        assert_eq!(modes[3..], ThemeChoice::ALL);
+        let tones: Vec<_> = ThemeOption::ALL.iter().map(|o| o.tone).collect();
+        assert!(tones[..3].iter().all(|t| *t == tones[0]));
+        assert!(tones[3..].iter().all(|t| *t == tones[3]));
+        assert_ne!(tones[0], tones[3]);
     }
 
     #[test]
