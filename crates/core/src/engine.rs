@@ -118,6 +118,18 @@ pub enum Command {
     /// when a server, or a definition Klefki keeps to put back, uses it by now. Answers with
     /// [`Event::UnusedSecretForgotten`], then [`Event::Secrets`].
     ForgetUnusedSecret(crate::model::ConnectionId),
+    /// The profiles (see [`Event::Profiles`], decision 012). Read only when asked: the Profiles page asks each time it is
+    /// opened.
+    Profiles,
+    /// Keep the profile `name` with `members`, in place of the profile `replaces` when given (to rename it or change its
+    /// servers). Answers with [`Event::Profiles`], or [`Event::ProfileRefused`] saying why nothing was kept.
+    SaveProfile {
+        name: String,
+        members: Vec<crate::model::ConnectionId>,
+        replaces: Option<String>,
+    },
+    /// Forget the profile of this name. Answers like [`Command::SaveProfile`].
+    DeleteProfile(String),
     /// Look for a newer Klefki release (see [`Event::Update`]), on a thread of its own. Only the release's signed
     /// checksums are fetched, and only when this build has a release key.
     CheckForUpdates,
@@ -226,6 +238,15 @@ pub enum Change {
     /// since are left as they are, and the rest of the file (Claude Code's own settings and history) too. Reviewed
     /// on its own, not with other changes.
     Restore { backup: String },
+    /// Turn on the servers of the profile `name`, `members` as [`crate::profiles::Profile`] has them, in `project` (a
+    /// project as `.claude.json` spells it), or in every project Claude Code knows when `None` (decision 012). With
+    /// `only`, also turn off every other server there, so the profile's servers are the only ones Claude Code loads.
+    UseProfile {
+        name: String,
+        members: Vec<crate::model::ConnectionId>,
+        project: Option<String>,
+        only: bool,
+    },
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -421,6 +442,10 @@ pub enum Event {
     },
     /// The activity log, after [`Command::Activity`].
     Activity(crate::activity::Activity),
+    /// The profiles, after [`Command::Profiles`], [`Command::SaveProfile`] or [`Command::DeleteProfile`].
+    Profiles(crate::profiles::Profiles),
+    /// A profile was not kept or forgotten: why, as a sentence.
+    ProfileRefused(String),
     /// Claude Desktop's servers, after [`Command::Desktop`].
     Desktop(crate::desktop::Desktop),
     /// What the Secrets page shows, after [`Command::Secrets`].
@@ -1153,6 +1178,35 @@ fn engine_main(
                         ..Default::default()
                     },
                 })),
+            Command::Profiles => shared
+                .emitter
+                .emit(Event::Profiles(match backup_dir(&shared) {
+                    Ok(dir) => crate::profiles::load(&dir),
+                    Err(problem) => crate::profiles::Profiles {
+                        problem: Some(problem),
+                        ..Default::default()
+                    },
+                })),
+            Command::SaveProfile {
+                name,
+                members,
+                replaces,
+            } => {
+                let saved = backup_dir(&shared).and_then(|dir| {
+                    crate::profiles::save(&dir, &name, &members, replaces.as_deref())
+                });
+                shared.emitter.emit(match saved {
+                    Ok(profiles) => Event::Profiles(profiles),
+                    Err(why) => Event::ProfileRefused(why),
+                });
+            }
+            Command::DeleteProfile(name) => {
+                let left = backup_dir(&shared).and_then(|dir| crate::profiles::delete(&dir, &name));
+                shared.emitter.emit(match left {
+                    Ok(profiles) => Event::Profiles(profiles),
+                    Err(why) => Event::ProfileRefused(why),
+                });
+            }
             Command::Desktop => shared
                 .emitter
                 .emit(Event::Desktop(crate::desktop::load(&shared.config.desktop))),
@@ -1446,6 +1500,8 @@ struct Stored {
     forget: Vec<String>,
     /// What the review said the plan does, for the activity log.
     summary: Vec<String>,
+    /// Servers it renames or moves, by their ids before and after: their profiles follow them once it is applied.
+    follow: Vec<(crate::model::ConnectionId, crate::model::ConnectionId)>,
 }
 
 /// What Claude Code does with its own commands: servers it adds, servers it removes and adds again (or copies), and
@@ -1879,6 +1935,26 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 forget,
                 ..
             } = resolved;
+            let mut notes = notes;
+            let follow = followed(changes);
+            if let Ok(dir) = backup_dir(shared) {
+                for (old, _) in &follow {
+                    let held = crate::profiles::holding(&dir, old);
+                    if !held.is_empty() {
+                        notes.push(format!(
+                            "{} is in the {} {}, which {} it where it goes.",
+                            old.shown_name(),
+                            if held.len() == 1 {
+                                "profile"
+                            } else {
+                                "profiles"
+                            },
+                            ops::and_list(&held),
+                            if held.len() == 1 { "keeps" } else { "keep" }
+                        ));
+                    }
+                }
+            }
             plans.next += 1;
             let id = plans.next;
             let nothing_to_do =
@@ -1913,12 +1989,41 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     cli,
                     forget,
                     summary,
+                    follow,
                 },
             );
             shared.emitter.emit(Event::PlanReady(view));
         }
         Err(e) => shared.emitter.emit(Event::PlanFailed(sanitize(&e))),
     }
+}
+
+/// The servers `changes` rename or move, by their ids before and after, as the files will spell them.
+fn followed(changes: &[Change]) -> Vec<(crate::model::ConnectionId, crate::model::ConnectionId)> {
+    use crate::model::{ConnectionId, Target};
+    changes
+        .iter()
+        .filter_map(|change| {
+            let (id, scope, project, name) = match change {
+                Change::Rename { id, name } => {
+                    let (scope, project, _) = ConnectionId::parse(id.connection.as_str())?;
+                    (id, scope, project, name.clone())
+                }
+                Change::Move { id, to } => {
+                    let (_, _, name) = ConnectionId::parse(id.connection.as_str())?;
+                    match to {
+                        Target::User => (id, Scope::User, None, name),
+                        Target::Local(p) => (id, Scope::Local, Some(p.clone()), name),
+                    }
+                }
+                _ => return None,
+            };
+            Some((
+                id.connection.clone(),
+                ConnectionId::new(scope, project.as_deref(), &name),
+            ))
+        })
+        .collect()
 }
 
 fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
@@ -1931,6 +2036,7 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
         cli,
         forget,
         summary,
+        follow,
     }) = plans.stored.remove(&id)
     else {
         return fail("This change was already applied or discarded. Prepare it again.".to_owned());
@@ -2048,6 +2154,13 @@ fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u64) {
     let changed = !written.is_empty() || !added.is_empty() || forgot;
     if changed && let Some(problem) = log_activity(shared, &summary, None, &backups) {
         notes.push(problem);
+    }
+    // A renamed or moved server stays in its profiles (decision 012).
+    if changed
+        && !follow.is_empty()
+        && let Err(why) = backup_dir(shared).and_then(|dir| crate::profiles::follow(&dir, &follow))
+    {
+        notes.push(format!("Its profiles still name it as it was: {why}"));
     }
     check_later(shared, id, started);
     shared.emitter.emit(Event::Applied {
@@ -8226,6 +8339,68 @@ mod tests {
         assert!(why.contains("no old switch-off list"), "{why}");
         // Nothing was written.
         assert_eq!(config_json(&env), legacy_config());
+    }
+
+    /// A rename or move used to drop the server from every profile, which then named it "no longer configured"
+    /// (found in review, PR #57). Its profiles follow it, and the review says so.
+    #[test]
+    fn a_renamed_or_moved_server_stays_in_its_profiles() {
+        let env = quiet_env(&serde_json::json!({
+            "mcpServers": {"gw": {"command": "gw"}, "db": {"command": "db"}, "other": {"command": "o"}},
+            "projects": {"/work/a": {}}
+        }));
+        let backups = env.dir.path().join("backups");
+        crate::profiles::save(
+            &backups,
+            "Work",
+            &[user_id("gw").connection, user_id("db").connection],
+            None,
+        )
+        .unwrap();
+        let core = env.start();
+        let plan = plan_for(&core, vec![rename(user_id("gw"), "gateway")]);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n == "gw is in the profile Work, which keeps it where it goes."),
+            "{:?}",
+            plan.notes
+        );
+        apply_and_wait(&core, &plan);
+        let members = || crate::profiles::load(&backups).profiles[0].members.clone();
+        assert_eq!(
+            members(),
+            [user_id("gateway").connection, user_id("db").connection]
+        );
+        // Moved to a project: the same, under its new place.
+        let plan = plan_for(
+            &core,
+            vec![Change::Move {
+                id: user_id("db"),
+                to: crate::model::Target::Local("/work/a".into()),
+            }],
+        );
+        apply_and_wait(&core, &plan);
+        assert_eq!(
+            members(),
+            [
+                user_id("gateway").connection,
+                local_id("db", "/work/a").connection
+            ]
+        );
+        // A server in no profile leaves the file as it is, and the review says nothing of profiles.
+        let before = std::fs::read_to_string(crate::profiles::path(&backups)).unwrap();
+        let plan = plan_for(&core, vec![rename(user_id("other"), "other2")]);
+        assert!(
+            !plan.notes.iter().any(|n| n.contains("profile")),
+            "{:?}",
+            plan.notes
+        );
+        apply_and_wait(&core, &plan);
+        assert_eq!(
+            std::fs::read_to_string(crate::profiles::path(&backups)).unwrap(),
+            before
+        );
     }
 
     fn rename(id: ServerId, name: &str) -> Change {

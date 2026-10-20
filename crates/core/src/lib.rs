@@ -17,6 +17,7 @@ mod install;
 mod model;
 mod ops;
 mod paste;
+mod profiles;
 mod restore;
 mod sanitize;
 mod secret_uses;

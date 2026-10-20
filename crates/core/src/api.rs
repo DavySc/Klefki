@@ -18,6 +18,7 @@ pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
+pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
 pub use crate::update::{UpdateCheck, Version};

@@ -68,6 +68,12 @@ impl ConnectionId {
         &self.0
     }
 
+    /// The server's name, cleaned for showing; empty for an id that is not one. For a server that is no longer in
+    /// the configuration, so has no row to take its name from.
+    pub fn shown_name(&self) -> String {
+        Self::parse(&self.0).map_or_else(String::new, |(.., name)| crate::sanitize::shown(&name))
+    }
+
     /// An id read back from where it was stored, such as the secret store's list: `None` unless it is one
     /// [`ConnectionId::new`] makes.
     pub(crate) fn from_stored(id: &str) -> Option<Self> {
@@ -278,6 +284,13 @@ mod tests {
         ] {
             assert_eq!(ConnectionId::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_connection_ids_name_is_shown_cleaned() {
+        let id = ConnectionId::new(crate::api::Scope::User, None, "gh\u{1b}[31m\u{202e}x");
+        assert_eq!(id.shown_name(), "ghx");
+        assert_eq!(ConnectionId("not an id".into()).shown_name(), "");
     }
 
     #[test]

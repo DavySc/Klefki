@@ -6,6 +6,7 @@ mod activity;
 mod command;
 mod desktop;
 mod explain;
+mod profiles;
 mod secrets;
 mod shell;
 mod sign_in;
