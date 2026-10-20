@@ -19518,6 +19518,21 @@ mod tests {
             h.query_by_label_contains("Tick at least one server.")
                 .is_none()
         );
+        // Named now, with nothing ticked: Save asks for a server, and typing in the name does not take that back.
+        h.get_by_label("Name").focus();
+        h.get_by_label("Name").type_text("Writing");
+        h.run();
+        assert!(
+            h.query_by_label_contains("Give the profile a name.")
+                .is_none()
+        );
+        h.get_by_label("Save profile").click();
+        h.run();
+        h.get_by_label_contains("Tick at least one server.");
+        h.get_by_label("Name").focus();
+        h.get_by_label("Name").type_text("2");
+        h.run();
+        h.get_by_label_contains("Tick at least one server.");
     }
 
     #[test]

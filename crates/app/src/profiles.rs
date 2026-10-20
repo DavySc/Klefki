@@ -801,7 +801,7 @@ fn editor(
             field.request_focus();
         }
         if field.changed() {
-            draft.problem = None;
+            settle(draft);
         }
         save |= field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         save |= ui.button("Save profile").clicked();
