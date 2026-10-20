@@ -69,15 +69,28 @@ pub struct Draft {
     problem: Option<&'static str>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 struct Choice {
     /// `None`: not chosen yet. `Some(None)`: every project.
     place: Option<Option<String>>,
+    /// "Only these servers there". Ticked at first (the owner's choice, 2026-10-20): a profile's servers are usually on
+    /// already, so using it otherwise mostly changes nothing.
     only: bool,
     /// Use profile… was pressed with no place chosen.
     asked: bool,
     /// The last Use… would have changed nothing: said on the card until where or how it is used changes.
     unchanged: Option<Unchanged>,
+}
+
+impl Default for Choice {
+    fn default() -> Self {
+        Self {
+            place: None,
+            only: true,
+            asked: false,
+            unchanged: None,
+        }
+    }
 }
 
 /// What the page's buttons asked the shell to do.
@@ -938,9 +951,6 @@ fn said_unchanged(ui: &mut Ui, unchanged: &mut Unchanged, covered: bool) {
         .wrap(),
     );
     live(ui, head.id);
-    if std::mem::take(&mut unchanged.fresh) {
-        head.scroll_to_me(None);
-    }
     if !covered {
         for line in &unchanged.already {
             let said = ui.add(egui::Label::new(line.as_str()).wrap());
@@ -955,6 +965,15 @@ fn said_unchanged(ui: &mut Ui, unchanged: &mut Unchanged, covered: bool) {
     }
     for warning in &unchanged.warnings {
         warn(ui, warning);
+    }
+    // The whole of it, not only its heading, which can sit at the bottom edge with the rest below (cross-review of
+    // #60).
+    if std::mem::take(&mut unchanged.fresh) {
+        let block = egui::Rect::from_min_max(
+            head.rect.min,
+            egui::pos2(head.rect.max.x, ui.cursor().top()),
+        );
+        ui.scroll_to_rect(block, None);
     }
 }
 

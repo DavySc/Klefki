@@ -19500,9 +19500,13 @@ mod tests {
             h.query_by_label_contains("Choose a project to use it in first.")
                 .is_none()
         );
-        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
-            .click();
-        h.run();
+        // Ticked from the start (the owner's choice, 2026-10-20): a profile's servers become the ones on there.
+        assert_eq!(
+            h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
+                .accesskit_node()
+                .toggled(),
+            Some(egui::accesskit::Toggled::True)
+        );
         h.get_by_label("Use profile…").click();
         h.run();
         assert_eq!(
@@ -19526,6 +19530,17 @@ mod tests {
             &sent(&engine)[..],
             [Command::Prepare(c)] if matches!(&c[..], [Change::UseProfile { project: None, only: true, .. }])
         ));
+        // Unticked, only its servers are turned on.
+        h.state_mut().preparing = false;
+        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
+            .click();
+        h.run();
+        h.get_by_label("Use profile…").click();
+        h.run();
+        assert!(matches!(
+            &sent(&engine)[..],
+            [Command::Prepare(c)] if matches!(&c[..], [Change::UseProfile { project: None, only: false, .. }])
+        ));
     }
 
     /// The owner's report: using profiles that were already in effect opened a review that only said "The
@@ -19538,6 +19553,10 @@ mod tests {
         h.get_by_role_and_label(Role::ComboBox, "Use in").click();
         h.run();
         h.get_by_label_contains("app/work").click();
+        h.run();
+        // Unticked, as the owner had it.
+        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
+            .click();
         h.run();
         h.get_by_label("Use profile…").click();
         h.run();
@@ -19646,7 +19665,6 @@ mod tests {
     /// app" under its servers; the no-op does not say it again.
     #[test]
     fn a_profile_on_alone_is_not_said_twice() {
-        use egui::accesskit::Role;
         let (mut h, engine) = profiles_harness();
         let mut beta = live_row("beta", Scope::User, None);
         beta.disabled_projects = vec!["/work/app".to_owned()];
@@ -19663,9 +19681,6 @@ mod tests {
         h.run();
         open_profiles(&mut h, &engine, work_profile());
         h.get_by_label_contains("Only these servers are on in app");
-        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
-            .click();
-        h.run();
         let again = "The server of Work, alpha, is already the only one on in app.";
         work_said_unchanged(&mut h, &engine, again, false);
         assert!(h.query_by_label(again).is_none());
