@@ -229,8 +229,26 @@ fn grouped(
     }
 }
 
-fn width<'a>(texts: impl Iterator<Item = &'a str>) -> usize {
-    texts.map(|t| t.chars().count()).max().unwrap_or(0)
+/// At most this many characters of a name are shown in a table: a name from claude.ai or a file can be any length,
+/// and one long name would widen every row. JSON has the whole name.
+const NAME_SHOWN: usize = 64;
+
+/// `name` as a table shows it: cut to [`NAME_SHOWN`] characters, the last one "…", when longer.
+fn table_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.char_indices().nth(NAME_SHOWN) {
+        Some(_) => {
+            let end = name
+                .char_indices()
+                .nth(NAME_SHOWN - 1)
+                .map_or(0, |(i, _)| i);
+            format!("{}\u{2026}", &name[..end]).into()
+        }
+        None => name.into(),
+    }
+}
+
+fn width(texts: impl Iterator<Item = impl AsRef<str>>) -> usize {
+    texts.map(|t| t.as_ref().chars().count()).max().unwrap_or(0)
 }
 
 fn pad(out: &mut String, text: &str, width: usize) {
@@ -264,15 +282,19 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     }
     // Blocked everywhere is the state column's to say, with the reason above.
     if let Some(b) = row.blocked.as_ref().filter(|_| row.not_loaded.is_none()) {
-        let mut note = format!(
-            "blocked by policy in {} of {project_count} projects: ",
-            b.projects.len()
-        );
-        note.push_str(&b.projects[..b.projects.len().min(PROJECTS_NAMED)].join(", "));
-        if b.projects.len() > PROJECTS_NAMED {
-            let _ = write!(note, " and {} more", b.projects.len() - PROJECTS_NAMED);
-        }
-        notes.push(note);
+        let what = if b.policy {
+            "blocked by policy"
+        } else {
+            "connectors off"
+        };
+        notes.push(format!(
+            "{what} in {} of {project_count} projects: {}",
+            b.projects.len(),
+            named(&b.projects)
+        ));
+    }
+    if let Some(why) = &row.may_not_load {
+        notes.push(format!("may not load: {}", why.trim_end_matches('.')));
     }
     // A plugin's or the organisation's server, like a user server, is one row for every project.
     let everywhere = row.scope.is_everywhere();
@@ -286,10 +308,11 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         }
     }
     if everywhere && row.enabled && row.disabled_in > 0 {
-        notes.push(format!(
-            "off in {} of {project_count} projects",
-            row.disabled_in
-        ));
+        let mut note = format!("off in {} of {project_count} projects", row.disabled_in);
+        if !row.disabled_projects.is_empty() {
+            let _ = write!(note, ": {}", named(&row.disabled_projects));
+        }
+        notes.push(note);
     }
     // Not loaded at all: what else it would leave out or be hidden by does not matter.
     let loaded = row.not_loaded.is_none();
@@ -337,7 +360,17 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
 /// At most this many projects are named in a note.
 const PROJECTS_NAMED: usize = 3;
 
-/// The state column: on, off, or not loaded (blocked, by policy) wherever it is on.
+/// `projects`, at most [`PROJECTS_NAMED`] of them by name, the rest counted.
+fn named(projects: &[String]) -> String {
+    let mut text = projects[..projects.len().min(PROJECTS_NAMED)].join(", ");
+    if projects.len() > PROJECTS_NAMED {
+        let _ = write!(text, " and {} more", projects.len() - PROJECTS_NAMED);
+    }
+    text
+}
+
+/// The state column: on, off, or not loaded (blocked, by policy, or connectors off, by the user's settings) wherever
+/// it is on.
 fn state(row: &ServerRow, project_count: usize) -> &'static str {
     // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
     let plugin_off = project_count > 0
@@ -347,8 +380,12 @@ fn state(row: &ServerRow, project_count: usize) -> &'static str {
             .is_some_and(|p| p.off_in.len() == project_count);
     if !row.enabled || plugin_off {
         "off"
-    } else if row.not_loaded.is_some() && row.blocked.is_some() {
-        "blocked"
+    } else if let (Some(_), Some(b)) = (&row.not_loaded, &row.blocked) {
+        if b.policy {
+            "blocked"
+        } else {
+            "connectors off"
+        }
     } else if row.not_loaded.is_some() {
         "not loaded"
     } else {
@@ -362,12 +399,12 @@ pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -
     if rows.is_empty() {
         return NOTHING.to_owned();
     }
-    let name_w = width(rows.iter().map(|r| r.name.as_str()));
+    let name_w = width(rows.iter().map(|r| table_name(&r.name)));
     let kind_w = width(rows.iter().map(|r| r.transport.label()));
     let state_w = width(rows.iter().map(|r| state(r, snapshot.project_count)));
     let mut out = String::new();
     grouped(&mut out, rows, home, |out, row| {
-        pad(out, &row.name, name_w);
+        pad(out, &table_name(&row.name), name_w);
         out.push_str("  ");
         pad(out, state(row, snapshot.project_count), state_w);
         out.push_str("  ");
@@ -401,6 +438,7 @@ fn transport_key(kind: TransportKind) -> &'static str {
         TransportKind::Http => "http",
         TransportKind::Sse => "sse",
         TransportKind::Ws => "ws",
+        TransportKind::ClaudeAi => "claude.ai",
         TransportKind::Invalid => "invalid",
     }
 }
@@ -435,6 +473,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     o.insert("enabled".into(), json!(row.enabled));
     if row.scope.is_everywhere() {
         o.insert("disabled_in".into(), json!(row.disabled_in));
+        o.insert("disabled_projects".into(), json!(row.disabled_projects));
         o.insert("project_count".into(), json!(project_count));
     }
     o.insert("approval".into(), json!(row.approval.map(approval_key)));
@@ -457,8 +496,11 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     if let Some(b) = &row.blocked {
         o.insert(
             "blocked".into(),
-            json!({"why": b.why, "projects": b.projects}),
+            json!({"why": b.why, "projects": b.projects, "policy": b.policy}),
         );
+    }
+    if row.may_not_load.is_some() {
+        o.insert("may_not_load".into(), json!(row.may_not_load));
     }
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
@@ -588,14 +630,14 @@ pub fn status_text(rows: &[(&ServerRow, Outcome)], home: Option<&str>) -> String
         return NOTHING.to_owned();
     }
     let cells: Vec<(String, String)> = rows.iter().map(|(r, o)| status_cells(r, o)).collect();
-    let name_w = width(rows.iter().map(|(r, _)| r.name.as_str()));
+    let name_w = width(rows.iter().map(|(r, _)| table_name(&r.name)));
     let label_w = width(cells.iter().map(|(l, _)| l.as_str()));
     let only_rows: Vec<&ServerRow> = rows.iter().map(|(r, _)| *r).collect();
     let mut out = String::new();
     let mut at = 0;
     grouped(&mut out, &only_rows, home, |out, row| {
         let (label, detail) = &cells[at];
-        pad(out, &row.name, name_w);
+        pad(out, &table_name(&row.name), name_w);
         out.push_str("  ");
         pad(out, label, label_w);
         out.push_str("  ");
@@ -853,6 +895,7 @@ mod tests {
             blocked: Some(klefki_core::api::Blocked {
                 why: "Blocked by policy: deniedMcpServers in /p/.claude/settings.json has serverName \"x\".".into(),
                 projects: vec!["/p".into()],
+                policy: true,
             }),
             ..user.clone()
         };
@@ -900,6 +943,86 @@ mod tests {
         assert_eq!(row_json(&row, 2)["scope"], "claudeai");
         assert!(matches!(skip(&row, true), Some(Outcome::ClaudeAi)));
         assert_eq!(heading(&row, None), "claude.ai");
+    }
+
+    #[test]
+    fn a_connector_turned_off_by_settings_is_not_said_to_be_blocked_by_policy() {
+        let s = fixture_snapshot();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let why = "Your settings turn off connectors from claude.ai with disableClaudeAiConnectors, in \
+                   .claude/settings.local.json. Remove disableClaudeAiConnectors there to let them load.";
+        let row = ServerRow {
+            name: "claude.ai Gmail".into(),
+            scope: Scope::ClaudeAi,
+            transport: TransportKind::ClaudeAi,
+            target: "on claude.ai".into(),
+            plugin: None,
+            enabled: true,
+            disabled_in: 1,
+            disabled_projects: vec!["/p1".into()],
+            blocked: Some(klefki_core::api::Blocked {
+                why: why.into(),
+                projects: vec!["/p2".into()],
+                policy: false,
+            }),
+            ..user.clone()
+        };
+        let said = notes(&row, 3);
+        assert!(
+            said.contains(&"connectors off in 1 of 3 projects: /p2".to_owned()),
+            "{said:?}"
+        );
+        assert!(
+            said.contains(&"off in 1 of 3 projects: /p1".to_owned()),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|n| n.contains("policy")), "{said:?}");
+        let json = row_json(&row, 3);
+        assert_eq!(json["transport"], "claude.ai");
+        assert_eq!(json["blocked"]["policy"], false);
+        assert_eq!(json["disabled_projects"], json!(["/p1"]));
+        // Off wherever it is on.
+        let everywhere = ServerRow {
+            not_loaded: Some(why.into()),
+            ..row.clone()
+        };
+        assert_eq!(state(&everywhere, 3), "connectors off");
+        // What Klefki cannot check: a note.
+        let unsure = ServerRow {
+            blocked: None,
+            may_not_load: Some("Your allowed list lets servers load by their address.".into()),
+            ..row
+        };
+        assert_eq!(state(&unsure, 3), "on");
+        assert!(notes(&unsure, 3).contains(
+            &"may not load: Your allowed list lets servers load by their address".to_owned()
+        ));
+        assert_eq!(
+            row_json(&unsure, 3)["may_not_load"],
+            "Your allowed list lets servers load by their address."
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_cut_in_the_tables_and_whole_in_json() {
+        let s = fixture_snapshot();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let long = format!("claude.ai {}", "é".repeat(300));
+        let row = ServerRow {
+            name: long.clone(),
+            ..user.clone()
+        };
+        let text = list_text(&s, &[&row], None);
+        let line = text.lines().nth(1).unwrap();
+        let shown = line.trim_start().split("  ").next().unwrap();
+        assert_eq!(shown.chars().count(), NAME_SHOWN, "{line}");
+        assert!(shown.ends_with('\u{2026}'), "{shown}");
+        let status = status_text(&[(&row, Outcome::Off)], None);
+        assert!(!status.contains(&long), "{status}");
+        assert_eq!(row_json(&row, 2)["name"], json!(long));
+        // Nearby: a name exactly that long is shown whole.
+        let exact = "x".repeat(NAME_SHOWN);
+        assert_eq!(table_name(&exact), exact);
     }
 
     #[test]

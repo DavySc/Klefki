@@ -148,7 +148,7 @@ impl ServerFields {
                     }
                 }
             }
-            TransportKind::Ws | TransportKind::Invalid => {
+            TransportKind::Ws | TransportKind::ClaudeAi | TransportKind::Invalid => {
                 problems.push((
                     Part::Address,
                     "Choose a program (stdio), http or sse.".to_owned(),

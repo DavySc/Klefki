@@ -78,6 +78,8 @@ pub enum TransportKind {
     Http,
     Sse,
     Ws,
+    /// A claude.ai connector, which Claude Code reaches through claude.ai (decision 011).
+    ClaudeAi,
     Invalid,
 }
 
@@ -88,6 +90,7 @@ impl TransportKind {
             Self::Http => "http",
             Self::Sse => "sse",
             Self::Ws => "ws",
+            Self::ClaudeAi => "claude.ai",
             Self::Invalid => "invalid",
         }
     }
@@ -208,6 +211,8 @@ pub struct ServerRow {
     pub enabled: bool,
     /// User servers only: in how many known projects the toggle is off (out of `Snapshot::project_count`).
     pub disabled_in: usize,
+    /// Those projects (as shown), in the inventory's order, where the inventory names them.
+    pub disabled_projects: Vec<String>,
     /// Project (`.mcp.json`) servers only.
     pub approval: Option<Approval>,
     /// Another server of the same name is loaded in its place. For a project server: a local one in its project.
@@ -243,6 +248,9 @@ pub struct ServerRow {
     /// Policy holds this server back in some projects only (decision 010). Where it does so everywhere it would load,
     /// [`ServerRow::not_loaded`] says so instead.
     pub blocked: Option<Blocked>,
+    /// Claude Code may not load this server, for a reason Klefki cannot check: why, as a note rather than a warning.
+    /// A claude.ai connector under an allowed list of addresses, as Klefki does not know its address (decision 011).
+    pub may_not_load: Option<String>,
 }
 
 /// Where policy keeps a server from loading, and why. Sanitised.
@@ -252,6 +260,9 @@ pub struct Blocked {
     pub why: String,
     /// The projects (as shown), in the inventory's order.
     pub projects: Vec<String>,
+    /// A rule on which servers load, or the organisation's setting: policy. `false`: the user's own setting, such as
+    /// one that turns claude.ai connectors off (decision 011).
+    pub policy: bool,
 }
 
 /// Where a plugin server comes from (decision 008). Sanitised.

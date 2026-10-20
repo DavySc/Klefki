@@ -218,10 +218,8 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                     definition: fingerprint(entry),
                 },
             );
-            r.disabled_in = disabled_by_project
-                .values()
-                .filter(|d| d.contains(name))
-                .count();
+            r.disabled_projects = off_projects(&disabled_by_project, &shown_projects, name);
+            r.disabled_in = r.disabled_projects.len();
             // A user server is one row, but the toggle is per project: it only counts as off when it is off
             // everywhere Claude knows about.
             r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
@@ -364,15 +362,28 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     // Where a user server is the one of its name: outside every project, and each project that does not hide it.
     for (i, blocked) in user_blocked {
         let r = &mut snap.servers[i];
+        // Where it is on, too, unless it is off everywhere: then the switch says so.
+        let off = if r.enabled {
+            &r.disabled_projects[..]
+        } else {
+            &[]
+        };
         let places: Vec<usize> = all_places
             .iter()
             .copied()
-            .filter(|&p| p == 0 || !r.shadowed_in.contains(&shown_projects[p - 1]))
+            .filter(|&p| {
+                p == 0
+                    || !(r.shadowed_in.contains(&shown_projects[p - 1])
+                        || off.contains(&shown_projects[p - 1]))
+            })
             .collect();
         if r.not_loaded.is_some() {
             continue;
         }
         (r.not_loaded, r.blocked) = verdict(&places, &blocked, &shown_projects);
+        if let (Some(why), false) = (&mut r.not_loaded, off.is_empty()) {
+            off_elsewhere(why, off);
+        }
         // Each cause where it applies: the rest of the projects load a server of the same name instead.
         if let (Some(why), false) = (&mut r.not_loaded, r.shadowed_in.is_empty()) {
             if !why.ends_with('.') {
@@ -424,12 +435,23 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         );
         r.status_cached = cached;
         r.managed = Some(display_path(&server.file));
-        r.disabled_in = disabled_by_project
-            .values()
-            .filter(|d| d.contains(&server.name))
-            .count();
+        r.disabled_projects = off_projects(&disabled_by_project, &shown_projects, &server.name);
+        r.disabled_in = r.disabled_projects.len();
         r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
-        (r.not_loaded, r.blocked) = verdict(&all_places, &blocked, &shown_projects);
+        let off = if r.enabled {
+            &r.disabled_projects[..]
+        } else {
+            &[]
+        };
+        let places: Vec<usize> = all_places
+            .iter()
+            .copied()
+            .filter(|&p| p == 0 || !off.contains(&shown_projects[p - 1]))
+            .collect();
+        (r.not_loaded, r.blocked) = verdict(&places, &blocked, &shown_projects);
+        if let (Some(why), false) = (&mut r.not_loaded, off.is_empty()) {
+            off_elsewhere(why, off);
+        }
         snap.servers.push(r);
     }
 
@@ -462,13 +484,12 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             true,
             status,
         );
-        r.transport = TransportKind::Http;
-        r.target = "claude.ai connector".to_owned();
+        // Claude Code reaches it through claude.ai, at an address Klefki does not know.
+        r.transport = TransportKind::ClaudeAi;
+        r.target = "on claude.ai".to_owned();
         r.status_cached = cached;
-        r.disabled_in = disabled_by_project
-            .values()
-            .filter(|d| d.contains(&name))
-            .count();
+        let off_in = off_projects(&disabled_by_project, &shown_projects, &name);
+        r.disabled_in = off_in.len();
         r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
         let only_organisation = only.as_ref().filter(|_| !org.connectors_too);
         if let Some(only) = only_organisation {
@@ -476,13 +497,43 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                 "Your organisation's {only} decides which servers Claude Code loads, and leaves out connectors from \
                  claude.ai. Your administrator can change this."
             ));
-        } else {
-            let blocked: Vec<(usize, String)> = all_places
+        } else if r.enabled {
+            // Where it is on: outside every project, and each project that does not turn it off.
+            let places: Vec<usize> = all_places
                 .iter()
-                .filter_map(|&p| Some((p, policy.places.get(p)?.blocks_connector(&name)?)))
+                .copied()
+                .filter(|&p| p == 0 || !off_in.contains(&shown_projects[p - 1]))
                 .collect();
-            (r.not_loaded, r.blocked) = verdict(&all_places, &blocked, &shown_projects);
+            let mut blocked = Vec::new();
+            let mut by_policy = BTreeMap::new();
+            let mut unsure = Vec::new();
+            for &p in &places {
+                match policy.places.get(p).map(|rules| rules.for_connector(&name)) {
+                    Some(policy::ForConnector::Held { why, policy: by }) => {
+                        by_policy.insert(p, by);
+                        blocked.push((p, why));
+                    }
+                    Some(policy::ForConnector::MayNot(why)) => unsure.push((p, why)),
+                    _ => {}
+                }
+            }
+            (r.not_loaded, r.blocked) = verdict(&places, &blocked, &shown_projects);
+            if let Some(b) = &mut r.blocked {
+                let first = b
+                    .projects
+                    .first()
+                    .and_then(|f| shown_projects.iter().position(|p| p == f))
+                    .map_or(0, |i| i + 1);
+                b.policy = by_policy.get(&first).copied().unwrap_or(true);
+            }
+            if let (Some(why), false) = (&mut r.not_loaded, off_in.is_empty()) {
+                off_elsewhere(why, &off_in);
+            }
+            if r.not_loaded.is_none() {
+                r.may_not_load = maybe(&places, &unsure, &shown_projects);
+            }
         }
+        r.disabled_projects = off_in;
         snap.servers.push(r);
     }
 
@@ -612,10 +663,8 @@ fn add_plugin_servers(
         let mut r = row(name, &runs[s], Scope::Plugin, None, true, Status::Unknown);
         // A plugin's command runs from the plugin's own folder (`${CLAUDE_PLUGIN_ROOT}`), not a project's.
         r.relative_paths.clear();
-        r.disabled_in = disabled_by_project
-            .values()
-            .filter(|d| d.contains(name))
-            .count();
+        r.disabled_projects = off_projects(disabled_by_project, shown_projects, name);
+        r.disabled_in = r.disabled_projects.len();
         r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
         let same_as = by_hand_name[s].or(by_plugin[s]);
         // Left out wherever its plugin is on.
@@ -710,6 +759,7 @@ fn held_back_here(why: &str, project: &Project<'_>) -> crate::api::Blocked {
     crate::api::Blocked {
         why: clip(&sanitize::sanitize_line(why)),
         projects: vec![clip(&sanitize(&project.display))],
+        policy: true,
     }
 }
 
@@ -764,7 +814,61 @@ fn verdict(
             why.clone()
         }
     });
-    (not_loaded, Some(crate::api::Blocked { why, projects }))
+    (
+        not_loaded,
+        Some(crate::api::Blocked {
+            why,
+            projects,
+            policy: true,
+        }),
+    )
+}
+
+/// The projects (as shown) where the server `name` is switched off.
+fn off_projects(
+    disabled_by_project: &BTreeMap<&String, BTreeSet<String>>,
+    shown_projects: &[String],
+    name: &str,
+) -> Vec<String> {
+    disabled_by_project
+        .values()
+        .zip(shown_projects)
+        .filter(|(d, _)| d.contains(name))
+        .map(|(_, p)| p.clone())
+        .collect()
+}
+
+/// Adds to `why`, a reason a server is not loaded, the projects where it is off, so each cause is said where it applies.
+fn off_elsewhere(why: &mut String, off_in: &[String]) {
+    if !why.ends_with('.') {
+        why.push('.');
+    }
+    why.push_str(&format!(" In {}, it is off.", off_in.join(", ")));
+}
+
+/// The note for a server that may not load in `unsure` of `places`, for a reason Klefki cannot check: in some
+/// projects only, it names them.
+fn maybe(
+    places: &[usize],
+    unsure: &[(usize, String)],
+    shown_projects: &[String],
+) -> Option<String> {
+    let counted: Vec<usize> = places
+        .iter()
+        .copied()
+        .filter(|&p| (p == 0) == shown_projects.is_empty())
+        .collect();
+    let hit: Vec<&(usize, String)> = unsure.iter().filter(|(p, _)| counted.contains(p)).collect();
+    let (_, why) = hit.first()?;
+    let why = clip(&sanitize::sanitize_line(why));
+    if hit.len() == counted.len() {
+        return Some(why);
+    }
+    let projects: Vec<&str> = hit
+        .iter()
+        .map(|(p, _)| shown_projects[p - 1].as_str())
+        .collect();
+    Some(format!("In {}: {why}", projects.join(", ")))
 }
 
 /// Names `project` on the user rows at `hidden`: there, a server of the same name is loaded instead.
@@ -844,6 +948,7 @@ fn row(
         status,
         enabled,
         disabled_in: 0,
+        disabled_projects: Vec::new(),
         approval: None,
         shadowed: false,
         shadowed_in: Vec::new(),
@@ -855,6 +960,7 @@ fn row(
         managed: None,
         not_loaded: None,
         blocked: None,
+        may_not_load: None,
     }
 }
 
@@ -3458,7 +3564,12 @@ mod tests {
             slack.project.is_none() && slack.not_loaded.is_none(),
             "{slack:#?}"
         );
-        assert_eq!(slack.target, "claude.ai connector");
+        // Reached through claude.ai, at an address Klefki does not know: nothing made up.
+        assert_eq!(
+            (slack.transport, slack.target.as_str()),
+            (TransportKind::ClaudeAi, "on claude.ai")
+        );
+        assert_eq!(slack.disabled_projects, [a.display().to_string()]);
         assert_eq!(slack.status, Status::Unknown);
         find(&s, Scope::ClaudeAi, "claude.ai Drive");
         assert_eq!(
@@ -3562,10 +3673,15 @@ mod tests {
             &json!({"allowedMcpServers": [{"serverName": "other"}]}),
         );
         let s = e.load();
+        let why = blocked_why(find(&s, Scope::ClaudeAi, "claude.ai Drive"));
+        assert!(why.contains("not on the list"), "{why}");
+        // What to do is what can be done: an allowed name cannot hold a connector's, an address rule can.
         assert!(
-            blocked_why(find(&s, Scope::ClaudeAi, "claude.ai Drive")).contains("not on the list")
+            why.contains("add a serverUrl rule with the address claude.ai shows for it"),
+            "{why}"
         );
-        // With address rules, its address decides, which Klefki cannot see: not said to be blocked.
+        assert!(!why.contains("Add a rule for it"), "{why}");
+        // With address rules, its address decides, which Klefki cannot see: not blocked, and not plainly on.
         e.write(
             "settings.json",
             &json!({"allowedMcpServers": [{"serverUrl": "https://mcp.example.com/*"}]}),
@@ -3575,6 +3691,242 @@ mod tests {
         assert!(
             drive.not_loaded.is_none() && drive.blocked.is_none(),
             "{drive:#?}"
+        );
+        let note = drive
+            .may_not_load
+            .as_deref()
+            .unwrap_or_else(|| panic!("{drive:#?}"));
+        assert!(
+            note.starts_with("Your allowed list lets servers load by their address"),
+            "{note}"
+        );
+        // Without a list, nothing to say.
+        e.write("settings.json", &json!({}));
+        let s = e.load();
+        assert!(connector(&s, "Drive").may_not_load.is_none());
+    }
+
+    #[test]
+    fn an_allowed_list_of_addresses_in_one_project_names_where_a_connector_may_not_load() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Drive"],
+                "projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}
+            }),
+        );
+        e.write(
+            "projects/b/.claude/settings.json",
+            &json!({"allowedMcpServers": [{"serverUrl": "https://mcp.example.com/*"}]}),
+        );
+        let s = e.load();
+        let note = connector(&s, "Drive").may_not_load.clone().unwrap();
+        assert!(note.starts_with(&format!("In {}: ", b.display())), "{note}");
+        assert!(note.contains(".claude/settings.json"), "{note}");
+    }
+
+    /// The claude.ai connector `name`'s row in `s`.
+    fn connector<'a>(s: &'a Snapshot, name: &str) -> &'a ServerRow {
+        find(s, Scope::ClaudeAi, &format!("claude.ai {name}"))
+    }
+
+    #[test]
+    fn connectors_are_off_where_claude_code_signs_in_with_a_key_or_another_provider() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"claudeAiMcpEverConnected": ["claude.ai Slack"]}),
+        );
+        // Each of these in the user's settings turns every connector off, as Claude Code 2.1.304's debug log says.
+        for (settings, says) in [
+            (json!({"apiKeyHelper": "get-key"}), "apiKeyHelper"),
+            (
+                json!({"env": {"ANTHROPIC_API_KEY": "k"}}),
+                "ANTHROPIC_API_KEY",
+            ),
+            (
+                json!({"env": {"ANTHROPIC_AUTH_TOKEN": "t"}}),
+                "ANTHROPIC_AUTH_TOKEN",
+            ),
+            (
+                json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}),
+                "CLAUDE_CODE_USE_BEDROCK",
+            ),
+            (
+                json!({"env": {"CLAUDE_CODE_USE_VERTEX": " Yes "}}),
+                "CLAUDE_CODE_USE_VERTEX",
+            ),
+            (
+                json!({"env": {"CLAUDE_CODE_USE_FOUNDRY": "on"}}),
+                "CLAUDE_CODE_USE_FOUNDRY",
+            ),
+            (
+                json!({"env": {"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}}),
+                "ENABLE_CLAUDEAI_MCP_SERVERS",
+            ),
+            (
+                json!({"env": {"ENABLE_CLAUDEAI_MCP_SERVERS": " Off "}}),
+                "ENABLE_CLAUDEAI_MCP_SERVERS",
+            ),
+        ] {
+            e.write("settings.json", &settings);
+            let s = e.load();
+            let slack = connector(&s, "Slack");
+            let why = blocked_why(slack);
+            assert!(why.contains(says), "{settings}: {why}");
+            assert!(why.contains(&format!("Remove {says} there")), "{why}");
+            // The user's own choice, not policy.
+            assert!(!slack.blocked.as_ref().unwrap().policy, "{slack:#?}");
+        }
+        // Nearby, and not: values Claude Code reads as unset or as "no".
+        for settings in [
+            json!({"apiKeyHelper": " "}),
+            json!({"env": {"ANTHROPIC_API_KEY": " "}}),
+            json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "0"}}),
+            json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "2"}}),
+            json!({"env": {"ENABLE_CLAUDEAI_MCP_SERVERS": "true"}}),
+            json!({"env": "ANTHROPIC_API_KEY"}),
+        ] {
+            e.write("settings.json", &settings);
+            let s = e.load();
+            let slack = connector(&s, "Slack");
+            assert!(
+                slack.not_loaded.is_none() && slack.blocked.is_none(),
+                "{settings}: {slack:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_project_turns_connectors_off_with_a_key_helper_or_provider_but_not_with_its_env_switch_or_key()
+     {
+        let e = Env::new();
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|p| e.project(p));
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Slack"],
+                "projects": {
+                    a.to_string_lossy(): {}, b.to_string_lossy(): {},
+                    c.to_string_lossy(): {}, d.to_string_lossy(): {}
+                }
+            }),
+        );
+        e.write(
+            "projects/a/.claude/settings.local.json",
+            &json!({"apiKeyHelper": "get-key"}),
+        );
+        // A project's env sets neither the switch nor a key.
+        e.write(
+            "projects/b/.claude/settings.json",
+            &json!({"env": {"ENABLE_CLAUDEAI_MCP_SERVERS": "false", "ANTHROPIC_AUTH_TOKEN": "t"}}),
+        );
+        e.write(
+            "projects/b/.claude/settings.local.json",
+            &json!({"env": {"ANTHROPIC_API_KEY": "k"}}),
+        );
+        // It does set a provider.
+        e.write(
+            "projects/c/.claude/settings.local.json",
+            &json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}),
+        );
+        e.write(
+            "projects/d/.claude/settings.json",
+            &json!({"apiKeyHelper": "get-key"}),
+        );
+        let s = e.load();
+        let slack = connector(&s, "Slack");
+        assert!(slack.not_loaded.is_none(), "{slack:#?}");
+        let blocked = slack.blocked.as_ref().unwrap();
+        assert_eq!(blocked.projects, [a, c, d].map(|p| p.display().to_string()));
+        assert!(
+            blocked
+                .why
+                .contains("apiKeyHelper, in .claude/settings.local.json"),
+            "{}",
+            blocked.why
+        );
+    }
+
+    #[test]
+    fn the_organisation_turning_connectors_off_is_policy_only_an_administrator_changes() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"claudeAiMcpEverConnected": ["claude.ai Slack"]}),
+        );
+        for settings in [
+            json!({"env": {"ANTHROPIC_API_KEY": "k"}}),
+            json!({"disableClaudeAiConnectors": true}),
+        ] {
+            e.write("org/managed-settings.json", &settings);
+            let s = e.load();
+            let slack = connector(&s, "Slack");
+            let why = blocked_why(slack);
+            assert!(
+                why.ends_with("Your administrator can change this."),
+                "{why}"
+            );
+            assert!(slack.blocked.as_ref().unwrap().policy);
+        }
+        // A switch in a file first, ahead of a key: the order Claude Code checks them in.
+        e.write(
+            "org/managed-settings.json",
+            &json!({"env": {"ANTHROPIC_API_KEY": "k"}}),
+        );
+        e.write("settings.json", &json!({"disableClaudeAiConnectors": true}));
+        let s = e.load();
+        assert!(blocked_why(connector(&s, "Slack")).starts_with("Your settings turn off"));
+    }
+
+    #[test]
+    fn a_connector_off_in_one_project_and_held_back_in_the_other_loads_nowhere() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Gmail"],
+                "mcpServers": {"u": {"command": "u"}},
+                "projects": {
+                    a.to_string_lossy(): {"disabledMcpServers": ["claude.ai Gmail", "u"]},
+                    b.to_string_lossy(): {}
+                }
+            }),
+        );
+        e.write(
+            "projects/b/.claude/settings.local.json",
+            &json!({"disableClaudeAiConnectors": true, "deniedMcpServers": [{"serverName": "u"}]}),
+        );
+        let s = e.load();
+        // Each cause where it applies.
+        for r in [connector(&s, "Gmail"), find(&s, Scope::User, "u")] {
+            let why = blocked_why(r);
+            assert!(why.starts_with(&format!("In {}: ", b.display())), "{why}");
+            assert!(
+                why.ends_with(&format!("In {}, it is off.", a.display())),
+                "{why}"
+            );
+            assert!(r.enabled, "{r:#?}");
+        }
+        // Off in both: the switch says so, not policy.
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Gmail"],
+                "projects": {
+                    a.to_string_lossy(): {"disabledMcpServers": ["claude.ai Gmail"]},
+                    b.to_string_lossy(): {"disabledMcpServers": ["claude.ai Gmail"]}
+                }
+            }),
+        );
+        let s = e.load();
+        let gmail = connector(&s, "Gmail");
+        assert!(
+            !gmail.enabled && gmail.not_loaded.is_none() && gmail.blocked.is_none(),
+            "{gmail:#?}"
         );
     }
 

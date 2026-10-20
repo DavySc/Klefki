@@ -211,7 +211,8 @@ fn type_name(transport: TransportKind) -> &'static str {
         TransportKind::Http => "http",
         TransportKind::Sse => "sse",
         TransportKind::Ws => "ws",
-        TransportKind::Stdio | TransportKind::Invalid => "stdio",
+        // A claude.ai connector has no definition of its own to write; never asked for.
+        TransportKind::Stdio | TransportKind::ClaudeAi | TransportKind::Invalid => "stdio",
     }
 }
 
