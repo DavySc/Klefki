@@ -1,0 +1,8 @@
+$ klefki-cli profiles
+exit: Some(0)
+--- stdout
+Work  3 servers
+  alpha  User
+  gamma  Local in <project>
+  gone   no longer configured
+--- stderr

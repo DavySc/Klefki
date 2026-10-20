@@ -1,0 +1,42 @@
+== review
+summary:
+  Rename loc to Loc in a
+notes:
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    projects["/work/a"].mcpServers
+  - loc
+  + Loc
+button: Rename
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "Loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}

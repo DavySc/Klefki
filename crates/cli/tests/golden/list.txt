@@ -1,0 +1,15 @@
+$ klefki-cli list
+exit: Some(0)
+--- stdout
+User
+  alpha   on   stdio  npx -y alpha-mcp --api-key … --token=… …
+  beta    on   http   http://127.0.0.1:9/mcp
+  delta   off  sse    https://delta.example.com/sse
+  remote  on   stdio  npx mcp-remote https://r.example.com/mcp --header Authorization: Bearer …
+
+Local in <project>
+  gamma   on   http   https://gamma.example.com/mcp
+
+Project in <project>
+  docs    on   stdio  node tools/docs-mcp.js  (pending approval)
+--- stderr

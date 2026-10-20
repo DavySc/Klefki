@@ -1,0 +1,32 @@
+== review
+summary:
+  Approve ps in repo
+warnings:
+  Claude Code will run ps from <tmp>/repo whenever you use that project. Only approve it if you trust the repository.
+  The approval goes into .claude/settings.local.json, which is not listed in this repository's .gitignore or .git/info/exclude, so it could be committed by accident (a global ignore file may still cover it).
+review ps would be allowed to run:
+  Command: node
+  Argument 1: server.js
+  Argument 2: --port
+  Argument 3: 9
+  Environment: NODE_OPTIONS=--require ./hook.js
+diff <tmp>/repo/.claude/settings.local.json:
+    enabledMcpjsonServers
+  + ps
+button: Approve
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 1,
+  "projects": {
+    "<tmp>/repo": {}
+  }
+}
+--- repo/.claude/settings.local.json
+{
+  "enabledMcpjsonServers": [
+    "ps"
+  ]
+}
+

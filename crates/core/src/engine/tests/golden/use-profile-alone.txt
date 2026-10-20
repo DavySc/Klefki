@@ -1,0 +1,61 @@
+== review
+summary:
+  Use the profile Writing in designs, and turn off every other server there
+warnings:
+  This also turns off db and memory, which are not in Writing.
+notes:
+  Klefki remembers what this switches: stop using Writing, or delete it, to put it back.
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    projects["/work/designs"].disabledMcpServers
+  + memory
+    projects["/work/designs"].disabledMcpServers
+  + db
+button: Use profile
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "mcpServers": {
+    "gw": {
+      "command": "gw"
+    },
+    "memory": {
+      "command": "m"
+    },
+    "db": {
+      "command": "d"
+    }
+  },
+  "projects": {
+    "/work/designs": {
+      "allowedTools": [],
+      "disabledMcpServers": [
+        "memory",
+        "db"
+      ]
+    },
+    "/work/notes": {}
+  }
+}
+--- profile-uses.json
+{
+  "version": 1,
+  "uses": [
+    {
+      "profile": "Writing",
+      "switches": [
+        {
+          "project": "/work/designs",
+          "name": "memory",
+          "off": true
+        },
+        {
+          "project": "/work/designs",
+          "name": "db",
+          "off": true
+        }
+      ]
+    }
+  ]
+}

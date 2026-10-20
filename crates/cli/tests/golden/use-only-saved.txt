@@ -1,0 +1,69 @@
+$ klefki-cli use Work --project <project> --only --yes
+exit: Some(0)
+--- stdout
+Use the profile Work in Repo, and turn off every other server there
+
+warning: This also turns off beta, docs and remote, which are not in Work.
+note: Klefki remembers what this switches: stop using Work, or delete it, to put it back.
+note: gone is in Work but no longer configured, so nothing is switched for it.
+note: A running Claude Code session may need a restart before it notices this.
+
+.claude.json
+    projects["<project>"].disabledMcpServers
+  + beta
+    projects["<project>"].disabledMcpServers
+  + remote
+    projects["<project>"].disabledMcpServers
+  + docs
+--- stderr
+Saved. The files as they were are kept in <tmp>/data/backups/claude.json.<stamp>.bak.
+--- .claude.json after
+{
+  "mcpServers": {
+    "alpha": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "alpha-mcp",
+        "--api-key",
+        "sk-live-ARGSECRET123456",
+        "--token=tok-SECRET-98765",
+        "ghp_abcdefghijklmnop1234"
+      ]
+    },
+    "beta": {
+      "type": "http",
+      "url": "http://127.0.0.1:9/mcp"
+    },
+    "delta": {
+      "type": "sse",
+      "url": "https://delta.example.com/sse"
+    },
+    "remote": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://r.example.com/mcp",
+        "--header",
+        "Authorization: Bearer hdr-SECRET-abcdef123"
+      ]
+    }
+  },
+  "projects": {
+    "<project>": {
+      "mcpServers": {
+        "gamma": {
+          "type": "http",
+          "url": "https://gamma.example.com/mcp"
+        }
+      },
+      "disabledMcpServers": [
+        "delta",
+        "beta",
+        "remote",
+        "docs"
+      ]
+    }
+  }
+}

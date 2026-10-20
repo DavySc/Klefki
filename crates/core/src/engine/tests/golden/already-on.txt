@@ -1,0 +1,40 @@
+== review
+summary:
+  Turn on gw in 2 projects
+warnings:
+  gw is a user server, and Claude Code switches it per project. This changes the 2 projects it knows today; a project it first opens later is not covered.
+already:
+  gw is already on in every project Claude Code knows.
+button: Turn on
+nothing to do
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}

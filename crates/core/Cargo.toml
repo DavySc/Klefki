@@ -67,5 +67,7 @@ wayland-backend = { version = "0.3", optional = true, features = ["dlopen"] }
 wayland = ["rfd/wayland", "dep:wayland-backend"]
 
 [dev-dependencies]
+# Golden files for the characterisation tests (`engine/tests/golden/`), as rust-analyzer uses it.
+expect-test = "1"
 filetime = "0.2"
 proptest = "1"

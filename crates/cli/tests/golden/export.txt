@@ -1,0 +1,52 @@
+$ klefki-cli export
+exit: Some(0)
+--- stdout
+{
+  "mcpServers": {
+    "alpha": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "alpha-mcp",
+        "--api-key",
+        "${API_KEY}",
+        "--token=${TOKEN}",
+        "${SECRET}"
+      ]
+    },
+    "beta": {
+      "type": "http",
+      "url": "http://127.0.0.1:9/mcp"
+    },
+    "delta": {
+      "type": "sse",
+      "url": "https://delta.example.com/sse"
+    },
+    "remote": {
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://r.example.com/mcp",
+        "--header",
+        "Authorization: Bearer ${AUTH_TOKEN}"
+      ]
+    },
+    "gamma": {
+      "type": "http",
+      "url": "https://gamma.example.com/mcp"
+    },
+    "docs": {
+      "command": "node",
+      "args": [
+        "tools/docs-mcp.js"
+      ]
+    }
+  }
+}
+--- stderr
+Set these variables where the servers are added:
+  API_KEY  (alpha: argument --api-key)
+  TOKEN  (alpha: argument --token)
+  SECRET  (alpha: an argument)
+  AUTH_TOKEN  (remote: argument Authorization)
