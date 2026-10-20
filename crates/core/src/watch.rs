@@ -52,6 +52,12 @@ pub(crate) fn watched_files(paths: &ConfigPaths, snapshot: &Snapshot) -> Vec<Pat
             .join("plugins")
             .join("known_marketplaces.json"),
     ];
+    // What the organisation sets (decision 009). The folder of drop-ins changes when one is added or removed.
+    if let Some(dir) = &paths.managed_dir {
+        files.push(dir.join(crate::config::managed::MCP_FILE));
+        files.extend(crate::config::managed::settings_files(dir, &mut Vec::new()));
+        files.push(dir.join(crate::config::managed::DROP_IN_DIR));
+    }
     for project in &snapshot.projects {
         // Like the inventory: a path that is not local and absolute is never touched, not even looked at.
         if inventory::is_safe_project_path(project) {
@@ -303,6 +309,30 @@ mod tests {
                 files.contains(&paths.claude_dir.join(file)),
                 "{file}: {files:?}"
             );
+        }
+    }
+
+    #[test]
+    fn what_the_organisation_sets_is_watched() {
+        let dir = tempfile::tempdir().unwrap();
+        let org = dir.path().join("org");
+        std::fs::create_dir_all(org.join("managed-settings.d")).unwrap();
+        std::fs::write(org.join("managed-settings.d").join("10.json"), "{}").unwrap();
+        let mut paths = ConfigPaths::in_dir(dir.path().join("cfg"));
+        assert!(
+            !watched_files(&paths, &Snapshot::default())
+                .iter()
+                .any(|f| f.starts_with(&org))
+        );
+        paths.managed_dir = Some(org.clone());
+        let files = watched_files(&paths, &Snapshot::default());
+        for file in [
+            "managed-mcp.json",
+            "managed-settings.json",
+            "managed-settings.d",
+            "managed-settings.d/10.json",
+        ] {
+            assert!(files.contains(&org.join(file)), "{file}: {files:?}");
         }
     }
 

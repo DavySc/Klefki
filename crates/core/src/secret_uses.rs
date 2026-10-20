@@ -132,11 +132,12 @@ pub(crate) fn read(
     snapshot: &Snapshot,
     keys: &FileKeys,
 ) -> Secrets {
-    // A plugin's servers are read from the plugin, not from a file Klefki manages (decision 008).
+    // A plugin's and the organisation's servers are read from their files, not from one Klefki manages (decisions
+    // 008 and 009).
     let rows: Vec<&crate::api::ServerRow> = snapshot
         .servers
         .iter()
-        .filter(|r| r.scope != Scope::Plugin)
+        .filter(|r| !r.scope.is_read_only())
         .collect();
     let ids: Vec<ServerId> = rows.iter().map(|r| r.id()).collect();
     let sources = crate::export::sources(paths, snapshot, keys, &ids);
@@ -609,6 +610,8 @@ mod tests {
                 scopes: Vec::new(),
             }),
             plugin: None,
+            managed: None,
+            not_loaded: None,
         }
     }
 

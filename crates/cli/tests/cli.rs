@@ -173,6 +173,8 @@ impl Env {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_klefki-cli"));
         cmd.args(args)
             .env("CLAUDE_CONFIG_DIR", self.root().join("cfg"))
+            // The organisation's folder, not the machine's: empty unless a test writes `org/…`.
+            .env("KLEFKI_MANAGED_DIR", self.root().join("org"))
             // Redirects the home folder on Linux and macOS. Windows finds it through the registry; a changed
             // `USERPROFILE` only breaks that lookup (CI: every user server "not checked: no home folder").
             .env("HOME", self.root().join("home"))
@@ -316,6 +318,68 @@ fn list_json_has_one_object_per_server_with_stable_fields() {
     assert_eq!(find("docs")["approval"], "pending");
     assert!(v["warnings"].as_array().unwrap().is_empty());
     assert!(!env.any_run());
+}
+
+#[test]
+fn list_and_status_show_what_the_organisation_sets_and_what_it_replaces() {
+    let env = Env::new();
+    let org = env.root().join("org");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(
+        org.join("managed-settings.json"),
+        r#"{"managedMcpServers": {
+            "beta": {"type": "http", "url": "https://beta.example.com/mcp"},
+            "wiki": {"type": "sse", "url": "https://wiki.example.com/sse"}}}"#,
+    )
+    .unwrap();
+    let out = env.run(&["list"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("\nOrganisation\n"), "{stdout}");
+    let wiki = line_of(&stdout, "wiki");
+    assert!(
+        wiki.contains("https://wiki.example.com/sse") && wiki.contains("set by your organisation"),
+        "{wiki}"
+    );
+    let beta = stdout
+        .lines()
+        .find(|l| l.contains("beta") && l.contains("127.0.0.1"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(beta.contains("not loaded"), "{beta}");
+
+    let out = env.run(&["list", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let servers = v["servers"].as_array().unwrap();
+    let wiki = servers.iter().find(|s| s["name"] == "wiki").unwrap();
+    assert_eq!(wiki["scope"], "organisation");
+    assert!(
+        wiki["managed"]
+            .as_str()
+            .unwrap()
+            .ends_with("managed-settings.json")
+    );
+    assert_eq!(wiki["not_loaded"], serde_json::Value::Null);
+    let user_beta = servers
+        .iter()
+        .find(|s| s["name"] == "beta" && s["scope"] == "user")
+        .unwrap();
+    assert!(
+        user_beta["not_loaded"]
+            .as_str()
+            .unwrap()
+            .contains("same name")
+    );
+    assert!(!env.any_run());
+
+    // Checks neither: the organisation's is not one Klefki checks, and the user's beta is not what Claude Code runs.
+    let out = env.status(&[]);
+    let stdout = text(&out.stdout);
+    assert!(!env.gets().contains(&"beta".to_owned()), "{stdout}");
+    assert!(!env.gets().contains(&"wiki".to_owned()), "{stdout}");
+    assert!(
+        line_of(&stdout, "wiki").contains("your organisation sets it"),
+        "{stdout}"
+    );
 }
 
 #[test]

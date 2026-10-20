@@ -37,6 +37,8 @@ pub enum Scope {
     Project,
     /// A server a Claude Code plugin brings. Read-only: it is changed in the plugin.
     Plugin,
+    /// A server the organisation sets in the machine's managed settings. Read-only: only an administrator changes it.
+    Managed,
 }
 
 impl Scope {
@@ -46,7 +48,18 @@ impl Scope {
             Self::Local => "Local",
             Self::Project => "Project",
             Self::Plugin => "Plugin",
+            Self::Managed => "Organisation",
         }
+    }
+
+    /// A server Klefki only switches on and off: no file of the user's holds it.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Plugin | Self::Managed)
+    }
+
+    /// One row for every project, switched per project (`disabledMcpServers`).
+    pub fn is_everywhere(self) -> bool {
+        matches!(self, Self::User | Self::Plugin | Self::Managed)
     }
 }
 
@@ -213,6 +226,11 @@ pub struct ServerRow {
     /// Plugin servers only: which plugin brings it. Such a row is read-only: Klefki holds no file key for it, so no
     /// change can name it.
     pub plugin: Option<PluginInfo>,
+    /// Organisation servers only: the file that sets it, as shown (decision 009).
+    pub managed: Option<String>,
+    /// Claude Code loads this server nowhere, though it is configured: why, as a sentence. Set when the
+    /// organisation's `managed-mcp.json` decides which servers load, or its server of the same name replaces this one.
+    pub not_loaded: Option<String>,
 }
 
 /// Where a plugin server comes from (decision 008). Sanitised.
@@ -269,6 +287,9 @@ pub struct Snapshot {
     pub legacy_disabled: Vec<LegacyDisabled>,
     /// Definitions Klefki kept because a change removed a server and could not add it back. Oldest first.
     pub kept: Vec<Kept>,
+    /// The organisation's `managed-mcp.json`, as shown, when it exists: then Claude Code loads only the
+    /// organisation's servers (decision 009).
+    pub organisation_only: Option<String>,
 }
 
 /// A server definition Klefki kept in its private folder after a change removed the server and could not put it back

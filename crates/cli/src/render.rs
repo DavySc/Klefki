@@ -47,6 +47,10 @@ pub enum Outcome {
     ProjectServer,
     /// A plugin's server: Klefki does not check those (decision 008).
     Plugin,
+    /// A server the organisation sets: Klefki does not check those (decision 009).
+    Organisation,
+    /// Claude Code loads it nowhere, for this reason (decision 009): another server answers to its name.
+    NotLoaded(String),
     /// Asked, but no answer came in time.
     NoAnswer,
 }
@@ -57,7 +61,12 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.status != Status::Connected,
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => false,
+            Outcome::Off
+            | Outcome::Rejected
+            | Outcome::ProjectServer
+            | Outcome::Plugin
+            | Outcome::Organisation
+            | Outcome::NotLoaded(_) => false,
         }
     }
 
@@ -66,7 +75,12 @@ impl Outcome {
         match self {
             Outcome::Checked(c) => c.failed(),
             Outcome::NoAnswer => true,
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => false,
+            Outcome::Off
+            | Outcome::Rejected
+            | Outcome::ProjectServer
+            | Outcome::Plugin
+            | Outcome::Organisation
+            | Outcome::NotLoaded(_) => false,
         }
     }
 
@@ -77,8 +91,12 @@ impl Outcome {
 
 /// Why `status` leaves this row out, if it does. Named servers are checked unless Claude Code would not run them.
 pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
-    if row.scope == Scope::Plugin {
+    if let Some(why) = &row.not_loaded {
+        Some(Outcome::NotLoaded(why.clone()))
+    } else if row.scope == Scope::Plugin {
         Some(Outcome::Plugin)
+    } else if row.scope == Scope::Managed {
+        Some(Outcome::Organisation)
     } else if !row.enabled {
         Some(Outcome::Off)
     } else if row.approval == Some(Approval::Rejected) {
@@ -221,8 +239,14 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         Some(Approval::Rejected) => notes.push("rejected".to_owned()),
         Some(Approval::Approved) | None => {}
     }
-    // A plugin's server, like a user server, is one row for every project.
-    let everywhere = matches!(row.scope, Scope::User | Scope::Plugin);
+    if let Some(why) = &row.not_loaded {
+        notes.push(format!("not loaded: {}", why.trim_end_matches('.')));
+    }
+    if let Some(file) = &row.managed {
+        notes.push(format!("set by your organisation in {file}"));
+    }
+    // A plugin's or the organisation's server, like a user server, is one row for every project.
+    let everywhere = row.scope.is_everywhere();
     if let Some(plugin) = &row.plugin {
         notes.push(format!("from the plugin {}", plugin.plugin));
         if !plugin.off_in.is_empty() {
@@ -262,7 +286,7 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if row.casing_collision {
         notes.push("another server's name differs only in case".to_owned());
     }
-    if row.scope == Scope::User && !row.relative_paths.is_empty() {
+    if row.scope == Scope::User && !row.relative_paths.is_empty() && row.not_loaded.is_none() {
         notes.push(format!(
             "relative to each session's folder: {}",
             row.relative_paths.join(", ")
@@ -320,6 +344,7 @@ fn scope_key(scope: Scope) -> &'static str {
         Scope::Local => "local",
         Scope::Project => "project",
         Scope::Plugin => "plugin",
+        Scope::Managed => "organisation",
     }
 }
 
@@ -362,7 +387,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     o.insert("transport".into(), json!(transport_key(row.transport)));
     o.insert("target".into(), json!(row.target));
     o.insert("enabled".into(), json!(row.enabled));
-    if matches!(row.scope, Scope::User | Scope::Plugin) {
+    if row.scope.is_everywhere() {
         o.insert("disabled_in".into(), json!(row.disabled_in));
         o.insert("project_count".into(), json!(project_count));
     }
@@ -379,6 +404,10 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
             json!({"name": plugin.plugin, "marketplace": plugin.marketplace, "same_as": plugin.same_as, "written_target": plugin.written_target, "off_in": plugin.off_in}),
         );
     }
+    if row.managed.is_some() {
+        o.insert("managed".into(), json!(row.managed));
+    }
+    o.insert("not_loaded".into(), json!(row.not_loaded));
     o.insert("casing_collision".into(), json!(row.casing_collision));
     o.insert("oauth".into(), json!(row.oauth.is_some()));
     o
@@ -462,6 +491,12 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
             NOT_CHECKED.to_owned(),
             "not checked: it comes from a plugin; Claude Code's /mcp shows its status".to_owned(),
         ),
+        Outcome::Organisation => (
+            NOT_CHECKED.to_owned(),
+            "not checked: your organisation sets it; Claude Code's /mcp shows its status"
+                .to_owned(),
+        ),
+        Outcome::NotLoaded(why) => ("Not loaded".to_owned(), format!("not checked: {why}")),
         Outcome::ProjectServer => {
             let label = match row.status {
                 Status::Unknown | Status::Checking => NOT_CHECKED,
@@ -545,7 +580,12 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
                 Status::Checking | Status::Unknown => "check failed",
             },
             Outcome::NoAnswer => "no answer",
-            Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => {
+            Outcome::Off
+            | Outcome::Rejected
+            | Outcome::ProjectServer
+            | Outcome::Plugin
+            | Outcome::Organisation
+            | Outcome::NotLoaded(_) => {
                 skipped += 1;
                 continue;
             }
@@ -586,6 +626,8 @@ pub fn status_json(
                 Outcome::Rejected => Some("rejected"),
                 Outcome::ProjectServer => Some("project_server"),
                 Outcome::Plugin => Some("plugin"),
+                Outcome::Organisation => Some("organisation"),
+                Outcome::NotLoaded(_) => Some("not_loaded"),
                 Outcome::Checked(_) | Outcome::NoAnswer => None,
             };
             let (status, detail, hint) = match outcome {
@@ -601,9 +643,12 @@ pub fn status_json(
                     c.hint.as_ref(),
                 ),
                 Outcome::NoAnswer => (Some("no_answer"), Some(NO_ANSWER.to_owned()), None),
-                Outcome::Off | Outcome::Rejected | Outcome::ProjectServer | Outcome::Plugin => {
-                    (None, None, None)
-                }
+                Outcome::Off
+                | Outcome::Rejected
+                | Outcome::ProjectServer
+                | Outcome::Plugin
+                | Outcome::Organisation
+                | Outcome::NotLoaded(_) => (None, None, None),
             };
             o.insert("checked".into(), json!(outcome.was_checked()));
             o.insert("skipped".into(), json!(skipped));
@@ -716,6 +761,17 @@ mod tests {
             notes(&rel, 2)
         );
         assert!(!notes(&in_repo, 2).iter().any(|n| n.contains("relative")));
+        // Not where Claude Code does not load it at all: that is what to say.
+        let replaced = ServerRow {
+            not_loaded: Some("Your organisation sets a server of the same name.".into()),
+            ..rel.clone()
+        };
+        let said = notes(&replaced, 2);
+        assert_eq!(
+            said[0],
+            "not loaded: Your organisation sets a server of the same name"
+        );
+        assert!(!said.iter().any(|n| n.contains("relative")), "{said:?}");
         assert_eq!(
             row_json(&rel, 2)["relative_paths"],
             json!(["build/index.js", "./c.json (in CFG)"])

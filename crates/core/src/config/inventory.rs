@@ -1,7 +1,7 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::docstore::LEGACY;
-use super::{ConfigPaths, fsx, plugins};
+use super::{ConfigPaths, fsx, managed, plugins};
 use crate::api::{
     Approval, LegacyDisabled, OAuthInfo, PluginInfo, Scope, ServerId, ServerRow, Snapshot, Status,
     TransportKind,
@@ -117,6 +117,28 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
 
     let hints = Hints::load(paths, &mut snap.warnings);
 
+    // What the organisation sets (decision 009): its servers come before every other of the same name, and with
+    // `managed-mcp.json` they are the only ones Claude Code loads.
+    let mut managed_warnings = Vec::new();
+    let org = managed::load(paths, &mut managed_warnings);
+    snap.warnings
+        .extend(managed_warnings.iter().map(|w| sanitize::sanitize_line(w)));
+    let only = org.only.as_deref().map(display_path);
+    snap.organisation_only.clone_from(&only);
+    let replaced_by = |name: &str| -> Option<String> {
+        if let Some(only) = &only {
+            return Some(format!(
+                "Your organisation's {only} decides which servers Claude Code loads, and this one is not among them."
+            ));
+        }
+        org.servers.iter().find(|s| s.name == name).map(|s| {
+            format!(
+                "Your organisation sets a server of the same name in {}, which Claude Code loads instead.",
+                display_path(&s.file)
+            )
+        })
+    };
+
     let projects = merged_projects(root);
     snap.project_count = projects.len();
     snap.projects = projects.keys().cloned().collect();
@@ -145,7 +167,8 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     let mut user_rows: HashMap<&str, usize> = HashMap::new();
     if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
         for (name, entry) in servers {
-            if let Some(key) = plugins::same_as_key(entry) {
+            let not_loaded = replaced_by(name);
+            if let (None, Some(key)) = (&not_loaded, plugins::same_as_key(entry)) {
                 by_hand.push(ByHand {
                     key,
                     name: name.clone(),
@@ -162,6 +185,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             let (status, cached) = hints.status_of(name);
             let mut r = row(name, entry, Scope::User, None, true, status);
             r.status_cached = cached;
+            r.not_loaded = not_loaded;
             keys.insert(
                 r.connection.clone(),
                 FileKey {
@@ -193,7 +217,8 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
-                    if !disabled.contains(name) {
+                    let not_loaded = replaced_by(name);
+                    if !disabled.contains(name) && not_loaded.is_none() {
                         hidden.extend(user_rows.get(name.as_str()));
                         if let Some(key) = plugins::same_as_key(entry) {
                             by_hand.push(ByHand::in_project(key, name, project));
@@ -208,6 +233,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                         Status::Unknown,
                     );
                     r.connection = ConnectionId::new(Scope::Local, Some(key), name);
+                    r.not_loaded = not_loaded;
                     keys.insert(
                         r.connection.clone(),
                         FileKey {
@@ -268,7 +294,11 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                     // Claude Code compares names as the file spells them, not as shown, and loads a project
                     // server only once it is approved.
                     r.shadowed = seen_local.contains(&name);
-                    if approval == Approval::Approved && !disabled.contains(&name) {
+                    r.not_loaded = replaced_by(&name);
+                    if approval == Approval::Approved
+                        && !disabled.contains(&name)
+                        && r.not_loaded.is_none()
+                    {
                         hidden.extend(user_rows.get(name.as_str()));
                         if let Some(key) = plugins::same_as_key(&entry) {
                             by_hand.push(ByHand::in_project(key, &name, project));
@@ -289,7 +319,28 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         r.shadowed = snap.project_count > 0 && r.shadowed_in.len() == snap.project_count;
     }
 
+    for server in &org.servers {
+        let (status, cached) = hints.status_of(&server.name);
+        let mut r = row(
+            &server.name,
+            &server.entry,
+            Scope::Managed,
+            None,
+            true,
+            status,
+        );
+        r.status_cached = cached;
+        r.managed = Some(display_path(&server.file));
+        r.disabled_in = disabled_by_project
+            .values()
+            .filter(|d| d.contains(&server.name))
+            .count();
+        r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
+        snap.servers.push(r);
+    }
+
     let raw_projects: Vec<&str> = projects.values().map(|p| p.raw.as_str()).collect();
+    let first_plugin = snap.servers.len();
     add_plugin_servers(
         paths,
         &mut snap,
@@ -298,6 +349,9 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         &raw_projects,
         &shown_projects,
     );
+    for r in &mut snap.servers[first_plugin..] {
+        r.not_loaded = replaced_by(&r.name);
+    }
 
     mark_casing_collisions(&mut snap.servers);
     snap
@@ -538,6 +592,8 @@ fn row(
         status_cached: false,
         oauth: oauth_info(entry),
         plugin: None,
+        managed: None,
+        not_loaded: None,
     }
 }
 
@@ -1240,7 +1296,10 @@ mod tests {
             }
         }
         fn paths(&self) -> ConfigPaths {
-            ConfigPaths::in_dir(self.dir.path())
+            let mut paths = ConfigPaths::in_dir(self.dir.path());
+            // The organisation's folder, empty unless a test writes `org/…`.
+            paths.managed_dir = Some(self.dir.path().join("org"));
+            paths
         }
         fn write(&self, rel: &str, v: &Value) {
             self.write_raw(rel, &serde_json::to_string(v).unwrap());
@@ -2879,5 +2938,135 @@ mod tests {
         assert!(s.warnings[0].contains("gone"), "{:?}", s.warnings);
         assert!(!s.warnings[0].contains('\u{1b}'), "{:?}", s.warnings);
         assert!(s.servers.is_empty());
+    }
+
+    // ------------------------------------------------------------ organisation servers (decision 009)
+
+    #[test]
+    fn an_organisations_servers_are_listed_read_only_and_switched_per_project() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"docs": {"type": "http", "url": "https://docs.example.com/mcp"}}}),
+        );
+        e.write(
+            "org/managed-settings.d/10-run.json",
+            &json!({"managedMcpServers": {"run": {"type": "stdio", "command": "node"}}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"mine": {"command": "mine"}},
+                "projects": {
+                    a.to_string_lossy(): {"disabledMcpServers": ["docs"]},
+                    b.to_string_lossy(): {}
+                }
+            }),
+        );
+        let s = e.load();
+        // A settings file may not name a program to run: said, and not listed.
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("\"run\""), "{:?}", s.warnings);
+        assert!(!s.servers.iter().any(|r| r.name == "run"));
+        let docs = find(&s, Scope::Managed, "docs");
+        assert_eq!(docs.target, "https://docs.example.com/mcp");
+        assert!(docs.project.is_none());
+        assert_eq!((docs.enabled, docs.disabled_in), (true, 1));
+        assert!(
+            docs.managed
+                .as_deref()
+                .is_some_and(|f| f.ends_with("managed-settings.json")),
+            "{docs:#?}"
+        );
+        assert!(docs.not_loaded.is_none());
+        assert!(find(&s, Scope::User, "mine").not_loaded.is_none());
+        // No file of the user's holds it: nothing can change it but the switch.
+        let inv = load(&e.paths());
+        assert!(!inv.keys.contains_key(&docs.connection));
+    }
+
+    #[test]
+    fn an_organisations_server_replaces_a_user_or_local_server_of_the_same_name() {
+        let e = Env::new();
+        let a = e.project("a");
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {
+                "shared": {"type": "http", "url": "https://org.example.com/mcp"},
+                "loc": {"type": "http", "url": "https://loc.example.com/mcp"}
+            }}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"shared": {"command": "mine"}, "other": {"command": "other"}},
+                "projects": {a.to_string_lossy(): {"mcpServers": {"loc": {"command": "loc"}}}}
+            }),
+        );
+        let s = e.load();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        for (scope, name) in [(Scope::User, "shared"), (Scope::Local, "loc")] {
+            let r = find(&s, scope, name);
+            let why = r.not_loaded.as_deref().unwrap_or_else(|| panic!("{r:#?}"));
+            assert!(why.contains("same name"), "{why}");
+            assert!(why.contains("managed-settings.json"), "{why}");
+        }
+        assert!(find(&s, Scope::User, "other").not_loaded.is_none());
+        assert!(find(&s, Scope::Managed, "shared").not_loaded.is_none());
+    }
+
+    #[test]
+    fn with_managed_mcp_json_only_the_organisations_servers_load() {
+        let e = Env::new();
+        let a = e.project("a");
+        e.plugin("p1", json!({"s": {"command": "plug"}}));
+        e.write(
+            "org/managed-mcp.json",
+            &json!({"mcpServers": {"run": {"type": "stdio", "command": "node", "args": ["org.js"]}}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"mine": {"command": "mine"}},
+                "projects": {a.to_string_lossy(): {"mcpServers": {"loc": {"command": "loc"}}}}
+            }),
+        );
+        e.write(
+            "projects/a/.mcp.json",
+            &json!({"mcpServers": {"team": {"command": "team"}}}),
+        );
+        let s = e.load();
+        let run = find(&s, Scope::Managed, "run");
+        assert!(run.not_loaded.is_none());
+        assert_eq!(run.target, "node org.js");
+        for (scope, name) in [
+            (Scope::User, "mine"),
+            (Scope::Local, "loc"),
+            (Scope::Project, "team"),
+            (Scope::Plugin, "plugin:p1:s"),
+        ] {
+            let r = find(&s, scope, name);
+            let why = r.not_loaded.as_deref().unwrap_or_else(|| panic!("{r:#?}"));
+            assert!(why.contains("managed-mcp.json"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_server_the_organisation_replaces_leaves_no_plugin_server_out() {
+        let e = Env::new();
+        e.plugin("p1", json!({"s": {"command": "same"}}));
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"mine": {"type": "http", "url": "https://org.example.com/mcp"}}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"mcpServers": {"mine": {"command": "same"}}}),
+        );
+        let s = e.load();
+        // Claude Code loads the organisation's "mine", not the user's, so nothing has the plugin's command.
+        let p = find(&s, Scope::Plugin, "plugin:p1:s");
+        assert!(!p.shadowed && plugin_info(p).same_as.is_none(), "{p:#?}");
     }
 }

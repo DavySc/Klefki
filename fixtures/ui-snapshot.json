@@ -86,6 +86,15 @@
       "approval": "rejected"
     },
     {
+      "name": "company-wiki",
+      "scope": "managed",
+      "transport": "http",
+      "target": "https://wiki.example.com/mcp",
+      "status": "unknown",
+      "enabled": true,
+      "managed": "C:/Program Files/ClaudeCode/managed-settings.json"
+    },
+    {
       "name": "plugin:docs-search:search",
       "scope": "plugin",
       "transport": "stdio",

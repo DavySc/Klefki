@@ -219,6 +219,7 @@ mod tests {
         ConfigPaths {
             claude_json: claude_dir.join(".claude.json"),
             claude_dir,
+            managed_dir: None,
         }
     }
 

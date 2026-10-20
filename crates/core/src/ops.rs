@@ -418,9 +418,9 @@ fn find<'a>(
     if let Some(row) = snapshot
         .servers
         .iter()
-        .find(|r| r.is(id) && r.scope == Scope::Plugin)
+        .find(|r| r.is(id) && r.scope.is_read_only())
     {
-        return Err(from_plugin(row));
+        return Err(read_only(row));
     }
     inventory::locate(snapshot, keys, id).ok_or_else(|| {
         format!(
@@ -430,8 +430,19 @@ fn find<'a>(
     })
 }
 
-/// Why a plugin's server cannot be changed here: Claude Code reads it from the plugin's own files.
-fn from_plugin(row: &ServerRow) -> String {
+/// Why a plugin's or the organisation's server cannot be changed here: Claude Code reads it from files that are not
+/// the user's.
+fn read_only(row: &ServerRow) -> String {
+    if row.scope == Scope::Managed {
+        return format!(
+            "{} is set by your organisation{}, and only an administrator can change it. Klefki can switch it on and off.",
+            row.name,
+            row.managed
+                .as_deref()
+                .map(|f| format!(" in {f}"))
+                .unwrap_or_default()
+        );
+    }
     match &row.plugin {
         Some(p) => format!(
             "{} comes from the plugin {}, and Klefki does not change a plugin's files. Change it in the plugin, or turn the plugin off in Claude Code.",
@@ -516,27 +527,24 @@ fn switch(
     keys: &FileKeys,
     out: &mut Resolved,
 ) -> Result<(), String> {
-    // A plugin's server: switched like a user server, by the name Claude Code gives it (decision 008, finding 2).
-    // Only `.claude.json` changes, never the plugin's files.
+    // A plugin's or the organisation's server: switched like a user server, by the name Claude Code gives it
+    // (decisions 008 and 009). Only `.claude.json` changes, never the plugin's or the organisation's files.
     if let Some(row) = snapshot
         .servers
         .iter()
-        .find(|r| r.is(id) && r.scope == Scope::Plugin)
+        .find(|r| r.is(id) && r.scope.is_read_only())
     {
-        // The name as the plugin's files spell it, from its connection; the row's own is cleaned for showing.
-        let Some((Scope::Plugin, None, name)) =
-            crate::model::ConnectionId::parse(row.connection.as_str())
-        else {
-            return Err(from_plugin(row));
+        // The name as the files spell it, from its connection; the row's own is cleaned for showing.
+        let name = match crate::model::ConnectionId::parse(row.connection.as_str()) {
+            Some((scope, None, name)) if scope == row.scope => name,
+            _ => return Err(read_only(row)),
         };
-        return switch_everywhere(
-            &row.name,
-            &name,
-            "a plugin's server",
-            enabled,
-            snapshot,
-            out,
-        );
+        let what = if row.scope == Scope::Managed {
+            "a server your organisation sets"
+        } else {
+            "a plugin's server"
+        };
+        return switch_everywhere(&row.name, &name, what, enabled, snapshot, out);
     }
     let (row, file) = find(id, snapshot, keys)?;
     let shown = &row.name;
@@ -558,7 +566,7 @@ fn switch(
                 ));
             }
         }
-        Scope::Plugin => return Err(from_plugin(row)),
+        Scope::Plugin | Scope::Managed => return Err(read_only(row)),
         Scope::User => {
             switch_everywhere(shown, &file.name, "a user server", enabled, snapshot, out)?;
         }
@@ -608,7 +616,7 @@ fn own_server<'a>(
         Scope::User => Ok(file),
         Scope::Local if file.project.is_some() => Ok(file),
         Scope::Local => Err(format!("{} has no project", row.name)),
-        Scope::Plugin => Err(from_plugin(row)),
+        Scope::Plugin | Scope::Managed => Err(read_only(row)),
         Scope::Project => Err(format!(
             "{} is defined in the repository's .mcp.json, and Klefki does not {what} files in a repository. Change it there, or switch it off here.",
             row.name
@@ -913,7 +921,7 @@ fn duplicate(
     let (row, file) = find(id, snapshot, keys)?;
     let shown = &row.name;
     let from = match row.scope {
-        Scope::Plugin => return Err(from_plugin(row)),
+        Scope::Plugin | Scope::Managed => return Err(read_only(row)),
         Scope::User => None,
         Scope::Local => Some(
             file.project
@@ -988,6 +996,20 @@ fn new_places(
     let same_project = |k: Option<&str>, p: &str| {
         k.is_some_and(|q| inventory::normalise_project(q) == inventory::normalise_project(p))
     };
+    // The organisation's servers come first wherever the new one would go (decision 009).
+    if let Some(file) = &snapshot.organisation_only {
+        out.warnings.push(format!(
+            "Your organisation's {file} decides which servers Claude Code loads, so Claude Code will not load {what}."
+        ));
+    } else if snapshot.servers.iter().any(|r| {
+        r.scope == Scope::Managed
+            && crate::model::ConnectionId::parse(r.connection.as_str())
+                .is_some_and(|(_, _, n)| n == name)
+    }) {
+        out.warnings.push(format!(
+            "Your organisation sets a server called {new}, which Claude Code loads instead of {what}."
+        ));
+    }
     let mut places = Vec::new();
     for target in targets {
         let to = match target {
@@ -1031,6 +1053,7 @@ fn new_places(
                 Scope::Local => "local",
                 Scope::Project => "project",
                 Scope::Plugin => "plugin",
+                Scope::Managed => "organisation",
             };
             match (&to, other.scope) {
                 (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
@@ -1591,6 +1614,140 @@ mod tests {
                 "{change:?}: {why}"
             );
         }
+    }
+
+    /// The organisation's folder `org` in `dir` with `managed-settings.json` setting the server `docs`, and the
+    /// `.claude.json` given.
+    fn organisation_inventory(dir: &Path, claude_json: Value) -> inventory::Inventory {
+        let org = dir.join("org");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(
+            org.join("managed-settings.json"),
+            r#"{"managedMcpServers":{"docs":{"type":"http","url":"https://docs.example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(".claude.json"), claude_json.to_string()).unwrap();
+        let mut paths = crate::config::ConfigPaths::in_dir(dir);
+        paths.managed_dir = Some(org);
+        inventory::load(&paths)
+    }
+
+    #[test]
+    fn an_organisations_server_is_switched_by_name_in_every_project_and_nothing_else() {
+        use crate::engine::Change;
+        use crate::model::Target;
+        let dir = tempfile::tempdir().unwrap();
+        let inv = organisation_inventory(dir.path(), json!({"projects": {"/q": {}, "/r": {}}}));
+        let row = inv
+            .snapshot
+            .servers
+            .iter()
+            .find(|r| r.scope == Scope::Managed)
+            .unwrap();
+        for enabled in [false, true] {
+            let change = Change::SetEnabled {
+                id: row.id(),
+                enabled,
+            };
+            let out = resolve(&[change], &inv.snapshot, &inv.keys).unwrap();
+            assert_eq!(
+                out.claude,
+                ["/q", "/r"]
+                    .map(|project| Op::SetDisabled {
+                        project: project.into(),
+                        name: "docs".into(),
+                        disabled: !enabled,
+                    })
+                    .to_vec()
+            );
+            assert!(out.settings.is_empty());
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("your organisation sets") && w.contains("2 projects")),
+                "{:?}",
+                out.warnings
+            );
+        }
+        let id = row.id();
+        for change in [
+            Change::Approve { id: id.clone() },
+            Change::Delete { id: id.clone() },
+            Change::Replace {
+                id: id.clone(),
+                json: r#"{"command":"y"}"#.into(),
+            },
+            Change::Rename {
+                id: id.clone(),
+                name: "other".into(),
+            },
+            Change::Duplicate {
+                id: id.clone(),
+                name: "copy".into(),
+                targets: vec![Target::User],
+            },
+            Change::Move {
+                id: id.clone(),
+                to: Target::User,
+            },
+        ] {
+            let Err(why) = resolve(std::slice::from_ref(&change), &inv.snapshot, &inv.keys) else {
+                panic!("{change:?} was planned");
+            };
+            assert!(
+                why.contains("set by your organisation")
+                    && why.contains("managed-settings.json")
+                    && why.contains("administrator"),
+                "{change:?}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_a_server_the_organisation_takes_the_place_of_says_so() {
+        use crate::engine::Change;
+        use crate::model::Target;
+        let add = |inv: &inventory::Inventory, name: &str| {
+            resolve(
+                &[Change::Add {
+                    name: name.into(),
+                    json: r#"{"type":"http","url":"https://mine.example.com/mcp"}"#.into(),
+                    targets: vec![Target::User],
+                    secret: None,
+                }],
+                &inv.snapshot,
+                &inv.keys,
+            )
+            .unwrap()
+            .warnings
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let inv = organisation_inventory(dir.path(), json!({"projects": {"/q": {}}}));
+        let warnings = add(&inv, "docs");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Your organisation sets a server called docs")),
+            "{warnings:?}"
+        );
+        assert!(!add(&inv, "mine").iter().any(|w| w.contains("organisation")),);
+
+        // With managed-mcp.json, Claude Code loads none of the user's servers.
+        std::fs::write(
+            dir.path().join("org/managed-mcp.json"),
+            r#"{"mcpServers":{}}"#,
+        )
+        .unwrap();
+        let mut paths = crate::config::ConfigPaths::in_dir(dir.path());
+        paths.managed_dir = Some(dir.path().join("org"));
+        let inv = inventory::load(&paths);
+        let warnings = add(&inv, "mine");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("managed-mcp.json decides") && w.contains("will not load")),
+            "{warnings:?}"
+        );
     }
 
     /// A plugin `p@m` that is on, with one server `s`, and the projects given.
