@@ -17,8 +17,9 @@ pub use crate::export_file::{
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
-pub use crate::ops::profile_alone_in;
+pub use crate::ops::{profile_alone_in, profile_in_use};
 pub use crate::paste::{Pasted, PastedServer};
+pub use crate::profile_uses::{ProfileUse, ProfileUses, Switch};
 pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
@@ -325,6 +326,9 @@ pub struct Snapshot {
     /// The names of Klefki's profiles (decision 012), in their order, for the command palette. Empty when the profiles
     /// file cannot be read.
     pub profiles: Vec<String>,
+    /// What each profile's uses switched, so that stopping it can put that back (decision 012). Read with the
+    /// profiles.
+    pub profile_uses: crate::profile_uses::ProfileUses,
     /// The organisation's `managed-mcp.json`, as shown, when it exists: then Claude Code loads only the
     /// organisation's servers (decision 009).
     pub organisation_only: Option<String>,

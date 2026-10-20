@@ -57,6 +57,7 @@ pub(crate) fn load() -> Snapshot {
         legacy_disabled: Vec::new(),
         kept: Vec::new(),
         profiles: Vec::new(),
+        profile_uses: Default::default(),
         organisation_only: None,
         organisation_notes: Vec::new(),
         servers: raw
