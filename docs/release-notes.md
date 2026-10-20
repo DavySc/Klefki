@@ -56,6 +56,13 @@ chmod +x klefki-{version}-linux-x86_64.AppImage
 
 AppImages need FUSE 2. If it does not start, install it: `sudo apt install libfuse2` on Ubuntu 22.04, `sudo apt install libfuse2t64` on 24.04 and later, or your distribution's `fuse2` / `fuse-libs` package.
 
+### Updates
+
+Once a day, a few seconds after it opens, Klefki asks GitHub whether a newer version is out. It uses a release only if the release is signed with Klefki's key, and a downloaded file only if the file matches that signature. GitHub sees your IP address and Klefki's version, as with any download. Nothing about your servers or settings is sent. You can turn this off in Settings, under *Updates*.
+
+- **Windows installer, macOS app, AppImage:** Klefki downloads the update by itself. It installs when you close Klefki, or straight away with *Restart to update*.
+- **MSI, zip, `.deb`:** Klefki shows that an update is out and opens its page. Install it the way you installed Klefki (for the `.deb`, with `sudo apt install` as above).
+
 ### Check a download
 
 {minisign}
