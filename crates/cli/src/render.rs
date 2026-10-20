@@ -20,7 +20,7 @@ pub struct Checked {
 }
 
 impl Checked {
-    /// The engine did not run the check at all, and says why as "not checked: <why>" (a project folder that is gone,
+    /// The engine did not run the check at all, and says why as `not checked: <why>` (a project folder that is gone,
     /// a name that is not safe to pass on).
     fn refused(&self) -> Option<&str> {
         match self.status {

@@ -1,0 +1,6 @@
+# cargo-mutants (the quality workflow, docs/quality.md). fake-claude is the test stand-in for the Claude CLI:
+# mutating it tests nothing of Klefki's.
+exclude_globs = ["crates/fake-claude/**"]
+# nextest stops at the first failing test. With `cargo test`, a mutant that breaks the engine makes dozens of tests
+# each wait out their 60 s deadline, and the mutant is reported as a timeout instead of caught.
+test_tool = "nextest"

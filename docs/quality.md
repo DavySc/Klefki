@@ -1,0 +1,44 @@
+# Quality suite
+
+What guards Klefki's behaviour, and how to use it when changing code, above all when simplifying it: a refactor
+must leave every test, golden file and baseline as it was.
+
+## Every pull request (CI on Windows, macOS and Linux)
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings` (with the app's
+  `disallowed-methods`, so the UI does no IO), `cargo test --workspace`. Threads also run `cargo deny check`.
+- Unit and engine tests in each module, the engine's model test (`engine/machine.rs`, proptest: random sequences of
+  changes never lose a server or its secret), the app's egui_kittest tests in `shell.rs` and the other pages, and
+  `klefki-cli`'s end-to-end tests in `crates/cli/tests/cli.rs`. Tests use a temporary `CLAUDE_CONFIG_DIR`, the
+  `fake-claude` stand-in and an in-memory secret store, never the real configuration or keychain.
+- Golden files: what users see and what lands on disk, byte for byte.
+  - `crates/core/src/engine/tests/golden/`: for each kind of change, the review (summary, warnings, notes, what it
+    would run, every diff, the button), the outcome, and every file it may write afterwards.
+  - `crates/cli/tests/golden/`: every `klefki-cli` command's stdout, stderr and exit code.
+  - A difference fails with a diff. When a change is meant, run the tests with `UPDATE_EXPECT=1` and review the
+    golden files in the pull request. **In a refactor, a golden file that changes means behaviour changed: stop.**
+
+## By hand or weekly (the `quality` workflow, Linux only)
+macOS minutes cost ten times as much, so heavy checks run on Linux, weekly on main, or from Actions > quality > Run
+workflow on a branch.
+- **coverage**: `cargo llvm-cov` line coverage per file; summary on the run page, `lcov.info` as an artifact.
+  Locally: `cargo install cargo-llvm-cov`, `rustup component add llvm-tools-preview`, `cargo llvm-cov --workspace
+  --summary-only`. The numbers include the test modules in each file, so a file's own code is covered a little
+  less than shown.
+- **baseline**: `scripts/perf-baseline.py`: start-up time and memory of the release app and `klefki-cli list` on a
+  70-row and a 950-row configuration. Compare a branch with main on the same machine only; software OpenGL is most
+  of the app's memory on a machine without a GPU.
+- **mutants** (by hand only): `cargo-mutants` changes the code one small edit at a time (a condition flipped, a
+  function returning a default) and checks that some test fails. A *missed* mutant is code no test really checks.
+  `diff` mutates only the lines the branch changes against main, which is what a refactor needs; a file path
+  mutates one file. The whole workspace has about 7,100 mutants at a minute or more each, so it is never run
+  whole. Locally (with `cargo-nextest` installed, which `.cargo/mutants.toml` asks for: it stops at the first failing
+  test, where `cargo test` would let every broken engine test wait out its 60 s deadline): `cargo mutants
+  --in-diff <(git diff origin/main...)` or `cargo mutants -f <file>`.
+
+## For a simplification slice
+1. One area per branch; behaviour unchanged.
+2. Before: for the files the slice changes, read coverage and run mutants on them. Missed mutants in code the
+   slice moves or rewrites get a test first, in its own commit, seen failing against a mutant.
+3. After: the full verify (CLAUDE.md), no golden file changed, the `quality` workflow with `mutants: diff` on the
+   branch shows no new missed mutants, and, for anything on the start-up path (engine start, configuration
+   loading, the app's first frame), `scripts/perf-baseline.py` on main and on the branch, both in the pull request.

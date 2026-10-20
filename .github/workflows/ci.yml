@@ -26,3 +26,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Broken links in doc comments (ripgrep's CI does the same). Linux only: the docs are the same everywhere.
+      - name: Doc comments
+        if: runner.os == 'Linux'
+        run: cargo doc --no-deps --document-private-items --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
