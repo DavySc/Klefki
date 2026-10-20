@@ -72,11 +72,11 @@ fn export(names: &[String], output: Option<&std::path::Path>, force: bool) -> u8
     let snapshot = api::load_snapshot();
     warn(&snapshot);
     let ids: Vec<_> = match select(&snapshot, names) {
-        // Everything means every server Klefki can export: a plugin's come with the plugin. One named is tried,
-        // and the export says why it was left out.
+        // Everything means every server Klefki can export: a plugin's come with the plugin, the organisation's
+        // with the machine. One named is tried, and the export says why it was left out.
         Ok(rows) => rows
             .into_iter()
-            .filter(|r| !names.is_empty() || r.scope != Scope::Plugin)
+            .filter(|r| !names.is_empty() || !r.scope.is_read_only())
             .map(ServerRow::id)
             .collect(),
         Err(why) => return usage(&why),
@@ -281,6 +281,9 @@ fn plural(n: usize) -> &'static str {
 fn warn(snapshot: &Snapshot) {
     for warning in &snapshot.warnings {
         eprintln!("warning: {warning}");
+    }
+    for note in &snapshot.organisation_notes {
+        eprintln!("note: {note}");
     }
 }
 

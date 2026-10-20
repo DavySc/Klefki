@@ -1208,6 +1208,7 @@ impl ShellApp {
             .show(ui, |ui| match self.page {
                 Page::Connections => {
                     self.warnings(ui);
+                    self.organisation_notes(ui);
                     self.legacy_notice(ui);
                     self.kept_notice(ui);
                     self.toolbar(ui);
@@ -1500,6 +1501,25 @@ impl ShellApp {
                     );
                 }
             });
+        ui.add_space(6.0);
+    }
+
+    /// What Claude Code ignores in the organisation's files: one muted line each, whole on hover. Only an
+    /// administrator can change it, so it does not take the warnings' room.
+    fn organisation_notes(&self, ui: &mut Ui) {
+        let notes = &self.snapshot.organisation_notes;
+        if notes.is_empty() {
+            return;
+        }
+        let pal = theme::palette(ui.ctx());
+        for note in notes {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} {note}", icon::INFO)).color(pal.text_muted),
+                )
+                .truncate(),
+            );
+        }
         ui.add_space(6.0);
     }
 
@@ -2075,7 +2095,7 @@ impl ShellApp {
         let all = rows.len();
         let rows: Vec<&ServerRow> = rows
             .into_iter()
-            .filter(|s| s.scope != Scope::Plugin)
+            .filter(|s| !s.scope.is_read_only())
             .collect();
         let left_out = all - rows.len();
         (rows, left_out)
@@ -2088,18 +2108,32 @@ impl ShellApp {
             return None;
         }
         Some(match self.single_selected() {
+            Some(s) if s.scope == Scope::Managed => {
+                format!(
+                    "{} is set by your organisation; only an administrator changes it",
+                    s.name
+                )
+            }
             Some(s) => format!("{} comes from a plugin and is changed there", s.name),
-            None => "the selected servers come from plugins and are changed there".to_owned(),
+            None => {
+                "the selected servers come from plugins or your organisation and are changed there"
+                    .to_owned()
+            }
         })
     }
 
-    /// Says what a change to the selection left out: the plugin servers in it. With none left to change, names the
-    /// one selected and where it can be changed.
+    /// Says what a change to the selection left out: the plugin and organisation servers in it. With none left to
+    /// change, names the one selected and where it can be changed.
     fn note_plugins_left_out(&mut self, changed: usize, left_out: usize) {
         if left_out == 0 {
             return;
         }
-        let text = if changed > 0 {
+        let organisation = self
+            .selected
+            .iter()
+            .filter_map(|&i| self.snapshot.servers.get(i))
+            .any(|s| s.scope == Scope::Managed);
+        let text = if changed > 0 && !organisation {
             match left_out {
                 1 => "Left out 1 plugin server: a plugin's server is changed in its plugin."
                     .to_owned(),
@@ -2107,6 +2141,20 @@ impl ShellApp {
                     "Left out {n} plugin servers: a plugin's server is changed in its plugin."
                 ),
             }
+        } else if changed > 0 {
+            let what = match left_out {
+                1 => "1 server".to_owned(),
+                n => format!("{n} servers"),
+            };
+            format!(
+                "Left out {what} Klefki only switches on and off: a plugin's server is changed in its plugin, your \
+                 organisation's by an administrator."
+            )
+        } else if let Some(s) = self.single_selected().filter(|s| s.scope == Scope::Managed) {
+            format!(
+                "{} is set by your organisation. Only an administrator can change it; Klefki switches it on and off.",
+                s.name
+            )
         } else if let Some(s) = self.single_selected() {
             let plugin = s.plugin.as_ref().map_or("", |p| p.plugin.as_str());
             format!(
@@ -2115,9 +2163,14 @@ impl ShellApp {
                 s.name
             )
         } else {
-            "The selected servers come from plugins. Change them in their plugins, or turn the plugins off in \
-             Claude Code (/plugin)."
-                .to_owned()
+            if organisation {
+                "The selected servers come from plugins or your organisation. Klefki only switches them on and off."
+                    .to_owned()
+            } else {
+                "The selected servers come from plugins. Change them in their plugins, or turn the plugins off in \
+                 Claude Code (/plugin)."
+                    .to_owned()
+            }
         };
         self.note(text, false);
     }
@@ -2200,7 +2253,7 @@ impl ShellApp {
         };
         // A plugin's servers come with the plugin; Klefki does not hold their definitions.
         rows.into_iter()
-            .filter(|&i| self.snapshot.servers[i].scope != Scope::Plugin)
+            .filter(|&i| !self.snapshot.servers[i].scope.is_read_only())
             .collect()
     }
 
@@ -2212,7 +2265,7 @@ impl ShellApp {
                 self.snapshot
                     .servers
                     .iter()
-                    .any(|s| s.scope != Scope::Plugin && matches_search(s, &q))
+                    .any(|s| !s.scope.is_read_only() && matches_search(s, &q))
             } else {
                 !self.changeable_selected().0.is_empty()
             }
@@ -4375,8 +4428,9 @@ impl ShellApp {
                 ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for (tab, title) in DetailTab::ALL {
-                    // A plugin's server has no definition here to show values or sign-in settings from.
-                    if s.scope == Scope::Plugin
+                    // A plugin's or the organisation's server has no definition here to show values or sign-in
+                    // settings from.
+                    if s.scope.is_read_only()
                         && !matches!(tab, DetailTab::General | DetailTab::Status)
                     {
                         continue;
@@ -4443,14 +4497,32 @@ impl ShellApp {
         // panel grows with it.
         let col_width = (ui.available_width() - 110.0).max(100.0);
         let tab = match self.tab {
-            DetailTab::HeadersEnv | DetailTab::Auth if s.scope == Scope::Plugin => {
-                DetailTab::General
-            }
+            DetailTab::HeadersEnv | DetailTab::Auth if s.scope.is_read_only() => DetailTab::General,
             tab => tab,
         };
         match tab {
             DetailTab::General => {
-                // First, before anyone looks for a way to edit it.
+                // First: Claude Code does not run it at all.
+                if let Some(why) = &s.not_loaded {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("Claude Code does not load this server. {why}"))
+                                .color(pal.warn),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                }
+                // Then, before anyone looks for a way to edit it.
+                if let Some(file) = &s.managed {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(managed_read_only(file)).color(pal.text_muted),
+                        )
+                        .wrap(),
+                    );
+                    ui.add_space(8.0);
+                }
                 if let Some(p) = &s.plugin {
                     ui.add(
                         egui::Label::new(RichText::new(plugin_read_only(p)).color(pal.text_muted))
@@ -4488,7 +4560,12 @@ impl ShellApp {
                                     kv("Plugin on", "in every project".to_owned())
                                 }
                             }
-                            None => kv("Project", s.project.clone().unwrap_or_else(|| "-".into())),
+                            None => match &s.managed {
+                                Some(file) => kv("Set in", file.clone()),
+                                None => {
+                                    kv("Project", s.project.clone().unwrap_or_else(|| "-".into()))
+                                }
+                            },
                         };
                         kv("Type", s.transport.label().to_owned());
                         let target = kv("Target", s.target.clone());
@@ -4498,10 +4575,7 @@ impl ShellApp {
                         {
                             target.on_hover_text(format!("The plugin writes: {written}"));
                         }
-                        let enabled = if matches!(s.scope, Scope::User | Scope::Plugin)
-                            && s.enabled
-                            && s.disabled_in > 0
-                        {
+                        let enabled = if s.scope.is_everywhere() && s.enabled && s.disabled_in > 0 {
                             format!(
                                 "disabled in {} of {} projects",
                                 s.disabled_in, self.snapshot.project_count
@@ -4517,16 +4591,25 @@ impl ShellApp {
                         if let Some(approval) = s.approval {
                             kv("Approval", approval.label().to_owned());
                         }
-                        let shadowed = kv(
-                            if s.scope == Scope::Plugin {
-                                "Left out"
-                            } else {
-                                "Shadowed"
-                            },
-                            shadowed_text(s, self.snapshot.project_count),
-                        );
-                        if !s.shadowed_in.is_empty() {
-                            shadowed.on_hover_text(shadowed_paths(s));
+                        // The organisation's servers win over every other of their name: never hidden, and what
+                        // they hide is said where they are.
+                        if s.scope == Scope::Managed {
+                            let replaced = replaced_by_organisation(&self.snapshot.servers, s);
+                            if !replaced.is_empty() {
+                                kv("Replaces", replaced.join("; "));
+                            }
+                        } else {
+                            let shadowed = kv(
+                                if s.scope == Scope::Plugin {
+                                    "Left out"
+                                } else {
+                                    "Shadowed"
+                                },
+                                shadowed_text(s, self.snapshot.project_count),
+                            );
+                            if !s.shadowed_in.is_empty() {
+                                shadowed.on_hover_text(shadowed_paths(s));
+                            }
                         }
                         if replaces {
                             kv("Replaces", format!("the user server {}", s.name));
@@ -4601,7 +4684,7 @@ impl ShellApp {
                         self.start_sign_in(s);
                     }
                 }
-                if s.plugin.is_none() && self.core.is_some() {
+                if !s.scope.is_read_only() && self.core.is_some() {
                     ui.add_space(12.0);
                     let form = ui.scope(|ui| self.definition_form(ui, s)).response;
                     self.reveal_definition(s, &form);
@@ -4614,7 +4697,9 @@ impl ShellApp {
                     .max_col_width(col_width)
                     .show(ui, |ui| {
                         ui.label(RichText::new("Status").color(pal.text_muted));
-                        if s.scope == Scope::Plugin {
+                        if s.not_loaded.is_some() {
+                            ui.label(NOT_LOADED);
+                        } else if s.scope.is_read_only() {
                             ui.label(PLUGIN_STATUS);
                         } else if self.last_known(i) {
                             ui.label(format!("{} (last known)", status.label()));
@@ -4637,11 +4722,8 @@ impl ShellApp {
                         .color(pal.warn),
                     );
                 }
-                if s.scope == Scope::Plugin {
-                    ui.add(
-                        egui::Label::new(RichText::new(PLUGIN_NOT_CHECKED).color(pal.text_muted))
-                            .wrap(),
-                    );
+                if let Some(why) = not_checked(s) {
+                    ui.add(egui::Label::new(RichText::new(why).color(pal.text_muted)).wrap());
                     return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
@@ -4765,7 +4847,7 @@ impl ShellApp {
     fn edit_selected(&mut self) {
         let Some(s) = self
             .single_selected()
-            .filter(|s| s.scope != Scope::Plugin)
+            .filter(|s| !s.scope.is_read_only())
             .cloned()
         else {
             return;
@@ -7867,6 +7949,7 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         hover: hover.map(str::to_owned),
     };
     // Most important first: those that don't fit beside the name are the ones left to the "+N".
+    // "Not loaded" is the status column's to say: once per row.
     let mut badges = Vec::new();
     if s.transport == klefki_core::api::TransportKind::Invalid {
         badges.push(loud("invalid", pal.danger, None));
@@ -7897,7 +7980,7 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     if s.casing_collision {
         badges.push(loud("casing", pal.warn, None));
     }
-    if s.scope == Scope::User && !s.relative_paths.is_empty() {
+    if s.scope == Scope::User && !s.relative_paths.is_empty() && s.not_loaded.is_none() {
         badges.push(loud(
             "relative path",
             pal.warn,
@@ -7908,7 +7991,7 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         ));
     }
     // The toggle is per project: a user server can be off in some and on in others.
-    if matches!(s.scope, Scope::User | Scope::Plugin) && s.enabled && s.disabled_in > 0 {
+    if s.scope.is_everywhere() && s.enabled && s.disabled_in > 0 {
         badges.push(loud(
             &format!("off in {}/{}", s.disabled_in, project_count),
             pal.warn,
@@ -8030,6 +8113,12 @@ fn status_cell(
     last_known: bool,
 ) {
     let pal = theme::palette(ui.ctx());
+    // Before the switch: on or off, Claude Code runs another server in its place.
+    if let Some(why) = not_checked(s).filter(|_| s.not_loaded.is_some()) {
+        ui.label(RichText::new(NOT_LOADED).color(pal.text_muted))
+            .on_hover_text(why);
+        return;
+    }
     if !s.enabled {
         ui.label(RichText::new("Disabled").color(pal.disabled));
         return;
@@ -8041,9 +8130,9 @@ fn status_cell(
         return;
     }
     // Never checked here: where its status is, not a check still to come.
-    if s.scope == Scope::Plugin {
+    if let Some(why) = not_checked(s) {
         ui.label(RichText::new(PLUGIN_STATUS).color(pal.text_muted))
-            .on_hover_text(PLUGIN_NOT_CHECKED);
+            .on_hover_text(why);
         return;
     }
     let color = match status {
@@ -8102,6 +8191,42 @@ const PLUGIN_STATUS: &str = "See /mcp";
 /// Why Klefki has no status for a plugin's server, and where it is.
 const PLUGIN_NOT_CHECKED: &str =
     "Klefki does not check a plugin's servers. In Claude Code, /mcp shows their status.";
+/// Why Klefki has no status for the organisation's server, and where it is.
+const ORGANISATION_NOT_CHECKED: &str = "Klefki does not check the servers your organisation sets. In Claude Code, /mcp shows their status.";
+/// The servers of `org`'s name, configured by hand, that Claude Code does not load because the organisation sets it.
+fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|o| {
+            matches!(o.scope, Scope::User | Scope::Local | Scope::Project)
+                && o.name == org.name
+                && o.not_loaded.is_some()
+        })
+        .map(|o| {
+            let scope = o.scope.label().to_lowercase();
+            match &o.project {
+                None => format!("your {scope} server {}", o.name),
+                Some(p) => format!("the {scope} server {} in {p}", o.name),
+            }
+        })
+        .collect()
+}
+
+/// The status of a server Claude Code loads nowhere (decision 009).
+const NOT_LOADED: &str = "Not loaded";
+
+/// Why Klefki never checks `s`, if it doesn't: Claude Code does not load it, or it is not one Klefki passes to Claude
+/// Code (decisions 008 and 009).
+fn not_checked(s: &ServerRow) -> Option<String> {
+    if let Some(why) = &s.not_loaded {
+        return Some(format!("Claude Code does not load this server. {why}"));
+    }
+    match s.scope {
+        Scope::Plugin => Some(PLUGIN_NOT_CHECKED.to_owned()),
+        Scope::Managed => Some(ORGANISATION_NOT_CHECKED.to_owned()),
+        _ => None,
+    }
+}
 
 /// Seconds the pointer rests on a failed status before it is explained.
 const EXPLAIN_AFTER: f64 = 0.1;
@@ -8178,6 +8303,13 @@ fn short_name(s: &ServerRow) -> &str {
 }
 
 /// What the details say under a plugin's server.
+fn managed_read_only(file: &str) -> String {
+    format!(
+        "Your organisation sets this server, in {file}. Klefki switches it on and off; only an administrator can \
+         change it."
+    )
+}
+
 fn plugin_read_only(p: &klefki_core::api::PluginInfo) -> String {
     format!(
         "Claude Code reads this server from the plugin {}. Klefki switches it on and off; to change it, change the \
@@ -8464,6 +8596,20 @@ mod tests {
     }
 
     #[test]
+    fn what_only_an_administrator_can_change_is_said_quietly() {
+        let note = "Claude Code ignores the server \"run\" in /etc/claude-code/managed-settings.json: it names a \
+                    program to run. Your administrator can change this.";
+        let mut h = harness_with(Snapshot {
+            organisation_notes: vec![note.to_owned()],
+            ..Snapshot::default()
+        });
+        h.run();
+        // One muted line, not the warning frame: the user cannot act on it (cross-review of #47).
+        h.get_by_label_contains("Claude Code ignores the server \"run\"");
+        assert!(h.query_by_label_contains(icon::WARNING).is_none());
+    }
+
+    #[test]
     fn clicking_a_row_selects_it_and_shows_detail() {
         let mut h = harness();
         h.run();
@@ -8538,6 +8684,8 @@ mod tests {
             status_cached: false,
             oauth: None,
             plugin: None,
+            managed: None,
+            not_loaded: None,
         };
         let mut h = harness_with(Snapshot {
             servers: vec![row("REMOTE_1"), row("REMOTE_2")],
@@ -8666,6 +8814,8 @@ mod tests {
             status_cached: false,
             oauth: None,
             plugin: None,
+            managed: None,
+            not_loaded: None,
         }
     }
 
@@ -11601,6 +11751,105 @@ mod tests {
         h.get_by_label("search").click();
         h.run();
         h.get_by_label("yes, but its plugin is off in every project");
+    }
+
+    fn organisation_row(name: &str) -> ServerRow {
+        ServerRow {
+            managed: Some("/etc/claude-code/managed-settings.json".into()),
+            ..live_row(name, Scope::Managed, None)
+        }
+    }
+
+    #[test]
+    fn an_organisations_server_is_read_only_and_switches() {
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(snapshot_of(vec![organisation_row("docs")]))
+            .unwrap();
+        h.run();
+        // Not checked here: where its status is.
+        h.get_by_label(PLUGIN_STATUS);
+        h.get_by_label("docs").click();
+        h.run();
+        h.get_by_label_contains(
+            "Your organisation sets this server, in /etc/claude-code/managed-settings.json",
+        );
+        h.get_by_label("Set in");
+        // Nothing to edit, and no values or sign-in tabs.
+        assert!(h.query_by_label("Env").is_none());
+        assert!(
+            h.get_by_label(icon::PENCIL_SIMPLE)
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(h.get_by_label(icon::TRASH).accesskit_node().is_disabled());
+        drain(&engine);
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        let sent = drain(&engine);
+        assert!(
+            matches!(sent.as_slice(), [Command::Prepare(changes)] if matches!(
+                changes.as_slice(),
+                [Change::SetEnabled { enabled: false, .. }]
+            )),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_claude_code_does_not_load_says_why() {
+        let (mut h, engine) = live_harness();
+        let why = "Your organisation sets a server of the same name in /etc/claude-code/managed-settings.json, \
+                   which Claude Code loads instead.";
+        let mine = ServerRow {
+            not_loaded: Some(why.into()),
+            relative_paths: vec!["mine.js".into()],
+            ..live_row("mine", Scope::User, None)
+        };
+        engine
+            .events
+            .send(snapshot_of(vec![mine, organisation_row("other")]))
+            .unwrap();
+        h.run();
+        // Said once, in the status column (cross-review of #47): no badge beside the name.
+        assert!(h.query_by_label("not loaded").is_none());
+        h.get_by_label(NOT_LOADED).hover();
+        h.run();
+        // Where Claude Code starts it does not matter: it does not start it.
+        assert!(h.query_by_label("relative path").is_none());
+        h.get_by_label("mine").click();
+        h.run();
+        h.get_by_label(&format!("Claude Code does not load this server. {why}"));
+        h.state_mut().tab = DetailTab::Status;
+        h.run();
+        // No "Check now": the check would answer for the organisation's server.
+        assert!(h.query_by_label("Check now").is_none());
+    }
+
+    #[test]
+    fn an_organisations_server_comes_first_and_says_what_it_replaces() {
+        let (mut h, engine) = live_harness();
+        let why = "Your organisation sets a server of the same name.";
+        let gone = |scope, project: Option<&str>| ServerRow {
+            not_loaded: Some(why.into()),
+            ..live_row("fs", scope, project)
+        };
+        engine
+            .events
+            .send(snapshot_of(vec![
+                live_row("alpha", Scope::User, None),
+                gone(Scope::User, None),
+                gone(Scope::Local, Some("/w/repo")),
+                organisation_row("fs"),
+            ]))
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().visible().first(), Some(&3));
+        h.state_mut().selected = BTreeSet::from([3]);
+        h.run();
+        h.get_by_label("your user server fs; the local server fs in /w/repo");
+        assert!(h.query_by_label("Shadowed").is_none());
     }
 
     #[test]

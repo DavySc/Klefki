@@ -2292,6 +2292,7 @@ fn refresh(shared: &Shared, state: &mut State, live_all: bool) {
         // checked: their names are not ones Klefki passes to `claude` (decision 008).
         let wanted = matches!(row.scope, Scope::User | Scope::Local)
             && row.enabled
+            && row.not_loaded.is_none()
             && (live_all || (shared.config.background_checks && (edit || needs_check(row))));
         if wanted && edit {
             tried.insert(row.connection.clone());
@@ -2493,6 +2494,10 @@ fn where_to_run(
     let Some(file) = file else {
         return Err("the server is no longer in the configuration".to_owned());
     };
+    // `claude mcp get` would answer for the server Claude Code loads in its place (decision 009).
+    if let Some(why) = &row.not_loaded {
+        return Err(format!("Claude Code does not load it. {why}"));
+    }
     let name = ServerName::parse(&file.name)
         .map_err(|e| format!("the server name is not safe to pass to claude ({e})"))?;
     let cwd = match (row.scope, &file.project) {
@@ -3000,7 +3005,11 @@ mod tests {
 
         fn config(&self) -> EngineConfig {
             EngineConfig {
-                paths: Some(ConfigPaths::in_dir(self.dir.path().join("cfg"))),
+                paths: Some(ConfigPaths {
+                    // The organisation's folder, empty unless a test writes `org/…`.
+                    managed_dir: Some(self.dir.path().join("org")),
+                    ..ConfigPaths::in_dir(self.dir.path().join("cfg"))
+                }),
                 claude: Some(fake_claude().to_path_buf()),
                 home: Some(self.dir.path().join("home")),
                 path_var: None,
@@ -4499,6 +4508,37 @@ mod tests {
         assert!(
             !events.iter().chain(&later).any(|e| matches!(e,
                 Event::Status { id, .. } | Event::Diagnosis { id, .. } if id.scope == Scope::Plugin)),
+            "{events:?} {later:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_claude_code_does_not_load_is_never_checked() {
+        // Decision 009: the organisation's server of the same name answers to the name, not this one.
+        let env = Env::new(
+            &serde_json::json!({"mcpServers": {"ok": {"command": "x"}, "mine": {"command": "y"}}, "projects": {"/p": {}}}),
+            r#"{"rules":[{"args":["--version"]},{"args":["mcp","get"],"stdout_file":"c.txt"}]}"#,
+            &[("c.txt", CONNECTED)],
+        );
+        let org = env.dir.path().join("org");
+        std::fs::create_dir_all(&org).unwrap();
+        std::fs::write(
+            org.join("managed-settings.json"),
+            r#"{"managedMcpServers":{"mine":{"type":"http","url":"https://org.example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        let core = env.start();
+        let events = collect(&core, |e| final_status(e, "ok").is_some());
+        core.send(Command::Check(ServerId::new(Scope::User, None, "mine")));
+        let later = collect(&core, |e| status_of(e, "mine").is_some());
+        assert_eq!(
+            env.gets().into_iter().map(|g| g.0).collect::<Vec<_>>(),
+            ["ok"],
+            "only the server Claude Code loads ran"
+        );
+        let said = status_of(&later, "mine").and_then(|(_, detail)| detail);
+        assert!(
+            said.as_deref().is_some_and(|d| d.contains("does not load")),
             "{events:?} {later:?}"
         );
     }
