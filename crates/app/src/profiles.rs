@@ -36,6 +36,9 @@ pub struct ProfilesPage {
     /// The projects (as shown) where each profile's servers are the only ones on, by name. Worked out once for the
     /// profiles and the snapshot shown, not every frame.
     alone: Option<HashMap<String, Vec<String>>>,
+    /// The projects (as shown) where each profile is in use: stopping it there would put back what it switched.
+    /// Worked out with [`Self::alone`].
+    in_use: Option<HashMap<String, Vec<(String, String)>>>,
     /// The profile whose "Use in" takes the keyboard when the cards are next drawn, asked for from the palette.
     /// Dropped once they are drawn, so focus never moves later on its own.
     reveal: Option<String>,
@@ -135,6 +138,7 @@ impl ProfilesPage {
     pub fn set(&mut self, profiles: Profiles) {
         self.profiles = Some(profiles);
         self.alone = None;
+        self.in_use = None;
         if std::mem::take(&mut self.saving) {
             self.editing = None;
         }
@@ -167,6 +171,7 @@ impl ProfilesPage {
     /// let go.
     pub fn snapshot_changed(&mut self) {
         self.alone = None;
+        self.in_use = None;
         // What a Use found already so was true of the files then: another change may have made it false since.
         for choice in self.choices.values_mut() {
             choice.unchanged = None;
@@ -330,6 +335,22 @@ impl ProfilesPage {
                         })
                         .collect()
                 });
+                let in_use = self.in_use.get_or_insert_with(|| {
+                    profiles
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            let places = klefki_core::api::profile_in_use(&p.name, snapshot)
+                                .into_iter()
+                                .map(|place| {
+                                    let shown = shown_project(&place, snapshot);
+                                    (place, shown)
+                                })
+                                .collect();
+                            (p.name.clone(), places)
+                        })
+                        .collect()
+                });
                 let query = self.filter.trim().to_lowercase();
                 let shown: Vec<&Profile> = profiles
                     .profiles
@@ -356,6 +377,7 @@ impl ProfilesPage {
                         snapshot,
                         Context {
                             alone: alone.get(&profile.name).map_or(&[], Vec::as_slice),
+                            in_use: in_use.get(&profile.name).map_or(&[], Vec::as_slice),
                             reveal,
                             editable,
                         },
@@ -397,6 +419,9 @@ impl ProfilesPage {
 struct Context<'a> {
     /// The projects (as shown) where its servers are the only ones on.
     alone: &'a [String],
+    /// The projects (as shown) where it is in use: stopping it there puts back what it switched.
+    /// Each as `.claude.json` spells it, and as shown.
+    in_use: &'a [(String, String)],
     /// Bring it into view, with where to use it taking the keyboard.
     reveal: bool,
     editable: bool,
@@ -454,18 +479,86 @@ fn card(
                 });
             });
             ui.add(egui::Label::new(summary(profile, snapshot)).wrap());
-            // Where the eye already is, under its servers: true of the files now, so it is not muted.
-            if !cx.alone.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(icon::CHECK_CIRCLE).color(pal.success));
-                    ui.add(
-                        egui::Label::new(format!(
-                            "Only these servers are on in {}.",
-                            named_few(cx.alone)
-                        ))
-                        .wrap(),
-                    );
-                });
+            // Where the eye already is, under its servers: true of the files now, so it is not muted. A project where it
+            // is both in use and on alone is said once.
+            let in_use: Vec<String> = cx.in_use.iter().map(|(_, shown)| shown.clone()).collect();
+            let (both, use_only): (Vec<String>, Vec<String>) =
+                in_use.iter().cloned().partition(|p| cx.alone.contains(p));
+            let alone_only: Vec<String> = cx
+                .alone
+                .iter()
+                .filter(|p| !in_use.contains(p))
+                .cloned()
+                .collect();
+            for (glyph, colour, text) in [
+                (
+                    icon::CHECK_CIRCLE,
+                    pal.success,
+                    (!both.is_empty()).then(|| {
+                        format!("In use in {}, where only these servers are on.", named_few(&both))
+                    }),
+                ),
+                (
+                    icon::STACK,
+                    pal.primary,
+                    (!use_only.is_empty()).then(|| format!("In use in {}.", named_few(&use_only))),
+                ),
+                (
+                    icon::CHECK_CIRCLE,
+                    pal.success,
+                    (!alone_only.is_empty())
+                        .then(|| format!("Only these servers are on in {}.", named_few(&alone_only))),
+                ),
+            ] {
+                if let Some(text) = text {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(glyph).color(colour));
+                        ui.add(egui::Label::new(text).wrap());
+                    });
+                }
+            }
+            if !cx.in_use.is_empty() && !asking {
+                let stop = |project: Option<String>| {
+                    Card::Asked(Asked::Use(Box::new(Change::StopProfile {
+                        name: profile.name.clone(),
+                        project,
+                        delete: false,
+                    })))
+                };
+                const STOP_TIP: &str = "Put back what this profile switched there, unless it was switched again \
+                                        since. You see every change before it is saved.";
+                match cx.in_use {
+                    [(_, one)] => {
+                        if ui
+                            .add(egui::Button::new(format!("Stop using in {one}…")).small())
+                            .on_hover_text(STOP_TIP)
+                            .clicked()
+                        {
+                            out = Some(stop(None));
+                        }
+                    }
+                    // Where to stop it: one project, or all of them.
+                    many => {
+                        ui.menu_button("Stop using in…", |ui| {
+                            for (place, shown) in many {
+                                if ui.button(shown).on_hover_text(place.as_str()).clicked() {
+                                    out = Some(stop(Some(place.clone())));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui
+                                .button(format!("All {} projects", many.len()))
+                                .clicked()
+                            {
+                                out = Some(stop(None));
+                                ui.close();
+                            }
+                        })
+                        .response
+                        .on_hover_text(STOP_TIP);
+                    }
+                }
             }
             let gone = gone(profile, snapshot);
             if !gone.is_empty() {
@@ -480,19 +573,46 @@ fn card(
             }
             if asking {
                 ui.add_space(6.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "Delete the profile {}? Its servers stay as they are.",
-                            profile.name
-                        ))
-                        .color(pal.warn),
+                // In use: deleting it stops using it first, as leaving a profile puts back what it switched. Delete
+                // only is there for keeping things as they are now.
+                let text = if cx.in_use.is_empty() {
+                    format!("Delete the profile {}? Its servers stay as they are.", profile.name)
+                } else {
+                    format!(
+                        "Delete the profile {}? It is in use in {}. Stop using it to put back what it switched there, \
+                         or delete only and keep things as they are now.",
+                        profile.name,
+                        named_few(&in_use)
                     )
-                    .wrap(),
-                );
-                ui.horizontal(|ui| {
+                };
+                ui.add(egui::Label::new(RichText::new(text).color(pal.warn)).wrap());
+                ui.horizontal_wrapped(|ui| {
+                    if !cx.in_use.is_empty() {
+                        let stop = egui::Button::new(
+                            RichText::new("Stop using and delete…").strong().color(pal.on_bright),
+                        )
+                        .fill(pal.primary);
+                        if ui
+                            .add(stop)
+                            .on_hover_text("See what is put back before anything is saved.")
+                            .clicked()
+                        {
+                            out = Some(Card::Asked(Asked::Use(Box::new(Change::StopProfile {
+                                name: profile.name.clone(),
+                                project: None,
+                                delete: true,
+                            }))));
+                            *confirm = None;
+                        }
+                    }
                     let delete = egui::Button::new(
-                        RichText::new("Delete profile").strong().color(pal.on_bright),
+                        RichText::new(if cx.in_use.is_empty() {
+                            "Delete profile"
+                        } else {
+                            "Delete only"
+                        })
+                        .strong()
+                        .color(pal.on_bright),
                     )
                     .fill(pal.danger);
                     if ui.add(delete).clicked() {
