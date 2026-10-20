@@ -710,6 +710,9 @@ impl ShellApp {
             }
             Event::PlanReady(plan) => {
                 self.preparing = false;
+                if self.duplicate.as_ref().is_some_and(|f| f.reviewing) {
+                    self.duplicate = None;
+                }
                 let saves_draft = std::mem::take(&mut self.draft_asked);
                 let profile = self.profile_asked.take();
                 // Said on the profile's card while the page is shown; once it is left, the review says it.
@@ -732,13 +735,19 @@ impl ShellApp {
                 self.draft_asked = false;
                 self.profile_asked = None;
                 self.adding.clear();
-                match self.add.as_mut().filter(|f| f.reviewing) {
+                let duplicate = self.duplicate.as_mut().filter(|f| f.reviewing);
+                match (self.add.as_mut().filter(|f| f.reviewing), duplicate) {
                     // Said in the Add dialog, which comes back as it was, so nothing typed is lost.
-                    Some(form) => {
+                    (Some(form), _) => {
                         form.reviewing = false;
                         form.failed = Some(why);
                     }
-                    None => {
+                    // The same for Duplicate.
+                    (None, Some(form)) => {
+                        form.reviewing = false;
+                        form.failed = Some(why);
+                    }
+                    (None, None) => {
                         self.outcome = Some(Outcome {
                             text: why,
                             ok: false,
@@ -2005,7 +2014,7 @@ impl ShellApp {
                     egui::TextStyle::Body,
                 );
                 let needed = galley.size().x + 2.0 * ui.spacing().item_spacing.x + 8.0;
-                if ui.available_width() >= needed {
+                if ui.available_size_before_wrap().x >= needed {
                     ui.separator();
                     ui.add(egui::Label::new(text).extend());
                 }
@@ -2500,6 +2509,8 @@ impl ShellApp {
             port_wanted: None,
             port_pending: None,
             port_checked: None,
+            reviewing: false,
+            failed: None,
         });
         if remote {
             self.send(Command::Inspect(source));
@@ -3118,7 +3129,7 @@ impl ShellApp {
 
     fn duplicate_dialog(&mut self, ctx: &egui::Context) {
         let pal = theme::palette(ctx);
-        let Some(form) = &mut self.duplicate else {
+        let Some(form) = self.duplicate.as_mut().filter(|f| !f.reviewing) else {
             return;
         };
         let problem = name_problem(&form.name);
@@ -3141,8 +3152,10 @@ impl ShellApp {
             _ => 0.0,
         };
         let list_height = (ctx.content_rect().height() - 500.0 - fields_height).clamp(96.0, 320.0);
+        // Why the last Review failed takes room by the buttons: a plain line and, small, what the tool said.
+        let failed_height = if form.failed.is_some() { 150.0 } else { 0.0 };
         // What the window leaves for the dialog's body, below its title and above its buttons.
-        let body_height = (ctx.content_rect().height() - 260.0).max(120.0);
+        let body_height = (ctx.content_rect().height() - 260.0 - failed_height).max(120.0);
         let modal = egui::Modal::new(egui::Id::new("duplicate_dialog")).show(ctx, |ui| {
             ui.set_width(520.0);
             ui.heading(format!("Duplicate {}", form.source.name));
@@ -3173,6 +3186,20 @@ impl ShellApp {
                 });
             // Outside the scrolled body: what Review will lead to, or why it cannot yet, stays by the button.
             ui.add_space(10.0);
+            if let Some(failed) = &form.failed {
+                // As in Add: what happened and what to do first; what a tool said small and muted, under it.
+                let (plain, detail) = failed.split_once('\n').unwrap_or((failed, ""));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(icon::WARNING_CIRCLE).color(pal.danger));
+                    ui.add(egui::Label::new(RichText::new(plain).color(pal.danger)).wrap());
+                });
+                if !detail.is_empty() {
+                    ui.add(
+                        egui::Label::new(RichText::new(detail).small().color(pal.text_muted))
+                            .wrap(),
+                    );
+                }
+            }
             if let Some(taken) = &taken {
                 ui.add(
                     egui::Label::new(
@@ -3219,7 +3246,15 @@ impl ShellApp {
         };
         if review {
             let adjust = match &mut form.copy {
-                CopyRead::Ready(fields) => fields.adjust().unwrap_or_default(),
+                CopyRead::Ready(fields) => {
+                    let adjust = fields.adjust().unwrap_or_default();
+                    // The form keeps the secret typed (wiped when dropped) until the plan is made, so a Review that
+                    // fails can be pressed again without typing it again.
+                    if let Some(Some(secret)) = adjust.client.as_ref().map(|c| &c.secret) {
+                        fields.secret = secret.clone();
+                    }
+                    adjust
+                }
                 _ => Default::default(),
             };
             let change = Change::Duplicate {
@@ -3234,7 +3269,9 @@ impl ShellApp {
                 .servers
                 .iter()
                 .any(|r| r.id() == form.source && r.oauth.is_some());
-            self.duplicate = None;
+            // Kept, hidden, until the plan comes: if it cannot be made, nothing typed is lost.
+            form.reviewing = true;
+            form.failed = None;
             self.prepare(vec![change]);
             self.adding_signs_in = signs_in;
         } else if cancel || closed_on_purpose(&modal) {
@@ -7989,6 +8026,10 @@ struct DuplicateForm {
     port_pending: Option<u16>,
     /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`]).
     port_checked: Option<(u16, Option<String>)>,
+    /// Review was pressed and the plan is being prepared: the dialog is hidden, and comes back as it was if that fails.
+    reviewing: bool,
+    /// Why the last Review failed, said in the dialog.
+    failed: Option<String>,
 }
 
 /// The Duplicate dialog's address and sign-in fields, from the original's definition.
@@ -14065,7 +14106,8 @@ mod tests {
         assert_eq!(h.state().duplicate.as_ref().unwrap().name, "beta_copy");
         h.get_by_label("Review").click();
         h.run();
-        assert!(h.state().duplicate.is_none());
+        // Hidden while the plan is made; kept until it comes.
+        assert!(h.query_by_label_contains("Duplicate beta").is_none());
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::Duplicate {
@@ -14075,6 +14117,13 @@ mod tests {
                 adjust: Default::default(),
             }]
         );
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(1, &["+ beta_copy"], &[], false)))
+            .unwrap();
+        h.run();
+        assert!(h.state().duplicate.is_none());
+        h.get_by_label_contains("Review the change");
     }
 
     const SSO_DEFINITION: &str = r#"{
@@ -14169,6 +14218,80 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[test]
+    fn duplicate_comes_back_as_it_was_when_its_plan_cannot_be_made() {
+        // The secret store was locked: the error says "press Review again", so the dialog must still be there, with
+        // the name, the new client and its secret as typed.
+        let (mut h, engine, _sso) = duplicate_sso();
+        h.state_mut().duplicate.as_mut().unwrap().name = "sso_eu".into();
+        copy_fields_of(&mut h).client_id = "acme-2".into();
+        h.run();
+        copy_fields_of(&mut h).secret.edit().push_str("new-s3cret");
+        h.run();
+        h.get_by_label("Review").click();
+        h.run();
+        assert_eq!(duplicate_requested(&engine).len(), 1);
+        assert!(h.query_by_label_contains("Duplicate sso").is_none());
+        engine
+            .events
+            .send(Event::PlanFailed(
+                "Klefki can't use your system's secret store. Start or unlock it and press Review again.\n\
+                 The store is locked."
+                    .to_owned(),
+            ))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Duplicate sso");
+        h.get_by_label("Klefki can't use your system's secret store. Start or unlock it and press Review again.");
+        h.get_by_label("The store is locked.");
+        // With the reason by the buttons, the dialog still fits in the window, the store's own long words included.
+        for size in [egui::vec2(1200.0, 720.0), egui::vec2(800.0, 480.0)] {
+            h.set_size(size);
+            h.state_mut().duplicate.as_mut().unwrap().failed = Some(
+                "Klefki can't use your system's secret store. Start or unlock it (GNOME Keyring or KWallet) and press \
+                 Review again.\nThe system's secret store is not available (Platform failure: zbus error: Failed to \
+                 connect to address `unix:path=/run/user/1000/bus`: No such file or directory (os error 2)). Klefki \
+                 keeps no plaintext copy of secrets anywhere else."
+                    .to_owned(),
+            );
+            h.run();
+            h.run();
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for label in ["Duplicate sso", "Review", "Cancel"] {
+                let rect = h.get_by_label(label).rect();
+                assert!(window.contains_rect(rect), "{size:?}: {label} at {rect:?}");
+            }
+        }
+        h.set_size(egui::vec2(1100.0, 900.0));
+        h.run();
+        assert_eq!(h.state().duplicate.as_ref().unwrap().name, "sso_eu");
+        let f = copy_fields_of(&mut h);
+        assert_eq!(f.client_id, "acme-2");
+        assert!(f.secret == Secret::new("new-s3cret".into()));
+        // Not said twice, beside the window as well.
+        assert!(h.state().outcome.is_none());
+        // Review again: the reason goes, and the same change is asked for.
+        h.get_by_label("Review").click();
+        h.run();
+        assert!(h.state().duplicate.as_ref().unwrap().failed.is_none());
+        assert!(matches!(
+            duplicate_requested(&engine).as_slice(),
+            [Change::Duplicate { name, .. }] if name == "sso_eu"
+        ));
+    }
+
+    #[test]
+    fn a_failed_plan_for_something_else_leaves_a_closed_duplicate_closed() {
+        let (mut h, engine) = duplicate_harness();
+        engine
+            .events
+            .send(Event::PlanFailed("alpha is gone.".to_owned()))
+            .unwrap();
+        h.run();
+        assert!(h.state().duplicate.is_none());
+        h.get_by_label_contains("alpha is gone.");
     }
 
     #[test]
@@ -17366,6 +17489,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn selecting_a_server_does_not_move_the_list() {
+        // "1 selected" goes beside the toolbar's buttons when it fits there, and is left out when it does not: on a
+        // line of its own it pushed every row down under the pointer, and the next click hit another row.
+        for size in [
+            egui::vec2(1200.0, 720.0),
+            egui::vec2(1100.0, 900.0),
+            egui::vec2(1000.0, 600.0),
+            egui::vec2(800.0, 480.0),
+        ] {
+            let (mut h, engine) = live_harness();
+            h.set_size(size);
+            let (a, b) = two_rows();
+            engine.events.send(snapshot_of(vec![a, b])).unwrap();
+            h.run();
+            let before = h.get_by_label("Name").rect().top();
+            h.get_by_label("beta").click();
+            h.run();
+            h.run();
+            let after = h.get_by_label("Name").rect().top();
+            // Rounded to the pixel; it moved 46 px.
+            assert!(
+                (after - before).abs() < 1.0,
+                "{size:?}: {before} -> {after}"
+            );
+            if let Some(count) = h.query_by_label("1 selected") {
+                // On the row of the last button, which may have wrapped.
+                let last = h.get_by_label(icon::EXPORT).rect();
+                let y = count.rect().center().y;
+                assert!(
+                    last.top() <= y && y <= last.bottom(),
+                    "{size:?}: beside the buttons, {:?} vs {last:?}",
+                    count.rect()
+                );
+            }
+        }
+    }
+
     // ---- settings: appearance
 
     #[test]
@@ -19337,6 +19498,29 @@ mod tests {
     }
 
     #[test]
+    fn what_save_said_stays_while_it_still_holds() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
+        h.get_by_label_contains("New profile").click();
+        h.run();
+        h.get_by_label("Save profile").click();
+        h.run();
+        // Ticking a server does not give the profile a name: the message stays.
+        h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.run();
+        h.get_by_label_contains("Give the profile a name.");
+        // Unticking the last one after Save asked for one does not bring a new message before the next Save.
+        h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.run();
+        h.get_by_label_contains("Give the profile a name.");
+        assert!(
+            h.query_by_label_contains("Tick at least one server.")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_new_profile_is_made_from_the_servers_ticked_in_it() {
         use egui::accesskit::Role;
         let (mut h, engine) = profiles_harness();
@@ -19361,6 +19545,12 @@ mod tests {
         h.get_by_label("User");
         h.get_by_label("Local · app");
         h.get_by_role_and_label(Role::CheckBox, "beta").click();
+        h.run();
+        // Ticked: the message goes at once, not on the next Save.
+        assert!(
+            h.query_by_label_contains("Tick at least one server.")
+                .is_none()
+        );
         h.get_by_role_and_label(Role::CheckBox, "lint").click();
         h.run();
         h.get_by_label("Save profile").click();

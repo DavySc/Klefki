@@ -867,14 +867,15 @@ fn use_profile(
     if !turned_off.is_empty() {
         let names: Vec<String> = turned_off.into_iter().collect();
         out.warnings.push(format!(
-            "This also turns off {}{}, which {} not in {shown_profile}.",
+            "{}his also turns off {}, which {} not in {shown_profile}.",
+            // In front: after the names it read as the last server's count.
+            if project.is_none() {
+                format!("In {}, t", count(off_places, "project"))
+            } else {
+                "T".to_owned()
+            },
             // Every one: what goes off is read before agreeing, and "and 3 more" hides which.
             and_list(&names),
-            if project.is_none() {
-                format!(" (in {})", count(off_places, "project"))
-            } else {
-                String::new()
-            },
             if names.len() == 1 { "is" } else { "are" }
         ));
     }
@@ -3300,7 +3301,8 @@ mod profile_review_regressions {
         .unwrap();
         assert!(
             everywhere.warnings.contains(
-                &"This also turns off b, c, d, e, f, g and h (in 1 project), which are not in Work.".to_owned()
+                &"In 1 project, this also turns off b, c, d, e, f, g and h, which are not in Work."
+                    .to_owned()
             ),
             "{:?}",
             everywhere.warnings

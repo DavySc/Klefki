@@ -720,6 +720,7 @@ fn editor(
         ui.horizontal(|ui| {
             if theme::checkbox(ui, &mut ticked, row.name.as_str()).changed() {
                 toggle(&mut draft.members, &row.connection, ticked);
+                settle(draft);
             }
             if let Some((badge, why)) = badge(row) {
                 ui.label(RichText::new(badge).color(pal.text_muted))
@@ -745,6 +746,7 @@ fn editor(
             let mut ticked = true;
             if theme::checkbox(ui, &mut ticked, id.shown_name()).changed() {
                 toggle(&mut draft.members, &id, ticked);
+                settle(draft);
             }
         }
     }
@@ -753,13 +755,7 @@ fn editor(
     }
     if save {
         let name = draft.name.trim();
-        draft.problem = if name.is_empty() {
-            Some("Give the profile a name.")
-        } else if draft.members.is_empty() {
-            Some("Tick at least one server.")
-        } else {
-            None
-        };
+        draft.problem = problem_of(draft);
         if draft.problem.is_none() {
             asked = Some(Edited::Save(Asked::Save {
                 name: name.to_owned(),
@@ -769,6 +765,24 @@ fn editor(
         }
     }
     asked
+}
+
+/// What keeps the draft from being saved, first things first.
+fn problem_of(draft: &Draft) -> Option<&'static str> {
+    if draft.name.trim().is_empty() {
+        Some("Give the profile a name.")
+    } else if draft.members.is_empty() {
+        Some("Tick at least one server.")
+    } else {
+        None
+    }
+}
+
+/// What Save said goes as soon as it no longer holds, not on the next Save; nothing new is said before Save.
+fn settle(draft: &mut Draft) {
+    if draft.problem.is_some() && problem_of(draft) != draft.problem {
+        draft.problem = None;
+    }
 }
 
 /// What keeps a server from loading, in a word or two, with the whole reason; as the Connections page says it.
