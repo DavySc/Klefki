@@ -440,12 +440,12 @@ fn default_backup_dir() -> Option<std::path::PathBuf> {
         .map(|d| d.data_local_dir().join("backups"))
 }
 
-/// Reads the real Claude Code configuration (read-only), once, without live checks.
 /// Whether this build checks for updates: only one with the release key built in (decision 009).
 pub fn checks_for_updates() -> bool {
     crate::update::RELEASE_KEY.is_some()
 }
 
+/// Reads the real Claude Code configuration (read-only), once, without live checks.
 pub fn load_snapshot() -> Arc<Snapshot> {
     match ConfigPaths::discover() {
         Some(paths) => load_snapshot_from(&paths),
