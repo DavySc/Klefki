@@ -4496,6 +4496,18 @@ impl ShellApp {
                         if replaces {
                             kv("Replaces", format!("the user server {}", s.name));
                         }
+                        if let Some(b) = &s.blocked {
+                            kv(
+                                "Blocked",
+                                format!(
+                                    "in {} of {} projects. {}",
+                                    b.projects.len(),
+                                    self.snapshot.project_count,
+                                    b.why
+                                ),
+                            )
+                            .on_hover_text(b.projects.join("\n"));
+                        }
                     });
                 if s.casing_collision && self.core.is_some() {
                     ui.add_space(8.0);
@@ -7891,6 +7903,19 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
             )),
         });
     }
+    // Policy in some projects only: often deliberate, so quiet; everywhere is "not loaded", above.
+    if let Some(b) = &s.blocked {
+        badges.push(Badge {
+            text: format!("blocked in {}/{}", b.projects.len(), project_count),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(format!(
+                "In {} of {project_count} projects, Claude Code's policy keeps this server from loading. {}",
+                b.projects.len(),
+                b.why
+            )),
+        });
+    }
     if let (false, false, Some(same)) = (s.shadowed, s.shadowed_in.is_empty(), same_as) {
         badges.push(Badge {
             text: format!("left out in {}/{}", s.shadowed_in.len(), project_count),
@@ -8567,6 +8592,7 @@ mod tests {
             plugin: None,
             managed: None,
             not_loaded: None,
+            blocked: None,
         };
         let mut h = harness_with(Snapshot {
             servers: vec![row("REMOTE_1"), row("REMOTE_2")],
@@ -8697,6 +8723,7 @@ mod tests {
             plugin: None,
             managed: None,
             not_loaded: None,
+            blocked: None,
         }
     }
 
@@ -11676,6 +11703,33 @@ mod tests {
             )),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn a_server_policy_holds_back_in_some_projects_says_where_and_why() {
+        let (mut h, engine) = live_harness();
+        let why = "Blocked by policy: deniedMcpServers in /p/.claude/settings.json has serverName \"mine\".";
+        let mine = ServerRow {
+            blocked: Some(klefki_core::api::Blocked {
+                why: why.into(),
+                projects: vec!["/home/me/p".into()],
+            }),
+            ..live_row("mine", Scope::User, None)
+        };
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![mine],
+                project_count: 3,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.get_by_label("blocked in 1/3");
+        h.get_by_label("mine").click();
+        h.run();
+        h.get_by_label("Blocked");
+        h.get_by_label(&format!("in 1 of 3 projects. {why}"));
     }
 
     #[test]

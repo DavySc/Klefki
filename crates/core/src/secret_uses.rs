@@ -612,6 +612,7 @@ mod tests {
             plugin: None,
             managed: None,
             not_loaded: None,
+            blocked: None,
         }
     }
 

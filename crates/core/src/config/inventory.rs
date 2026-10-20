@@ -1,7 +1,7 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::docstore::LEGACY;
-use super::{ConfigPaths, fsx, managed, plugins};
+use super::{ConfigPaths, fsx, managed, plugins, policy};
 use crate::api::{
     Approval, LegacyDisabled, OAuthInfo, PluginInfo, Scope, ServerId, ServerRow, Snapshot, Status,
     TransportKind,
@@ -172,16 +172,30 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     // one is left out.
     let mut by_hand: Vec<ByHand> = Vec::new();
 
+    // Policy (decision 010), per place: outside every project (0), then each project in the inventory's order.
+    let raw_projects: Vec<&str> = projects.values().map(|p| p.raw.as_str()).collect();
+    let mut policy_warnings = Vec::new();
+    let policy = policy::load(paths, &raw_projects, &mut policy_warnings);
+    add_warnings(&mut snap, policy_warnings);
+    let all_places: Vec<usize> = (0..=projects.len()).collect();
+    // User rows and where policy holds each back, judged once shadowing is known.
+    let mut user_blocked: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
+
     // User rows by name as the file spells it, to mark the projects where a closer scope hides them.
     let mut user_rows: HashMap<&str, usize> = HashMap::new();
     if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
         for (name, entry) in servers {
             let not_loaded = replaced_by(name);
+            let blocked = match &not_loaded {
+                None => blocked_at(&policy, &all_places, name, entry, false),
+                Some(_) => Vec::new(),
+            };
             if let (None, Some(key)) = (&not_loaded, plugins::same_as_key(entry)) {
                 by_hand.push(ByHand {
                     key,
                     name: name.clone(),
                     project: None,
+                    blocked: blocked.iter().map(|b| b.0).collect(),
                     off_in: disabled_by_project
                         .values()
                         .zip(&shown_projects)
@@ -191,6 +205,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                 });
             }
             user_rows.insert(name, snap.servers.len());
+            user_blocked.push((snap.servers.len(), blocked));
             let (status, cached) = hints.status_of(name);
             let mut r = row(name, entry, Scope::User, None, true, status);
             r.status_cached = cached;
@@ -214,7 +229,8 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         }
     }
 
-    for (key, project) in &projects {
+    for (index, (key, project)) in projects.iter().enumerate() {
+        let place = index + 1;
         let disabled = &disabled_by_project[key];
         let mut seen_local = BTreeSet::new();
         // The user rows that a local or approved project server of this project replaces. A name that is off here
@@ -226,12 +242,20 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
-                    let not_loaded = replaced_by(name);
-                    if !disabled.contains(name) && not_loaded.is_none() {
+                    let not_loaded = replaced_by(name).or_else(|| {
+                        blocked_at(&policy, &[place], name, entry, false)
+                            .pop()
+                            .map(|b| b.1)
+                    });
+                    // Names merge before policy: a blocked server still takes its name here.
+                    if !disabled.contains(name) && replaced_by(name).is_none() {
                         hidden.extend(user_rows.get(name.as_str()));
-                        if let Some(key) = plugins::same_as_key(entry) {
-                            by_hand.push(ByHand::in_project(key, name, project));
-                        }
+                    }
+                    if !disabled.contains(name)
+                        && not_loaded.is_none()
+                        && let Some(key) = plugins::same_as_key(entry)
+                    {
+                        by_hand.push(ByHand::in_project(key, name, project));
                     }
                     let mut r = row(
                         name,
@@ -242,7 +266,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                         Status::Unknown,
                     );
                     r.connection = ConnectionId::new(Scope::Local, Some(key), name);
-                    r.not_loaded = not_loaded;
+                    r.not_loaded = not_loaded.map(|w| clip(&sanitize::sanitize_line(&w)));
                     keys.insert(
                         r.connection.clone(),
                         FileKey {
@@ -303,16 +327,20 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                     // Claude Code compares names as the file spells them, not as shown, and loads a project
                     // server only once it is approved.
                     r.shadowed = seen_local.contains(&name);
-                    r.not_loaded = replaced_by(&name);
+                    let replaced = replaced_by(&name);
+                    let blocked = blocked_at(&policy, &[place], &name, &entry, false).pop();
                     if approval == Approval::Approved
                         && !disabled.contains(&name)
-                        && r.not_loaded.is_none()
+                        && replaced.is_none()
                     {
                         hidden.extend(user_rows.get(name.as_str()));
-                        if let Some(key) = plugins::same_as_key(&entry) {
+                        if let (None, Some(key)) = (&blocked, plugins::same_as_key(&entry)) {
                             by_hand.push(ByHand::in_project(key, &name, project));
                         }
                     }
+                    r.not_loaded = replaced
+                        .or(blocked.map(|b| b.1))
+                        .map(|w| clip(&sanitize::sanitize_line(&w)));
                     snap.servers.push(r);
                 }
             }
@@ -326,6 +354,20 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     for &i in user_rows.values() {
         let r = &mut snap.servers[i];
         r.shadowed = snap.project_count > 0 && r.shadowed_in.len() == snap.project_count;
+    }
+    // Where a user server is the one of its name: outside every project, and each project that does not hide it.
+    for (i, blocked) in user_blocked {
+        let r = &mut snap.servers[i];
+        let places: Vec<usize> = all_places
+            .iter()
+            .copied()
+            .filter(|&p| p == 0 || !r.shadowed_in.contains(&shown_projects[p - 1]))
+            .collect();
+        let (not_loaded, partly) = verdict(&places, &blocked, &shown_projects);
+        if r.not_loaded.is_none() {
+            r.not_loaded = not_loaded;
+        }
+        r.blocked = partly;
     }
 
     for server in &org.servers {
@@ -359,10 +401,11 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             .filter(|d| d.contains(&server.name))
             .count();
         r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
+        let blocked = blocked_at(&policy, &all_places, &server.name, &server.entry, true);
+        (r.not_loaded, r.blocked) = verdict(&all_places, &blocked, &shown_projects);
         snap.servers.push(r);
     }
 
-    let raw_projects: Vec<&str> = projects.values().map(|p| p.raw.as_str()).collect();
     let first_plugin = snap.servers.len();
     add_plugin_servers(
         paths,
@@ -371,9 +414,13 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         &disabled_by_project,
         &raw_projects,
         &shown_projects,
+        &policy,
     );
     for r in &mut snap.servers[first_plugin..] {
-        r.not_loaded = replaced_by(&r.name);
+        if let Some(why) = replaced_by(&r.name) {
+            r.not_loaded = Some(why);
+            r.blocked = None;
+        }
     }
 
     mark_casing_collisions(&mut snap.servers);
@@ -389,11 +436,16 @@ struct ByHand {
     project: Option<String>,
     /// A user server: the projects (as shown) where it is off.
     off_in: BTreeSet<String>,
+    /// The places (0: outside every project, then each project) where policy holds it back.
+    blocked: Vec<usize>,
 }
 
 impl ByHand {
-    /// Whether Claude Code loads this server in `project` (`None`: outside every project).
-    fn loaded_in(&self, project: Option<&str>) -> bool {
+    /// Whether Claude Code loads this server in the place `place`, `project` (`None`: outside every project).
+    fn loaded_in(&self, place: usize, project: Option<&str>) -> bool {
+        if self.blocked.contains(&place) {
+            return false;
+        }
         match (&self.project, project) {
             (None, None) => true,
             (None, Some(p)) => !self.off_in.contains(p),
@@ -407,6 +459,8 @@ impl ByHand {
             name: name.to_owned(),
             project: Some(clip(&sanitize(&project.display))),
             off_in: BTreeSet::new(),
+            // Only added where it is loaded.
+            blocked: Vec::new(),
         }
     }
 }
@@ -421,16 +475,12 @@ fn add_plugin_servers(
     disabled_by_project: &BTreeMap<&String, BTreeSet<String>>,
     raw_projects: &[&str],
     shown_projects: &[String],
+    policy: &policy::Policy,
 ) {
     let mut warnings = Vec::new();
     let loaded = plugins::load(paths, raw_projects, &mut warnings);
     // A project's `settings.local.json` is also read for approvals: said once.
-    for w in warnings {
-        let w = sanitize::sanitize_line(&w);
-        if !snap.warnings.contains(&w) {
-            snap.warnings.push(w);
-        }
-    }
+    add_warnings(snap, warnings);
     let servers = &loaded.servers;
     // Where a server is loaded or left out: outside every project (where nothing is off), then each project.
     let off: Vec<Option<&BTreeSet<String>>> = std::iter::once(None)
@@ -454,6 +504,8 @@ fn add_plugin_servers(
     let mut hidden = vec![vec![false; places.len()]; servers.len()];
     let mut by_hand_name: Vec<Option<&str>> = vec![None; servers.len()];
     let mut by_plugin: Vec<Option<&str>> = vec![None; servers.len()];
+    // Per server: the places where policy holds it back.
+    let mut blocked: Vec<Vec<(usize, String)>> = vec![Vec::new(); servers.len()];
     for (i, place) in places.iter().enumerate() {
         // Where the row says it is left out: in projects, or outside every project when Claude Code knows none. Only
         // there is the other server named, so the count and the name never disagree.
@@ -465,11 +517,13 @@ fn add_plugin_servers(
             let hand = keys[s].as_ref().and_then(|key| {
                 by_hand
                     .iter()
-                    .find(|m| m.key == *key && m.loaded_in(*place))
+                    .find(|m| m.key == *key && m.loaded_in(i, *place))
             });
             let earlier = plugin_keys[s]
                 .as_deref()
                 .and_then(|k| loaded_here.get(k).copied());
+            // Policy comes before the plugins are compared: a blocked one hides nothing.
+            let held_back = policy.places[i].blocks(&names[s], &runs[s], false);
             if let Some(m) = hand {
                 if shown {
                     by_hand_name[s].get_or_insert(&m.name);
@@ -480,6 +534,8 @@ fn add_plugin_servers(
                     by_plugin[s].get_or_insert(earlier);
                 }
                 hidden[s][i] = true;
+            } else if let Some(why) = held_back {
+                blocked[s].push((i, why));
             } else if let Some(k) = &plugin_keys[s]
                 && !off[i].is_some_and(|d| d.contains(&names[s]))
             {
@@ -512,6 +568,11 @@ fn add_plugin_servers(
             .filter(|(_, h)| **h)
             .map(|(p, _)| p.clone())
             .collect();
+        // Where it would load: its plugin is on there, and nothing hides it.
+        let would_load: Vec<usize> = (0..places.len())
+            .filter(|&i| on[s][i] && !hidden[s][i])
+            .collect();
+        (r.not_loaded, r.blocked) = verdict(&would_load, &blocked[s], shown_projects);
         let written = classify(&server.entry).1;
         let written_target = (written != r.target).then_some(written);
         r.plugin = Some(PluginInfo {
@@ -528,6 +589,70 @@ fn add_plugin_servers(
         });
         snap.servers.push(r);
     }
+}
+
+/// Adds `warnings`, cleaned, unless already there: several readers look at the same settings files.
+fn add_warnings(snap: &mut Snapshot, warnings: Vec<String>) {
+    for w in warnings {
+        let w = sanitize::sanitize_line(&w);
+        if !snap.warnings.contains(&w) {
+            snap.warnings.push(w);
+        }
+    }
+}
+
+/// The places among `places` where policy holds the server `name`, `entry` back, and why.
+fn blocked_at(
+    policy: &policy::Policy,
+    places: &[usize],
+    name: &str,
+    entry: &Value,
+    organisation: bool,
+) -> Vec<(usize, String)> {
+    places
+        .iter()
+        .filter_map(|&p| {
+            let why = policy.places.get(p)?.blocks(name, entry, organisation)?;
+            Some((p, why))
+        })
+        .collect()
+}
+
+/// What a row says about policy, from the places it would load in and where policy holds it back there: not loaded
+/// when held back in all of them, else the projects where it is. Counted like "left out": projects, or outside every
+/// project when Claude Code knows none.
+fn verdict(
+    places: &[usize],
+    blocked: &[(usize, String)],
+    shown_projects: &[String],
+) -> (Option<String>, Option<crate::api::Blocked>) {
+    let counted: Vec<usize> = places
+        .iter()
+        .copied()
+        .filter(|&p| (p == 0) == shown_projects.is_empty())
+        .collect();
+    let counted = if counted.is_empty() {
+        places.to_vec()
+    } else {
+        counted
+    };
+    let hit: Vec<&(usize, String)> = blocked
+        .iter()
+        .filter(|(p, _)| counted.contains(p))
+        .collect();
+    let Some((_, why)) = hit.first() else {
+        return (None, None);
+    };
+    let why = clip(&sanitize::sanitize_line(why));
+    if hit.len() == counted.len() {
+        return (Some(why), None);
+    }
+    let projects = hit
+        .iter()
+        .filter(|(p, _)| *p > 0)
+        .map(|(p, _)| shown_projects[p - 1].clone())
+        .collect();
+    (None, Some(crate::api::Blocked { why, projects }))
 }
 
 /// Names `project` on the user rows at `hidden`: there, a server of the same name is loaded instead.
@@ -617,6 +742,7 @@ fn row(
         plugin: None,
         managed: None,
         not_loaded: None,
+        blocked: None,
     }
 }
 
@@ -3153,5 +3279,156 @@ mod tests {
         // Claude Code loads the organisation's "mine", not the user's, so nothing has the plugin's command.
         let p = find(&s, Scope::Plugin, "plugin:p1:s");
         assert!(!p.shadowed && plugin_info(p).same_as.is_none(), "{p:#?}");
+    }
+
+    // ------------------------------------------------------------ policy (decision 010)
+
+    fn blocked_why(r: &ServerRow) -> &str {
+        r.not_loaded
+            .as_deref()
+            .unwrap_or_else(|| panic!("not loaded: {r:#?}"))
+    }
+
+    #[test]
+    fn a_server_a_rule_blocks_everywhere_is_not_loaded_and_says_which_rule() {
+        let e = Env::new();
+        let a = e.project("a");
+        e.write(
+            "settings.json",
+            &json!({"deniedMcpServers": [{"serverName": "x"}, {"serverCommand": ["loc"]}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"x": {"command": "x"}, "ok": {"command": "ok"}},
+                "projects": {a.to_string_lossy(): {"mcpServers": {"l": {"command": "loc"}}}}
+            }),
+        );
+        let s = e.load();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let why = blocked_why(find(&s, Scope::User, "x"));
+        assert!(
+            why.starts_with("Blocked by policy") && why.contains("serverName \"x\""),
+            "{why}"
+        );
+        assert!(why.contains("settings.json"), "{why}");
+        let why = blocked_why(find(&s, Scope::Local, "l"));
+        assert!(why.contains("serverCommand [\"loc\"]"), "{why}");
+        let ok = find(&s, Scope::User, "ok");
+        assert!(ok.not_loaded.is_none() && ok.blocked.is_none(), "{ok:#?}");
+    }
+
+    #[test]
+    fn a_projects_own_rules_block_a_user_server_there_only() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        let shown = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        e.write(
+            "projects/a/.claude/settings.local.json",
+            &json!({"deniedMcpServers": [{"serverName": "x"}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"x": {"command": "x"}},
+                "projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}
+            }),
+        );
+        let s = e.load();
+        let x = find(&s, Scope::User, "x");
+        assert!(x.not_loaded.is_none(), "{x:#?}");
+        let blocked = x.blocked.as_ref().unwrap_or_else(|| panic!("{x:#?}"));
+        assert_eq!(blocked.projects, [shown(&a)]);
+        assert!(
+            blocked.why.contains("settings.local.json"),
+            "{}",
+            blocked.why
+        );
+
+        // Variant: blocked in both, so in every project: not loaded.
+        e.write(
+            "projects/b/.claude/settings.json",
+            &json!({"deniedMcpServers": [{"serverName": "x"}]}),
+        );
+        let s = e.load();
+        let x = find(&s, Scope::User, "x");
+        assert!(x.blocked.is_none(), "{x:#?}");
+        assert!(blocked_why(x).contains("Blocked by policy"));
+    }
+
+    #[test]
+    fn a_blocked_local_server_still_takes_the_users_name() {
+        // Names merge first: the user's x does not come back where the local x is blocked.
+        let e = Env::new();
+        let a = e.project("a");
+        let shown = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        e.write(
+            "settings.json",
+            &json!({"deniedMcpServers": [{"serverCommand": ["localx"]}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"x": {"command": "userx"}},
+                "projects": {a.to_string_lossy(): {"mcpServers": {"x": {"command": "localx"}}}}
+            }),
+        );
+        let s = e.load();
+        assert!(blocked_why(find(&s, Scope::Local, "x")).contains("localx"));
+        let user = find(&s, Scope::User, "x");
+        assert_eq!(user.shadowed_in, [shown(&a)]);
+        assert!(
+            user.not_loaded.is_none() && user.blocked.is_none(),
+            "{user:#?}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_server_leaves_no_plugin_server_out_and_a_plugins_is_blocked_by_its_full_name() {
+        let e = Env::new();
+        e.plugin(
+            "p1",
+            json!({"s": {"command": "same"}, "t": {"command": "t"}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"mcpServers": {"hand": {"command": "same"}}}),
+        );
+        let mut settings: Value = serde_json::from_str(
+            &std::fs::read_to_string(e.dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        settings["deniedMcpServers"] =
+            json!([{"serverName": "hand"}, {"serverName": "plugin:p1:t"}]);
+        e.write("settings.json", &settings);
+        let s = e.load();
+        let p = find(&s, Scope::Plugin, "plugin:p1:s");
+        assert!(!p.shadowed && plugin_info(p).same_as.is_none(), "{p:#?}");
+        assert!(blocked_why(find(&s, Scope::Plugin, "plugin:p1:t")).contains("plugin:p1:t"));
+    }
+
+    #[test]
+    fn an_allowed_list_holds_back_the_users_servers_but_not_the_organisations() {
+        let e = Env::new();
+        e.write(
+            "settings.json",
+            &json!({"allowedMcpServers": [{"serverName": "ok"}]}),
+        );
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {
+                "docs": {"type": "http", "url": "https://docs.example.com/mcp"},
+                "gone": {"type": "http", "url": "https://gone.example.com/mcp"}
+            }, "deniedMcpServers": [{"serverUrl": "https://gone.example.com/*"}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"mcpServers": {"ok": {"command": "ok"}, "no": {"command": "no"}}}),
+        );
+        let s = e.load();
+        assert!(find(&s, Scope::User, "ok").not_loaded.is_none());
+        assert!(blocked_why(find(&s, Scope::User, "no")).contains("allowedMcpServers"));
+        assert!(find(&s, Scope::Managed, "docs").not_loaded.is_none());
+        assert!(blocked_why(find(&s, Scope::Managed, "gone")).contains("serverUrl"));
     }
 }
