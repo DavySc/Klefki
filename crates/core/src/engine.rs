@@ -464,9 +464,16 @@ pub struct Core {
     updating: Arc<Mutex<Updating>>,
     /// Why this copy of Klefki is updated by hand, if it is (see [`crate::install::InstallKind::Manual`]).
     by_hand: Option<String>,
+    /// The engine has a release key, so it checks for updates.
+    checks_for_updates: bool,
 }
 
 impl Core {
+    /// Whether this Klefki checks for updates: only a build with the release key built in (decision 009).
+    pub fn checks_for_updates(&self) -> bool {
+        self.checks_for_updates
+    }
+
     /// Why this copy of Klefki is updated by hand (the MSI, the zip, the `.deb`); `None` when it installs updates
     /// itself.
     pub fn updated_by_hand(&self) -> Option<&str> {
@@ -529,6 +536,7 @@ impl Core {
             pick_dialog: None,
             updating: Arc::default(),
             by_hand: None,
+            checks_for_updates: false,
         };
         (core, Detached { commands, events })
     }
@@ -650,6 +658,7 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
     let open_dialog = Some(Arc::clone(&config.open_dialog));
     let pick_dialog = Some(Arc::clone(&config.pick_dialog));
     let updating = Arc::<Mutex<Updating>>::default();
+    let checks_for_updates = config.release_key.is_some();
     let by_hand = match &config.install {
         crate::install::InstallKind::Manual(why) => Some(why.clone()),
         _ => None,
@@ -663,6 +672,7 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
         pick_dialog,
         updating,
         by_hand,
+        checks_for_updates,
     }
 }
 
@@ -5531,6 +5541,7 @@ mod tests {
             },
             || {},
         );
+        assert!(core.checks_for_updates());
         let version = crate::update::Version::parse("0.2.0").unwrap();
         assert_eq!(
             update_found(&core),
@@ -5627,6 +5638,7 @@ mod tests {
     fn without_a_release_key_no_update_check_reaches_out() {
         let env = Env::new(&serde_json::json!({}), "{}", &[]);
         let core = env.start();
+        assert!(!core.checks_for_updates());
         assert_eq!(update_found(&core), crate::update::UpdateCheck::NoKey);
     }
 

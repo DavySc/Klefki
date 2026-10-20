@@ -437,8 +437,8 @@ impl ShellApp {
     pub fn with_core(core: Core, theme: ThemeChoice) -> Self {
         let mut app = Self::new(Arc::new(Snapshot::default()), theme);
         app.updated_by_hand = core.updated_by_hand().map(str::to_owned);
+        app.checks_for_updates = core.checks_for_updates();
         app.core = Some(core);
-        app.checks_for_updates = klefki_core::api::checks_for_updates();
         app
     }
 

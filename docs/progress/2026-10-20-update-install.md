@@ -38,6 +38,19 @@ install it (Windows per-user setup, macOS app, AppImage), on "Restart to update"
   the zip check when present.
 - Release build without a key: 18,624,848 bytes (no new dependencies).
 
+## Release key (Davy, 2026-10-20 07:05Z)
+- `minisign.pub` committed (key ID 07EC67D46C36E208; base64 decodes to 42 bytes, `Ed` + that ID + key). Builds now
+  carry the key, so the app checks for updates and the release workflow signs `SHA256SUMS`.
+- With the key built in, 70 app tests failed: `ShellApp::with_core` read the build-time constant, so every test
+  harness started checking for updates. Fixed: `Core::checks_for_updates()` (true when the engine has a key; a
+  detached test core has none), replacing `api::checks_for_updates()`. App tests pass with and without the key.
+- Windows CI on 0dc0776: the AppImage path test used `Path::is_absolute`, false for `/home/...` on Windows; now a
+  leading `/` (4ab5717). The model test `no_change_ever_loses_a_server_or_its_secret` failed with a new seed
+  (`cc 7a12d6aa…c7d7c`) that also fails on main cd600a1: an existing bug, reported, not fixed here
+  (`/mnt/project-files/packaging/model-test-seed-2026-10-20.md`).
+- Release build with the key: 20,250,504 bytes (TLS, as measured in 6a). Workspace tests with the key: 1227 passed;
+  app tests without it: 373 passed. clippy, fmt, deny ok.
+
 ## Not verified
 Each install path on its real system (tests swap bundles and AppImages in temporary folders on Linux; the NSIS flags
 are from cargo-packager 0.11.8's template), and whether macOS asks again for an app Klefki replaced. Both wait on the
