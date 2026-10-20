@@ -23,6 +23,10 @@ fi
 
 key=$(umask 077 && mktemp)
 trap 'rm -f "$key"' EXIT
-printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+# minisign needs the file's comment line; a secret saved as the key line alone gets it back.
+if [[ "$MINISIGN_SECRET_KEY" != "untrusted comment:"* ]]; then
+  printf '%s\n' "untrusted comment: minisign encrypted secret key" > "$key"
+fi
+printf '%s\n' "$MINISIGN_SECRET_KEY" >> "$key"
 printf '%s\n' "${MINISIGN_PASSWORD:-}" | minisign -S -s "$key" -m "$sums" -t "$comment" > /dev/null
 minisign -V -p "$pub" -m "$sums"

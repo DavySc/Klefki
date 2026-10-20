@@ -97,6 +97,16 @@ def check_macos(dist, version, app, problems):
     dmg = dist / f"klefki-{version}-macos-universal.dmg"
     if not dmg.is_file():
         problems.append(f"missing {dmg.name}")
+    # Klefki updates itself from this zip, so it must hold the signed app at its top level.
+    update = dist / f"klefki-{version}-macos-universal.app.zip"
+    if not update.is_file():
+        problems.append(f"missing {update.name}")
+    else:
+        with zipfile.ZipFile(update) as z:
+            names = set(z.namelist())
+        for entry in ("Klefki.app/Contents/MacOS/klefki", "Klefki.app/Contents/_CodeSignature/CodeResources"):
+            if entry not in names:
+                problems.append(f"{update.name} has no {entry}")
     if app is None:
         problems.append("pass --app with the Klefki.app that went into the disk image")
         return

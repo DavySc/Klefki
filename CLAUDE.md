@@ -28,7 +28,7 @@ If a command can't run, report the work as **unverified**.
 - Never create entries in `project` scope (`Target` is `User | Local` only). Project servers are toggled through `disabledMcpServers` in the project entry of `~/.claude.json`, like every other server. The repository's `.claude/settings.local.json` is written only to approve a project server (`enabledMcpjsonServers`), after showing its full command.
 - Secrets live in the OS keyring, keyed by `ConnectionId`. No plaintext fallback. Never read `~/.claude/.credentials.json`.
 - Claude is spawned with no shell, no `.cmd` or `.bat`, and names matching `^[A-Za-z0-9_-]{1,64}$`. URLs opened are https only. TLS verification is always on.
-- Network: only the update check in `klefki-core` (decision 009): https to GitHub, and nothing trusted unless signed by the release key built in from `minisign.pub`. That key signs only in the `release` environment, behind the owner's required approval, for `v*` tags only the owner can create (`docs/RELEASING.md`).
+- Network: only Klefki's own updates in `klefki-core` (decision 009): https to GitHub, and nothing trusted unless signed by the release key built in from `minisign.pub`. A downloaded package is installed or started only if its SHA-256 matches the signed `SHA256SUMS`. That key signs only in the `release` environment, behind the owner's required approval, for `v*` tags only the owner can create (`docs/RELEASING.md`).
 - `.mcp.json`, server metadata and CLI output are untrusted: size-limit, validate and sanitize them (ANSI, control and bidi characters).
 
 ## Progress

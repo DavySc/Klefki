@@ -534,6 +534,8 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             desktop: crate::desktop::DesktopRoots::default(),
             releases: Arc::new(crate::update::Offline),
             release_key: None,
+            install: crate::install::InstallKind::Manual("Updated by hand in tests.".into()),
+            updates_dir: None,
         },
         || {},
     );
@@ -2089,5 +2091,206 @@ fn a_kept_definition_that_took_a_shared_client_secret_is_not_forgotten() {
         StoreFault::Works,
     ));
     cases.push((Step::Forget { pick: 0 }, vec![], StoreFault::Works));
+    check(&cases).unwrap();
+}
+
+/// After `setup`, checked on its own: an edit of `name` in pa, a rename of it to `{name}_r`, then `arrive` puts
+/// another server under `name` there. The check of the three, made together, must leave the edit on the renamed
+/// server and the newcomer as it came.
+fn edit_rename_then_arrive(
+    setup: impl Fn(&Rig) -> Vec<Change>,
+    name: &str,
+    arrive: impl Fn(&Rig) -> Change,
+) {
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    for change in setup(&rig) {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    }
+    quiet_for(&rig, Duration::from_millis(600));
+    let pa = rig.projects[0].clone();
+    let old = (Some(pa.clone()), name.to_owned());
+    let renamed = (Some(pa), format!("{name}_r"));
+    let edited = definition(false, 2, 1);
+    for change in [
+        Change::Replace {
+            id: rig.id(&old),
+            json: edited.to_string(),
+        },
+        Change::Rename {
+            id: rig.id(&old),
+            name: renamed.1.clone(),
+        },
+        arrive(&rig),
+    ] {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    }
+    let arrived = rig.world().servers[&old].clone();
+    assert_ne!(arrived, edited);
+    quiet_for(&rig, Duration::from_millis(1200));
+    let world = rig.world();
+    assert_eq!(world.servers.get(&renamed), Some(&edited));
+    assert_eq!(world.servers.get(&old), Some(&arrived));
+}
+
+#[test]
+fn an_earlier_edits_check_does_not_land_on_a_copy_under_the_name_it_was_renamed_from() {
+    // Found by the model-based test (seed 7a12d6aa): q edited, renamed to q_r, then p copied into pa as q. The check
+    // of all three replayed the edit on the copy, so both servers ended with the edited definition.
+    edit_rename_then_arrive(
+        |_| Vec::new(),
+        "q",
+        |rig| Change::Duplicate {
+            id: rig.id(&(None, "p".to_owned())),
+            name: "q".into(),
+            targets: vec![Target::Local(rig.projects[0].clone())],
+        },
+    );
+}
+
+#[test]
+fn an_earlier_edits_check_does_not_land_on_a_server_moved_in_under_the_name_it_was_renamed_from() {
+    // The variant, as the seed had it: p copied into pa and checked, then that copy edited and renamed, and the user's
+    // p moved into pa.
+    let user_p = || (None, "p".to_owned());
+    edit_rename_then_arrive(
+        |rig| {
+            vec![Change::Duplicate {
+                id: rig.id(&user_p()),
+                name: "p".into(),
+                targets: vec![Target::Local(rig.projects[0].clone())],
+            }]
+        },
+        "p",
+        |rig| Change::Move {
+            id: rig.id(&user_p()),
+            to: Target::Local(rig.projects[0].clone()),
+        },
+    );
+}
+
+/// q in pa switched off and renamed to q_r, then `arrive` puts another server under q there: the check of the three,
+/// made together, must leave q_r off and the newcomer on.
+fn switch_off_rename_then_arrive(arrive: impl Fn(&Rig) -> Change) {
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let pa = rig.projects[0].clone();
+    let old = (Some(pa.clone()), "q".to_owned());
+    for change in [
+        Change::SetEnabled {
+            id: rig.id(&old),
+            enabled: false,
+        },
+        Change::Rename {
+            id: rig.id(&old),
+            name: "q_r".into(),
+        },
+        arrive(&rig),
+    ] {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    }
+    let off = || rig.config()["projects"][&pa]["disabledMcpServers"].clone();
+    assert_eq!(off(), json!(["q_r"]));
+    quiet_for(&rig, Duration::from_millis(1200));
+    assert_eq!(off(), json!(["q_r"]));
+}
+
+#[test]
+fn an_earlier_switch_offs_check_does_not_turn_off_a_copy_under_the_name_it_was_renamed_from() {
+    // Found in review: like the edit above, the check replayed the switch-off under the old name.
+    switch_off_rename_then_arrive(|rig| Change::Duplicate {
+        id: rig.id(&(None, "p".to_owned())),
+        name: "q".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    });
+}
+
+#[test]
+fn an_earlier_switch_offs_check_does_not_turn_off_a_server_moved_in_under_the_name_it_was_renamed_from()
+ {
+    // The variant: the user's p, copied to the user as q first, is moved into pa under q.
+    let rig_copy = |rig: &Rig| Change::Duplicate {
+        id: rig.id(&(None, "p".to_owned())),
+        name: "q".into(),
+        targets: vec![Target::User],
+    };
+    switch_off_rename_then_arrive(move |rig| {
+        let outcome = rig.run(vec![rig_copy(rig)]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+        Change::Move {
+            id: rig.id(&(None, "q".to_owned())),
+            to: Target::Local(rig.projects[0].clone()),
+        }
+    });
+}
+
+#[test]
+fn a_late_check_does_not_put_an_edit_back_on_a_server_renamed_since() {
+    // The shrunk sequence of seed 7a12d6aa, as the model-based test runs it.
+    use Fault::*;
+    let cases = [
+        (
+            Step::Copy {
+                pick: 6,
+                to: 1,
+                rename: false,
+            },
+            vec![Works],
+            StoreFault::Works,
+        ),
+        (
+            Step::Move { pick: 3, to: 1 },
+            vec![TimesOutAfter],
+            StoreFault::Works,
+        ),
+        (
+            Step::Edit {
+                pick: 3,
+                oauth: false,
+                url: 0,
+                client: 1,
+            },
+            vec![Works, Works],
+            StoreFault::Works,
+        ),
+        (
+            Step::Rename { pick: 3 },
+            vec![Works, Works, NeverStarts],
+            StoreFault::SetFails,
+        ),
+        (
+            Step::Move { pick: 7, to: 1 },
+            vec![Works, Works],
+            StoreFault::Works,
+        ),
+        (Step::Move { pick: 5, to: 0 }, vec![], StoreFault::Works),
+        (
+            Step::CopyToKept { pick: 3, kept: 2 },
+            vec![],
+            StoreFault::Works,
+        ),
+        (
+            Step::Copy {
+                pick: 5,
+                to: 2,
+                rename: false,
+            },
+            vec![],
+            StoreFault::Works,
+        ),
+        (
+            Step::Edit {
+                pick: 7,
+                oauth: false,
+                url: 2,
+                client: 0,
+            },
+            vec![Works, NeverStarts],
+            StoreFault::Works,
+        ),
+    ];
     check(&cases).unwrap();
 }
