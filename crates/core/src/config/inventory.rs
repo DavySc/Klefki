@@ -371,12 +371,14 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     }
 
     for server in &org.servers {
-        // Claude Code compares a plugin's server with the organisation's too, wherever those are on.
+        let blocked = blocked_at(&policy, &all_places, &server.name, &server.entry, true);
+        // Claude Code compares a plugin's server with the organisation's too, wherever those are on and allowed.
         if let Some(key) = plugins::same_as_key(&server.entry) {
             by_hand.push(ByHand {
                 key,
                 name: server.name.clone(),
                 project: None,
+                blocked: blocked.iter().map(|b| b.0).collect(),
                 off_in: disabled_by_project
                     .values()
                     .zip(&shown_projects)
@@ -401,7 +403,6 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             .filter(|d| d.contains(&server.name))
             .count();
         r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
-        let blocked = blocked_at(&policy, &all_places, &server.name, &server.entry, true);
         (r.not_loaded, r.blocked) = verdict(&all_places, &blocked, &shown_projects);
         snap.servers.push(r);
     }
@@ -3261,6 +3262,40 @@ mod tests {
         // A broken one still lists nothing: Claude Code's own settings are unknown then.
         e.write_raw(".claude.json", "{ broken");
         assert!(e.load().servers.is_empty());
+    }
+
+    #[test]
+    fn an_organisations_server_policy_blocks_leaves_no_plugin_server_out() {
+        let e = Env::new();
+        e.plugin(
+            "p2",
+            json!({"web2": {"type": "http", "url": "https://x.example.com/mcp"}}),
+        );
+        e.write(
+            "org/managed-settings.json",
+            &json!({
+                "managedMcpServers": {"orgweb": {"type": "http", "url": "https://x.example.com/mcp"}},
+                "deniedMcpServers": [{"serverName": "orgweb"}]
+            }),
+        );
+        e.write(".claude.json", &json!({}));
+        let s = e.load();
+        assert!(find(&s, Scope::Managed, "orgweb").not_loaded.is_some());
+        let web2 = find(&s, Scope::Plugin, "plugin:p2:web2");
+        assert!(
+            !web2.shadowed && plugin_info(web2).same_as.is_none(),
+            "{web2:#?}"
+        );
+    }
+
+    #[test]
+    fn a_broken_organisation_file_is_one_quiet_note_not_also_a_warning() {
+        let e = Env::new();
+        e.write_raw("org/managed-settings.json", "{ broken");
+        e.write(".claude.json", &json!({}));
+        let s = e.load();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        assert_eq!(s.organisation_notes.len(), 1, "{:?}", s.organisation_notes);
     }
 
     #[test]

@@ -17,7 +17,11 @@ Goal: roadmap item 2. Say when Claude Code's policy keeps a server from loading,
   `serverUrl "https://api.example.com/*"`; `proj2/.claude/settings.local.json` denies `other`. Claude Code loads
   `other` in proj, user `x` and `l2` in proj2. Klefki: `web` and local `x` not loaded (naming the rule), `other`
   blocked in 1 of 2 projects, user `x` shadowed in 1 of 2. Same.
-- Full verify on this branch (on top of #47): exit 0; 353 + 21 + 26 + 793 passed, 0 failed; deny ok.
+- Rebuilt on #47 after its cross-review fixes: a blocked organisation server leaves no plugin duplicate out
+  (`an_organisations_server_policy_blocks_leaves_no_plugin_server_out`); a broken organisation file is one quiet
+  note, not also a policy warning (`a_broken_organisation_file_is_one_quiet_note_not_also_a_warning`). Both failed
+  first.
+- Full verify on this branch (on top of #47 2ba30ba): exit 0; 355 + 21 + 26 + 797 passed, 0 failed; deny ok.
 
 ## Next
 Warn in a change's review when policy will block it; then claude.ai connectors.

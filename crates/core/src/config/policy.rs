@@ -304,8 +304,9 @@ pub(crate) fn load(
     let mut organisation = Vec::new();
     let mut only_organisation = false;
     if let Some(dir) = &paths.managed_dir {
+        // What goes wrong reading the organisation's files is already said, once, as an organisation note.
         for file in managed::settings_files(dir, &mut Vec::new()) {
-            let rules = read_rules(&file, warnings);
+            let rules = read_rules(&file, &mut Vec::new());
             only_organisation |= rules.only_organisation;
             organisation.push((file, rules));
         }
