@@ -2114,9 +2114,15 @@ impl ShellApp {
                     s.name
                 )
             }
+            Some(s) if s.scope == Scope::ClaudeAi => {
+                format!(
+                    "{} is a claude.ai connector and is changed on claude.ai",
+                    s.name
+                )
+            }
             Some(s) => format!("{} comes from a plugin and is changed there", s.name),
             None => {
-                "the selected servers come from plugins or your organisation and are changed there"
+                "the selected servers come from plugins, your organisation or claude.ai and are changed there"
                     .to_owned()
             }
         })
@@ -2132,7 +2138,7 @@ impl ShellApp {
             .selected
             .iter()
             .filter_map(|&i| self.snapshot.servers.get(i))
-            .any(|s| s.scope == Scope::Managed);
+            .any(|s| matches!(s.scope, Scope::Managed | Scope::ClaudeAi));
         let text = if changed > 0 && !organisation {
             match left_out {
                 1 => "Left out 1 plugin server: a plugin's server is changed in its plugin."
@@ -2148,7 +2154,15 @@ impl ShellApp {
             };
             format!(
                 "Left out {what} Klefki only switches on and off: a plugin's server is changed in its plugin, your \
-                 organisation's by an administrator."
+                 organisation's by an administrator, a claude.ai connector on claude.ai."
+            )
+        } else if let Some(s) = self
+            .single_selected()
+            .filter(|s| s.scope == Scope::ClaudeAi)
+        {
+            format!(
+                "{} is a connector of your claude.ai account. Change it on claude.ai; Klefki switches it on and off.",
+                s.name
             )
         } else if let Some(s) = self.single_selected().filter(|s| s.scope == Scope::Managed) {
             format!(
@@ -2164,7 +2178,8 @@ impl ShellApp {
             )
         } else {
             if organisation {
-                "The selected servers come from plugins or your organisation. Klefki only switches them on and off."
+                "The selected servers come from plugins, your organisation or claude.ai. Klefki only switches them on \
+                 and off."
                     .to_owned()
             } else {
                 "The selected servers come from plugins. Change them in their plugins, or turn the plugins off in \
@@ -4526,6 +4541,13 @@ impl ShellApp {
                 if let Some(p) = &s.plugin {
                     ui.add(
                         egui::Label::new(RichText::new(plugin_read_only(p)).color(pal.text_muted))
+                            .wrap(),
+                    );
+                    ui.add_space(8.0);
+                }
+                if s.scope == Scope::ClaudeAi {
+                    ui.add(
+                        egui::Label::new(RichText::new(CONNECTOR_READ_ONLY).color(pal.text_muted))
                             .wrap(),
                     );
                     ui.add_space(8.0);
@@ -8224,6 +8246,8 @@ const PLUGIN_STATUS: &str = "See /mcp";
 const PLUGIN_NOT_CHECKED: &str =
     "Klefki does not check a plugin's servers. In Claude Code, /mcp shows their status.";
 /// Why Klefki has no status for the organisation's server, and where it is.
+const CONNECTOR_NOT_CHECKED: &str =
+    "Klefki does not check claude.ai connectors. In Claude Code, /mcp shows their status.";
 const ORGANISATION_NOT_CHECKED: &str = "Klefki does not check the servers your organisation sets. In Claude Code, /mcp shows their status.";
 /// The servers of `org`'s name, configured by hand, that Claude Code does not load because the organisation sets it.
 fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<String> {
@@ -8258,6 +8282,7 @@ fn not_checked(s: &ServerRow) -> Option<String> {
     match s.scope {
         Scope::Plugin => Some(PLUGIN_NOT_CHECKED.to_owned()),
         Scope::Managed => Some(ORGANISATION_NOT_CHECKED.to_owned()),
+        Scope::ClaudeAi => Some(CONNECTOR_NOT_CHECKED.to_owned()),
         _ => None,
     }
 }
@@ -8335,6 +8360,11 @@ fn short_name(s: &ServerRow) -> &str {
         .filter(|rest| !rest.is_empty())
         .unwrap_or(&s.name)
 }
+
+/// What the details say under a claude.ai connector (decision 011).
+const CONNECTOR_READ_ONLY: &str = "This is a connector of your claude.ai account, which Claude Code fetches from \
+     claude.ai each session. Klefki lists the ones Claude Code has connected before, so one you have since removed on \
+     claude.ai may still be here. Klefki switches it on and off; add, remove or change connectors on claude.ai.";
 
 /// What the details say under a plugin's server.
 fn managed_read_only(file: &str) -> String {
@@ -11804,6 +11834,38 @@ mod tests {
             managed: Some("/etc/claude-code/managed-settings.json".into()),
             ..live_row(name, Scope::Managed, None)
         }
+    }
+
+    #[test]
+    fn a_claude_ai_connector_is_read_only_says_where_it_comes_from_and_switches() {
+        let (mut h, engine) = live_harness();
+        let slack = ServerRow {
+            target: "claude.ai connector".into(),
+            ..live_row("claude.ai Slack", Scope::ClaudeAi, None)
+        };
+        engine.events.send(snapshot_of(vec![slack])).unwrap();
+        h.run();
+        h.get_by_label(PLUGIN_STATUS);
+        h.get_by_label("claude.ai Slack").click();
+        h.run();
+        h.get_by_label_contains("a connector of your claude.ai account");
+        assert!(
+            h.get_by_label(icon::PENCIL_SIMPLE)
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(h.get_by_label(icon::TRASH).accesskit_node().is_disabled());
+        drain(&engine);
+        h.get_by_label(icon::TOGGLE_LEFT).click();
+        h.run();
+        let sent = drain(&engine);
+        assert!(
+            matches!(sent.as_slice(), [Command::Prepare(changes)] if matches!(
+                changes.as_slice(),
+                [Change::SetEnabled { enabled: false, .. }]
+            )),
+            "{sent:?}"
+        );
     }
 
     #[test]

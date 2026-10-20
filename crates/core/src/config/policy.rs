@@ -236,6 +236,8 @@ struct FileRules {
     allowed: Option<Vec<Rule>>,
     /// `allowManagedMcpServersOnly: true`, which counts only in the organisation's files.
     only_organisation: bool,
+    /// `disableClaudeAiConnectors: true`, which counts in any file.
+    connectors_off: bool,
 }
 
 fn read_rules(path: &Path, source: Source, warnings: &mut Vec<String>) -> FileRules {
@@ -273,6 +275,7 @@ fn read_rules(path: &Path, source: Source, warnings: &mut Vec<String>) -> FileRu
         denied: list("deniedMcpServers", false).unwrap_or_default(),
         allowed: list("allowedMcpServers", true),
         only_organisation: doc.get("allowManagedMcpServersOnly") == Some(&Value::Bool(true)),
+        connectors_off: doc.get("disableClaudeAiConnectors") == Some(&Value::Bool(true)),
     }
 }
 
@@ -284,11 +287,16 @@ pub(crate) struct Rules {
     allowed: Option<Vec<Rule>>,
     /// The files with an allowed list that counts, and whose they are, for a message.
     allowed_files: Vec<(PathBuf, Source)>,
+    /// The first file that turns claude.ai connectors off (`disableClaudeAiConnectors`).
+    connectors_off: Option<(PathBuf, Source)>,
 }
 
 impl Rules {
     fn add(&mut self, file: &Path, source: Source, rules: &FileRules, allow_counts: bool) {
         self.denied.extend(rules.denied.iter().cloned());
+        if rules.connectors_off && self.connectors_off.is_none() {
+            self.connectors_off = Some((file.to_path_buf(), source));
+        }
         if let (true, Some(allowed)) = (allow_counts, &rules.allowed) {
             self.allowed
                 .get_or_insert_with(Vec::new)
@@ -383,6 +391,42 @@ impl Rules {
             let _ = write!(why, " (allowedMcpServers in {})", theirs.join(", "));
         }
         Some(why)
+    }
+}
+
+impl Rules {
+    /// Why Claude Code does not load the claude.ai connector `name`, or `None` when it may (decision 011). Klefki does
+    /// not know a connector's address, so only what does not need it is said: connectors turned off, a denied name,
+    /// and an allowed list with no address rules (a connector's name, with its space, cannot be allowed).
+    pub(crate) fn blocks_connector(&self, name: &str) -> Option<String> {
+        if let Some((file, source)) = &self.connectors_off {
+            let (who, next) = match source {
+                Source::User => ("Your settings turn", "Remove it to let them load."),
+                Source::Project => ("The project's settings turn", "Remove it to let them load."),
+                Source::ProjectLocal => (
+                    "The project's local settings turn",
+                    "Remove it to let them load.",
+                ),
+                Source::Organisation => (
+                    "Your organisation turns",
+                    "Your administrator can change this.",
+                ),
+            };
+            return Some(format!(
+                "{who} off connectors from claude.ai. {next} (disableClaudeAiConnectors in {})",
+                shown(file, *source)
+            ));
+        }
+        let unknown = serde_json::json!({"type": "claudeai-proxy"});
+        let has_address_rules = self
+            .allowed
+            .iter()
+            .flatten()
+            .any(|r| matches!(r.what, Match::Url(_)));
+        if has_address_rules && !self.denied.iter().any(|r| r.matches(name, &unknown)) {
+            return None;
+        }
+        self.blocks(name, &unknown, false)
     }
 }
 

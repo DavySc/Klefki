@@ -49,6 +49,8 @@ pub enum Outcome {
     Plugin,
     /// A server the organisation sets: Klefki does not check those (decision 009).
     Organisation,
+    /// A claude.ai connector: Klefki does not check those (decision 011).
+    ClaudeAi,
     /// Claude Code loads it nowhere, for this reason (decision 009): another server answers to its name.
     NotLoaded(String),
     /// Asked, but no answer came in time.
@@ -66,6 +68,7 @@ impl Outcome {
             | Outcome::ProjectServer
             | Outcome::Plugin
             | Outcome::Organisation
+            | Outcome::ClaudeAi
             | Outcome::NotLoaded(_) => false,
         }
     }
@@ -80,6 +83,7 @@ impl Outcome {
             | Outcome::ProjectServer
             | Outcome::Plugin
             | Outcome::Organisation
+            | Outcome::ClaudeAi
             | Outcome::NotLoaded(_) => false,
         }
     }
@@ -97,6 +101,8 @@ pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
         Some(Outcome::Plugin)
     } else if row.scope == Scope::Managed {
         Some(Outcome::Organisation)
+    } else if row.scope == Scope::ClaudeAi {
+        Some(Outcome::ClaudeAi)
     } else if !row.enabled {
         Some(Outcome::Off)
     } else if row.approval == Some(Approval::Rejected) {
@@ -253,6 +259,9 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if let Some(file) = &row.managed {
         notes.push(format!("set by your organisation in {file}"));
     }
+    if row.scope == Scope::ClaudeAi {
+        notes.push("a connector of your claude.ai account".to_owned());
+    }
     // Blocked everywhere is the state column's to say, with the reason above.
     if let Some(b) = row.blocked.as_ref().filter(|_| row.not_loaded.is_none()) {
         let mut note = format!(
@@ -381,6 +390,7 @@ fn scope_key(scope: Scope) -> &'static str {
         Scope::Project => "project",
         Scope::Plugin => "plugin",
         Scope::Managed => "organisation",
+        Scope::ClaudeAi => "claudeai",
     }
 }
 
@@ -538,6 +548,11 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
             "not checked: your organisation sets it; Claude Code's /mcp shows its status"
                 .to_owned(),
         ),
+        Outcome::ClaudeAi => (
+            NOT_CHECKED.to_owned(),
+            "not checked: a connector of your claude.ai account; Claude Code's /mcp shows its status"
+                .to_owned(),
+        ),
         Outcome::NotLoaded(why) => ("Not loaded".to_owned(), format!("not checked: {why}")),
         Outcome::ProjectServer => {
             let label = match row.status {
@@ -627,6 +642,7 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
             | Outcome::ProjectServer
             | Outcome::Plugin
             | Outcome::Organisation
+            | Outcome::ClaudeAi
             | Outcome::NotLoaded(_) => {
                 skipped += 1;
                 continue;
@@ -669,6 +685,7 @@ pub fn status_json(
                 Outcome::ProjectServer => Some("project_server"),
                 Outcome::Plugin => Some("plugin"),
                 Outcome::Organisation => Some("organisation"),
+                Outcome::ClaudeAi => Some("claudeai"),
                 Outcome::NotLoaded(_) => Some("not_loaded"),
                 Outcome::Checked(_) | Outcome::NoAnswer => None,
             };
@@ -690,6 +707,7 @@ pub fn status_json(
                 | Outcome::ProjectServer
                 | Outcome::Plugin
                 | Outcome::Organisation
+                | Outcome::ClaudeAi
                 | Outcome::NotLoaded(_) => (None, None, None),
             };
             o.insert("checked".into(), json!(outcome.was_checked()));
@@ -865,6 +883,23 @@ mod tests {
                 .contains("deniedMcpServers")
         );
         assert!(!row_json(user, 3).contains_key("blocked"));
+    }
+
+    #[test]
+    fn a_claude_ai_connector_says_where_it_comes_from_and_is_not_checked() {
+        let s = fixture_snapshot();
+        let user = s.servers.iter().find(|r| r.scope == Scope::User).unwrap();
+        let row = ServerRow {
+            name: "claude.ai Slack".into(),
+            scope: Scope::ClaudeAi,
+            target: "claude.ai connector".into(),
+            plugin: None,
+            ..user.clone()
+        };
+        assert_eq!(notes(&row, 2)[0], "a connector of your claude.ai account");
+        assert_eq!(row_json(&row, 2)["scope"], "claudeai");
+        assert!(matches!(skip(&row, true), Some(Outcome::ClaudeAi)));
+        assert_eq!(heading(&row, None), "claude.ai");
     }
 
     #[test]

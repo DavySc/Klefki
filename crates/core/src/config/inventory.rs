@@ -450,6 +450,42 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         }
     }
 
+    // claude.ai connectors (decision 011): Claude Code fetches them from claude.ai each session and keeps no list, only
+    // the names of those it has connected before, and of those waiting for a sign-in.
+    for name in connector_names(root, &hints) {
+        let (status, cached) = hints.status_of(&name);
+        let mut r = row(
+            &name,
+            &serde_json::json!({"type": "http"}),
+            Scope::ClaudeAi,
+            None,
+            true,
+            status,
+        );
+        r.transport = TransportKind::Http;
+        r.target = "claude.ai connector".to_owned();
+        r.status_cached = cached;
+        r.disabled_in = disabled_by_project
+            .values()
+            .filter(|d| d.contains(&name))
+            .count();
+        r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
+        let only_organisation = only.as_ref().filter(|_| !org.connectors_too);
+        if let Some(only) = only_organisation {
+            r.not_loaded = Some(format!(
+                "Your organisation's {only} decides which servers Claude Code loads, and leaves out connectors from \
+                 claude.ai. Your administrator can change this."
+            ));
+        } else {
+            let blocked: Vec<(usize, String)> = all_places
+                .iter()
+                .filter_map(|&p| Some((p, policy.places.get(p)?.blocks_connector(&name)?)))
+                .collect();
+            (r.not_loaded, r.blocked) = verdict(&all_places, &blocked, &shown_projects);
+        }
+        snap.servers.push(r);
+    }
+
     mark_casing_collisions(&mut snap.servers);
     snap
 }
@@ -643,6 +679,30 @@ fn blocked_at(
             Some((p, why))
         })
         .collect()
+}
+
+/// At most this many claude.ai connectors are listed.
+const MAX_CONNECTORS: usize = 200;
+
+/// The names of the claude.ai connectors Claude Code has connected before (`claudeAiMcpEverConnected` in
+/// `.claude.json`), then of those its needs-auth cache holds: only names it gives connectors (`claude.ai …`), once.
+fn connector_names(root: &serde_json::Map<String, Value>, hints: &Hints) -> Vec<String> {
+    let ever = root
+        .get("claudeAiMcpEverConnected")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    let mut names: Vec<String> = Vec::new();
+    for name in ever.chain(hints.needs_auth.keys().map(String::as_str)) {
+        if name.starts_with("claude.ai ") && !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+        if names.len() == MAX_CONNECTORS {
+            break;
+        }
+    }
+    names
 }
 
 /// Where policy holds a local or project server back: its own project.
@@ -1376,7 +1436,9 @@ impl<'de> Visitor<'de> for Level {
         let mut out = serde_json::Map::new();
         while let Some(key) = map.next_key::<String>()? {
             let kept = match (self, key.as_str()) {
-                (Level::Root, "mcpServers") => Some(map.next_value::<Value>()?),
+                (Level::Root, "mcpServers" | "claudeAiMcpEverConnected") => {
+                    Some(map.next_value::<Value>()?)
+                }
                 (Level::Root, "projects") => Some(map.next_value_seed(Level::Projects)?),
                 (Level::Projects, _) => Some(map.next_value_seed(Level::Entry)?),
                 (Level::Entry, k) if ENTRY_KEYS.contains(&k) => Some(map.next_value::<Value>()?),
@@ -3365,6 +3427,155 @@ mod tests {
         // Claude Code loads the organisation's "mine", not the user's, so nothing has the plugin's command.
         let p = find(&s, Scope::Plugin, "plugin:p1:s");
         assert!(!p.shadowed && plugin_info(p).same_as.is_none(), "{p:#?}");
+    }
+
+    // ------------------------------------------------------------ claude.ai connectors (decision 011)
+
+    #[test]
+    fn connectors_claude_code_connected_before_are_listed_read_only_and_switched_per_project() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Slack", "claude.ai Drive", "not a connector", 7],
+                "projects": {
+                    a.to_string_lossy(): {"disabledMcpServers": ["claude.ai Slack"]},
+                    b.to_string_lossy(): {}
+                }
+            }),
+        );
+        // One that needs signing in now is listed too, with that status.
+        e.write(
+            "mcp-needs-auth-cache.json",
+            &json!({"claude.ai Linear": {"timestamp": now_ms()}}),
+        );
+        let s = e.load();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let slack = find(&s, Scope::ClaudeAi, "claude.ai Slack");
+        assert_eq!((slack.enabled, slack.disabled_in), (true, 1));
+        assert!(
+            slack.project.is_none() && slack.not_loaded.is_none(),
+            "{slack:#?}"
+        );
+        assert_eq!(slack.target, "claude.ai connector");
+        assert_eq!(slack.status, Status::Unknown);
+        find(&s, Scope::ClaudeAi, "claude.ai Drive");
+        assert_eq!(
+            find(&s, Scope::ClaudeAi, "claude.ai Linear").status,
+            Status::NeedsAuth
+        );
+        // Only names Claude Code gives connectors.
+        assert!(!s.servers.iter().any(|r| r.name == "not a connector"));
+        // No file of the user's holds it: nothing to change but the switch.
+        let inv = load(&e.paths());
+        assert!(!inv.keys.contains_key(&slack.connection));
+        assert!(Scope::ClaudeAi.is_read_only() && Scope::ClaudeAi.is_everywhere());
+    }
+
+    #[test]
+    fn connectors_turned_off_in_settings_are_not_loaded_and_say_where() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Slack"],
+                "projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}
+            }),
+        );
+        e.write(
+            "projects/a/.claude/settings.json",
+            &json!({"disableClaudeAiConnectors": true}),
+        );
+        let s = e.load();
+        let slack = find(&s, Scope::ClaudeAi, "claude.ai Slack");
+        assert!(slack.not_loaded.is_none(), "{slack:#?}");
+        let blocked = slack
+            .blocked
+            .as_ref()
+            .unwrap_or_else(|| panic!("{slack:#?}"));
+        assert_eq!(blocked.projects.len(), 1);
+        assert!(
+            blocked.why.contains("disableClaudeAiConnectors"),
+            "{}",
+            blocked.why
+        );
+
+        // In the user's own settings: everywhere.
+        e.write("settings.json", &json!({"disableClaudeAiConnectors": true}));
+        let s = e.load();
+        let why = blocked_why(find(&s, Scope::ClaudeAi, "claude.ai Slack"));
+        assert!(
+            why.starts_with("Your settings turn off connectors from claude.ai"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn with_managed_mcp_json_connectors_load_only_when_the_organisation_allows_them() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"claudeAiMcpEverConnected": ["claude.ai Slack"]}),
+        );
+        e.write("org/managed-mcp.json", &json!({"mcpServers": {}}));
+        let s = e.load();
+        assert!(
+            blocked_why(find(&s, Scope::ClaudeAi, "claude.ai Slack")).contains("managed-mcp.json")
+        );
+
+        e.write(
+            "org/managed-settings.json",
+            &json!({"allowAllClaudeAiMcps": true}),
+        );
+        let s = e.load();
+        let slack = find(&s, Scope::ClaudeAi, "claude.ai Slack");
+        assert!(slack.not_loaded.is_none(), "{slack:#?}");
+    }
+
+    #[test]
+    fn a_connector_is_denied_by_its_name_and_an_allowed_list_without_addresses_holds_it_back() {
+        let e = Env::new();
+        e.write(
+            ".claude.json",
+            &json!({"claudeAiMcpEverConnected": ["claude.ai Slack", "claude.ai Drive"]}),
+        );
+        e.write(
+            "settings.json",
+            &json!({"deniedMcpServers": [{"serverName": "claude.ai Slack"}]}),
+        );
+        let s = e.load();
+        assert!(
+            blocked_why(find(&s, Scope::ClaudeAi, "claude.ai Slack"))
+                .contains("the name claude.ai Slack")
+        );
+        assert!(
+            find(&s, Scope::ClaudeAi, "claude.ai Drive")
+                .not_loaded
+                .is_none()
+        );
+
+        // An allowed list with no address rules: a connector's name cannot be allowed, so nothing lets it load.
+        e.write(
+            "settings.json",
+            &json!({"allowedMcpServers": [{"serverName": "other"}]}),
+        );
+        let s = e.load();
+        assert!(
+            blocked_why(find(&s, Scope::ClaudeAi, "claude.ai Drive")).contains("not on the list")
+        );
+        // With address rules, its address decides, which Klefki cannot see: not said to be blocked.
+        e.write(
+            "settings.json",
+            &json!({"allowedMcpServers": [{"serverUrl": "https://mcp.example.com/*"}]}),
+        );
+        let s = e.load();
+        let drive = find(&s, Scope::ClaudeAi, "claude.ai Drive");
+        assert!(
+            drive.not_loaded.is_none() && drive.blocked.is_none(),
+            "{drive:#?}"
+        );
     }
 
     // ------------------------------------------------------------ policy (decision 010)

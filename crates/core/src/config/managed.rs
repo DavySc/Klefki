@@ -57,6 +57,8 @@ pub(crate) struct Managed {
     pub servers: Vec<ManagedServer>,
     /// `managed-mcp.json`, when it exists: then Claude Code loads only `servers`.
     pub only: Option<PathBuf>,
+    /// `allowAllClaudeAiMcps: true` in a settings file: claude.ai connectors load even with `managed-mcp.json`.
+    pub connectors_too: bool,
 }
 
 /// Reads what the organisation sets, if `paths` names its folder. Problems are added to `warnings`, a file at a time.
@@ -68,16 +70,19 @@ pub(crate) fn load(paths: &ConfigPaths, warnings: &mut Vec<String>) -> Managed {
     for file in settings_files(dir, warnings) {
         match read(&file) {
             Ok(None) => {}
-            Ok(Some(doc)) => match doc.get("managedMcpServers") {
-                Some(Value::Object(servers)) => {
-                    warnings.extend(add(&mut out.servers, servers, &file, by_address));
+            Ok(Some(doc)) => {
+                out.connectors_too |= doc.get("allowAllClaudeAiMcps") == Some(&Value::Bool(true));
+                match doc.get("managedMcpServers") {
+                    Some(Value::Object(servers)) => {
+                        warnings.extend(add(&mut out.servers, servers, &file, by_address));
+                    }
+                    None => {}
+                    Some(_) => warnings.push(format!(
+                        "Ignored \"managedMcpServers\" in {}: it is not an object keyed by server name.",
+                        show(&file)
+                    )),
                 }
-                None => {}
-                Some(_) => warnings.push(format!(
-                    "Ignored \"managedMcpServers\" in {}: it is not an object keyed by server name.",
-                    show(&file)
-                )),
-            },
+            }
             Err(e) => warnings.push(format!("Could not read {}: {e}", show(&file))),
         }
     }

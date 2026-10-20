@@ -124,6 +124,7 @@ fn scope_of(word: &str) -> Scope {
         "local" => Scope::Local,
         "plugin" => Scope::Plugin,
         "managed" => Scope::Managed,
+        "claudeai" => Scope::ClaudeAi,
         _ => Scope::Project,
     }
 }

@@ -41,6 +41,9 @@ pub enum Scope {
     Project,
     /// A server a Claude Code plugin brings. Read-only: it is changed in the plugin.
     Plugin,
+    /// A connector of the user's claude.ai account, which Claude Code fetches each session (decision 011). Read-only:
+    /// it is changed on claude.ai. Klefki knows the ones Claude Code has connected before, by name.
+    ClaudeAi,
 }
 
 impl Scope {
@@ -50,18 +53,22 @@ impl Scope {
             Self::Local => "Local",
             Self::Project => "Project",
             Self::Plugin => "Plugin",
+            Self::ClaudeAi => "claude.ai",
             Self::Managed => "Organisation",
         }
     }
 
     /// A server Klefki only switches on and off: no file of the user's holds it.
     pub fn is_read_only(self) -> bool {
-        matches!(self, Self::Plugin | Self::Managed)
+        matches!(self, Self::Plugin | Self::Managed | Self::ClaudeAi)
     }
 
     /// One row for every project, switched per project (`disabledMcpServers`).
     pub fn is_everywhere(self) -> bool {
-        matches!(self, Self::User | Self::Plugin | Self::Managed)
+        matches!(
+            self,
+            Self::User | Self::Plugin | Self::Managed | Self::ClaudeAi
+        )
     }
 }
 
