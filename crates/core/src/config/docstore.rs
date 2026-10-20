@@ -98,11 +98,13 @@ pub(crate) enum Op {
     },
     /// Copy server `name` from `from` (same places as [`Op::RemoveServer`]) to `to` as `new_name`. The definition is
     /// taken from the file as it is when the change is made, secrets included, so they never leave this module.
+    /// `base` gives the copy's addresses another start (see [`crate::adjust::Adjust::base`]).
     CopyServer {
         from: Option<String>,
         name: String,
         to: Option<String>,
         new_name: String,
+        base: Option<crate::adjust::Rebase>,
     },
 }
 
@@ -2027,6 +2029,7 @@ fn expand_copies<'a>(
             name,
             to,
             new_name,
+            base,
         } = op
         else {
             out.push(op.clone());
@@ -2068,6 +2071,15 @@ fn expand_copies<'a>(
         if definition.get("oauth").is_some() && purpose != Purpose::Preview {
             return Err(invalid(oauth_refusal(name)));
         }
+        let definition = match base {
+            None => definition,
+            Some(base) => crate::adjust::Adjust {
+                base: Some(base.clone()),
+                ..Default::default()
+            }
+            .apply(&definition, name)
+            .map_err(invalid)?,
+        };
         out.push(Op::AddServer {
             project: to.clone(),
             name: new_name.clone(),
@@ -4929,6 +4941,7 @@ mod tests {
             name: name.to_owned(),
             to: to.map(str::to_owned),
             new_name: new_name.to_owned(),
+            base: None,
         }
     }
 

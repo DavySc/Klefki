@@ -1,4 +1,5 @@
 //! Turns what the user asked for into document edits. Needs the current inventory to know which projects exist.
+use crate::adjust::Adjust;
 use crate::api::{
     Approval, Change, Review, Scope, ServerId, ServerRow, Snapshot, Target, TransportKind,
 };
@@ -149,8 +150,13 @@ pub(crate) fn resolve(
             Change::Delete { id } => delete(id, snapshot, keys, &mut out)?,
             Change::Replace { id, json } => replace(id, json, snapshot, keys, &mut out)?,
             Change::Rename { id, name } => rename(id, name, snapshot, keys, &mut out)?,
-            Change::Duplicate { id, name, targets } => {
-                duplicate(id, name, targets, snapshot, keys, &mut out)?;
+            Change::Duplicate {
+                id,
+                name,
+                targets,
+                adjust,
+            } => {
+                duplicate(id, name, targets, adjust, snapshot, keys, &mut out)?;
             }
             Change::MigrateLegacyDisabled { project } => {
                 migrate_legacy(project, snapshot, &mut out)?;
@@ -246,6 +252,7 @@ fn relative_in_user_servers(out: &Resolved, snapshot: &Snapshot) -> Vec<String> 
                 name,
                 to: None,
                 new_name,
+                ..
             } => found.push((new_name, found_in(from, name))),
             _ => {}
         }
@@ -303,7 +310,9 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
                 ),
             };
         }
-        Change::Duplicate { id, name, targets } => {
+        Change::Duplicate {
+            id, name, targets, ..
+        } => {
             return format!(
                 "Duplicate {} as {}{}",
                 shown(id).2,
@@ -691,6 +700,7 @@ fn replace(
         remove: true,
         to: here,
         edited: Some(value),
+        adjust: Default::default(),
     });
     Ok(())
 }
@@ -756,6 +766,7 @@ fn move_server(
         name: file.name.clone(),
         to: to.clone(),
         new_name: file.name.clone(),
+        base: None,
     };
     let remove = Op::RemoveServer {
         project: file.project.clone(),
@@ -775,6 +786,7 @@ fn move_server(
                 name: file.name.clone(),
             },
             edited: None,
+            adjust: Default::default(),
         });
     }
     Ok(())
@@ -914,6 +926,7 @@ fn duplicate(
     id: &ServerId,
     name: &str,
     targets: &[Target],
+    adjust: &Adjust,
     snapshot: &Snapshot,
     keys: &FileKeys,
     out: &mut Resolved,
@@ -939,15 +952,17 @@ fn duplicate(
     if targets.is_empty() {
         return Err("Choose where the copy goes.".to_owned());
     }
+    adjust_problem(adjust, row)
+        .map_err(|why| format!("{shown} cannot be copied that way: {why}."))?;
     for to in new_places(name, targets, "this copy", None, snapshot, keys, out)? {
-        let op = Op::CopyServer {
-            from: from.clone(),
-            name: file.name.clone(),
-            to: to.clone(),
-            new_name: name.to_owned(),
-        };
         if row.oauth.is_none() {
-            out.claude.push(op);
+            out.claude.push(Op::CopyServer {
+                from: from.clone(),
+                name: file.name.clone(),
+                to,
+                new_name: name.to_owned(),
+                base: adjust.base.clone(),
+            });
             continue;
         }
         out.swaps.push(Swap {
@@ -961,13 +976,44 @@ fn duplicate(
                 name: name.to_owned(),
             },
             edited: None,
+            adjust: adjust.clone(),
         });
     }
     out.notes.push(
-        "The copy keeps the original's environment and header values; it does not share a sign-in."
-            .to_owned(),
+        if adjust.client.is_some() {
+            "The copy keeps the original's environment and header values; it signs in as the client given here, and does not share a sign-in."
+        } else {
+            "The copy keeps the original's environment and header values; it does not share a sign-in."
+        }
+        .to_owned(),
     );
     Ok(())
+}
+
+/// Why `adjust` does not fit the server in `row`, said before anything is read; the definition it makes is checked
+/// in full once the original's is read.
+fn adjust_problem(adjust: &Adjust, row: &ServerRow) -> Result<(), String> {
+    if let Some(base) = &adjust.base {
+        if !matches!(
+            row.transport,
+            TransportKind::Http | TransportKind::Sse | TransportKind::Ws
+        ) {
+            return Err("it has no address".to_owned());
+        }
+        let to = base.to.as_str();
+        if to.is_empty() || to.trim() != to || !to.contains("://") {
+            return Err(
+                "the new address must start with https:// and have no spaces around it".to_owned(),
+            );
+        }
+    }
+    if adjust.touches_sign_in() && row.oauth.is_none() {
+        return Err("it does not sign in with OAuth".to_owned());
+    }
+    match adjust.client_problem() {
+        Some(why) => Err(why.to_owned()),
+        None => Ok(()),
+    }
 }
 
 /// Where a new server called `name` goes, as the file spells each project: refused when a target is unknown or
@@ -1600,6 +1646,7 @@ mod tests {
                 id: id.clone(),
                 name: "copy".into(),
                 targets: vec![Target::User],
+                adjust: Default::default(),
             },
             Change::Move {
                 id: id.clone(),
@@ -1685,6 +1732,7 @@ mod tests {
                 id: id.clone(),
                 name: "copy".into(),
                 targets: vec![Target::User],
+                adjust: Default::default(),
             },
             Change::Move {
                 id: id.clone(),

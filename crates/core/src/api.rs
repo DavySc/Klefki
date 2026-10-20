@@ -2,6 +2,7 @@
 use std::sync::Arc;
 
 pub use crate::activity::{Activity, ActivityEntry, Backup};
+pub use crate::adjust::{Adjust, Client, CopyFields, Rebase, shared_base};
 pub use crate::config::ConfigPaths;
 pub use crate::config::definition::Definition;
 pub use crate::desktop::{Desktop, DesktopServer};
