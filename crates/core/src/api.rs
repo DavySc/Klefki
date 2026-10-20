@@ -7,7 +7,7 @@ pub use crate::config::definition::Definition;
 pub use crate::desktop::{Desktop, DesktopServer};
 pub use crate::engine::{
     Change, Command, Core, Detached, Diagnosis, Event, FileDiff, Focus, Hint, PlanView, Review,
-    SignInFailure, SignInStep,
+    SignInFailure, SignInStep, UpdateDownload,
 };
 pub use crate::export::{Exported, Variable};
 pub use crate::export_file::{
@@ -352,6 +352,9 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
     let config = crate::engine::EngineConfig {
         releases,
         release_key: crate::update::RELEASE_KEY.map(str::to_owned),
+        install: crate::install::this_install(),
+        updates_dir: directories::ProjectDirs::from("dev", "klefki", "klefki")
+            .map(|d| d.data_local_dir().join("updates")),
         ..real_config(None)
     };
     crate::engine::start_with(config, wake)
@@ -394,6 +397,10 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         // Only the app looks for updates ([`start`]): the command-line tool then carries no TLS code at all.
         releases: std::sync::Arc::new(crate::update::Offline),
         release_key: None,
+        install: crate::install::InstallKind::Manual(
+            "The command-line tool does not update Klefki.".into(),
+        ),
+        updates_dir: None,
     }
 }
 
@@ -450,11 +457,6 @@ fn open_https(link: &str) -> std::io::Result<()> {
 fn default_backup_dir() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("dev", "klefki", "klefki")
         .map(|d| d.data_local_dir().join("backups"))
-}
-
-/// Whether this build checks for updates: only one with the release key built in (decision 009).
-pub fn checks_for_updates() -> bool {
-    crate::update::RELEASE_KEY.is_some()
 }
 
 /// Reads the real Claude Code configuration (read-only), once, without live checks.
