@@ -17,6 +17,7 @@ pub use crate::export_file::{
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
+pub use crate::ops::profile_alone_in;
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
@@ -321,6 +322,9 @@ pub struct Snapshot {
     pub legacy_disabled: Vec<LegacyDisabled>,
     /// Definitions Klefki kept because a change removed a server and could not add it back. Oldest first.
     pub kept: Vec<Kept>,
+    /// The names of Klefki's profiles (decision 012), in their order, for the command palette. Empty when the profiles
+    /// file cannot be read.
+    pub profiles: Vec<String>,
     /// The organisation's `managed-mcp.json`, as shown, when it exists: then Claude Code loads only the
     /// organisation's servers (decision 009).
     pub organisation_only: Option<String>,

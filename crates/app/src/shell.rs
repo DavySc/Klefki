@@ -365,6 +365,8 @@ pub struct ShellApp {
     pub profiles: Option<crate::profiles::ProfilesPage>,
     /// A profile being made or edited when the Profiles page was left, to carry on with when it is opened again.
     profile_draft: Option<crate::profiles::Draft>,
+    /// The profiles' names as last read, for the palette to offer each: with each snapshot, and after a save or delete.
+    profile_names: Vec<String>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -439,6 +441,7 @@ impl ShellApp {
             secrets: None,
             profiles: None,
             profile_draft: None,
+            profile_names: Vec::new(),
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -605,6 +608,11 @@ impl ShellApp {
                 }
             }
             Event::Profiles(profiles) => {
+                let names: Vec<String> = profiles.profiles.iter().map(|p| p.name.clone()).collect();
+                if names != self.profile_names {
+                    self.profile_names = names;
+                    self.command.invalidate();
+                }
                 if let Some(page) = &mut self.profiles {
                     page.set(profiles);
                 }
@@ -675,6 +683,10 @@ impl ShellApp {
                 }
                 self.grid_cache = None;
                 self.command.invalidate();
+                if let Some(page) = &mut self.profiles {
+                    page.snapshot_changed();
+                }
+                self.profile_names.clone_from(&snapshot.profiles);
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
@@ -2188,6 +2200,31 @@ impl ShellApp {
             None,
             command::Action::Desktop,
         );
+        add(
+            icon::STACK,
+            "Profiles".into(),
+            "Named sets of servers to turn on together in a project".into(),
+            None,
+            command::Action::Profiles,
+        );
+        if live {
+            for name in &self.profile_names {
+                add(
+                    icon::STACK,
+                    format!("Use profile {name}…"),
+                    "Choose a project, then review".into(),
+                    None,
+                    command::Action::UseProfile(name.clone()),
+                );
+            }
+            add(
+                icon::PLUS,
+                "New profile".into(),
+                "Pick servers that belong together and give them a name".into(),
+                None,
+                command::Action::NewProfile,
+            );
+        }
         // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
         if live {
             add(
@@ -2259,6 +2296,16 @@ impl ShellApp {
             A::Settings => self.go(Page::Settings),
             A::ActivityLog => self.go(Page::ActivityLog),
             A::Desktop => self.go(Page::Desktop),
+            A::Profiles => self.go(Page::Profiles),
+            A::NewProfile | A::UseProfile(_) => {
+                self.go(Page::Profiles);
+                if let Some(page) = &mut self.profiles {
+                    match action {
+                        A::UseProfile(name) => page.reveal(name),
+                        _ => page.start_new(),
+                    }
+                }
+            }
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),
@@ -19103,6 +19150,99 @@ mod tests {
             .unwrap();
         h.run();
         while engine.commands.try_recv().is_ok() {}
+    }
+
+    /// The profiles harness, with beta off in notes: there Work's alpha is the only server on.
+    fn snapshot_with_beta_off_in_notes(off: bool) -> klefki_core::api::Event {
+        let a = live_row("alpha", Scope::User, None);
+        let mut b = live_row("beta", Scope::User, None);
+        if off {
+            b.disabled_projects = vec!["/home/notes".to_owned()];
+            b.disabled_in = 1;
+        }
+        let l = live_row("lint", Scope::Local, Some("/work/app"));
+        let la = live_row("alpha", Scope::Local, Some("/work/app"));
+        klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+            servers: vec![a, b, l, la],
+            projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+            project_count: 2,
+            ..Snapshot::default()
+        }))
+    }
+
+    #[test]
+    fn a_profile_says_where_only_its_servers_are_on_and_follows_the_files() {
+        let (mut h, engine) = profiles_harness();
+        engine
+            .events
+            .send(snapshot_with_beta_off_in_notes(true))
+            .unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label("Only its servers are on in notes.");
+        // Beta on again: worked out anew from the files, nothing remembered.
+        engine
+            .events
+            .send(snapshot_with_beta_off_in_notes(false))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label_contains("Only its servers are on")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_palette_opens_profiles_starts_one_and_uses_one() {
+        let (mut h, engine) = profiles_harness();
+        // Each snapshot names the profiles, so opening the palette reads nothing.
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                profiles: vec!["Work".to_owned()],
+                ..(*h.state().snapshot).clone()
+            })))
+            .unwrap();
+        h.run();
+        sent(&engine);
+        ctrl_k(&mut h);
+        assert_eq!(sent(&engine), []);
+        type_into_palette(&mut h, "use work");
+        h.get_by_label_contains("Use profile Work…");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().page, Page::Profiles);
+        assert_eq!(sent(&engine), [Command::Profiles]);
+        engine
+            .events
+            .send(klefki_core::api::Event::Profiles(work_profile()))
+            .unwrap();
+        h.run();
+        h.run();
+        // Where to use it has the keyboard: Space opens the list of projects.
+        h.key_press(egui::Key::Space);
+        h.run();
+        h.get_by_label("Every project");
+
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "new profile");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.get_by_label("Name");
+        h.get_by_label("Save profile");
+    }
+
+    #[test]
+    fn the_palette_goes_to_profiles_from_anywhere_and_offers_no_change_on_sample_data() {
+        let mut h = harness();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "profiles");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().page, Page::Profiles);
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "new profile");
+        assert!(h.query_by_label_contains("New profile").is_none());
     }
 
     #[test]
