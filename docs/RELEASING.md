@@ -21,7 +21,7 @@ Klefki uses only signing that costs nothing (owner's decision, 2026-10-20). What
 | System | Signing | What users see |
 |---|---|---|
 | Windows | None yet. Planned: Authenticode through [SignPath Foundation](https://signpath.org/), free for open-source projects. | Unsigned: SmartScreen warns ("Windows protected your PC", then *More info*, *Run anyway*), and Smart App Control, where it is on, blocks the app. Signed: the publisher shows as SignPath Foundation, Smart App Control allows it, and the SmartScreen warning fades as the certificate gains reputation. |
-| macOS | Ad-hoc signature, made in the workflow (no Apple account). | Gatekeeper says it cannot verify Klefki. Users allow it once per install in System Settings, Privacy & Security, *Open Anyway* (the release notes say how). Removing that step needs Developer ID signing and notarisation, which need the paid Apple Developer Program, so it is not planned. |
+| macOS | Ad-hoc signature, made in the workflow (no Apple account). | Gatekeeper says it cannot verify Klefki. Users allow it once per download in System Settings, Privacy & Security, *Open Anyway* (the release notes say how), so again for every version downloaded by hand: the approval belongs to that download. An update that Klefki downloads itself (slice 6) carries no download mark, so it is not asked about. Removing that step needs Developer ID signing and notarisation, which need the paid Apple Developer Program, so it is not planned. |
 | Linux | None needed: Linux does not check publishers. | Nothing. |
 | All | `SHA256SUMS` signed with minisign, and a build provenance attestation for every file. | Anyone can check a download (release notes, *Check a download*). |
 

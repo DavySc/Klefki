@@ -30,6 +30,11 @@ unidentified app (allowed once in System Settings) rather than a damaged one.
 
 ## Not verified / open
 - Gatekeeper's message for the ad-hoc signed download needs a person on a Mac.
+- Cross-review (review 5580940735 on 38fd889, approved with three UX items): Smart App Control note moved above the
+  Windows table (it blocks the installers too) with a way forward (follow releases, or the user's own choice to turn
+  it off); macOS notes say a version downloaded by hand asks again. Not verifiable here: whether `klefki-cli`, run
+  from Terminal through the symlink, is blocked on its first run. Try it on the first release; if it is, add one line
+  saying to allow it in Privacy & Security (no `xattr` workaround).
 
 ## Next
 Trial run, cross-review, merge. Then: first release (unsigned), then the owner applies to SignPath Foundation.
