@@ -36,8 +36,12 @@ pub struct ProfilesPage {
     /// The projects (as shown) where each profile's servers are the only ones on, by name. Worked out once for the
     /// profiles and the snapshot shown, not every frame.
     alone: Option<HashMap<String, Vec<String>>>,
-    /// The profile whose "Use in" takes the keyboard on the next frame, asked for from the palette.
+    /// The profile whose "Use in" takes the keyboard when the cards are next drawn, asked for from the palette.
+    /// Dropped once they are drawn, so focus never moves later on its own.
     reveal: Option<String>,
+    /// New profile was asked for from the palette: the editor opens once the profiles are read, if they can be
+    /// changed.
+    new_asked: bool,
 }
 
 /// A profile being made or edited.
@@ -117,23 +121,23 @@ impl ProfilesPage {
         self.alone = None;
     }
 
-    /// Starts a new profile, unless one is being made or edited: that is not thrown away.
+    /// Starts a new profile once the profiles are read, unless one is being made or edited: that is not thrown away.
+    /// Not while the file cannot be read in full, as the page's own New profile.
     pub fn start_new(&mut self) {
         if self.editing.is_none() {
-            self.editing = Some(Draft {
-                replaces: None,
-                name: String::new(),
-                members: Vec::new(),
-                focus: true,
-                problem: None,
-            });
-            self.refused = None;
+            self.new_asked = true;
         }
     }
 
     /// Brings the profile `name` into view, with where to use it taking the keyboard. A filter that would hide it is
-    /// cleared.
+    /// cleared. Not while a profile is being made or edited, which fills the page: that is said instead.
     pub fn reveal(&mut self, name: String) {
+        if self.editing.is_some() {
+            self.refused = Some(format!(
+                "Finish or cancel the profile you are editing first, then use {name}."
+            ));
+            return;
+        }
         self.filter.clear();
         self.reveal = Some(name);
     }
@@ -169,12 +173,34 @@ impl ProfilesPage {
                 };
                 // Said once, up front: Klefki changes nothing in a file it could not read in full.
                 let editable = profiles.problem.is_none();
+                if std::mem::take(&mut self.new_asked) {
+                    if editable {
+                        self.editing = Some(Draft {
+                            replaces: None,
+                            name: String::new(),
+                            members: Vec::new(),
+                            focus: true,
+                            problem: None,
+                        });
+                        self.refused = None;
+                    } else {
+                        self.refused = Some(
+                            "No profile can be made until the profiles file can be read in full (see above)."
+                                .to_owned(),
+                        );
+                    }
+                }
                 if let Some(problem) = &profiles.problem {
+                    // "Still usable" only when something could be read to use.
+                    let usable = if profiles.profiles.is_empty() {
+                        ""
+                    } else {
+                        "; those read can still be used"
+                    };
                     warn(
                         ui,
                         &format!(
-                            "{problem} No profile can be made, changed or deleted until the file is fixed; they \
-                             can still be used."
+                            "{problem} No profile can be made, changed or deleted until the file is fixed{usable}."
                         ),
                     );
                     ui.add_space(8.0);
@@ -290,6 +316,8 @@ impl ProfilesPage {
                     }
                     ui.add_space(8.0);
                 }
+                // Asked for a profile that is not there (any more): not waited for.
+                self.reveal = None;
             });
         if asked.is_some() {
             self.refused = None;
@@ -362,11 +390,18 @@ fn card(
                 });
             });
             ui.add(egui::Label::new(summary(profile, snapshot)).wrap());
+            // Where the eye already is, under its servers: true of the files now, so it is not muted.
             if !cx.alone.is_empty() {
-                muted(
-                    ui,
-                    &format!("Only its servers are on in {}.", named_few(cx.alone)),
-                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(icon::CHECK_CIRCLE).color(pal.success));
+                    ui.add(
+                        egui::Label::new(format!(
+                            "Only these servers are on in {}.",
+                            named_few(cx.alone)
+                        ))
+                        .wrap(),
+                    );
+                });
             }
             let gone = gone(profile, snapshot);
             if !gone.is_empty() {

@@ -36,8 +36,9 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   profiles hold it, and once it is applied they hold it under its new name or place.
 - Using a profile records nothing as "active": Klefki shows what is on from the files, so nothing can disagree with
   them. A profile's card names the projects where it is on alone: of the servers Claude Code switches there, its
-  members are on and every other one is off, so using it there with "Only these servers there" would change nothing.
-  It is worked out again for each new snapshot.
+  members are on and every other one is off, so using it there with "Only these servers there" would change nothing,
+  and each member there loads (none held back by policy, another server of its name, its plugin, as a duplicate, or as
+  a project server not approved there). It is worked out again for each new snapshot.
 - The command palette offers the Profiles page, New profile, and "Use profile NAME…" for each profile, which opens the
   page with where to use it taking the keyboard. Each snapshot names the profiles, read with it like the list of
   kept definitions, so opening the palette reads nothing; a save or delete updates the names at once.
