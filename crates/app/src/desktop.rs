@@ -310,7 +310,7 @@ fn row(ui: &mut Ui, server: &DesktopServer, in_code: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::shell::{Page, ShellApp};
     use crate::theme::ThemeChoice;
     use egui_kittest::Harness;
@@ -359,7 +359,8 @@ mod tests {
         }
     }
 
-    fn sample() -> Desktop {
+    /// Also drawn by the look tests (`shell/look.rs`).
+    pub(crate) fn sample() -> Desktop {
         let mut files = server(
             "filesystem",
             "npx -y @modelcontextprotocol/server-filesystem C:/Users/me",

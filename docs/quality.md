@@ -16,6 +16,13 @@ must leave every test, golden file and baseline as it was.
   - `crates/cli/tests/golden/`: every `klefki-cli` command's stdout, stderr and exit code.
   - A difference fails with a diff. When a change is meant, run the tests with `UPDATE_EXPECT=1` and review the
     golden files in the pull request. **In a refactor, a golden file that changes means behaviour changed: stop.**
+- Look tests (`crates/app/src/shell/look.rs`, Linux only): every page, dialog, detail tab, the four themes and a
+  small window, drawn with wgpu on Mesa's OpenGL software renderer and compared pixel for pixel (threshold 0) with
+  the pictures in `crates/app/src/shell/look/`. A one-step colour change or a 1 px spacing change fails them. A
+  failure leaves `<name>.new.png` and `<name>.diff.png` beside the picture; CI uploads them as `look-changes`. When a
+  change to the look is meant, run `UPDATE_SNAPSHOTS=1 cargo test -p klefki look` and show the pictures in the pull
+  request. **In a refactor, a picture that changes means the look changed: stop.** Linux only because each system's
+  graphics stack draws edges a little differently; the pictures were made on Ubuntu 24.04's Mesa, as CI uses.
 
 ## By hand or weekly (the `quality` workflow, Linux only)
 macOS minutes cost ten times as much, so heavy checks run on Linux, weekly on main, or from Actions > quality > Run
@@ -41,7 +48,7 @@ workflow on a branch.
 1. One area per branch; behaviour unchanged.
 2. Before: for the files the slice changes, read coverage and run mutants on them. Missed mutants in code the
    slice moves or rewrites get a test first, in its own commit, seen failing against a mutant.
-3. After: the full verify (CLAUDE.md), no golden file changed, no new missed mutants, and, for anything on the start-up path (engine start, configuration
+3. After: the full verify (CLAUDE.md), no golden file or look picture changed, no new missed mutants, and, for anything on the start-up path (engine start, configuration
    loading, the app's first frame), `scripts/perf-baseline.py` on main and on the branch, both in the pull request.
    For mutants: a slice that changes code runs the `quality` workflow with `mutants: diff`. A slice that only moves
    code (A1, A2) would mutate every moved line, hours beyond the job's limit: instead compare the missed mutants of

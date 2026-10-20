@@ -23,6 +23,14 @@ winresource = { version = "0.1.34", default-features = false }
 [dev-dependencies]
 egui_kittest = { version = "=0.36.1", features = ["eframe"] }
 
+# The look tests (`src/shell/look.rs`) draw each screen with wgpu and compare it with a saved picture. Linux only:
+# each system's graphics stack draws edges a little differently, and one set of pictures is enough to keep the look.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+egui_kittest = { version = "=0.36.1", features = ["eframe", "snapshot", "wgpu"] }
+# Only to pin the look tests to OpenGL (llvmpipe in CI), whatever other drivers a machine has; the version
+# egui_kittest uses.
+egui-wgpu = "=0.36.2"
+
 # Installers and bundles, built by `.github/workflows/release.yml` with cargo-packager (see docs/RELEASING.md).
 # The release workflow builds both binaries first; packaging only collects them. The NSIS installer installs
 # for the current user (its default), so it needs no administrator prompt.

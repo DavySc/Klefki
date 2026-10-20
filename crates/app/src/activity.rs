@@ -285,7 +285,7 @@ fn backup_line(ui: &mut Ui, backup: &Backup, copied: Option<&str>, change: bool)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::shell::{Page, ShellApp};
     use crate::theme::ThemeChoice;
     use egui_kittest::Harness;
@@ -329,7 +329,8 @@ mod tests {
         }
     }
 
-    fn sample() -> Activity {
+    /// Also drawn by the look tests (`shell/look.rs`).
+    pub(crate) fn sample() -> Activity {
         Activity {
             entries: vec![
                 ActivityEntry {

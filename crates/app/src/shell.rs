@@ -9345,6 +9345,10 @@ impl DiffTops {
     }
 }
 
+/// Pictures of every screen and dialog: a refactor that changes the look fails (see `docs/quality.md`).
+#[cfg(all(test, target_os = "linux"))]
+mod look;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -422,7 +422,7 @@ fn matches_unused(u: &UnusedSecret, query: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::shell::{DetailTab, Page, ShellApp};
     use crate::theme::ThemeChoice;
@@ -487,7 +487,8 @@ mod tests {
         }
     }
 
-    fn sample() -> Secrets {
+    /// Also drawn by the look tests (`shell/look.rs`).
+    pub(crate) fn sample() -> Secrets {
         let first = fixture_snapshot().servers[0].name.clone();
         let second = fixture_snapshot().servers[1].name.clone();
         Secrets {
