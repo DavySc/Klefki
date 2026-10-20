@@ -532,6 +532,8 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             sign_in_timeout: Duration::from_secs(5),
             changer: Some(changer),
             desktop: crate::desktop::DesktopRoots::default(),
+            releases: Arc::new(crate::update::Offline),
+            release_key: None,
         },
         || {},
     );

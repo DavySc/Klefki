@@ -11,7 +11,7 @@ use klefki_core::api::{
     Approval, Change, Command, ConnectionId, Core, Definition, Diagnosis, Event, Exported,
     FileChoice, Hint, ImportFile, LegacyDisabled, Part, Pasted, PastedServer, PlanView, SaveError,
     Scope, Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status, Target,
-    TransportKind, same_project, secret_reference,
+    TransportKind, UpdateCheck, same_project, secret_reference,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -355,6 +355,10 @@ pub struct ShellApp {
     pub tab: DetailTab,
     pub theme: ThemeChoice,
     pub tone: Tone,
+    /// Klefki's own updates: when to look, and what was found.
+    pub updates: crate::updates::Updates,
+    /// This build can check for updates (it has a release key).
+    checks_for_updates: bool,
 }
 
 impl ShellApp {
@@ -420,6 +424,8 @@ impl ShellApp {
             tab: DetailTab::General,
             theme,
             tone: Tone::default(),
+            updates: crate::updates::Updates::default(),
+            checks_for_updates: false,
         }
     }
 
@@ -427,6 +433,7 @@ impl ShellApp {
     pub fn with_core(core: Core, theme: ThemeChoice) -> Self {
         let mut app = Self::new(Arc::new(Snapshot::default()), theme);
         app.core = Some(core);
+        app.checks_for_updates = klefki_core::api::checks_for_updates();
         app
     }
 
@@ -528,6 +535,7 @@ impl ShellApp {
             }
         }
         match event {
+            Event::Update(found) => self.updates.answered(found, crate::updates::now()),
             Event::Desktop(desktop) => {
                 // Not kept once the page is left: it is read again when the page is opened.
                 if let Some(page) = &mut self.desktop {
@@ -1060,6 +1068,7 @@ impl ShellApp {
 
     fn show(&mut self, ui: &mut Ui) {
         self.poll_core();
+        self.look_for_updates(ui.ctx());
         if ui.input(|i| i.key_pressed(egui::Key::F5)) {
             self.refresh();
         }
@@ -1286,6 +1295,19 @@ impl ShellApp {
                 {
                     self.refresh();
                 }
+                if let Some(version) = self.updates.available()
+                    && ui
+                        .button(
+                            RichText::new(format!("{} Klefki {version}", icon::ARROW_CIRCLE_UP))
+                                .color(pal.primary),
+                        )
+                        .on_hover_text(format!(
+                            "Klefki {version} is out. Opens its page on GitHub, with what is new and the downloads."
+                        ))
+                        .clicked()
+                {
+                    self.send(Command::OpenReleasePage(version));
+                }
                 let mut changed = false;
                 egui::ComboBox::from_id_salt("theme")
                     .selected_text(format!("{} {}", self.theme.icon(), self.theme.label()))
@@ -1364,6 +1386,26 @@ impl ShellApp {
                 }
             });
         });
+    }
+
+    /// Starts the automatic check for updates once the window has been open a moment, and wakes up for it.
+    fn look_for_updates(&mut self, ctx: &egui::Context) {
+        if !self.checks_for_updates || self.core.is_none() {
+            return;
+        }
+        let uptime = ctx.input(|i| i.time);
+        if self.updates.due(uptime, crate::updates::now()) {
+            self.send(Command::CheckForUpdates);
+        } else if self.updates.auto && uptime < crate::updates::START_DELAY {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                crate::updates::START_DELAY - uptime,
+            ));
+        }
+    }
+
+    fn check_for_updates_now(&mut self) {
+        self.updates.check_now();
+        self.send(Command::CheckForUpdates);
     }
 
     /// Claude Code's version, when it is known. Not while Claude Code cannot be found: the version would be of a
@@ -3451,6 +3493,76 @@ impl ShellApp {
             );
             ui.add(egui::Label::new(RichText::new(problem).small().color(pal.text_muted)).wrap());
         }
+        self.update_settings(ui);
+    }
+
+    fn update_settings(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        ui.add_space(24.0);
+        ui.label(RichText::new("Updates").strong());
+        ui.add_space(6.0);
+        if !self.checks_for_updates {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "Klefki {}. This build does not check for updates: it was not built by Klefki's release \
+                         workflow.",
+                        klefki_core::api::Version::current()
+                    ))
+                    .color(pal.text_muted),
+                )
+                .wrap(),
+            );
+            return;
+        }
+        egui::Grid::new("updates")
+            .num_columns(2)
+            .spacing([24.0, 14.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Klefki").color(pal.text_muted));
+                ui.horizontal(|ui| {
+                    ui.label(klefki_core::api::Version::current().to_string());
+                    ui.add_space(12.0);
+                    if self.updates.checking {
+                        ui.spinner();
+                        ui.label(RichText::new("Checking…").color(pal.text_muted));
+                        return;
+                    }
+                    if let Some(version) = self.updates.available() {
+                        ui.label(
+                            RichText::new(format!("{version} is available")).color(pal.primary),
+                        );
+                        if ui.button("What's new").clicked() {
+                            self.send(Command::OpenReleasePage(version));
+                        }
+                    } else if let Some(UpdateCheck::UpToDate) = &self.updates.found {
+                        ui.label(RichText::new("Up to date").color(pal.text_muted));
+                    }
+                    if ui.button("Check now").clicked() {
+                        self.check_for_updates_now();
+                    }
+                });
+                ui.end_row();
+            });
+        if let Some(UpdateCheck::Failed(why)) = &self.updates.found
+            && !self.updates.checking
+        {
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(RichText::new(why.as_str()).color(pal.warn)).wrap());
+        }
+        ui.add_space(10.0);
+        ui.checkbox(&mut self.updates.auto, "Check for updates automatically");
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Once a day, Klefki asks GitHub whether a newer version is out. Nothing about you or your \
+                     servers is sent. Every release is checked against Klefki's signature before it is offered.",
+                )
+                .small()
+                .color(pal.text_muted),
+            )
+            .wrap(),
+        );
     }
 
     /// Moves the selection `step` rows through the list as shown, starting at the top when nothing is selected.
@@ -5167,6 +5279,7 @@ impl eframe::App for ShellApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         theme::save_choice(storage, self.theme);
         theme::save_tone(storage, self.tone);
+        self.updates.save(storage);
     }
 }
 
@@ -17222,5 +17335,125 @@ mod tests {
         h.run();
         h.get_by_label_contains("From ");
         assert!(h.query_by_label_contains("No file chosen.").is_none());
+    }
+
+    // ---- updates (decision 009)
+
+    fn update_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness_at_60fps();
+        h.state_mut().checks_for_updates = true;
+        (h, engine)
+    }
+
+    fn update_checks_sent(engine: &klefki_core::api::Detached) -> usize {
+        drain_all(engine)
+            .into_iter()
+            .filter(|c| matches!(c, Command::CheckForUpdates))
+            .count()
+    }
+
+    #[test]
+    fn klefki_checks_for_updates_once_after_starting_not_while_starting() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        assert_eq!(update_checks_sent(&engine), 0, "not while starting");
+        // Nothing else asks for frames here: the check must wake the window by itself.
+        let frames = (crate::updates::START_DELAY * 60.0) as usize + 30;
+        for _ in 0..frames {
+            h.step();
+        }
+        assert!(h.ctx.input(|i| i.time) >= crate::updates::START_DELAY);
+        assert_eq!(update_checks_sent(&engine), 1);
+        for _ in 0..120 {
+            h.step();
+        }
+        assert_eq!(update_checks_sent(&engine), 0, "once a run");
+    }
+
+    #[test]
+    fn a_build_without_a_release_key_never_checks_and_says_so() {
+        let (mut h, engine) = live_harness_at_60fps();
+        for _ in 0..((crate::updates::START_DELAY * 60.0) as usize + 30) {
+            h.step();
+        }
+        assert_eq!(update_checks_sent(&engine), 0);
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label_contains("This build does not check for updates");
+        assert!(h.query_by_label("Check now").is_none());
+    }
+
+    #[test]
+    fn a_found_update_shows_in_the_top_bar_and_opens_its_page() {
+        let (mut h, engine) = update_harness();
+        h.state_mut().updates.auto = false;
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        engine
+            .events
+            .send(Event::Update(UpdateCheck::Available {
+                version,
+                page: "https://github.com/DavySc/Klefki/releases/tag/v999.0.0".into(),
+            }))
+            .unwrap();
+        h.run();
+        drain_all(&engine);
+        h.get_by_label_contains("Klefki 999.0.0").click();
+        h.run();
+        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+        // Settings says the same, with the same way to it.
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label("999.0.0 is available");
+        h.get_by_label("What's new").click();
+        h.run();
+        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+    }
+
+    #[test]
+    fn settings_check_now_shows_progress_then_the_answer() {
+        let (mut h, engine) = update_harness();
+        h.state_mut().updates.auto = false;
+        h.state_mut().go(Page::Settings);
+        h.run();
+        assert!(
+            h.query_by_label_contains("Klefki 999").is_none(),
+            "no update shown before one is found"
+        );
+        h.get_by_label("Check now").click();
+        // The spinner asks for frames until the answer comes.
+        h.run_steps(2);
+        assert_eq!(update_checks_sent(&engine), 1);
+        h.get_by_label("Checking…");
+        engine
+            .events
+            .send(Event::Update(UpdateCheck::Failed(
+                "Could not reach GitHub: no connection".into(),
+            )))
+            .unwrap();
+        h.run();
+        h.get_by_label("Could not reach GitHub: no connection");
+        h.get_by_label("Check now").click();
+        h.run_steps(2);
+        engine
+            .events
+            .send(Event::Update(UpdateCheck::UpToDate))
+            .unwrap();
+        h.run();
+        h.get_by_label("Up to date");
+        assert!(h.query_by_label_contains("Could not reach").is_none());
+    }
+
+    #[test]
+    fn turning_automatic_checks_off_is_remembered() {
+        let (mut h, _engine) = update_harness();
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label("Check for updates automatically").click();
+        h.run();
+        assert!(!h.state().updates.auto);
+        let mut storage = crate::theme::tests::MemoryStorage::default();
+        eframe::App::save(h.state_mut(), &mut storage);
+        assert!(!crate::updates::Updates::load(Some(&storage)).auto);
     }
 }

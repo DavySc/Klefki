@@ -19,6 +19,7 @@ pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
+pub use crate::update::{UpdateCheck, Version};
 
 /// Whether two project keys name the same folder, as the engine compares them: `c:\Repos\x\` is `C:/Repos/x`.
 pub fn same_project(a: &str, b: &str) -> bool {
@@ -306,7 +307,12 @@ pub struct LegacyDisabled {
 /// `claude`, and runs live status checks in the background. `wake` is called whenever events are waiting, so the
 /// UI can repaint.
 pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
-    crate::engine::start_with(real_config(None), wake)
+    let config = crate::engine::EngineConfig {
+        releases: std::sync::Arc::new(crate::update::Https::default()),
+        release_key: crate::update::RELEASE_KEY.map(str::to_owned),
+        ..real_config(None)
+    };
+    crate::engine::start_with(config, wake)
 }
 
 /// Starts the engine for a command-line run: like [`start`], but with the Claude CLI at `claude` when given (it must
@@ -343,6 +349,9 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
         desktop: crate::desktop::DesktopRoots::discover(),
+        // Only the app looks for updates ([`start`]): the command-line tool then carries no TLS code at all.
+        releases: std::sync::Arc::new(crate::update::Offline),
+        release_key: None,
     }
 }
 
@@ -402,6 +411,11 @@ fn default_backup_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Reads the real Claude Code configuration (read-only), once, without live checks.
+/// Whether this build checks for updates: only one with the release key built in (decision 009).
+pub fn checks_for_updates() -> bool {
+    crate::update::RELEASE_KEY.is_some()
+}
+
 pub fn load_snapshot() -> Arc<Snapshot> {
     match ConfigPaths::discover() {
         Some(paths) => load_snapshot_from(&paths),

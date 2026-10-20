@@ -10,6 +10,7 @@ mod secrets;
 mod shell;
 mod sign_in;
 mod theme;
+mod updates;
 
 use shell::ShellApp;
 
@@ -39,6 +40,7 @@ fn main() -> eframe::Result {
             };
             let mut app = app;
             app.tone = tone;
+            app.updates = updates::Updates::load(cc.storage);
             Ok(Box::new(app))
         }),
     )

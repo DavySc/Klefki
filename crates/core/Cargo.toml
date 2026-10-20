@@ -27,6 +27,10 @@ rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 # The save dialog belongs to Klefki's window: its handle, and waiting for the dialog's answer off the UI thread.
 raw-window-handle = "0.6"
 pollster = "0.4"
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+minisign-verify = "0.3.0"
+rustls-native-certs = "0.8.5"
 
 # Ending a process together with what it started: a process group on Unix, a job object on Windows.
 [target.'cfg(unix)'.dependencies]

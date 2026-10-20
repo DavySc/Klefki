@@ -118,6 +118,11 @@ pub enum Command {
     /// when a server, or a definition Klefki keeps to put back, uses it by now. Answers with
     /// [`Event::UnusedSecretForgotten`], then [`Event::Secrets`].
     ForgetUnusedSecret(crate::model::ConnectionId),
+    /// Look for a newer Klefki release (see [`Event::Update`]), on a thread of its own. Only the release's signed
+    /// checksums are fetched, and only when this build has a release key.
+    CheckForUpdates,
+    /// Open the page of a release that [`Event::Update`] offered.
+    OpenReleasePage(crate::update::Version),
 }
 
 /// Where a sign-in is ([`Event::SignIn`]). Text is sanitised.
@@ -420,6 +425,8 @@ pub enum Event {
         connection: crate::model::ConnectionId,
         result: Result<(), String>,
     },
+    /// What [`Command::CheckForUpdates`] found.
+    Update(crate::update::UpdateCheck),
 }
 
 /// The UI's handle to the engine.
@@ -552,6 +559,10 @@ pub(crate) struct EngineConfig {
     pub changer: Option<Arc<dyn swap::Claude>>,
     /// Where Claude Desktop's configuration can be. Tests give folders of their own, or none.
     pub desktop: crate::desktop::DesktopRoots,
+    /// Fetches Klefki's release files from GitHub. Tests serve files of their own, and never reach the network.
+    pub releases: Arc<dyn crate::update::Fetch>,
+    /// The public key Klefki's releases are signed with; `None` turns update checks off.
+    pub release_key: Option<String>,
 }
 
 /// Opens an https link in the user's browser.
@@ -1064,6 +1075,23 @@ fn engine_main(
             Command::SecretsAfterFileChange => secrets(&shared, &state, SecretsAsk::Reuse),
             Command::ForgetUnusedSecret(connection) => {
                 secrets(&shared, &state, SecretsAsk::Forget(connection));
+            }
+            // A slow or unreachable network must not hold up other commands.
+            Command::CheckForUpdates => {
+                let emitter = shared.emitter.clone();
+                let releases = Arc::clone(&shared.config.releases);
+                let key = shared.config.release_key.clone();
+                std::thread::spawn(move || {
+                    let found = crate::update::check(
+                        releases.as_ref(),
+                        crate::update::Version::current(),
+                        key.as_deref(),
+                    );
+                    emitter.emit(Event::Update(found));
+                });
+            }
+            Command::OpenReleasePage(version) => {
+                let _ = (shared.config.open_url)(&crate::update::release_page(version));
             }
         }
     }
@@ -3010,6 +3038,8 @@ mod tests {
                 sign_in_timeout: Duration::from_secs(20),
                 changer: None,
                 desktop: crate::desktop::DesktopRoots::default(),
+                releases: Arc::new(crate::update::Offline),
+                release_key: None,
             }
         }
 
@@ -5315,6 +5345,54 @@ mod tests {
             }
         )));
         assert!(!env.dir.path().join("backups").exists());
+    }
+
+    fn update_found(core: &Core) -> crate::update::UpdateCheck {
+        core.send(Command::CheckForUpdates);
+        let events = collect(core, |e| e.iter().any(|x| matches!(x, Event::Update(_))));
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                Event::Update(found) => Some(found),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_newer_signed_release_is_reported_and_its_page_opened_on_request() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let (releases, key) = crate::update::test_release();
+        let core = start_with(
+            EngineConfig {
+                releases,
+                release_key: Some(key),
+                ..env.config()
+            },
+            || {},
+        );
+        let version = crate::update::Version::parse("0.2.0").unwrap();
+        assert_eq!(
+            update_found(&core),
+            crate::update::UpdateCheck::Available {
+                version,
+                page: "https://github.com/DavySc/Klefki/releases/tag/v0.2.0".into(),
+            }
+        );
+        core.send(Command::OpenReleasePage(version));
+        // Commands are handled in order, so once this check answers, the page was opened.
+        update_found(&core);
+        assert_eq!(
+            *lock(&env.opened),
+            ["https://github.com/DavySc/Klefki/releases/tag/v0.2.0"]
+        );
+    }
+
+    #[test]
+    fn without_a_release_key_no_update_check_reaches_out() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        let core = env.start();
+        assert_eq!(update_found(&core), crate::update::UpdateCheck::NoKey);
     }
 
     fn activity(core: &Core) -> crate::activity::Activity {
