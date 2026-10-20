@@ -4362,7 +4362,13 @@ impl ShellApp {
                         kv("Scope", s.scope.label().to_owned());
                         match &s.plugin {
                             Some(p) => {
-                                kv("Plugin", format!("{}, from {}", p.plugin, p.marketplace))
+                                kv("Plugin", format!("{}, from {}", p.plugin, p.marketplace));
+                                if !p.off_in.is_empty() {
+                                    kv("Plugin on", plugin_on_text(p, self.snapshot.project_count))
+                                        .on_hover_text(format!("Off in:\n{}", p.off_in.join("\n")))
+                                } else {
+                                    kv("Plugin on", "in every project".to_owned())
+                                }
                             }
                             None => kv("Project", s.project.clone().unwrap_or_else(|| "-".into())),
                         };
@@ -4382,6 +4388,8 @@ impl ShellApp {
                                 "disabled in {} of {} projects",
                                 s.disabled_in, self.snapshot.project_count
                             )
+                        } else if plugin_off_everywhere(s, self.snapshot.project_count) {
+                            "yes, but its plugin is off in every project".to_owned()
                         } else if s.enabled {
                             "yes".to_owned()
                         } else {
@@ -7726,7 +7734,12 @@ struct Badge {
 
 fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     let pal = theme::palette(ui.ctx());
-    let color = if s.enabled { pal.text } else { pal.disabled };
+    // Like a user server off in every project: a plugin's server whose plugin is.
+    let color = if s.enabled && !plugin_off_everywhere(s, project_count) {
+        pal.text
+    } else {
+        pal.disabled
+    };
     ui.add(egui::Label::new(RichText::new(short_name(s)).color(color)).truncate());
     let loud = |text: &str, fill: Color32, hover: Option<&str>| Badge {
         text: text.to_owned(),
@@ -7782,6 +7795,18 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
             pal.warn,
             None,
         ));
+    }
+    // A project's own settings can switch the plugin off there: quiet, as it is often deliberate.
+    if let Some(off) = s.plugin.as_ref().map(|p| p.off_in.len()).filter(|n| *n > 0) {
+        badges.push(Badge {
+            text: format!("plugin off in {off}/{project_count}"),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(format!(
+                "Its plugin is off in {off} of {project_count} projects, by the project's own settings or yours, \
+                 so Claude Code does not load it there. The details name the projects."
+            )),
+        });
     }
     if let (false, false, Some(same)) = (s.shadowed, s.shadowed_in.is_empty(), same_as) {
         badges.push(Badge {
@@ -8040,6 +8065,32 @@ fn plugin_read_only(p: &klefki_core::api::PluginInfo) -> String {
          plugin, or turn the plugin off in Claude Code (/plugin).",
         p.plugin
     )
+}
+
+/// A plugin's server whose plugin is off in every project Claude Code knows: it loads in none of them.
+fn plugin_off_everywhere(s: &ServerRow, project_count: usize) -> bool {
+    project_count > 0
+        && s.plugin
+            .as_ref()
+            .is_some_and(|p| p.off_in.len() == project_count)
+}
+
+/// Where a plugin's server's plugin is on, naming where it is off by folder, at most a few.
+fn plugin_on_text(p: &klefki_core::api::PluginInfo, project_count: usize) -> String {
+    let off = p.off_in.len();
+    let named: Vec<&str> = p.off_in[..off.min(SHADOWED_NAMED)]
+        .iter()
+        .map(|p| folder_name(p))
+        .collect();
+    let mut text = format!(
+        "in {} of {project_count} projects; off in {}",
+        project_count.saturating_sub(off),
+        named.join(", ")
+    );
+    if off > SHADOWED_NAMED {
+        text.push_str(&format!(" and {} more", off - SHADOWED_NAMED));
+    }
+    text
 }
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
@@ -11279,6 +11330,7 @@ mod tests {
                 marketplace: "team".into(),
                 same_as: same_as.map(str::to_owned),
                 written_target: None,
+                off_in: Vec::new(),
             }),
             shadowed: same_as.is_some(),
             ..live_row(name, Scope::Plugin, None)
@@ -11387,6 +11439,49 @@ mod tests {
         // No tabs for values or sign-in: there is no definition here to show them from.
         assert!(h.query_by_label("Env").is_none());
         assert!(h.query_by_label("Auth").is_none());
+    }
+
+    #[test]
+    fn a_plugin_off_in_some_projects_says_where() {
+        let (mut h, engine) = live_harness();
+        let mut p = plugin_row("plugin:docs:search", None);
+        p.plugin.as_mut().unwrap().off_in = vec!["/home/me/work/app".into(), "/home/me/web".into()];
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![p],
+                project_count: 3,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.get_by_label("plugin off in 2/3");
+        h.get_by_label("search").click();
+        h.run();
+        h.get_by_label("Plugin on");
+        h.get_by_label("in 1 of 3 projects; off in app, web");
+        h.get_by_label("yes");
+    }
+
+    #[test]
+    fn a_plugin_off_in_every_project_reads_so() {
+        // Cross-review of #46: it read "Enabled: yes" like a server that loads.
+        let (mut h, engine) = live_harness();
+        let mut p = plugin_row("plugin:docs:search", None);
+        p.plugin.as_mut().unwrap().off_in = vec!["/home/me/work/app".into(), "/home/me/web".into()];
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![p],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        h.get_by_label("plugin off in 2/2");
+        h.get_by_label("search").click();
+        h.run();
+        h.get_by_label("yes, but its plugin is off in every project");
     }
 
     #[test]

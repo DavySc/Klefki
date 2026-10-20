@@ -38,6 +38,9 @@ struct RawServer {
     same_as: Option<String>,
     #[serde(default)]
     written_target: Option<String>,
+    /// Plugin servers: the projects where the plugin is off.
+    #[serde(default)]
+    plugin_off_in: Vec<String>,
 }
 
 pub(crate) fn load() -> Snapshot {
@@ -98,6 +101,7 @@ pub(crate) fn load() -> Snapshot {
                         marketplace: sanitize(marketplace),
                         same_as: s.same_as.as_deref().map(sanitize),
                         written_target: s.written_target.as_deref().map(sanitize),
+                        off_in: s.plugin_off_in.iter().map(|p| sanitize(p)).collect(),
                     }
                 }),
             })

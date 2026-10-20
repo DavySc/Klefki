@@ -289,11 +289,13 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         r.shadowed = snap.project_count > 0 && r.shadowed_in.len() == snap.project_count;
     }
 
+    let raw_projects: Vec<&str> = projects.values().map(|p| p.raw.as_str()).collect();
     add_plugin_servers(
         paths,
         &mut snap,
         &by_hand,
         &disabled_by_project,
+        &raw_projects,
         &shown_projects,
     );
 
@@ -340,12 +342,19 @@ fn add_plugin_servers(
     snap: &mut Snapshot,
     by_hand: &[ByHand],
     disabled_by_project: &BTreeMap<&String, BTreeSet<String>>,
+    raw_projects: &[&str],
     shown_projects: &[String],
 ) {
     let mut warnings = Vec::new();
-    let servers = plugins::load(paths, &mut warnings);
-    snap.warnings
-        .extend(warnings.iter().map(|w| sanitize::sanitize_line(w)));
+    let loaded = plugins::load(paths, raw_projects, &mut warnings);
+    // A project's `settings.local.json` is also read for approvals: said once.
+    for w in warnings {
+        let w = sanitize::sanitize_line(&w);
+        if !snap.warnings.contains(&w) {
+            snap.warnings.push(w);
+        }
+    }
+    let servers = &loaded.servers;
     // Where a server is loaded or left out: outside every project (where nothing is off), then each project.
     let off: Vec<Option<&BTreeSet<String>>> = std::iter::once(None)
         .chain(disabled_by_project.values().map(Some))
@@ -353,52 +362,76 @@ fn add_plugin_servers(
     let places: Vec<Option<&str>> = std::iter::once(None)
         .chain(shown_projects.iter().map(|p| Some(p.as_str())))
         .collect();
-    // In each place, the plugin servers loaded there so far, by definition: the first one stays.
-    let mut loaded: Vec<HashMap<String, String>> = vec![HashMap::new(); places.len()];
-    for server in servers {
-        let name = server.full_name();
-        let run = server.expanded();
-        // Claude Code puts every plugin server in its needs-auth cache, whatever the server is: no status from it.
-        let mut r = row(&name, &run, Scope::Plugin, None, true, Status::Unknown);
-        // A plugin's command runs from the plugin's own folder (`${CLAUDE_PLUGIN_ROOT}`), not a project's.
-        r.relative_paths.clear();
-        r.disabled_in = disabled_by_project
-            .values()
-            .filter(|d| d.contains(&name))
-            .count();
-        r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
-        let key = plugins::same_as_key(&run);
-        let plugin_key = plugins::same_as_plugin_key(&run);
-        let (mut by_hand_name, mut by_plugin): (Option<&str>, Option<String>) = (None, None);
-        let mut hidden = vec![false; places.len()];
-        for (i, place) in places.iter().enumerate() {
-            let hand = key.as_ref().and_then(|key| {
+    let names: Vec<String> = servers
+        .iter()
+        .map(plugins::PluginServer::full_name)
+        .collect();
+    let runs: Vec<Value> = servers
+        .iter()
+        .map(plugins::PluginServer::expanded)
+        .collect();
+    let keys: Vec<Option<String>> = runs.iter().map(plugins::same_as_key).collect();
+    let plugin_keys: Vec<Option<String>> = runs.iter().map(plugins::same_as_plugin_key).collect();
+    // Per server and place: its plugin is on there; Claude Code leaves it out there.
+    let mut on = vec![vec![false; places.len()]; servers.len()];
+    let mut hidden = vec![vec![false; places.len()]; servers.len()];
+    let mut by_hand_name: Vec<Option<&str>> = vec![None; servers.len()];
+    let mut by_plugin: Vec<Option<&str>> = vec![None; servers.len()];
+    for (i, place) in places.iter().enumerate() {
+        // Where the row says it is left out: in projects, or outside every project when Claude Code knows none. Only
+        // there is the other server named, so the count and the name never disagree.
+        let shown = (i == 0) == (snap.project_count == 0);
+        // The plugin servers loaded here so far, by definition: the first one stays.
+        let mut loaded_here: HashMap<&str, &str> = HashMap::new();
+        for &s in &loaded.on[i] {
+            on[s][i] = true;
+            let hand = keys[s].as_ref().and_then(|key| {
                 by_hand
                     .iter()
                     .find(|m| m.key == *key && m.loaded_in(*place))
             });
-            let earlier = plugin_key.as_ref().and_then(|k| loaded[i].get(k));
+            let earlier = plugin_keys[s]
+                .as_deref()
+                .and_then(|k| loaded_here.get(k).copied());
             if let Some(m) = hand {
-                by_hand_name.get_or_insert(&m.name);
-                hidden[i] = true;
+                if shown {
+                    by_hand_name[s].get_or_insert(&m.name);
+                }
+                hidden[s][i] = true;
             } else if let Some(earlier) = earlier {
-                by_plugin.get_or_insert_with(|| earlier.clone());
-                hidden[i] = true;
-            } else if let Some(k) = &plugin_key
-                && !off[i].is_some_and(|d| d.contains(&name))
+                if shown {
+                    by_plugin[s].get_or_insert(earlier);
+                }
+                hidden[s][i] = true;
+            } else if let Some(k) = &plugin_keys[s]
+                && !off[i].is_some_and(|d| d.contains(&names[s]))
             {
-                loaded[i].insert(k.clone(), name.clone());
+                loaded_here.insert(k, &names[s]);
             }
         }
-        let same_as = by_hand_name.map(str::to_owned).or(by_plugin);
+    }
+    for (s, server) in servers.iter().enumerate() {
+        let name = &names[s];
+        // Claude Code puts every plugin server in its needs-auth cache, whatever the server is: no status from it.
+        let mut r = row(name, &runs[s], Scope::Plugin, None, true, Status::Unknown);
+        // A plugin's command runs from the plugin's own folder (`${CLAUDE_PLUGIN_ROOT}`), not a project's.
+        r.relative_paths.clear();
+        r.disabled_in = disabled_by_project
+            .values()
+            .filter(|d| d.contains(name))
+            .count();
+        r.enabled = !(snap.project_count > 0 && r.disabled_in == snap.project_count);
+        let same_as = by_hand_name[s].or(by_plugin[s]);
+        // Left out wherever its plugin is on.
+        let on_projects: Vec<usize> = (1..places.len()).filter(|&i| on[s][i]).collect();
         r.shadowed = if snap.project_count == 0 {
-            hidden[0]
+            hidden[s][0]
         } else {
-            hidden[1..].iter().all(|h| *h)
+            !on_projects.is_empty() && on_projects.iter().all(|&i| hidden[s][i])
         };
         r.shadowed_in = shown_projects
             .iter()
-            .zip(&hidden[1..])
+            .zip(&hidden[s][1..])
             .filter(|(_, h)| **h)
             .map(|(p, _)| p.clone())
             .collect();
@@ -407,8 +440,14 @@ fn add_plugin_servers(
         r.plugin = Some(PluginInfo {
             plugin: clip(&sanitize::sanitize_line(&server.plugin)),
             marketplace: clip(&sanitize::sanitize_line(&server.marketplace)),
-            same_as: same_as.map(|n| clip(&sanitize::sanitize_line(&n))),
+            same_as: same_as.map(|n| clip(&sanitize::sanitize_line(n))),
             written_target,
+            off_in: shown_projects
+                .iter()
+                .zip(&on[s][1..])
+                .filter(|(_, on)| !**on)
+                .map(|(p, _)| p.clone())
+                .collect(),
         });
         snap.servers.push(r);
     }
@@ -2551,7 +2590,8 @@ mod tests {
                 plugin: "p1".into(),
                 marketplace: "mkt".into(),
                 same_as: None,
-                written_target: None
+                written_target: None,
+                off_in: Vec::new()
             }
         );
         let beta = find(s, Scope::Plugin, "plugin:p1:beta");
@@ -2731,6 +2771,99 @@ mod tests {
         let dup2 = find(&e.load(), Scope::Plugin, "plugin:p2:dup2").clone();
         assert!(!dup2.shadowed, "{dup2:#?}");
         assert_eq!(dup2.shadowed_in, [sa]);
+    }
+
+    #[test]
+    fn a_projects_own_settings_switch_a_plugin_there_and_what_it_leaves_out() {
+        let e = Env::new();
+        let (a, b, c) = (e.project("a"), e.project("b"), e.project("c"));
+        let shown = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        e.plugin("p1", json!({"s": {"command": "one"}}));
+        e.plugin("p2", json!({"t": {"command": "same"}}));
+        e.plugin("p3", json!({"u": {"command": "same"}}));
+        // p2 is off for the user but on in a; p1 is off in b, by its local file.
+        e.write(
+            "settings.json",
+            &json!({"enabledPlugins": {"p1@mkt": true, "p2@mkt": false, "p3@mkt": true}}),
+        );
+        e.write(
+            "projects/a/.claude/settings.json",
+            &json!({"enabledPlugins": {"p2@mkt": true}}),
+        );
+        e.write(
+            "projects/b/.claude/settings.local.json",
+            &json!({"enabledPlugins": {"p1@mkt": false}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {}, b.to_string_lossy(): {}, c.to_string_lossy(): {}
+            }}),
+        );
+        let s = e.load();
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let p1 = find(&s, Scope::Plugin, "plugin:p1:s");
+        assert_eq!(plugin_info(p1).off_in, [shown(&b)]);
+        let p2 = find(&s, Scope::Plugin, "plugin:p2:t");
+        assert_eq!(plugin_info(p2).off_in, [shown(&b), shown(&c)]);
+        assert!(!p2.shadowed && p2.shadowed_in.is_empty(), "{p2:#?}");
+        // In a, p2 comes first (its place in the user's file) and p3's server, the same, is left out there only.
+        let p3 = find(&s, Scope::Plugin, "plugin:p3:u");
+        assert!(plugin_info(p3).off_in.is_empty());
+        assert!(!p3.shadowed);
+        assert_eq!(p3.shadowed_in, [shown(&a)]);
+        assert_eq!(plugin_info(p3).same_as.as_deref(), Some("plugin:p2:t"));
+
+        // Off in a too: on nowhere, so not listed (like a plugin off for the user), and it leaves nothing out.
+        e.write(
+            "projects/a/.claude/settings.local.json",
+            &json!({"enabledPlugins": {"p2@mkt": false}}),
+        );
+        let s = e.load();
+        assert!(!s.servers.iter().any(|r| r.name == "plugin:p2:t"));
+        let p3 = find(&s, Scope::Plugin, "plugin:p3:u");
+        assert!(
+            p3.shadowed_in.is_empty() && plugin_info(p3).same_as.is_none(),
+            "{p3:#?}"
+        );
+    }
+
+    #[test]
+    fn a_server_left_out_only_outside_every_project_names_nothing() {
+        // Cross-review of #46: "left out in 0 of 2 projects: same as plugin:p1:s" contradicted itself.
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        let shown = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        e.plugin("p1", json!({"s": {"command": "same"}}));
+        e.plugin("p2", json!({"t": {"command": "same"}}));
+        // p1 comes first, but is off in both projects: there p2's server loads.
+        for p in ["a", "b"] {
+            e.write(
+                &format!("projects/{p}/.claude/settings.json"),
+                &json!({"enabledPlugins": {"p1@mkt": false}}),
+            );
+        }
+        e.write(
+            ".claude.json",
+            &json!({"projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}}),
+        );
+        let s = e.load();
+        let t = find(&s, Scope::Plugin, "plugin:p2:t");
+        assert!(
+            !t.shadowed && t.shadowed_in.is_empty() && plugin_info(t).same_as.is_none(),
+            "{t:#?}"
+        );
+
+        // Variant: on again in a, so left out there, and named.
+        e.write(
+            "projects/a/.claude/settings.json",
+            &json!({"enabledPlugins": {"p1@mkt": true}}),
+        );
+        let s = e.load();
+        let t = find(&s, Scope::Plugin, "plugin:p2:t");
+        assert!(!t.shadowed, "{t:#?}");
+        assert_eq!(t.shadowed_in, [shown(&a)]);
+        assert_eq!(plugin_info(t).same_as.as_deref(), Some("plugin:p1:s"));
     }
 
     #[test]
