@@ -2169,6 +2169,62 @@ fn an_earlier_edits_check_does_not_land_on_a_server_moved_in_under_the_name_it_w
     );
 }
 
+/// q in pa switched off and renamed to q_r, then `arrive` puts another server under q there: the check of the three,
+/// made together, must leave q_r off and the newcomer on.
+fn switch_off_rename_then_arrive(arrive: impl Fn(&Rig) -> Change) {
+    let rig = start_checking_after(Duration::from_millis(400));
+    while !matches!(rig.next(), Event::Snapshot(_)) {}
+    let pa = rig.projects[0].clone();
+    let old = (Some(pa.clone()), "q".to_owned());
+    for change in [
+        Change::SetEnabled {
+            id: rig.id(&old),
+            enabled: false,
+        },
+        Change::Rename {
+            id: rig.id(&old),
+            name: "q_r".into(),
+        },
+        arrive(&rig),
+    ] {
+        let outcome = rig.run(vec![change]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+    }
+    let off = || rig.config()["projects"][&pa]["disabledMcpServers"].clone();
+    assert_eq!(off(), json!(["q_r"]));
+    quiet_for(&rig, Duration::from_millis(1200));
+    assert_eq!(off(), json!(["q_r"]));
+}
+
+#[test]
+fn an_earlier_switch_offs_check_does_not_turn_off_a_copy_under_the_name_it_was_renamed_from() {
+    // Found in review: like the edit above, the check replayed the switch-off under the old name.
+    switch_off_rename_then_arrive(|rig| Change::Duplicate {
+        id: rig.id(&(None, "p".to_owned())),
+        name: "q".into(),
+        targets: vec![Target::Local(rig.projects[0].clone())],
+    });
+}
+
+#[test]
+fn an_earlier_switch_offs_check_does_not_turn_off_a_server_moved_in_under_the_name_it_was_renamed_from()
+ {
+    // The variant: the user's p, copied to the user as q first, is moved into pa under q.
+    let rig_copy = |rig: &Rig| Change::Duplicate {
+        id: rig.id(&(None, "p".to_owned())),
+        name: "q".into(),
+        targets: vec![Target::User],
+    };
+    switch_off_rename_then_arrive(move |rig| {
+        let outcome = rig.run(vec![rig_copy(rig)]);
+        assert!(matches!(outcome, Outcome::Done), "{outcome:?}");
+        Change::Move {
+            id: rig.id(&(None, "q".to_owned())),
+            to: Target::Local(rig.projects[0].clone()),
+        }
+    });
+}
+
 #[test]
 fn a_late_check_does_not_put_an_edit_back_on_a_server_renamed_since() {
     // The shrunk sequence of seed 7a12d6aa, as the model-based test runs it.

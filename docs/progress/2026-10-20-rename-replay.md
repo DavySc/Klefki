@@ -23,6 +23,19 @@ held `p` by then: a server moved or copied in since. The check then wrote that o
   the variant `an_edit_of_a_server_renamed_twice_ends_on_its_last_name`. Seed added to
   `proptest-regressions/engine/machine.txt`.
 - Full verify (fmt, clippy -D warnings, `cargo test --workspace`, `cargo deny check`): exit 0.
+- Longer search: `PROPTEST_CASES=3000 cargo test -p klefki-core --lib no_change_ever_loses`: exit 0, 1 passed (111 s).
 
 ## Open / next
 - None known. Cross-review, then merge.
+
+## Cross-review fixes
+- Blocking (review on f0772a0): a switch-off had the same bug. Switched off in a project, renamed, and another server
+  copied in under the old name: the check replayed `SetDisabled` under the old name and turned the newcomer off.
+  `as_they_ended` now moves a renamed server's switch-offs (and switch-ons) with its edits: in its project, or in any
+  project for a user server; renamed in place when the server was added in the log.
+- Reproducers (fail on f0772a0, pass now): docstore
+  `a_switch_off_of_a_server_renamed_since_stays_with_it_when_another_takes_its_old_name` (intact and overwritten);
+  engine `an_earlier_switch_offs_check_does_not_turn_off_a_copy_under_the_name_it_was_renamed_from` and the move-in
+  variant `an_earlier_switch_offs_check_does_not_turn_off_a_server_moved_in_under_the_name_it_was_renamed_from`. Guard:
+  `switching_a_server_on_again_before_its_rename_leaves_the_newcomer_under_its_old_name_alone` (passes before and after).
+- Not covered by the model test: `World` tracks only the plugin's switch-off state, not other servers'.

@@ -1546,14 +1546,15 @@ fn legacy_names(
 /// added (and edited) under its new name. The later delete or rename then finds it gone, which is done.
 ///
 /// A server renamed later that was not added in the log (it was there before, or came in by a copy or a rename) has
-/// its edits replayed after the rename, under its new name, each as a plan of its own. Under the old name they would
-/// land on whatever is there now, such as a server copied or moved in since.
+/// its edits and switch-offs replayed after the rename, under its new name, each as a plan of its own. Under the old
+/// name they would land on whatever is there now, such as a server copied or moved in since. A switch-off is this
+/// server's when it is in the server's project, or, for a user server, in any project.
 fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
     let mut plans: Vec<Vec<Option<Op>>> = log
         .iter()
         .map(|p| p.ops.iter().cloned().map(Some).collect())
         .collect();
-    // The edits moved after each plan's renames, replayed right after it, in order.
+    // The edits and switch-offs moved after each plan's renames, replayed right after it, in order.
     let mut after: Vec<Vec<Option<Op>>> = vec![Vec::new(); plans.len()];
     let here = |project: &Option<String>, name: &str, at: &Option<String>, n: &str| {
         n == name
@@ -1561,6 +1562,12 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                 (Some(a), Some(b)) => crate::api::same_project(a, b),
                 (a, b) => a == b,
             }
+    };
+    let switched_here = |project: &str, name: &str, at: &Option<String>, n: &str| {
+        n == name
+            && at
+                .as_ref()
+                .is_none_or(|p| crate::api::same_project(project, p))
     };
     for j in 0..plans.len() {
         for k in 0..plans[j].len() {
@@ -1589,6 +1596,11 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                     match op {
                         Some(Op::ReplaceServer { project, name, .. })
                             if here(project, name, &at, &n) =>
+                        {
+                            edits.push((i, moved, o));
+                        }
+                        Some(Op::SetDisabled { project, name, .. })
+                            if switched_here(project, name, &at, &n) =>
                         {
                             edits.push((i, moved, o));
                         }
@@ -1631,7 +1643,9 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                         } else {
                             &mut plans[i][o]
                         };
-                        if let Some(Op::ReplaceServer { name, .. }) = slot {
+                        if let Some(Op::ReplaceServer { name, .. } | Op::SetDisabled { name, .. }) =
+                            slot
+                        {
                             name.clone_from(new_name);
                         }
                     }
@@ -1640,19 +1654,20 @@ fn as_they_ended(log: &[Plan]) -> Vec<Vec<Op>> {
                     }
                 }
                 None => {
-                    // Oldest first, so the last edit has the last word.
+                    // Oldest first, so the last change has the last word.
                     for (i, moved, o) in edits.into_iter().rev() {
                         let slot = if moved {
                             &mut after[i][o]
                         } else {
                             &mut plans[i][o]
                         };
-                        if let Some(Op::ReplaceServer { project, entry, .. }) = slot.take() {
-                            after[j].push(Some(Op::ReplaceServer {
-                                project,
-                                name: new_name.clone(),
-                                entry,
-                            }));
+                        if let Some(mut op @ (Op::ReplaceServer { .. } | Op::SetDisabled { .. })) =
+                            slot.take()
+                            && let Op::ReplaceServer { name, .. } | Op::SetDisabled { name, .. } =
+                                &mut op
+                        {
+                            name.clone_from(new_name);
+                            after[j].push(Some(op));
                         }
                     }
                 }
@@ -5336,6 +5351,53 @@ mod tests {
         };
         at_once(false);
         at_once(true);
+    }
+
+    #[test]
+    fn a_switch_off_of_a_server_renamed_since_stays_with_it_when_another_takes_its_old_name() {
+        // Found in review: a is switched off in /q, renamed to A, and c copied in as a. Replayed under its old name,
+        // the switch-off turned the copy off.
+        for overwritten in [false, true] {
+            let f = Fixture::new(&pretty(&servers_doc()));
+            let log = [
+                apply_ops(&f, vec![disable("/q", "a")]),
+                apply_ops(
+                    &f,
+                    vec![
+                        rename_server(None, "a", "A"),
+                        rename_disabled("/q", "a", "A"),
+                    ],
+                ),
+                apply_ops(&f, vec![copy(None, "c", None, "a")]),
+            ];
+            let done = f.json();
+            assert_eq!(done["projects"]["/q"]["disabledMcpServers"], json!(["A"]));
+            if overwritten {
+                std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+            }
+            assert_eq!(f.store.verify(&log, &|| false), Ok(overwritten));
+            assert_eq!(f.json(), done, "overwritten: {overwritten}");
+        }
+    }
+
+    #[test]
+    fn switching_a_server_on_again_before_its_rename_leaves_the_newcomer_under_its_old_name_alone()
+    {
+        // The variant: off, on again, renamed; the copy under the old name is then switched off on its own.
+        let f = Fixture::new(&pretty(&servers_doc()));
+        let log = [
+            apply_ops(&f, vec![disable("/q", "a")]),
+            apply_ops(&f, vec![enable("/q", "a")]),
+            apply_ops(&f, vec![rename_server(None, "a", "A")]),
+            apply_ops(&f, vec![copy(None, "c", None, "a")]),
+            apply_ops(&f, vec![disable("/q", "a")]),
+        ];
+        let done = f.json();
+        assert_eq!(done["projects"]["/q"]["disabledMcpServers"], json!(["a"]));
+        assert_eq!(f.store.verify(&log, &|| false), Ok(false));
+        std::fs::write(&f.store.path, pretty(&servers_doc())).unwrap();
+        assert_eq!(f.store.verify(&log, &|| false), Ok(true));
+        assert_eq!(f.json(), done);
     }
 
     #[test]
