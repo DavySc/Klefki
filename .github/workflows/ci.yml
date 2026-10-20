@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Linux GUI build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libegl1 libgl1-mesa-dri
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -26,6 +26,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The look tests' pictures that differ, with a picture of the difference (crates/app/src/shell/tests/look.rs).
+      - name: Changed pictures
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: look-changes
+          path: |
+            crates/app/src/shell/tests/look/*.new.png
+            crates/app/src/shell/tests/look/*.diff.png
+          if-no-files-found: ignore
       # Broken links in doc comments (ripgrep's CI does the same). Linux only: the docs are the same everywhere.
       - name: Doc comments
         if: runner.os == 'Linux'

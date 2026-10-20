@@ -16,6 +16,24 @@ must leave every test, golden file and baseline as it was.
   - `crates/cli/tests/golden/`: every `klefki-cli` command's stdout, stderr and exit code.
   - A difference fails with a diff. When a change is meant, run the tests with `UPDATE_EXPECT=1` and review the
     golden files in the pull request. **In a refactor, a golden file that changes means behaviour changed: stop.**
+- Look tests (`crates/app/src/shell/tests/look.rs`, Linux only): 58 pictures in `crates/app/src/shell/tests/look/`,
+  compared pixel for pixel (threshold 0). Pages, detail tabs, statuses (checking, failed, a diagnosis), empty and
+  error states and the update in the top bar at 1100×800; every dialog (Add in each mode, Import, Duplicate, Move,
+  Export, casing, profiles, sign-in, the reviews including Delete and "nothing to do", and the outcome messages) at
+  the smallest window, 800×480; the list in the four themes, and the dialogs with colours of their own (review,
+  outcome, sign-in) in light too. Drawn with wgpu on Mesa's OpenGL software renderer (pinned in the test, so Vulkan
+  drivers do not change it). A one-step colour change or a 1 px spacing change fails them.
+  - A failure leaves `<name>.new.png` and `<name>.diff.png` beside the picture (ignored by git); CI uploads them as
+    the `look-changes` artifact.
+  - When a change to the look is meant: `UPDATE_SNAPSHOTS=1 cargo test -p klefki look`, and show the pictures in
+    the pull request. **In a refactor, a picture that changes means the look changed: stop.**
+  - A new screen, dialog or state gets a picture in the same pull request.
+  - Mesa drift: the pictures match Ubuntu 24.04's Mesa (25.2.8), as on CI's `ubuntu-latest`. If the runner image
+    moves to another Mesa, every look test fails at once on unrelated pull requests, with differences scattered over
+    edges and text rather than in one place. Then fix it in its own pull request: take the pictures from that run's
+    `look-changes` artifact (the `.new.png` files, renamed), look at them side by side with the old ones, and say
+    which Mesa they come from. Never run `UPDATE_SNAPSHOTS=1` on a machine whose Mesa differs from CI's; the cloud
+    sessions' container has the same one.
 
 ## By hand or weekly (the `quality` workflow, Linux only)
 macOS minutes cost ten times as much, so heavy checks run on Linux, weekly on main, or from Actions > quality > Run
@@ -41,7 +59,7 @@ workflow on a branch.
 1. One area per branch; behaviour unchanged.
 2. Before: for the files the slice changes, read coverage and run mutants on them. Missed mutants in code the
    slice moves or rewrites get a test first, in its own commit, seen failing against a mutant.
-3. After: the full verify (CLAUDE.md), no golden file changed, no new missed mutants, and, for anything on the start-up path (engine start, configuration
+3. After: the full verify (CLAUDE.md), no golden file or look picture changed, no new missed mutants, and, for anything on the start-up path (engine start, configuration
    loading, the app's first frame), `scripts/perf-baseline.py` on main and on the branch, both in the pull request.
    For mutants: a slice that changes code runs the `quality` workflow with `mutants: diff`. A slice that only moves
    code (A1, A2) would mutate every moved line, hours beyond the job's limit: instead compare the missed mutants of

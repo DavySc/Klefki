@@ -20212,4 +20212,8 @@ mod tests {
         h.run();
         h.get_by_label("not loaded");
     }
+
+    /// Pictures of every screen and dialog: a refactor that changes the look fails (see `docs/quality.md`).
+    #[cfg(target_os = "linux")]
+    mod look;
 }
