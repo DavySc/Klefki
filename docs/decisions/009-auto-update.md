@@ -57,7 +57,10 @@ switch.
 ## Installing (slice 6b)
 - **Which installs update themselves.** Worked out at start from where Klefki runs (`crates/core/src/install.rs`):
   the per-user Windows setup (its `uninstall.exe` is next to `klefki.exe`, wherever the user installed it), a macOS
-  `Klefki.app`, and an AppImage (the `APPIMAGE` variable its runtime sets, naming a file that exists). The MSI (an
+  `Klefki.app` (not one Gatekeeper translocated, which is a read-only copy), and an AppImage (the `APPIMAGE` variable
+  its runtime sets, naming a file that exists, and only while Klefki runs from `APPDIR`: both are passed on to every
+  program started from any AppImage, so a `.deb` Klefki started from an AppImage editor's terminal would otherwise
+  overwrite the editor). The MSI (an
   administrator's), the zip (unpacked by hand) and the `.deb` (apt, with sudo) keep the notice and the release page,
   with a sentence saying why.
 - **What is downloaded.** Only the one file that install needs, from
@@ -65,14 +68,22 @@ switch.
   `…-macos-universal.app.zip` (new: the signed app, zipped with `ditto` so its signature survives) or
   `…-linux-x86_64.AppImage`. Only a file named in the signed `SHA256SUMS` of the release the check accepted is asked
   for; it streams to an owner-only folder in Klefki's data folder (`updates/`), at most 256 MB, hashed as it is
-  written. A file whose SHA-256 differs is deleted and never run.
+  written. A file whose SHA-256 differs is deleted and never run. Packages of earlier updates are deleted first.
+- **Only what can be installed.** Before downloading, Klefki checks that it can create a file next to the app or the
+  AppImage. If not (a standard user with Klefki in `/Applications`, a disk image), it downloads nothing and says to
+  move Klefki to a folder the user can change; the button then opens the release page.
 - **When.** With "Check for updates automatically" on, a found release downloads in the background at once; off, on
   a click ("Update: 1.2.3" in the top bar, Download in Settings). A release found on an earlier day is looked up again
   at start, so it can be downloaded. The top bar then offers "Restart to update", disabled while a change is open
-  (restarting would lose it). Otherwise the update installs when Klefki closes (`eframe::App::on_exit`).
+  (restarting would lose it). Otherwise the update installs when Klefki closes (`eframe::App::on_exit`). A failure
+  then cannot be shown, so it is kept in `updates/` and shown by the next start's check, which also does not download
+  the same release again unasked. After an update, the top bar says "Updated to 1.2.3 · What's new" once. For
+  installs that update themselves the switch reads "Update Klefki automatically", so turning it on is consent to
+  installing, not only to checking.
 - **How it is installed.**
   - Windows: the setup runs with `/P /R` (progress, no questions, start Klefki again) on restart, `/S` (silent) on
-    close. The setup closes a running Klefki itself.
+    close, both with `/NS` so the shortcuts the user kept, moved or deleted are not made again. The setup closes a
+    running Klefki itself, so a Klefki opened again within the seconds the silent setup runs is closed too.
   - macOS: `/usr/bin/ditto -x -k` unpacks the app into a folder next to the old one; the old app is moved aside,
     the new one into its place (the old one is put back if that fails), then the old one deleted. Restart is
     `/usr/bin/open -n`.
@@ -81,4 +92,6 @@ switch.
     version as it was and says to download the new one by hand.
 - **Not verified until the first signed release:** each install path on its real system (the tests replace bundles
   and AppImages in temporary folders, and the setup's flags are cargo-packager's documented ones), and whether macOS
-  asks again for an app Klefki replaced itself (the download carries no quarantine flag, so it should not).
+  asks again for an app Klefki replaced itself (the download carries no quarantine flag, so it should not). Also
+  unverified: whether macOS Keychain asks again for Klefki's stored client secrets after each update, since the
+  ad-hoc signature changes with every build.

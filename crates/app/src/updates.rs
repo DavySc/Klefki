@@ -20,6 +20,8 @@ pub struct Updates {
     last_checked: Option<u64>,
     /// A newer release found by an earlier check, until a check finds none.
     available: Option<Version>,
+    /// This run is the release an earlier run found: Klefki was updated since. Said once.
+    pub updated: Option<Version>,
     /// What the check this run found, or why it failed.
     pub found: Option<UpdateCheck>,
     pub checking: bool,
@@ -36,6 +38,7 @@ impl Default for Updates {
             auto: true,
             last_checked: None,
             available: None,
+            updated: None,
             found: None,
             checking: false,
             considered: false,
@@ -48,12 +51,12 @@ impl Default for Updates {
 impl Updates {
     pub fn load(storage: Option<&dyn eframe::Storage>) -> Updates {
         let get = |key| storage.and_then(|s| s.get_string(key));
+        let remembered = get(AVAILABLE_KEY).and_then(|v| Version::parse(&v));
         Updates {
             auto: get(AUTO_KEY).is_none_or(|v| v != "off"),
             last_checked: get(LAST_KEY).and_then(|v| v.parse().ok()),
-            available: get(AVAILABLE_KEY)
-                .and_then(|v| Version::parse(&v))
-                .filter(|v| *v > Version::current()),
+            available: remembered.filter(|v| *v > Version::current()),
+            updated: remembered.filter(|v| *v == Version::current()),
             ..Updates::default()
         }
     }
@@ -99,7 +102,8 @@ impl Updates {
         self.checking = false;
         match &found {
             UpdateCheck::Available { version, .. } => {
-                if self.ready() != Some(*version) {
+                // A download of an older release is of no use; a failure stays, so it is not tried again unasked.
+                if self.ready().is_some_and(|ready| ready != *version) {
                     self.download = None;
                 }
                 self.available = Some(*version);
@@ -276,10 +280,14 @@ mod tests {
 
     #[test]
     fn a_remembered_release_that_is_not_newer_is_dropped() {
-        // After installing the update by hand, the remembered version is this one: nothing to offer.
+        // After the update, the remembered version is this one: nothing to offer, and it is said once.
         let mut storage = MemoryStorage::default();
         eframe::Storage::set_string(&mut storage, AVAILABLE_KEY, Version::current().to_string());
-        assert_eq!(Updates::load(Some(&storage)).available(), None);
+        let updated = Updates::load(Some(&storage));
+        assert_eq!(updated.available(), None);
+        assert_eq!(updated.updated, Some(Version::current()));
+        updated.save(&mut storage);
+        assert_eq!(Updates::load(Some(&storage)).updated, None, "once");
         eframe::Storage::set_string(&mut storage, AVAILABLE_KEY, "garbage".into());
         assert_eq!(Updates::load(Some(&storage)).available(), None);
     }
@@ -367,6 +375,11 @@ mod tests {
             "not again by itself after a failure"
         );
         assert_eq!(updates.download_failed(), Some("no connection"));
+        updates.answered(found.clone(), NOW);
+        assert!(
+            !updates.download_due(),
+            "nor when the same release is found again"
+        );
         updates.downloaded(UpdateDownload::Ready(newer()));
         assert_eq!(updates.ready(), Some(newer()));
         // The same release found again keeps the download.

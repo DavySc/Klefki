@@ -546,7 +546,13 @@ impl ShellApp {
                     self.download_update();
                 }
             }
-            Event::UpdateDownload(done) => self.updates.downloaded(done),
+            Event::UpdateDownload(done) => {
+                // Found out only now (the app's folder cannot be changed): the page is the way from here.
+                if let UpdateDownload::Manual(why) = &done {
+                    self.updated_by_hand = Some(why.clone());
+                }
+                self.updates.downloaded(done);
+            }
             Event::Desktop(desktop) => {
                 // Not kept once the page is left: it is read again when the page is opened.
                 if let Some(page) = &mut self.desktop {
@@ -1309,6 +1315,20 @@ impl ShellApp {
                 }
                 if let Some(version) = self.updates.available() {
                     self.update_button(ui, version, pal.primary);
+                } else if let Some(version) = self.updates.updated
+                    && ui
+                        .button(
+                            RichText::new(format!(
+                                "{} Updated to {version} · What's new",
+                                icon::CHECK_CIRCLE
+                            ))
+                            .color(pal.primary),
+                        )
+                        .on_hover_text("Opens the release's page on GitHub.")
+                        .clicked()
+                {
+                    self.updates.updated = None;
+                    self.send(Command::OpenReleasePage(version));
                 }
                 let mut changed = false;
                 egui::ComboBox::from_id_salt("theme")
@@ -1482,6 +1502,12 @@ impl ShellApp {
             || self.duplicate.is_some()
             || self.moving.is_some()
             || self.sign_in.is_some()
+            || self.secret.is_some()
+            || self.secret_input.is_some()
+            || self.casing.is_some()
+            || self.forgetting.is_some()
+            || self.exporting.is_some()
+            || self.import_waiting
     }
 
     fn check_for_updates_now(&mut self) {
@@ -3732,7 +3758,12 @@ impl ShellApp {
             }
         }
         ui.add_space(10.0);
-        ui.checkbox(&mut self.updates.auto, "Check for updates automatically");
+        let automatic = if self.updated_by_hand.is_some() {
+            "Check for updates automatically"
+        } else {
+            "Update Klefki automatically"
+        };
+        ui.checkbox(&mut self.updates.auto, automatic);
         ui.add(
             egui::Label::new(
                 RichText::new(
@@ -17950,11 +17981,107 @@ mod tests {
     }
 
     #[test]
+    fn the_switch_says_whether_it_updates_or_only_checks() {
+        let (mut h, _engine) = update_harness();
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label("Update Klefki automatically");
+        h.state_mut().updated_by_hand = Some("Klefki was installed with the MSI.".into());
+        h.run();
+        h.get_by_label("Check for updates automatically");
+    }
+
+    #[test]
+    fn an_app_that_cannot_replace_itself_says_why_and_offers_the_page() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1);
+        let why =
+            "Klefki cannot replace itself in this folder. Move Klefki to a folder you can change.";
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Manual(why.into())))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Update: 999.0.0").click();
+        h.run();
+        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label(why);
+    }
+
+    #[test]
+    fn an_update_that_failed_at_close_is_shown_and_not_downloaded_again_unasked() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        let why = "The update could not be installed when Klefki closed: denied.";
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Failed(why.into())))
+            .unwrap();
+        found(&engine, version);
+        h.run();
+        assert_eq!(downloads_sent(&engine), 0);
+        h.state_mut().go(Page::Settings);
+        h.run();
+        h.get_by_label(why);
+        h.get_by_label("Download").click();
+        h.run_steps(2);
+        assert_eq!(downloads_sent(&engine), 1, "on request");
+    }
+
+    #[test]
+    fn after_an_update_klefki_says_so_once() {
+        let (mut h, engine) = update_harness();
+        let version = klefki_core::api::Version::current();
+        h.state_mut().updates.updated = Some(version);
+        h.run();
+        h.get_by_label_contains(&format!("Updated to {version}"))
+            .click();
+        h.run();
+        assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
+        assert!(h.query_by_label_contains("Updated to").is_none());
+    }
+
+    #[test]
+    fn restarting_waits_for_every_open_dialog() {
+        let (mut h, engine) = update_harness();
+        h.run();
+        let version = klefki_core::api::Version::parse("999.0.0").unwrap();
+        found(&engine, version);
+        engine
+            .events
+            .send(Event::UpdateDownload(UpdateDownload::Ready(version)))
+            .unwrap();
+        h.run();
+        h.state_mut().forgetting = Some("x".into());
+        h.run();
+        assert!(
+            h.get_by_label_contains("Restart to update")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.state_mut().forgetting = None;
+        h.state_mut().import_waiting = true;
+        h.run_steps(2);
+        assert!(
+            h.get_by_label_contains("Restart to update")
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+
+    #[test]
     fn turning_automatic_checks_off_is_remembered() {
         let (mut h, _engine) = update_harness();
         h.state_mut().go(Page::Settings);
         h.run();
-        h.get_by_label("Check for updates automatically").click();
+        h.get_by_label("Update Klefki automatically").click();
         h.run();
         assert!(!h.state().updates.auto);
         let mut storage = crate::theme::tests::MemoryStorage::default();

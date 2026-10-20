@@ -51,6 +51,19 @@ install it (Windows per-user setup, macOS app, AppImage), on "Restart to update"
 - Release build with the key: 20,250,504 bytes (TLS, as measured in 6a). Workspace tests with the key: 1227 passed;
   app tests without it: 373 passed. clippy, fmt, deny ok.
 
+## Cross-review of 0dc0776 (3 blockers, fold-ins), fixed
+- An inherited `APPIMAGE` named another program: trusted only while Klefki runs from `APPDIR`, with tests for the
+  inherited case, a look-alike mount and a missing `APPDIR`.
+- Windows updates made the shortcuts again: `/NS` on both setups.
+- An install failing at close failed silently, daily: `can_replace` checks before downloading (nothing downloaded
+  that cannot be installed; translocated apps are Manual), and a failure at close is kept in `updates/` and shown by
+  the next check, with no new download unasked.
+- Fold-ins: "Update Klefki automatically" for self-updating installs; "Updated to x · What's new" once; restart also
+  waits for the secret, casing, forget, export and import dialogs; earlier packages deleted; 009 notes on Keychain
+  prompts and on a Klefki reopened while the silent setup runs.
+- `scripts/sign-checksums.sh` adds the key file's comment line when the secret holds only the key line (Davy stored
+  it so; minisign refuses such a file, checked locally with a fresh key, both forms then sign and verify).
+
 ## Not verified
 Each install path on its real system (tests swap bundles and AppImages in temporary folders on Linux; the NSIS flags
 are from cargo-packager 0.11.8's template), and whether macOS asks again for an app Klefki replaced. Both wait on the

@@ -29,13 +29,13 @@ pub enum InstallKind {
 }
 
 impl InstallKind {
-    /// Works out how the program at `exe` was installed. `appimage` is the `APPIMAGE` variable the AppImage runtime
-    /// sets, and `uninstaller` whether the Windows setup's `uninstall.exe` is next to `exe` (the MSI and the zip have
+    /// Works out how the program at `exe` was installed. `appimage` holds the `APPIMAGE` and `APPDIR` variables the
+    /// AppImage runtime sets (the AppImage, and where it is mounted), and `uninstaller` whether the Windows setup's `uninstall.exe` is next to `exe` (the MSI and the zip have
     /// none; the setup installs per user, wherever the user chose).
     pub(crate) fn detect(
         os: &str,
         exe: &Path,
-        appimage: Option<&Path>,
+        appimage: Option<(&Path, &Path)>,
         uninstaller: bool,
     ) -> InstallKind {
         let manual = |why: &str| InstallKind::Manual(why.to_owned());
@@ -63,16 +63,29 @@ impl InstallKind {
                     .and_then(Path::parent)
                     .filter(|app| app.extension().is_some_and(|e| e == "app"));
                 match bundle {
+                    // Gatekeeper runs an app never moved out of Downloads from a read-only copy.
+                    Some(app) if app.to_string_lossy().contains("/AppTranslocation/") => manual(
+                        "macOS runs this Klefki from a temporary copy. Move Klefki to your Applications folder to \
+                         get updates.",
+                    ),
                     Some(app) => InstallKind::MacApp(app.to_path_buf()),
                     None => manual(
                         "This copy of Klefki is not an app bundle, so it is updated by hand.",
                     ),
                 }
             }
+            // Linux paths, compared as text so the same rule holds wherever this runs. The variables are passed on to
+            // every program started from an AppImage, so they are Klefki's only when it runs from that mount.
             "linux" => match appimage {
-                // A Linux path, checked as text so the same rule holds wherever this runs.
-                Some(path) if path.to_string_lossy().starts_with('/') => {
-                    InstallKind::AppImage(path.to_path_buf())
+                Some((image, mount))
+                    if image.to_string_lossy().starts_with('/')
+                        && !mount.as_os_str().is_empty()
+                        && exe.to_string_lossy().starts_with(&format!(
+                            "{}/",
+                            mount.to_string_lossy().trim_end_matches('/')
+                        )) =>
+                {
+                    InstallKind::AppImage(image.to_path_buf())
                 }
                 _ => manual(
                     "Klefki was installed from the .deb package: update it with apt, as the release notes say.",
@@ -98,14 +111,16 @@ pub(crate) fn this_install() -> InstallKind {
     let Ok(exe) = std::env::current_exe() else {
         return InstallKind::Manual("Klefki could not tell where it is installed.".into());
     };
-    // Set by the AppImage runtime to the AppImage it started from; only trusted when that file exists.
-    let appimage = std::env::var_os("APPIMAGE")
+    // Set by the AppImage runtime to the AppImage it started from and where it mounted it.
+    let image = std::env::var_os("APPIMAGE")
         .map(PathBuf::from)
         .filter(|path| path.is_file());
+    let mount = std::env::var_os("APPDIR").map(PathBuf::from);
     let uninstaller = exe
         .parent()
         .is_some_and(|dir| dir.join("uninstall.exe").is_file());
-    InstallKind::detect(std::env::consts::OS, &exe, appimage.as_deref(), uninstaller)
+    let appimage = image.as_deref().zip(mount.as_deref());
+    InstallKind::detect(std::env::consts::OS, &exe, appimage, uninstaller)
 }
 
 /// A downloaded update whose checksum matched, ready to install.
@@ -114,6 +129,64 @@ pub(crate) struct Staged {
     pub version: Version,
     pub kind: InstallKind,
     pub file: PathBuf,
+}
+
+/// Whether Klefki can put a new version where this one is: it must be able to create files next to the app or the
+/// AppImage, which a standard user cannot in `/Applications`, nor anyone on a disk image. Checked before downloading,
+/// so nothing is downloaded that cannot be installed.
+pub(crate) fn can_replace(kind: &InstallKind) -> Result<(), String> {
+    let (path, what) = match kind {
+        InstallKind::MacApp(bundle) => (
+            bundle,
+            "Move Klefki to a folder you can change, such as your own Applications folder, or update it by hand.",
+        ),
+        InstallKind::AppImage(image) => (
+            image,
+            "Move the AppImage to a folder you can change, or update it by hand.",
+        ),
+        InstallKind::WindowsSetup => return Ok(()),
+        InstallKind::Manual(why) => return Err(why.clone()),
+    };
+    let writable = path.parent().is_some_and(|dir| {
+        tempfile::Builder::new()
+            .prefix(".klefki-check-")
+            .tempfile_in(dir)
+            .is_ok()
+    });
+    if writable {
+        Ok(())
+    } else {
+        Err(format!(
+            "Klefki cannot replace itself in this folder. {what}"
+        ))
+    }
+}
+
+/// Where an install that failed as Klefki closed leaves its reason, for the next start to show.
+const FAILED_NOTE: &str = "install-failed.txt";
+
+/// Keeps why installing failed as Klefki closed (nothing is on screen then).
+pub(crate) fn note_failure(dir: &Path, why: &str) {
+    if crate::config::docstore::create_private_dir(dir).is_ok() {
+        let _ = std::fs::remove_file(dir.join(FAILED_NOTE));
+        if let Ok(mut file) = crate::config::docstore::create_private_file(&dir.join(FAILED_NOTE)) {
+            let _ = file.write_all(why.as_bytes());
+        }
+    }
+}
+
+/// Why installing failed when Klefki last closed, once: the note is removed.
+pub(crate) fn take_failure(dir: &Path) -> Option<String> {
+    use std::io::Read;
+    let path = dir.join(FAILED_NOTE);
+    let mut text = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok();
+    let _ = std::fs::remove_file(&path);
+    Some(crate::sanitize::sanitize(&text)).filter(|why| !why.trim().is_empty())
 }
 
 /// Downloads this install's package of `release` into `dir` and checks it against the signed checksum. A file that
@@ -136,9 +209,17 @@ pub(crate) fn download(
         .ok_or_else(|| format!("The release has no {name}."))?;
     crate::config::docstore::create_private_dir(dir)
         .map_err(|e| format!("Could not make the folder for the download ({e})."))?;
+    // Packages of earlier updates (or a partial one) are not kept.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("klefki-")
+                && entry.file_type().is_ok_and(|t| t.is_file())
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     let file = dir.join(&name);
-    // A file left by an earlier run is replaced: it may be partial.
-    let _ = std::fs::remove_file(&file);
     let mut out = HashingFile {
         file: crate::config::docstore::create_private_file(&file)
             .map_err(|e| format!("Could not save the download ({e})."))?,
@@ -196,7 +277,12 @@ pub(crate) fn apply(staged: &Staged, relaunch: bool) -> Result<(), String> {
         // The setup closes a running Klefki itself. `/P` shows its progress without asking anything, `/S` shows
         // nothing, and `/R` starts Klefki again when it is done (cargo-packager's NSIS installer).
         InstallKind::WindowsSetup => {
-            let args: &[&str] = if relaunch { &["/P", "/R"] } else { &["/S"] };
+            // `/NS`: the shortcuts the user kept, moved or deleted stay as they are.
+            let args: &[&str] = if relaunch {
+                &["/P", "/R", "/NS"]
+            } else {
+                &["/S", "/NS"]
+            };
             Command::new(&staged.file)
                 .args(args)
                 .spawn()
@@ -412,25 +498,58 @@ mod tests {
             InstallKind::Manual(_)
         ));
 
+        // Translocated by Gatekeeper (never moved out of Downloads): a read-only copy, so updated by hand.
+        assert!(matches!(
+            mac("/private/var/folders/x/T/AppTranslocation/1234/d/Klefki.app/Contents/MacOS/klefki"),
+            InstallKind::Manual(why) if why.contains("Applications folder")
+        ));
+
         let image = Path::new("/home/ann/Apps/klefki.AppImage");
+        let mount = Path::new("/tmp/.mount_x");
+        let linux =
+            |exe: &str, appimage| InstallKind::detect("linux", Path::new(exe), appimage, false);
         assert_eq!(
-            InstallKind::detect(
-                "linux",
-                Path::new("/tmp/.mount_x/usr/bin/klefki"),
-                Some(image),
-                false
-            ),
+            linux("/tmp/.mount_x/usr/bin/klefki", Some((image, mount))),
             InstallKind::AppImage(image.into())
         );
         assert!(matches!(
-            InstallKind::detect("linux", Path::new("/usr/bin/klefki"), None, false),
+            linux("/usr/bin/klefki", None),
             InstallKind::Manual(why) if why.contains(".deb")
         ));
+        assert!(matches!(
+            linux("/usr/bin/klefki", Some((Path::new("relative"), mount))),
+            InstallKind::Manual(_)
+        ));
+    }
+
+    /// Another AppImage (an editor, a terminal) passes `APPIMAGE` and `APPDIR` on to what is started from it: they
+    /// name that program, not Klefki, which must never replace it.
+    #[test]
+    fn an_appimage_klefki_was_started_from_is_not_taken_for_klefki() {
+        let editor = Path::new("/home/ann/Apps/Editor.AppImage");
+        let linux = |exe: &str, appdir: &str| {
+            InstallKind::detect(
+                "linux",
+                Path::new(exe),
+                Some((editor, Path::new(appdir))),
+                false,
+            )
+        };
+        assert!(matches!(
+            linux("/usr/bin/klefki", "/tmp/.mount_editor"),
+            InstallKind::Manual(why) if why.contains(".deb")
+        ));
+        // Klefki's own mount only: a mount whose name starts the same is another one.
+        assert!(matches!(
+            linux("/tmp/.mount_editorX/usr/bin/klefki", "/tmp/.mount_editor"),
+            InstallKind::Manual(_)
+        ));
+        // Without APPDIR there is no telling whose APPIMAGE it is.
         assert!(matches!(
             InstallKind::detect(
                 "linux",
                 Path::new("/usr/bin/klefki"),
-                Some(Path::new("relative")),
+                Some((editor, Path::new(""))),
                 false
             ),
             InstallKind::Manual(_)
@@ -531,6 +650,82 @@ mod tests {
             download(&files, &release, &manual, &updates),
             Err("Use apt.".into())
         );
+    }
+
+    #[test]
+    fn nothing_is_downloaded_for_a_place_klefki_cannot_change() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            can_replace(&InstallKind::AppImage(dir.path().join("k.AppImage"))),
+            Ok(())
+        );
+        assert_eq!(
+            can_replace(&InstallKind::MacApp(dir.path().join("Klefki.app"))),
+            Ok(())
+        );
+        assert_eq!(can_replace(&InstallKind::WindowsSetup), Ok(()));
+        assert_eq!(
+            can_replace(&InstallKind::Manual("Use apt.".into())),
+            Err("Use apt.".into())
+        );
+        // A folder that cannot take a new file, like /Applications for a standard user or a disk image.
+        let gone = dir.path().join("not-there");
+        assert!(matches!(
+            can_replace(&InstallKind::MacApp(gone.join("Klefki.app"))),
+            Err(why) if why.contains("cannot replace itself") && why.contains("Applications folder")
+        ));
+        assert!(matches!(
+            can_replace(&InstallKind::AppImage(gone.join("k.AppImage"))),
+            Err(why) if why.contains("cannot replace itself")
+        ));
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "the check leaves nothing behind");
+    }
+
+    #[test]
+    fn a_new_download_clears_earlier_packages_but_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates = dir.path().join("updates");
+        std::fs::create_dir(&updates).unwrap();
+        std::fs::write(updates.join("klefki-0.1.5-linux-x86_64.AppImage"), "old").unwrap();
+        std::fs::write(
+            updates.join("klefki-0.2.0-linux-x86_64.AppImage"),
+            "partial",
+        )
+        .unwrap();
+        note_failure(&updates, "kept");
+        let kind = InstallKind::AppImage(dir.path().join("k.AppImage"));
+        let (files, release) = release("klefki-0.2.0-linux-x86_64.AppImage", b"new klefki");
+        download(&files, &release, &kind, &updates).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&updates)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["install-failed.txt", "klefki-0.2.0-linux-x86_64.AppImage"]
+        );
+    }
+
+    #[test]
+    fn a_failure_at_close_is_told_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let updates = dir.path().join("updates");
+        assert_eq!(take_failure(&updates), None);
+        note_failure(
+            &updates,
+            "Could not replace /Applications/Klefki.app (denied).",
+        );
+        note_failure(
+            &updates,
+            "Could not replace /Applications/Klefki.app (denied again).",
+        );
+        assert_eq!(
+            take_failure(&updates).as_deref(),
+            Some("Could not replace /Applications/Klefki.app (denied again).")
+        );
+        assert_eq!(take_failure(&updates), None, "once");
     }
 
     #[cfg(unix)]

@@ -466,6 +466,8 @@ pub struct Core {
     by_hand: Option<String>,
     /// The engine has a release key, so it checks for updates.
     checks_for_updates: bool,
+    /// Where downloaded updates wait (see [`EngineConfig::updates_dir`]).
+    updates_dir: Option<PathBuf>,
 }
 
 impl Core {
@@ -482,13 +484,19 @@ impl Core {
 
     /// Installs the update [`Command::DownloadUpdate`] got ready, here and now: Klefki calls it when it is closing,
     /// when the engine may already be gone. With `relaunch`, the new version is started and the caller should close
-    /// Klefki at once (on Windows the installer closes it anyway). Fails when no update is ready.
+    /// Klefki at once (on Windows the installer closes it anyway). Fails when no update is ready. Without `relaunch`
+    /// nothing is on screen any more, so a failure is kept, and the next check reports it.
     pub fn install_update(&self, relaunch: bool) -> Result<crate::update::Version, String> {
         let staged = lock(&self.updating)
             .staged
             .take()
             .ok_or("No update has been downloaded.")?;
-        crate::install::apply(&staged, relaunch)?;
+        if let Err(why) = crate::install::apply(&staged, relaunch) {
+            if !relaunch && let Some(dir) = &self.updates_dir {
+                crate::install::note_failure(dir, &why);
+            }
+            return Err(why);
+        }
         Ok(staged.version)
     }
 
@@ -537,6 +545,7 @@ impl Core {
             updating: Arc::default(),
             by_hand: None,
             checks_for_updates: false,
+            updates_dir: None,
         };
         (core, Detached { commands, events })
     }
@@ -659,6 +668,7 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
     let pick_dialog = Some(Arc::clone(&config.pick_dialog));
     let updating = Arc::<Mutex<Updating>>::default();
     let checks_for_updates = config.release_key.is_some();
+    let updates_dir = config.updates_dir.clone();
     let by_hand = match &config.install {
         crate::install::InstallKind::Manual(why) => Some(why.clone()),
         _ => None,
@@ -673,6 +683,7 @@ pub(crate) fn start_with(config: EngineConfig, wake: impl Fn() + Send + Sync + '
         updating,
         by_hand,
         checks_for_updates,
+        updates_dir,
     }
 }
 
@@ -1152,6 +1163,19 @@ fn engine_main(
             Command::CheckForUpdates => {
                 let shared = Arc::clone(&shared);
                 std::thread::spawn(move || {
+                    // Before the answer, so the app knows not to download again what it could not install.
+                    if let Some(why) = shared
+                        .config
+                        .updates_dir
+                        .as_deref()
+                        .and_then(crate::install::take_failure)
+                    {
+                        shared
+                            .emitter
+                            .emit(Event::UpdateDownload(UpdateDownload::Failed(format!(
+                                "The update could not be installed when Klefki closed: {why}"
+                            ))));
+                    }
                     let (found, release) = crate::update::check_release(
                         shared.config.releases.as_ref(),
                         crate::update::Version::current(),
@@ -1247,8 +1271,9 @@ enum SecretsAsk {
 /// Downloads the release the last check found, unless it is already downloaded. `None` while another download of it
 /// runs: that one answers.
 fn download_update(shared: &Shared) -> Option<UpdateDownload> {
-    if let crate::install::InstallKind::Manual(why) = &shared.config.install {
-        return Some(UpdateDownload::Manual(why.clone()));
+    // Nothing is downloaded that cannot be installed.
+    if let Err(why) = crate::install::can_replace(&shared.config.install) {
+        return Some(UpdateDownload::Manual(why));
     }
     let release = {
         let mut updating = lock(&shared.updating);
@@ -5608,6 +5633,38 @@ mod tests {
             std::fs::metadata(&file).unwrap().modified().unwrap(),
             modified
         );
+    }
+
+    #[test]
+    fn an_update_that_failed_as_klefki_closed_is_reported_by_the_next_check() {
+        let env = Env::new(&serde_json::json!({}), "{}", &[]);
+        crate::install::note_failure(
+            &env.dir.path().join("updates"),
+            "Could not replace it (denied).",
+        );
+        let (releases, key) = crate::update::test_release();
+        let core = start_with(
+            EngineConfig {
+                releases,
+                release_key: Some(key),
+                ..env.config()
+            },
+            || {},
+        );
+        core.send(Command::CheckForUpdates);
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Update(_))));
+        let failed = events.iter().position(|e| {
+            matches!(e, Event::UpdateDownload(UpdateDownload::Failed(why))
+                if why == "The update could not be installed when Klefki closed: Could not replace it (denied).")
+        });
+        let answer = events.iter().position(|e| matches!(e, Event::Update(_)));
+        assert!(
+            failed.unwrap() < answer.unwrap(),
+            "told before the answer: {events:?}"
+        );
+        // Once.
+        update_found(&core);
+        assert!(!env.dir.path().join("updates/install-failed.txt").exists());
     }
 
     #[test]
