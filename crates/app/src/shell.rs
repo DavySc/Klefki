@@ -3,7 +3,7 @@
 use crate::command::{self, CommandPalette, Entry, shortcut};
 use crate::explain::Explanation;
 use crate::sign_in::{self, SignInView};
-use crate::theme::{self, Palette, ThemeChoice, Tone};
+use crate::theme::{self, Palette, ThemeChoice, ThemeOption, Tone};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use egui_phosphor::regular as icon;
@@ -1346,21 +1346,32 @@ impl ShellApp {
                     self.updates.updated = None;
                     self.send(Command::OpenReleasePage(version));
                 }
-                let mut changed = false;
+                let mut picked = None;
+                let current = ThemeOption::of(self.theme, self.tone);
                 egui::ComboBox::from_id_salt("theme")
-                    .selected_text(format!("{} {}", self.theme.icon(), self.theme.label()))
-                    .width(120.0)
+                    .selected_text(format!("{} {}", current.icon(), current.label()))
+                    .width(140.0)
+                    // All five fit without a scroll bar (the default is 200 px).
+                    .height(260.0)
                     .show_ui(ui, |ui| {
                         flat_items(ui);
-                        for choice in ThemeChoice::ALL {
-                            let text = format!("{} {}", choice.icon(), choice.label());
-                            changed |= ui.selectable_value(&mut self.theme, choice, text).changed();
+                        for option in ThemeOption::ALL {
+                            let text = format!("{} {}", option.icon(), option.label());
+                            if ui.selectable_label(option == current, text).clicked() {
+                                picked = Some(option);
+                            }
                         }
                     })
                     .response
                     .on_hover_text("Theme");
-                if changed {
-                    theme::set_choice(ui.ctx(), self.theme);
+                if let Some(option) = picked {
+                    let (choice, tone) = option.parts();
+                    self.theme = choice;
+                    theme::set_choice(ui.ctx(), choice);
+                    if let Some(tone) = tone {
+                        self.tone = tone;
+                        theme::set_tone(ui.ctx(), tone);
+                    }
                 }
                 if ui
                     .button(
@@ -9317,40 +9328,55 @@ mod tests {
     }
 
     #[test]
-    fn theme_dropdown_offers_all_three_and_switches_the_palette() {
+    fn theme_dropdown_offers_every_theme_and_switches_the_palette() {
         use ThemeChoice::{Dark, Light, System};
-        let shown = |c: ThemeChoice| format!("{} {}", c.icon(), c.label());
+        let shown = |o: ThemeOption| format!("{} {}", o.icon(), o.label());
         let mut h = harness();
         h.run();
         assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
+        let cool_dark = ThemeOption::of(Dark, Tone::Cool);
 
-        // Closed, the dropdown shows the current choice only.
-        h.get_by_value(&shown(Dark));
+        // Closed, the dropdown shows the current theme only.
+        h.get_by_value(&shown(cool_dark));
         assert!(h.query_by_label_contains("Light").is_none());
         assert!(h.query_by_label_contains("System").is_none());
 
-        // Open, all three are offered.
-        h.get_by_value(&shown(Dark)).click();
+        // Open, every theme is offered, each with its own icon.
+        h.get_by_value(&shown(cool_dark)).click();
         h.run();
-        h.get_by_label_contains("System");
-        h.get_by_label_contains("Dark");
-        h.get_by_label_contains("Light").click();
+        for o in ThemeOption::ALL {
+            h.get_by_label(&shown(o));
+        }
+        h.get_by_label(&shown(ThemeOption::of(Light, Tone::Cool)))
+            .click();
         h.run();
         assert_eq!(h.state().theme, Light);
         assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
 
-        h.get_by_value(&shown(Light)).click();
+        // A warm one sets the greys too.
+        let warm_light = ThemeOption::of(Light, Tone::Warm);
+        h.get_by_value(&shown(ThemeOption::of(Light, Tone::Cool)))
+            .click();
         h.run();
-        h.get_by_label_contains("System").click();
+        h.get_by_label(&shown(warm_light)).click();
         h.run();
-        assert_eq!(h.state().theme, System);
+        assert_eq!((h.state().theme, h.state().tone), (Light, Tone::Warm));
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
 
-        h.get_by_value(&shown(System)).click();
+        // System keeps the greys.
+        h.get_by_value(&shown(warm_light)).click();
         h.run();
-        h.get_by_label_contains("Dark").click();
+        h.get_by_label(&shown(ThemeOption::System)).click();
+        h.run();
+        assert_eq!((h.state().theme, h.state().tone), (System, Tone::Warm));
+
+        h.get_by_value(&shown(ThemeOption::System)).click();
+        h.run();
+        h.get_by_label(&shown(ThemeOption::of(Dark, Tone::Warm)))
+            .click();
         h.run();
         assert_eq!(h.state().theme, Dark);
-        assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
+        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
     }
 
     #[test]
@@ -9391,12 +9417,13 @@ mod tests {
 
     #[test]
     fn dropdown_options_do_not_change_size_on_hover() {
-        let shown = format!("{} {}", ThemeChoice::Dark.icon(), ThemeChoice::Dark.label());
+        let dark = ThemeOption::of(ThemeChoice::Dark, Tone::Cool);
+        let shown = format!("{} {}", dark.icon(), dark.label());
         let mut h = harness();
         h.run();
         h.get_by_value(&shown).click();
         h.run();
-        for option in ["System", "Light"] {
+        for option in ["System", "Light (cool)", "Dark (warm)"] {
             let before = h.get_by_label_contains(option).rect();
             h.get_by_label_contains(option).hover();
             h.run();
