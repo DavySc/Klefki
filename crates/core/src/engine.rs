@@ -283,6 +283,9 @@ pub struct PlanView {
     /// When [`Self::nothing_to_do`]: what is already so, one sentence per change that can say it, naming the servers
     /// and where ("loc is already on in a."). Empty otherwise.
     pub already: Vec<String>,
+    /// When [`Self::nothing_to_do`]: a profile was used without "only" where other servers are on, so using it with
+    /// "only" would change something.
+    pub others_on: bool,
 }
 
 /// One plain-language explanation of a common failure, in the parts a compiler error has.
@@ -1937,6 +1940,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 reviews,
                 forget,
                 already,
+                others_on,
                 ..
             } = resolved;
             let mut notes = notes;
@@ -1985,6 +1989,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 warnings,
                 nothing_to_do,
                 already: if nothing_to_do { already } else { Vec::new() },
+                others_on: nothing_to_do && others_on,
             };
             plans.stored.insert(
                 id,
@@ -2578,6 +2583,18 @@ impl State {
         }
         let mut snapshot = next.snapshot;
         snapshot.kept = kept_list(shared);
+        snapshot.profiles = shared
+            .config
+            .backup_dir
+            .as_deref()
+            .map(|dir| {
+                crate::profiles::load(dir)
+                    .profiles
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect()
+            })
+            .unwrap_or_default();
         let before = std::mem::replace(&mut self.snapshot, Arc::new(snapshot));
         shared
             .emitter
@@ -5836,12 +5853,34 @@ mod tests {
                 "The server of Docs, gw, is already on in a. Other servers there are left as they are.".to_owned()
             ]
         );
+        // Work's servers are all a has: nothing else to turn off. Docs leaves loc on there.
+        assert!(!work.others_on && docs.others_on, "{work:?} {docs:?}");
+        // Reviewer's case: none of its servers loads there. Said why, with no hint to turn the others off.
+        let local = plan_for(
+            &core,
+            vec![profile(
+                "Local",
+                &[local_id("loc", "/work/a")],
+                Some("/work/b"),
+                false,
+            )],
+        );
+        assert!(local.nothing_to_do, "{local:?}");
+        assert_eq!(
+            local.already,
+            vec![
+                "None of the servers of Local loads in b, so there is nothing to turn on there.".to_owned(),
+                "In Local, these load only in a project of their own, so they stay as they are: loc (a).".to_owned()
+            ]
+        );
+        assert!(!local.others_on, "{local:?}");
         // Alone: in b, gw is the only server, so it is already the only one on.
         let alone = plan_for(
             &core,
             vec![profile("Docs", &[user_id("gw")], Some("/work/b"), true)],
         );
         assert!(alone.nothing_to_do, "{alone:?}");
+        assert!(!alone.others_on, "{alone:?}");
         assert_eq!(
             alone.already,
             vec!["The server of Docs, gw, is already the only one on in b.".to_owned()]
@@ -8450,6 +8489,22 @@ mod tests {
 
     /// A rename or move used to drop the server from every profile, which then named it "no longer configured"
     /// (found in review, PR #57). Its profiles follow it, and the review says so.
+    /// The palette offers each profile, so every snapshot names them, read anew like the rest: a profile made by hand
+    /// shows after a refresh.
+    #[test]
+    fn each_snapshot_names_the_profiles() {
+        let env = quiet_env(&serde_json::json!({"mcpServers": {"gw": {"command": "gw"}}}));
+        let backups = env.dir.path().join("backups");
+        crate::profiles::save(&backups, "Work", &[user_id("gw").connection], None).unwrap();
+        let core = env.start();
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert_eq!(snapshots(&events)[0].profiles, ["Work"]);
+        crate::profiles::save(&backups, "Notes", &[user_id("gw").connection], None).unwrap();
+        core.send(Command::Refresh { live_all: false });
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert_eq!(snapshots(&events)[0].profiles, ["Work", "Notes"]);
+    }
+
     #[test]
     fn a_renamed_or_moved_server_stays_in_its_profiles() {
         let env = quiet_env(&serde_json::json!({

@@ -368,6 +368,8 @@ pub struct ShellApp {
     pub profiles: Option<crate::profiles::ProfilesPage>,
     /// A profile being made or edited when the Profiles page was left, to carry on with when it is opened again.
     profile_draft: Option<crate::profiles::Draft>,
+    /// The profiles' names as last read, for the palette to offer each: with each snapshot, and after a save or delete.
+    profile_names: Vec<String>,
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
@@ -443,6 +445,7 @@ impl ShellApp {
             secrets: None,
             profiles: None,
             profile_draft: None,
+            profile_names: Vec::new(),
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
@@ -609,6 +612,11 @@ impl ShellApp {
                 }
             }
             Event::Profiles(profiles) => {
+                let names: Vec<String> = profiles.profiles.iter().map(|p| p.name.clone()).collect();
+                if names != self.profile_names {
+                    self.profile_names = names;
+                    self.command.invalidate();
+                }
                 if let Some(page) = &mut self.profiles {
                     page.set(profiles);
                 }
@@ -679,6 +687,10 @@ impl ShellApp {
                 }
                 self.grid_cache = None;
                 self.command.invalidate();
+                if let Some(page) = &mut self.profiles {
+                    page.snapshot_changed();
+                }
+                self.profile_names.clone_from(&snapshot.profiles);
                 if snapshot.cli_version.is_some() {
                     self.cli_version = snapshot.cli_version.clone();
                 }
@@ -705,7 +717,7 @@ impl ShellApp {
                     .filter(|_| plan.nothing_to_do && self.plan.is_none())
                     .and_then(|name| Some((name, self.profiles.as_mut()?)));
                 if let Some((name, page)) = card {
-                    page.unchanged(&name, plan.already, plan.warnings);
+                    page.unchanged(&name, plan.already, plan.warnings, plan.others_on);
                     self.send(Command::Discard(plan.id));
                 } else if self.plan.is_some() {
                     // Only one dialog at a time; the one open (perhaps being saved) keeps it.
@@ -2208,6 +2220,31 @@ impl ShellApp {
             None,
             command::Action::Desktop,
         );
+        add(
+            icon::STACK,
+            "Profiles".into(),
+            "Named sets of servers to turn on together in a project".into(),
+            None,
+            command::Action::Profiles,
+        );
+        if live {
+            for name in &self.profile_names {
+                add(
+                    icon::STACK,
+                    format!("Use profile {name}…"),
+                    "Choose a project, then review".into(),
+                    None,
+                    command::Action::UseProfile(name.clone()),
+                );
+            }
+            add(
+                icon::PLUS,
+                "New profile".into(),
+                "Pick servers that belong together and give them a name".into(),
+                None,
+                command::Action::NewProfile,
+            );
+        }
         // Last, so the servers stay in view of an empty search; the toolbar and Ctrl+N are the quick way.
         if live {
             add(
@@ -2279,6 +2316,16 @@ impl ShellApp {
             A::Settings => self.go(Page::Settings),
             A::ActivityLog => self.go(Page::ActivityLog),
             A::Desktop => self.go(Page::Desktop),
+            A::Profiles => self.go(Page::Profiles),
+            A::NewProfile | A::UseProfile(_) => {
+                self.go(Page::Profiles);
+                if let Some(page) = &mut self.profiles {
+                    match action {
+                        A::UseProfile(name) => page.reveal(name),
+                        _ => page.start_new(),
+                    }
+                }
+            }
             A::Duplicate => self.open_duplicate(),
             A::Move => self.open_move(),
             A::Add => self.open_add(),
@@ -11635,6 +11682,7 @@ mod tests {
             warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
             nothing_to_do,
             already: Vec::new(),
+            others_on: false,
             reviews: Vec::new(),
             summary: Vec::new(),
             action: String::new(),
@@ -19150,6 +19198,99 @@ mod tests {
         while engine.commands.try_recv().is_ok() {}
     }
 
+    /// The profiles harness, with beta off in notes: there Work's alpha is the only server on.
+    fn snapshot_with_beta_off_in_notes(off: bool) -> klefki_core::api::Event {
+        let a = live_row("alpha", Scope::User, None);
+        let mut b = live_row("beta", Scope::User, None);
+        if off {
+            b.disabled_projects = vec!["/home/notes".to_owned()];
+            b.disabled_in = 1;
+        }
+        let l = live_row("lint", Scope::Local, Some("/work/app"));
+        let la = live_row("alpha", Scope::Local, Some("/work/app"));
+        klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+            servers: vec![a, b, l, la],
+            projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+            project_count: 2,
+            ..Snapshot::default()
+        }))
+    }
+
+    #[test]
+    fn a_profile_says_where_only_its_servers_are_on_and_follows_the_files() {
+        let (mut h, engine) = profiles_harness();
+        engine
+            .events
+            .send(snapshot_with_beta_off_in_notes(true))
+            .unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label("Only these servers are on in notes.");
+        // Beta on again: worked out anew from the files, nothing remembered.
+        engine
+            .events
+            .send(snapshot_with_beta_off_in_notes(false))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label_contains("Only these servers are on")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_palette_opens_profiles_starts_one_and_uses_one() {
+        let (mut h, engine) = profiles_harness();
+        // Each snapshot names the profiles, so opening the palette reads nothing.
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                profiles: vec!["Work".to_owned()],
+                ..(*h.state().snapshot).clone()
+            })))
+            .unwrap();
+        h.run();
+        sent(&engine);
+        ctrl_k(&mut h);
+        assert_eq!(sent(&engine), []);
+        type_into_palette(&mut h, "use work");
+        h.get_by_label_contains("Use profile Work…");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().page, Page::Profiles);
+        assert_eq!(sent(&engine), [Command::Profiles]);
+        engine
+            .events
+            .send(klefki_core::api::Event::Profiles(work_profile()))
+            .unwrap();
+        h.run();
+        h.run();
+        // Where to use it has the keyboard: Space opens the list of projects.
+        h.key_press(egui::Key::Space);
+        h.run();
+        h.get_by_label("Every project");
+
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "new profile");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        h.get_by_label("Name");
+        h.get_by_label("Save profile");
+    }
+
+    #[test]
+    fn the_palette_goes_to_profiles_from_anywhere_and_offers_no_change_on_sample_data() {
+        let mut h = harness();
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "profiles");
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert_eq!(h.state().page, Page::Profiles);
+        ctrl_k(&mut h);
+        type_into_palette(&mut h, "new profile");
+        assert!(h.query_by_label_contains("New profile").is_none());
+    }
+
     #[test]
     fn the_profiles_page_is_read_when_opened_and_let_go_when_left() {
         let (mut h, engine) = profiles_harness();
@@ -19408,6 +19549,7 @@ mod tests {
             true,
         );
         plan.already = vec!["The server of Work, alpha, is already on in app. Other servers there are left as they are.".to_owned()];
+        plan.others_on = true;
         engine.events.send(Event::PlanReady(plan)).unwrap();
         h.run();
         // No review with nothing to save: the plan is let go.
@@ -19431,6 +19573,102 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label_contains("Review the change");
+    }
+
+    /// Uses Work in app (unticked) and has it said on the card, as the owner would.
+    fn work_said_unchanged(
+        h: &mut Harness<'static, ShellApp>,
+        engine: &klefki_core::api::Detached,
+        already: &str,
+        others_on: bool,
+    ) {
+        use egui::accesskit::Role;
+        h.get_by_role_and_label(Role::ComboBox, "Use in").click();
+        h.run();
+        h.get_by_label_contains("app/work").click();
+        h.run();
+        h.get_by_label("Use profile…").click();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        let mut plan = plan_view(7, &[], &[], true);
+        plan.already = vec![already.to_owned()];
+        plan.others_on = others_on;
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label_contains("Nothing to change");
+    }
+
+    /// Cross-review of #60: the card said "already on" after another change had turned those servers off. What a Use
+    /// found is true of the files then, so a new snapshot lets it go.
+    #[test]
+    fn what_a_profile_found_already_so_goes_when_the_files_change() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        work_said_unchanged(
+            &mut h,
+            &engine,
+            "The server of Work, alpha, is already on in app.",
+            true,
+        );
+        let mut alpha = live_row("alpha", Scope::User, None);
+        alpha.disabled_projects = vec!["/work/app".to_owned()];
+        alpha.disabled_in = 1;
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![alpha, live_row("beta", Scope::User, None)],
+                projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Nothing to change").is_none());
+        assert!(h.query_by_label_contains("already on in app").is_none());
+    }
+
+    /// Cross-review of #60: where none of its servers loads, ticking "only" turns things off and nothing on, so the
+    /// card does not suggest it; the reason the engine gives is shown instead.
+    #[test]
+    fn the_hint_to_tick_only_is_given_only_when_other_servers_are_on() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        let why = "None of the servers of Work loads in app, so there is nothing to turn on there.";
+        work_said_unchanged(&mut h, &engine, why, false);
+        h.get_by_label(why);
+        assert!(
+            h.query_by_label_contains("tick Only these servers there")
+                .is_none()
+        );
+    }
+
+    /// Cross-review of #60: used alone where it is on alone, the card already says "Only these servers are on in
+    /// app" under its servers; the no-op does not say it again.
+    #[test]
+    fn a_profile_on_alone_is_not_said_twice() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        let mut beta = live_row("beta", Scope::User, None);
+        beta.disabled_projects = vec!["/work/app".to_owned()];
+        beta.disabled_in = 1;
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![live_row("alpha", Scope::User, None), beta],
+                projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label_contains("Only these servers are on in app");
+        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
+            .click();
+        h.run();
+        let again = "The server of Work, alpha, is already the only one on in app.";
+        work_said_unchanged(&mut h, &engine, again, false);
+        assert!(h.query_by_label(again).is_none());
     }
 
     /// The page was left before the answer came: the review says it, rather than nothing at all.
@@ -19519,7 +19757,7 @@ mod tests {
             "profiles.json has 2 entries Klefki does not understand; they are left out.".into(),
         );
         open_profiles(&mut h, &engine, profiles);
-        // Said once, with what it means; the profiles can still be used, not changed.
+        // Said once, with what it means; the profiles read can still be used, not changed.
         h.get_by_label_contains("2 entries Klefki does not understand");
         h.get_by_label_contains("until the file is fixed");
         h.get_by_label("Work");
@@ -19536,6 +19774,82 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
+    }
+
+    /// Found in review of PR #58: the palette's New profile opened the editor though the page offers no New profile
+    /// while the file is read in part; the work was refused only on Save.
+    #[test]
+    fn the_palettes_new_profile_says_why_not_while_the_file_is_read_in_part() {
+        let (mut h, engine) = profiles_harness();
+        let ctx = h.ctx.clone();
+        h.state_mut().run(&ctx, command::Action::NewProfile);
+        h.run();
+        let mut profiles = work_profile();
+        profiles.problem = Some("profiles.json is from a newer Klefki.".into());
+        engine
+            .events
+            .send(klefki_core::api::Event::Profiles(profiles))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label("Save profile").is_none());
+        h.get_by_label_contains(
+            "No profile can be made until the profiles file can be read in full",
+        );
+        h.get_by_label_contains("those read can still be used");
+        // Nothing read: nothing said to be usable.
+        let nothing = klefki_core::api::Profiles {
+            problem: Some("profiles.json is from a newer Klefki.".into()),
+            ..klefki_core::api::Profiles::default()
+        };
+        engine
+            .events
+            .send(klefki_core::api::Event::Profiles(nothing))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("can still be used").is_none());
+        // The variant: read in full, the editor opens.
+        let (mut h, engine) = profiles_harness();
+        let ctx = h.ctx.clone();
+        h.state_mut().run(&ctx, command::Action::NewProfile);
+        engine
+            .events
+            .send(klefki_core::api::Event::Profiles(work_profile()))
+            .unwrap();
+        h.run();
+        h.get_by_label("Save profile");
+    }
+
+    /// Found in review of PR #58: "Use profile Work…" picked while a profile is being edited left the request
+    /// waiting, and focus jumped to Work's "Use in" once the edit was done.
+    #[test]
+    fn use_from_the_palette_while_editing_says_so_and_moves_no_focus_later() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label_contains("New profile").click();
+        h.run();
+        let ctx = h.ctx.clone();
+        h.state_mut()
+            .run(&ctx, command::Action::UseProfile("Work".into()));
+        h.run();
+        h.get_by_label_contains("Finish or cancel the profile you are editing first");
+        h.get_by_label("Cancel").click();
+        h.run();
+        h.run();
+        let focused = h.query_all_by(|n| n.is_focused()).count();
+        assert_eq!(focused, 0, "focus moved with nobody asking");
+        // The variant: a profile that is no longer there is not waited for.
+        h.state_mut()
+            .run(&ctx, command::Action::UseProfile("Gone".into()));
+        h.run();
+        let mut later = work_profile();
+        later.profiles[0].name = "Gone".into();
+        engine
+            .events
+            .send(klefki_core::api::Event::Profiles(later))
+            .unwrap();
+        h.run();
+        h.run();
+        assert_eq!(h.query_all_by(|n| n.is_focused()).count(), 0);
     }
 
     #[test]

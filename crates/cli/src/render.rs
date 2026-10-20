@@ -522,6 +522,100 @@ pub fn list_json(snapshot: &Snapshot, rows: &[&ServerRow]) -> String {
     to_text(&json!({"schema": SCHEMA, "servers": servers, "warnings": snapshot.warnings}))
 }
 
+/// One server of a profile: the row it names, if it is still configured.
+fn members<'a>(
+    profile: &'a klefki_core::api::Profile,
+    snapshot: &'a Snapshot,
+) -> Vec<(&'a klefki_core::api::ConnectionId, Option<&'a ServerRow>)> {
+    profile
+        .members
+        .iter()
+        .map(|m| (m, snapshot.servers.iter().find(|r| &r.connection == m)))
+        .collect()
+}
+
+/// `profiles`: each profile with its servers and where they are the only ones on.
+pub fn profiles_text(
+    profiles: &klefki_core::api::Profiles,
+    snapshot: &Snapshot,
+    home: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    if profiles.profiles.is_empty() {
+        out.push_str("No profiles yet. Make one on Klefki's Profiles page.\n");
+        return out;
+    }
+    for (i, profile) in profiles.profiles.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let n = profile.members.len();
+        let _ = writeln!(
+            out,
+            "{}  {n} server{}",
+            profile.name,
+            if n == 1 { "" } else { "s" }
+        );
+        let servers = members(profile, snapshot);
+        let names: Vec<String> = servers
+            .iter()
+            .map(|(id, row)| match row {
+                Some(r) => table_name(&r.name).into_owned(),
+                None => table_name(&id.shown_name()).into_owned(),
+            })
+            .collect();
+        let w = width(names.iter());
+        for ((_, row), name) in servers.iter().zip(&names) {
+            out.push_str("  ");
+            pad(&mut out, name, w);
+            out.push_str("  ");
+            match row {
+                Some(r) => out.push_str(&heading(r, home)),
+                None => out.push_str("no longer configured"),
+            }
+            trim_end(&mut out);
+            out.push('\n');
+        }
+        let alone: Vec<String> = klefki_core::api::profile_alone_in(&profile.members, snapshot)
+            .iter()
+            .map(|p| short_path(p, home))
+            .collect();
+        if !alone.is_empty() {
+            let _ = writeln!(out, "  Only these servers are on in {}.", alone.join(", "));
+        }
+    }
+    out
+}
+
+pub fn profiles_json(profiles: &klefki_core::api::Profiles, snapshot: &Snapshot) -> String {
+    let list: Vec<Value> = profiles
+        .profiles
+        .iter()
+        .map(|profile| {
+            let servers: Vec<Value> = members(profile, snapshot)
+                .into_iter()
+                .map(|(id, row)| match row {
+                    Some(r) => json!({
+                        "name": r.name,
+                        "scope": scope_key(r.scope),
+                        "project": r.project,
+                        "configured": true,
+                    }),
+                    None => json!({"name": id.shown_name(), "configured": false}),
+                })
+                .collect();
+            json!({
+                "name": profile.name,
+                "servers": servers,
+                "alone_in": klefki_core::api::profile_alone_in(&profile.members, snapshot),
+            })
+        })
+        .collect();
+    let mut warnings = snapshot.warnings.clone();
+    warnings.extend(profiles.problem.clone());
+    to_text(&json!({"schema": SCHEMA, "profiles": list, "warnings": warnings}))
+}
+
 fn to_text(value: &Value) -> String {
     let mut text = serde_json::to_string_pretty(value).unwrap_or_default();
     text.push('\n');

@@ -33,6 +33,15 @@ pub struct ProfilesPage {
     project_filter: String,
     /// A save was asked for: once the engine answers with the profiles, the editor's work is done.
     saving: bool,
+    /// The projects (as shown) where each profile's servers are the only ones on, by name. Worked out once for the
+    /// profiles and the snapshot shown, not every frame.
+    alone: Option<HashMap<String, Vec<String>>>,
+    /// The profile whose "Use in" takes the keyboard when the cards are next drawn, asked for from the palette.
+    /// Dropped once they are drawn, so focus never moves later on its own.
+    reveal: Option<String>,
+    /// New profile was asked for from the palette: the editor opens once the profiles are read, if they can be
+    /// changed.
+    new_asked: bool,
 }
 
 /// Using a profile would write nothing: what is already so, and what would still keep a server from loading.
@@ -40,6 +49,10 @@ pub struct ProfilesPage {
 struct Unchanged {
     already: Vec<String>,
     warnings: Vec<String>,
+    /// Other servers are on there: "Only these servers there" would turn them off.
+    others_on: bool,
+    /// Not drawn yet: brought into view when it is.
+    fresh: bool,
 }
 
 /// A profile being made or edited.
@@ -108,6 +121,7 @@ impl ProfilesPage {
     /// answer on opening the page leaves a draft carried over from before.
     pub fn set(&mut self, profiles: Profiles) {
         self.profiles = Some(profiles);
+        self.alone = None;
         if std::mem::take(&mut self.saving) {
             self.editing = None;
         }
@@ -116,12 +130,55 @@ impl ProfilesPage {
     }
 
     /// Using `profile` would change nothing: said on its card, rather than in a review with nothing to save.
-    /// `already` says what is already so; `warnings`, what still keeps a server from loading there.
-    pub fn unchanged(&mut self, profile: &str, already: Vec<String>, warnings: Vec<String>) {
+    /// `already` says what is already so; `warnings`, what still keeps a server from loading there; `others_on`, that
+    /// other servers there are on, which "Only these servers there" would turn off.
+    pub fn unchanged(
+        &mut self,
+        profile: &str,
+        already: Vec<String>,
+        warnings: Vec<String>,
+        others_on: bool,
+    ) {
         self.choices
             .entry(profile.to_owned())
             .or_default()
-            .unchanged = Some(Unchanged { already, warnings });
+            .unchanged = Some(Unchanged {
+            already,
+            warnings,
+            others_on,
+            fresh: true,
+        });
+    }
+
+    /// A new snapshot is shown: where each profile is on alone is worked out again, and what a Use found already so is
+    /// let go.
+    pub fn snapshot_changed(&mut self) {
+        self.alone = None;
+        // What a Use found already so was true of the files then: another change may have made it false since.
+        for choice in self.choices.values_mut() {
+            choice.unchanged = None;
+        }
+    }
+
+    /// Starts a new profile once the profiles are read, unless one is being made or edited: that is not thrown away.
+    /// Not while the file cannot be read in full, as the page's own New profile.
+    pub fn start_new(&mut self) {
+        if self.editing.is_none() {
+            self.new_asked = true;
+        }
+    }
+
+    /// Brings the profile `name` into view, with where to use it taking the keyboard. A filter that would hide it is
+    /// cleared. Not while a profile is being made or edited, which fills the page: that is said instead.
+    pub fn reveal(&mut self, name: String) {
+        if self.editing.is_some() {
+            self.refused = Some(format!(
+                "Finish or cancel the profile you are editing first, then use {name}."
+            ));
+            return;
+        }
+        self.filter.clear();
+        self.reveal = Some(name);
     }
 
     pub fn refused(&mut self, why: String) {
@@ -155,12 +212,34 @@ impl ProfilesPage {
                 };
                 // Said once, up front: Klefki changes nothing in a file it could not read in full.
                 let editable = profiles.problem.is_none();
+                if std::mem::take(&mut self.new_asked) {
+                    if editable {
+                        self.editing = Some(Draft {
+                            replaces: None,
+                            name: String::new(),
+                            members: Vec::new(),
+                            focus: true,
+                            problem: None,
+                        });
+                        self.refused = None;
+                    } else {
+                        self.refused = Some(
+                            "No profile can be made until the profiles file can be read in full (see above)."
+                                .to_owned(),
+                        );
+                    }
+                }
                 if let Some(problem) = &profiles.problem {
+                    // "Still usable" only when something could be read to use.
+                    let usable = if profiles.profiles.is_empty() {
+                        ""
+                    } else {
+                        "; those read can still be used"
+                    };
                     warn(
                         ui,
                         &format!(
-                            "{problem} No profile can be made, changed or deleted until the file is fixed; they \
-                             can still be used."
+                            "{problem} No profile can be made, changed or deleted until the file is fixed{usable}."
                         ),
                     );
                     ui.add_space(8.0);
@@ -227,6 +306,17 @@ impl ProfilesPage {
                     self.refused = None;
                 }
                 ui.add_space(8.0);
+                let alone = self.alone.get_or_insert_with(|| {
+                    profiles
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            let places = klefki_core::api::profile_alone_in(&p.members, snapshot);
+                            let shown = places.iter().map(|place| shown_project(place, snapshot)).collect();
+                            (p.name.clone(), shown)
+                        })
+                        .collect()
+                });
                 let query = self.filter.trim().to_lowercase();
                 let shown: Vec<&Profile> = profiles
                     .profiles
@@ -243,14 +333,22 @@ impl ProfilesPage {
                         .unchanged
                         .is_some()
                         .then(|| (choice.place.clone(), choice.only));
+                    let reveal = self.reveal.as_deref() == Some(profile.name.as_str());
+                    if reveal {
+                        self.reveal = None;
+                    }
                     let out = card(
                         ui,
                         profile,
                         snapshot,
+                        Context {
+                            alone: alone.get(&profile.name).map_or(&[], Vec::as_slice),
+                            reveal,
+                            editable,
+                        },
                         choice,
                         &mut self.confirm,
                         &mut self.project_filter,
-                        editable,
                     );
                     // What was said is about the place and way it was used: gone once either changes, or the card
                     // asks for something else.
@@ -269,6 +367,8 @@ impl ProfilesPage {
                     }
                     ui.add_space(8.0);
                 }
+                // Asked for a profile that is not there (any more): not waited for.
+                self.reveal = None;
             });
         if asked.is_some() {
             self.refused = None;
@@ -280,16 +380,26 @@ impl ProfilesPage {
     }
 }
 
+/// What a card shows beyond the profile itself.
+struct Context<'a> {
+    /// The projects (as shown) where its servers are the only ones on.
+    alone: &'a [String],
+    /// Bring it into view, with where to use it taking the keyboard.
+    reveal: bool,
+    editable: bool,
+}
+
 /// One profile: its name, its servers, where to use it, and its buttons.
 fn card(
     ui: &mut Ui,
     profile: &Profile,
     snapshot: &Snapshot,
+    cx: Context,
     choice: &mut Choice,
     confirm: &mut Option<String>,
     project_filter: &mut String,
-    editable: bool,
 ) -> Option<Card> {
+    let editable = cx.editable;
     let pal = theme::palette(ui.ctx());
     let mut out = None;
     egui::Frame::new()
@@ -331,6 +441,19 @@ fn card(
                 });
             });
             ui.add(egui::Label::new(summary(profile, snapshot)).wrap());
+            // Where the eye already is, under its servers: true of the files now, so it is not muted.
+            if !cx.alone.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(icon::CHECK_CIRCLE).color(pal.success));
+                    ui.add(
+                        egui::Label::new(format!(
+                            "Only these servers are on in {}.",
+                            named_few(cx.alone)
+                        ))
+                        .wrap(),
+                    );
+                });
+            }
             let gone = gone(profile, snapshot);
             if !gone.is_empty() {
                 muted(
@@ -388,6 +511,10 @@ fn card(
                         }
                     });
                 let combo = combo.response.labelled_by(use_in.id);
+                if cx.reveal {
+                    combo.request_focus();
+                    combo.scroll_to_me(Some(egui::Align::Center));
+                }
                 if let Some(Some(p)) = &choice.place {
                     combo.on_hover_text(p.as_str());
                 }
@@ -420,8 +547,17 @@ fn card(
             if choice.asked && choice.place.is_none() {
                 warn(ui, "Choose a project to use it in first.");
             }
-            if let Some(u) = &choice.unchanged {
-                said_unchanged(ui, u, choice.only);
+            if let Some(u) = &mut choice.unchanged {
+                // Said already, under its servers, when it is used alone where it is on alone.
+                let covered = choice.only
+                    && match &choice.place {
+                        Some(Some(p)) => cx.alone.contains(&shown_project(p, snapshot)),
+                        Some(None) => {
+                            !snapshot.projects.is_empty() && cx.alone.len() == snapshot.projects.len()
+                        }
+                        None => false,
+                    };
+                said_unchanged(ui, u, covered);
             }
             if snapshot.projects.is_empty() {
                 muted(
@@ -764,6 +900,16 @@ fn shown_project(path: &str, snapshot: &Snapshot) -> String {
     }
 }
 
+/// A few projects by name, and how many more: "q, r and 2 more".
+fn named_few(names: &[String]) -> String {
+    const FEW: usize = 3;
+    match names {
+        [one] => one.clone(),
+        [first @ .., last] if names.len() <= FEW => format!("{} and {last}", first.join(", ")),
+        _ => format!("{} and {} more", names[..FEW].join(", "), names.len() - FEW),
+    }
+}
+
 /// The folder a project's folder is in; empty for a project at the top.
 fn parent_of(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
@@ -773,12 +919,17 @@ fn parent_of(path: &str) -> &str {
     }
 }
 
-/// Next to the button that asked: nothing to save, what is already so, and how to get more done when the other
-/// servers were left alone. Not a warning: nothing went wrong.
-fn said_unchanged(ui: &mut Ui, unchanged: &Unchanged, only: bool) {
+/// Next to the button that asked: nothing to save, what is already so (unless `covered`, said under its servers
+/// already), and how to turn the other servers off when some are on. Not a warning: nothing went wrong. Read out by a
+/// screen reader without moving the focus (WCAG 2.2, 4.1.3 Status Messages), and brought into view once.
+fn said_unchanged(ui: &mut Ui, unchanged: &mut Unchanged, covered: bool) {
     let pal = theme::palette(ui.ctx());
     ui.add_space(6.0);
-    ui.add(
+    let live = |ui: &Ui, id: egui::Id| {
+        ui.ctx()
+            .accesskit_node_builder(id, |node| node.set_live(egui::accesskit::Live::Polite));
+    };
+    let head = ui.add(
         egui::Label::new(
             RichText::new(format!("{} Nothing to change", icon::CHECK_CIRCLE))
                 .strong()
@@ -786,10 +937,17 @@ fn said_unchanged(ui: &mut Ui, unchanged: &Unchanged, only: bool) {
         )
         .wrap(),
     );
-    for line in &unchanged.already {
-        ui.add(egui::Label::new(line.as_str()).wrap());
+    live(ui, head.id);
+    if std::mem::take(&mut unchanged.fresh) {
+        head.scroll_to_me(None);
     }
-    if !only {
+    if !covered {
+        for line in &unchanged.already {
+            let said = ui.add(egui::Label::new(line.as_str()).wrap());
+            live(ui, said.id);
+        }
+    }
+    if unchanged.others_on {
         muted(
             ui,
             "To turn the other servers there off, tick Only these servers there and use the profile again.",
@@ -810,4 +968,19 @@ fn warn(ui: &mut Ui, text: &str) {
     ui.add(
         egui::Label::new(RichText::new(format!("{} {text}", icon::WARNING)).color(pal.warn)).wrap(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_few;
+
+    #[test]
+    fn a_few_projects_are_named_and_the_rest_counted() {
+        let names = |n: usize| (0..n).map(|i| format!("p{i}")).collect::<Vec<_>>();
+        assert_eq!(named_few(&names(1)), "p0");
+        assert_eq!(named_few(&names(2)), "p0 and p1");
+        assert_eq!(named_few(&names(3)), "p0, p1 and p2");
+        assert_eq!(named_few(&names(4)), "p0, p1, p2 and 1 more");
+        assert_eq!(named_few(&names(9)), "p0, p1, p2 and 6 more");
+    }
 }

@@ -1,5 +1,4 @@
 //! The only surface the UI may use. The UI holds an immutable, sanitised [`Snapshot`].
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub use crate::activity::{Activity, ActivityEntry, Backup};
@@ -18,6 +17,7 @@ pub use crate::export_file::{
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
+pub use crate::ops::profile_alone_in;
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
@@ -316,15 +316,15 @@ pub struct Snapshot {
     /// The same projects as paths, in one normal spelling.
     pub projects: Vec<String>,
     pub servers: Vec<ServerRow>,
-    /// The names switched off in each of [`Snapshot::projects`] (`disabledMcpServers`), as the file spells them: what a
-    /// change finds already off is not said to be turned off.
-    pub switched_off: BTreeMap<String, BTreeSet<String>>,
     /// Problems found while reading the configuration. Already sanitised.
     pub warnings: Vec<String>,
     /// Projects whose entry still has the switch-off list of older Claude Code versions.
     pub legacy_disabled: Vec<LegacyDisabled>,
     /// Definitions Klefki kept because a change removed a server and could not add it back. Oldest first.
     pub kept: Vec<Kept>,
+    /// The names of Klefki's profiles (decision 012), in their order, for the command palette. Empty when the profiles
+    /// file cannot be read.
+    pub profiles: Vec<String>,
     /// The organisation's `managed-mcp.json`, as shown, when it exists: then Claude Code loads only the
     /// organisation's servers (decision 009).
     pub organisation_only: Option<String>,
@@ -377,8 +377,7 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
         releases,
         release_key: crate::update::RELEASE_KEY.map(str::to_owned),
         install: crate::install::this_install(),
-        updates_dir: directories::ProjectDirs::from("dev", "klefki", "klefki")
-            .map(|d| d.data_local_dir().join("updates")),
+        updates_dir: data_dir().map(|d| d.join("updates")),
         ..real_config(None)
     };
     crate::engine::start_with(config, wake)
@@ -479,8 +478,31 @@ fn open_https(link: &str) -> std::io::Result<()> {
 /// so they stay on this machine: on Windows the local, not the roaming, application data folder (which a company
 /// may sync to a server or redirect to a network share).
 fn default_backup_dir() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "klefki", "klefki")
-        .map(|d| d.data_local_dir().join("backups"))
+    data_dir().map(|d| d.join("backups"))
+}
+
+/// Klefki's own folder for what it keeps (backups, profiles, the Activity log, updates), or the one
+/// `KLEFKI_DATA_DIR` names, so a test or a try-out never touches the machine's. Empty: the machine's.
+fn data_dir() -> Option<std::path::PathBuf> {
+    match std::env::var_os("KLEFKI_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => Some(std::path::PathBuf::from(dir)),
+        _ => directories::ProjectDirs::from("dev", "klefki", "klefki")
+            .map(|d| d.data_local_dir().to_path_buf()),
+    }
+}
+
+/// The profiles (decision 012) for a command-line run, read as the app reads them. Writes nothing.
+pub fn load_profiles() -> Profiles {
+    match default_backup_dir() {
+        Some(dir) => crate::profiles::load(&dir),
+        None => Profiles {
+            problem: Some(
+                "There is no private folder for Klefki's data, so no profiles can be read."
+                    .to_owned(),
+            ),
+            ..Profiles::default()
+        },
+    }
 }
 
 /// Reads the real Claude Code configuration (read-only), once, without live checks.

@@ -22,8 +22,31 @@ pub enum Cmd {
         /// Replace the file if it is there.
         force: bool,
     },
+    /// The profiles (decision 012): their servers, and where each is on alone.
+    Profiles {
+        json: bool,
+    },
+    /// Use a profile: the change is shown, and saved once confirmed.
+    Use {
+        profile: String,
+        place: Place,
+        /// Turn every other server there off.
+        only: bool,
+        /// Save without asking.
+        yes: bool,
+    },
     Help,
     Version,
+}
+
+/// Where `use` uses a profile.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Place {
+    /// The project of the current folder.
+    Here,
+    Project(PathBuf),
+    /// Every project Claude Code knows.
+    Every,
 }
 
 /// What was wrong with the command line.
@@ -40,18 +63,22 @@ fn bad(why: String) -> Usage {
 }
 
 pub const HELP: &str = "\
-klefki-cli: list Claude Code's MCP servers, check whether they connect, export them.
+klefki-cli: list Claude Code's MCP servers, check whether they connect, export them,
+and use Klefki's profiles.
 
 Examples:
   klefki-cli status                 check every server that is on
   klefki-cli status docs            check one server, a project server too
   klefki-cli status --json | jq '.servers[] | select(.status == \"failed\") | .name'
   klefki-cli export github -o servers.json
+  klefki-cli use Writing --only     only the Writing profile's servers in this project
 
 Usage:
   klefki-cli list   [NAME...] [--json]
   klefki-cli status [NAME...] [--json] [--claude PATH]
   klefki-cli export [NAME...] [-o FILE [--force]]
+  klefki-cli profiles [--json]
+  klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]
   klefki-cli help
   klefki-cli --version
 
@@ -66,6 +93,12 @@ Commands:
            header value, and anything else that looks like a secret, is written
            as a ${VAR} reference; stderr lists the variables to set. Reads the
            configuration only and runs nothing; writes only the --output file.
+  profiles List the profiles made in Klefki: their servers, and the projects
+           where their servers are the only ones on. Reads only.
+  use      Turn a profile's servers on in a project: the one of the current
+           folder, the --project folder, or --all projects Claude Code knows.
+           Shows the change first and saves it once you say yes (or --yes),
+           keeping a backup, as the app does.
 
 Options:
   NAME           Only these servers (by name, in every scope).
@@ -75,6 +108,10 @@ Options:
                  Write the export to FILE instead of stdout. An existing file
                  is kept unless you confirm, or add --force. Claude Code's own
                  files and .mcp.json files are never written.
+  --project DIR  use: the project to use the profile in (default: this folder).
+  --all          use: every project Claude Code knows today.
+  --only         use: turn every other server in those projects off.
+  -y, --yes      use: save without asking.
   -h, --help     Show this help.
   -V, --version  Show the version.
 
@@ -83,10 +120,13 @@ Options:
 Exit status:
   0  Done; for status, every server checked is connected; for export, every
      server named is in the block.
-  1  status found a server that is not connected; export left one out.
-  2  The command line was wrong, or a NAME matches no server.
+  1  status found a server that is not connected; export left one out; use
+     could not make or save the change.
+  2  The command line was wrong, a NAME matches no server, or use names a
+     profile or folder that is not there.
   3  Claude Code could not be used: not found, or no check got an answer.
-  4  export could not write the --output file (it is there, or not allowed).
+  4  export could not write the --output file (it is there, or not allowed);
+     use saved nothing: not confirmed, or nobody at a terminal and no --yes.
 
 Reads CLAUDE_CONFIG_DIR like Claude Code does.
 ";
@@ -101,12 +141,17 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
         "list" => Kind::List,
         "status" => Kind::Status,
         "export" => Kind::Export,
+        "profiles" => Kind::Profiles,
+        "use" => Kind::Use,
         "help" | "-h" | "--help" => return Ok(Cmd::Help),
         "-V" | "--version" => return Ok(Cmd::Version),
         other if other.starts_with('-') => return Err(bad(format!("unknown option {other}"))),
         other => {
             return Err(bad(
-                match crate::suggest::closest(other, ["list", "status", "export", "help"]) {
+                match crate::suggest::closest(
+                    other,
+                    ["list", "status", "export", "profiles", "use", "help"],
+                ) {
                     Some(meant) => format!("unknown command {other:?}; did you mean {meant:?}?"),
                     None => format!("unknown command {other:?}"),
                 },
@@ -121,6 +166,11 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
     let mut output = None;
     let mut force = false;
     let export = kind == Kind::Export;
+    let using = kind == Kind::Use;
+    let mut project = None;
+    let mut every = false;
+    let mut only = false;
+    let mut yes = false;
     while let Some(arg) = args.next() {
         // A path may not be text the platform can show; it is kept as given.
         if !only_names
@@ -137,6 +187,13 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             set_output(&mut output, Some(path.into()))?;
             continue;
         }
+        if !only_names
+            && using
+            && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--project="))
+        {
+            set_project(&mut project, Some(path.into()))?;
+            continue;
+        }
         let arg = text(arg)?;
         match arg.as_str() {
             _ if only_names => names.push(arg),
@@ -144,7 +201,21 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             "--json" if kind == Kind::Export => {
                 return Err(bad("export always prints JSON; leave out --json".to_owned()));
             }
+            "--json" if using => {
+                return Err(bad(
+                    "use prints the change for people; leave out --json".to_owned()
+                ));
+            }
             "--json" => json = true,
+            "--project" if using => set_project(&mut project, args.next())?,
+            "--all" if using => every = true,
+            "--only" if using => only = true,
+            "-y" | "--yes" if using => yes = true,
+            "--project" | "--all" | "--only" | "-y" | "--yes" => {
+                return Err(bad(format!(
+                    "{arg} is only for use: {command} changes no project"
+                )));
+            }
             "-h" | "--help" => return Ok(Cmd::Help),
             "--claude" if status => claude = Some(claude_path(args.next())?),
             "--claude" => {
@@ -187,6 +258,44 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
             output,
             force,
         },
+        Kind::Profiles if !names.is_empty() => {
+            return Err(bad(
+                "profiles takes no names: it lists every profile".to_owned()
+            ));
+        }
+        Kind::Profiles => Cmd::Profiles { json },
+        Kind::Use => {
+            let profile = match <[String; 1]>::try_from(names) {
+                Ok([profile]) => profile,
+                Err(names) if names.is_empty() => {
+                    return Err(bad(
+                        "use needs the name of a profile; `klefki-cli profiles` lists them"
+                            .to_owned(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(bad(
+                        "use takes one profile; put a name with spaces in quotes".to_owned(),
+                    ));
+                }
+            };
+            let place = match (project, every) {
+                (Some(_), true) => {
+                    return Err(bad(
+                        "--project or --all, not both: one project, or every one".to_owned(),
+                    ));
+                }
+                (Some(path), false) => Place::Project(path),
+                (None, true) => Place::Every,
+                (None, false) => Place::Here,
+            };
+            Cmd::Use {
+                profile,
+                place,
+                only,
+                yes,
+            }
+        }
     })
 }
 
@@ -195,6 +304,21 @@ enum Kind {
     List,
     Status,
     Export,
+    Profiles,
+    Use,
+}
+
+fn set_project(project: &mut Option<PathBuf>, value: Option<OsString>) -> Result<(), Usage> {
+    match value {
+        _ if project.is_some() => Err(bad("--project is given once: one project".to_owned())),
+        Some(path) if !path.is_empty() => {
+            *project = Some(PathBuf::from(path));
+            Ok(())
+        }
+        _ => Err(bad(
+            "--project needs the path of a project folder".to_owned()
+        )),
+    }
 }
 
 fn set_output(output: &mut Option<PathBuf>, value: Option<OsString>) -> Result<(), Usage> {
@@ -323,6 +447,54 @@ mod tests {
         assert!(refused(&["export", "--json"]).contains("always prints JSON"));
         assert!(refused(&["export", "--claude", "/x"]).contains("export starts no program"));
         assert!(refused(&["exprot"]).contains("did you mean \"export\""));
+    }
+
+    #[test]
+    fn profiles_lists_and_use_takes_one_profile_and_where() {
+        assert_eq!(p(&["profiles"]), Ok(Cmd::Profiles { json: false }));
+        assert_eq!(p(&["profiles", "--json"]), Ok(Cmd::Profiles { json: true }));
+        let used = |place, only, yes| Cmd::Use {
+            profile: "Work".into(),
+            place,
+            only,
+            yes,
+        };
+        assert_eq!(p(&["use", "Work"]), Ok(used(Place::Here, false, false)));
+        assert_eq!(
+            p(&["use", "--project", "/w/app", "Work", "--only"]),
+            Ok(used(Place::Project("/w/app".into()), true, false))
+        );
+        assert_eq!(
+            p(&["use", "Work", "--project=/w/app", "-y"]),
+            Ok(used(Place::Project("/w/app".into()), false, true))
+        );
+        assert_eq!(
+            p(&["use", "--all", "--yes", "--", "--Work"]),
+            Ok(Cmd::Use {
+                profile: "--Work".into(),
+                place: Place::Every,
+                only: false,
+                yes: true,
+            })
+        );
+        let refused = |args: &[&str]| match p(args) {
+            Err(Usage::Bad(why)) => why,
+            other => panic!("{args:?} gave {other:?}"),
+        };
+        assert!(refused(&["use"]).contains("use needs the name of a profile"));
+        assert!(refused(&["use", "A", "B"]).contains("one profile"));
+        assert!(refused(&["use", "A", "--all", "--project", "/x"]).contains("not both"));
+        assert!(refused(&["use", "A", "--project"]).contains("--project needs"));
+        assert!(refused(&["use", "A", "--project", "/x", "--project", "/y"]).contains("once"));
+        assert!(refused(&["use", "A", "--json"]).contains("--json"));
+        assert!(refused(&["profiles", "Work"]).contains("profiles takes no names"));
+        for option in ["--only", "--all", "--yes", "--project"] {
+            assert!(
+                refused(&["list", option, "x"]).contains("only for use"),
+                "{option}"
+            );
+        }
+        assert!(refused(&["prfiles"]).contains("did you mean \"profiles\""));
     }
 
     #[test]

@@ -40,11 +40,18 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   names what is already so rather than only "the configuration already looks like this". "This also turns off" names
   only servers that are on now.
 - Using a profile records nothing as "active": Klefki shows what is on from the files, so nothing can disagree with
-  them.
+  them. A profile's card names the projects where it is on alone: of the servers Claude Code switches there, its
+  members are on and every other one is off, so using it there with "Only these servers there" would change nothing,
+  and each member there loads (none held back by policy, another server of its name, its plugin, as a duplicate, or as
+  a project server not approved there). It is worked out again for each new snapshot.
+- `klefki-cli profiles` lists them and `klefki-cli use` uses one, through the same plan, after showing it and asking
+  (decision 006; the owner chose this on 2026-10-20).
+- The command palette offers the Profiles page, New profile, and "Use profile NAME…" for each profile, which opens the
+  page with where to use it taking the keyboard. Each snapshot names the profiles, read with it like the list of
+  kept definitions, so opening the palette reads nothing; a save or delete updates the names at once.
 
 ## Not yet
-- Profiles from the command palette and `klefki-cli` (the CLI only reads today; writing from it is a new capability).
-- Which profile a project matches now, worked out from the files.
+- Which profiles a project is on alone in, shown on the Connections page too.
 - Undo after using a profile (Restore in the Activity log puts it back), and a backup of `profiles.json` before a
   profile is deleted.
 - A rename or move made outside Klefki (by Claude Code's own commands, or by hand) leaves the profile naming the old
