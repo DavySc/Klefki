@@ -36,6 +36,12 @@ pub enum Action {
     SignIn,
     /// Export the selected servers, or every server in the list.
     Export,
+    /// The Profiles page.
+    Profiles,
+    /// Start a new profile on the Profiles page.
+    NewProfile,
+    /// The Profiles page, with where to use this profile taking the keyboard.
+    UseProfile(String),
 }
 
 pub struct Entry {

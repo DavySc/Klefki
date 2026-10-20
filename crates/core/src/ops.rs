@@ -835,6 +835,75 @@ fn use_profile(
     Ok(())
 }
 
+/// The projects (as [`Snapshot::projects`] spells them) where a profile is on alone now: of the servers Claude Code
+/// switches there, its members are on and every other one is off, so using it there with "Only these servers there"
+/// would change nothing, and every member there loads: none is held back by policy, by another server of its name,
+/// by its plugin, as a duplicate, or as a project server not approved there. Worked out from the files each time, as
+/// nothing records which profile was used (decision 012). A project where none of its members loads is never one.
+pub fn profile_alone_in(
+    members: &[crate::model::ConnectionId],
+    snapshot: &Snapshot,
+) -> Vec<String> {
+    // Each server with the scope, project and name the files spell it with, and whether it is a member: worked out
+    // once, not for each project.
+    let rows: Vec<(&ServerRow, Scope, Option<String>, String, bool)> = snapshot
+        .servers
+        .iter()
+        .filter_map(|r| {
+            let (scope, project, name) = crate::model::ConnectionId::parse(r.connection.as_str())?;
+            Some((r, scope, project, name, members.contains(&r.connection)))
+        })
+        .collect();
+    if !rows.iter().any(|r| r.4) {
+        return Vec::new();
+    }
+    snapshot
+        .projects
+        .iter()
+        .filter(|place| {
+            let here = crate::sanitize::shown(place);
+            let mut on: BTreeSet<&str> = BTreeSet::new();
+            let mut off: BTreeSet<&str> = BTreeSet::new();
+            let mut wanted: BTreeSet<&str> = BTreeSet::new();
+            let mut members_here: Vec<&ServerRow> = Vec::new();
+            for (row, scope, project, name, member) in &rows {
+                let off_here = match scope {
+                    // A local or project server loads in its own project only, where its switch is its own.
+                    Scope::Local | Scope::Project => {
+                        if project.as_deref() != Some(place.as_str()) {
+                            continue;
+                        }
+                        !row.enabled
+                    }
+                    _ => row.disabled_projects.contains(&here),
+                };
+                if off_here {
+                    off.insert(name);
+                } else {
+                    on.insert(name);
+                }
+                // Claude Code switches by name: a name a member has stays on, whichever server it is.
+                if *member {
+                    wanted.insert(name);
+                    members_here.push(row);
+                }
+            }
+            // As things are: nothing changes, so a server is off where its switch is off now.
+            let off_now = |_: &str, name: &str| off.contains(name);
+            let loads = |row: &ServerRow| {
+                held_back(row, place, snapshot, &off_now).is_none()
+                    && (row.scope != Scope::Project
+                        || (row.approval == Some(Approval::Approved) && !row.shadowed))
+            };
+            !wanted.is_empty()
+                && wanted.iter().all(|n| !off.contains(n))
+                && on.iter().all(|n| wanted.contains(n))
+                && members_here.iter().all(|r| loads(r))
+        })
+        .cloned()
+        .collect()
+}
+
 /// A project by its folder's name, with the folder that holds it when another project's folder has that name too.
 fn project_label(path: &str, snapshot: &Snapshot) -> String {
     let name = folder_name(path);
@@ -2060,6 +2129,139 @@ mod tests {
         }
     }
 
+    /// Which projects a profile is on alone in: worked out from the files, so it is right after any change.
+    #[test]
+    fn a_profile_is_on_alone_where_its_servers_are_the_only_ones_on() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {
+                    "/q": {"disabledMcpServers": ["b"]},
+                    "/r": {},
+                    "/s": {"disabledMcpServers": ["a", "b"]},
+                    "/t": {"disabledMcpServers": ["b", "l"], "mcpServers": {"l": {"command": "l"}}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        let a = [member(Scope::User, None, "a")];
+        // /r has b on too, /s has a off; in /t the local l is off as well.
+        assert_eq!(profile_alone_in(&a, &inv.snapshot), ["/q", "/t"]);
+        // A local server counts in its own project only.
+        let a_and_l = [
+            member(Scope::User, None, "a"),
+            member(Scope::Local, Some("/t"), "l"),
+        ];
+        assert_eq!(profile_alone_in(&a_and_l, &inv.snapshot), ["/q"]);
+        // Nothing of it loads anywhere: no project, though every server is off in /s.
+        let gone = [member(Scope::User, None, "github")];
+        assert!(profile_alone_in(&gone, &inv.snapshot).is_empty());
+        assert!(profile_alone_in(&[], &inv.snapshot).is_empty());
+    }
+
+    /// Claude Code switches by name: a member that shares its name with another server is on with it. But it loads
+    /// only when it is the one of that name Claude Code takes: the local server, not the user one it replaces.
+    #[test]
+    fn a_profile_is_on_alone_where_a_member_shares_its_name_with_another_server() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".claude.json"),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {"/q": {"disabledMcpServers": ["b"], "mcpServers": {"a": {"command": "local-a"}}}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+        assert_eq!(
+            profile_alone_in(&[member(Scope::Local, Some("/q"), "a")], &inv.snapshot),
+            ["/q"]
+        );
+        // Found in review of PR #58: the user a does not load in q, the local a does in its place.
+        assert!(profile_alone_in(&[member(Scope::User, None, "a")], &inv.snapshot).is_empty());
+    }
+
+    /// The general rule: a profile is on alone in a project exactly when using it there alone changes nothing. Tried
+    /// over every way of switching the servers of a project off, for several profiles.
+    #[test]
+    fn a_profile_is_on_alone_exactly_where_using_it_alone_changes_nothing() {
+        let names = ["a", "b", "l", "claude.ai Slack"];
+        let profiles = [
+            vec![member(Scope::User, None, "a")],
+            vec![
+                member(Scope::User, None, "a"),
+                member(Scope::User, None, "b"),
+            ],
+            vec![member(Scope::Local, Some("/q"), "l")],
+            vec![
+                member(Scope::ClaudeAi, None, "claude.ai Slack"),
+                member(Scope::User, None, "github"),
+            ],
+            vec![member(Scope::Local, Some("/r"), "m")],
+        ];
+        for bits in 0..(1u32 << names.len()) {
+            let off_in_q: Vec<&str> = names
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, n)| *n)
+                .collect();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(".claude.json"),
+                json!({
+                    "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                    "claudeAiMcpEverConnected": ["claude.ai Slack"],
+                    "projects": {
+                        "/q": {"disabledMcpServers": off_in_q, "mcpServers": {"l": {"command": "l"}}},
+                        "/r": {"mcpServers": {"m": {"command": "m"}}}
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let inv = inventory::load(&crate::config::ConfigPaths::in_dir(dir.path()));
+            for members in &profiles {
+                let alone = profile_alone_in(members, &inv.snapshot);
+                for place in ["/q", "/r"] {
+                    let unchanged = use_it(&inv, members, Some(place), true).is_ok_and(|out| {
+                        let found = members.iter().any(|m| {
+                            inv.snapshot.servers.iter().any(|r| {
+                                &r.connection == m
+                                    && crate::model::ConnectionId::parse(m.as_str()).is_some_and(
+                                        |(_, p, _)| p.is_none() || p.as_deref() == Some(place),
+                                    )
+                            })
+                        });
+                        found
+                            && out.claude.iter().all(|op| match op {
+                                Op::SetDisabled {
+                                    project,
+                                    name,
+                                    disabled,
+                                } => {
+                                    project == place
+                                        && *disabled
+                                            == (place == "/q" && off_in_q.contains(&name.as_str()))
+                                }
+                                _ => false,
+                            })
+                    });
+                    assert_eq!(
+                        alone.iter().any(|p| p == place),
+                        unchanged,
+                        "{members:?} in {place}, off in /q: {off_in_q:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_project_is_named_by_its_folder_and_the_one_above_when_two_share_a_name() {
         let dir = tempfile::tempdir().unwrap();
@@ -2880,6 +3082,56 @@ mod profile_review_regressions {
             "{:?}",
             everywhere.warnings
         );
+    }
+
+    /// Found in review of PR #58: "Only its servers are on in q" was said while policy kept the only member from
+    /// loading there, so Claude Code loaded nothing.
+    #[test]
+    fn a_profile_is_not_on_alone_where_policy_keeps_a_member_from_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = json!({
+            "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+            "projects": {"/q": {"disabledMcpServers": ["b"]}}
+        });
+        let a = [crate::model::ConnectionId::new(Scope::User, None, "a")];
+        // Without the rule, it is on alone in q.
+        let inv0 = inv(dir.path(), config.clone());
+        assert_eq!(profile_alone_in(&a, &inv0.snapshot), ["/q"]);
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"deniedMcpServers":[{"serverName":"a"}]}"#,
+        )
+        .unwrap();
+        let inv = inv(dir.path(), config);
+        assert!(profile_alone_in(&a, &inv.snapshot).is_empty());
+    }
+
+    /// The variant: a project server not approved for its project is not loaded, so not on alone either; approved,
+    /// it is.
+    #[test]
+    fn a_profile_is_not_on_alone_where_a_member_is_a_project_server_not_approved() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = dir.path().join("q");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(
+            q.join(".mcp.json"),
+            r#"{"mcpServers":{"repo":{"command":"r"}}}"#,
+        )
+        .unwrap();
+        let key = q.to_string_lossy().replace('\\', "/");
+        let alone = |entry: serde_json::Value| {
+            let inv = inv(dir.path(), json!({"projects": {&key: entry}}));
+            let row = inv
+                .snapshot
+                .servers
+                .iter()
+                .find(|r| r.scope == Scope::Project)
+                .unwrap();
+            profile_alone_in(std::slice::from_ref(&row.connection), &inv.snapshot)
+        };
+        assert!(alone(json!({})).is_empty());
+        assert!(alone(json!({"disabledMcpjsonServers": ["repo"]})).is_empty());
+        assert_eq!(alone(json!({"enabledMcpjsonServers": ["repo"]})).len(), 1);
     }
 
     /// A member that policy blocks stays off whatever disabledMcpServers says.

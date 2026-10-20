@@ -2573,6 +2573,18 @@ impl State {
         }
         let mut snapshot = next.snapshot;
         snapshot.kept = kept_list(shared);
+        snapshot.profiles = shared
+            .config
+            .backup_dir
+            .as_deref()
+            .map(|dir| {
+                crate::profiles::load(dir)
+                    .profiles
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect()
+            })
+            .unwrap_or_default();
         let before = std::mem::replace(&mut self.snapshot, Arc::new(snapshot));
         shared
             .emitter
@@ -8343,6 +8355,22 @@ mod tests {
 
     /// A rename or move used to drop the server from every profile, which then named it "no longer configured"
     /// (found in review, PR #57). Its profiles follow it, and the review says so.
+    /// The palette offers each profile, so every snapshot names them, read anew like the rest: a profile made by hand
+    /// shows after a refresh.
+    #[test]
+    fn each_snapshot_names_the_profiles() {
+        let env = quiet_env(&serde_json::json!({"mcpServers": {"gw": {"command": "gw"}}}));
+        let backups = env.dir.path().join("backups");
+        crate::profiles::save(&backups, "Work", &[user_id("gw").connection], None).unwrap();
+        let core = env.start();
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert_eq!(snapshots(&events)[0].profiles, ["Work"]);
+        crate::profiles::save(&backups, "Notes", &[user_id("gw").connection], None).unwrap();
+        core.send(Command::Refresh { live_all: false });
+        let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+        assert_eq!(snapshots(&events)[0].profiles, ["Work", "Notes"]);
+    }
+
     #[test]
     fn a_renamed_or_moved_server_stays_in_its_profiles() {
         let env = quiet_env(&serde_json::json!({

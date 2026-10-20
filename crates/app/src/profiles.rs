@@ -33,6 +33,15 @@ pub struct ProfilesPage {
     project_filter: String,
     /// A save was asked for: once the engine answers with the profiles, the editor's work is done.
     saving: bool,
+    /// The projects (as shown) where each profile's servers are the only ones on, by name. Worked out once for the
+    /// profiles and the snapshot shown, not every frame.
+    alone: Option<HashMap<String, Vec<String>>>,
+    /// The profile whose "Use in" takes the keyboard when the cards are next drawn, asked for from the palette.
+    /// Dropped once they are drawn, so focus never moves later on its own.
+    reveal: Option<String>,
+    /// New profile was asked for from the palette: the editor opens once the profiles are read, if they can be
+    /// changed.
+    new_asked: bool,
 }
 
 /// A profile being made or edited.
@@ -99,11 +108,38 @@ impl ProfilesPage {
     /// answer on opening the page leaves a draft carried over from before.
     pub fn set(&mut self, profiles: Profiles) {
         self.profiles = Some(profiles);
+        self.alone = None;
         if std::mem::take(&mut self.saving) {
             self.editing = None;
         }
         self.confirm = None;
         self.refused = None;
+    }
+
+    /// A new snapshot is shown: where each profile is on alone is worked out again.
+    pub fn snapshot_changed(&mut self) {
+        self.alone = None;
+    }
+
+    /// Starts a new profile once the profiles are read, unless one is being made or edited: that is not thrown away.
+    /// Not while the file cannot be read in full, as the page's own New profile.
+    pub fn start_new(&mut self) {
+        if self.editing.is_none() {
+            self.new_asked = true;
+        }
+    }
+
+    /// Brings the profile `name` into view, with where to use it taking the keyboard. A filter that would hide it is
+    /// cleared. Not while a profile is being made or edited, which fills the page: that is said instead.
+    pub fn reveal(&mut self, name: String) {
+        if self.editing.is_some() {
+            self.refused = Some(format!(
+                "Finish or cancel the profile you are editing first, then use {name}."
+            ));
+            return;
+        }
+        self.filter.clear();
+        self.reveal = Some(name);
     }
 
     pub fn refused(&mut self, why: String) {
@@ -137,12 +173,34 @@ impl ProfilesPage {
                 };
                 // Said once, up front: Klefki changes nothing in a file it could not read in full.
                 let editable = profiles.problem.is_none();
+                if std::mem::take(&mut self.new_asked) {
+                    if editable {
+                        self.editing = Some(Draft {
+                            replaces: None,
+                            name: String::new(),
+                            members: Vec::new(),
+                            focus: true,
+                            problem: None,
+                        });
+                        self.refused = None;
+                    } else {
+                        self.refused = Some(
+                            "No profile can be made until the profiles file can be read in full (see above)."
+                                .to_owned(),
+                        );
+                    }
+                }
                 if let Some(problem) = &profiles.problem {
+                    // "Still usable" only when something could be read to use.
+                    let usable = if profiles.profiles.is_empty() {
+                        ""
+                    } else {
+                        "; those read can still be used"
+                    };
                     warn(
                         ui,
                         &format!(
-                            "{problem} No profile can be made, changed or deleted until the file is fixed; they \
-                             can still be used."
+                            "{problem} No profile can be made, changed or deleted until the file is fixed{usable}."
                         ),
                     );
                     ui.add_space(8.0);
@@ -209,6 +267,17 @@ impl ProfilesPage {
                     self.refused = None;
                 }
                 ui.add_space(8.0);
+                let alone = self.alone.get_or_insert_with(|| {
+                    profiles
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            let places = klefki_core::api::profile_alone_in(&p.members, snapshot);
+                            let shown = places.iter().map(|place| shown_project(place, snapshot)).collect();
+                            (p.name.clone(), shown)
+                        })
+                        .collect()
+                });
                 let query = self.filter.trim().to_lowercase();
                 let shown: Vec<&Profile> = profiles
                     .profiles
@@ -220,14 +289,22 @@ impl ProfilesPage {
                 }
                 for profile in shown {
                     let choice = self.choices.entry(profile.name.clone()).or_default();
+                    let reveal = self.reveal.as_deref() == Some(profile.name.as_str());
+                    if reveal {
+                        self.reveal = None;
+                    }
                     let out = card(
                         ui,
                         profile,
                         snapshot,
+                        Context {
+                            alone: alone.get(&profile.name).map_or(&[], Vec::as_slice),
+                            reveal,
+                            editable,
+                        },
                         choice,
                         &mut self.confirm,
                         &mut self.project_filter,
-                        editable,
                     );
                     match out {
                         Some(Card::Edit) => {
@@ -239,6 +316,8 @@ impl ProfilesPage {
                     }
                     ui.add_space(8.0);
                 }
+                // Asked for a profile that is not there (any more): not waited for.
+                self.reveal = None;
             });
         if asked.is_some() {
             self.refused = None;
@@ -250,16 +329,26 @@ impl ProfilesPage {
     }
 }
 
+/// What a card shows beyond the profile itself.
+struct Context<'a> {
+    /// The projects (as shown) where its servers are the only ones on.
+    alone: &'a [String],
+    /// Bring it into view, with where to use it taking the keyboard.
+    reveal: bool,
+    editable: bool,
+}
+
 /// One profile: its name, its servers, where to use it, and its buttons.
 fn card(
     ui: &mut Ui,
     profile: &Profile,
     snapshot: &Snapshot,
+    cx: Context,
     choice: &mut Choice,
     confirm: &mut Option<String>,
     project_filter: &mut String,
-    editable: bool,
 ) -> Option<Card> {
+    let editable = cx.editable;
     let pal = theme::palette(ui.ctx());
     let mut out = None;
     egui::Frame::new()
@@ -301,6 +390,19 @@ fn card(
                 });
             });
             ui.add(egui::Label::new(summary(profile, snapshot)).wrap());
+            // Where the eye already is, under its servers: true of the files now, so it is not muted.
+            if !cx.alone.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(icon::CHECK_CIRCLE).color(pal.success));
+                    ui.add(
+                        egui::Label::new(format!(
+                            "Only these servers are on in {}.",
+                            named_few(cx.alone)
+                        ))
+                        .wrap(),
+                    );
+                });
+            }
             let gone = gone(profile, snapshot);
             if !gone.is_empty() {
                 muted(
@@ -358,6 +460,10 @@ fn card(
                         }
                     });
                 let combo = combo.response.labelled_by(use_in.id);
+                if cx.reveal {
+                    combo.request_focus();
+                    combo.scroll_to_me(Some(egui::Align::Center));
+                }
                 if let Some(Some(p)) = &choice.place {
                     combo.on_hover_text(p.as_str());
                 }
@@ -731,6 +837,16 @@ fn shown_project(path: &str, snapshot: &Snapshot) -> String {
     }
 }
 
+/// A few projects by name, and how many more: "q, r and 2 more".
+fn named_few(names: &[String]) -> String {
+    const FEW: usize = 3;
+    match names {
+        [one] => one.clone(),
+        [first @ .., last] if names.len() <= FEW => format!("{} and {last}", first.join(", ")),
+        _ => format!("{} and {} more", names[..FEW].join(", "), names.len() - FEW),
+    }
+}
+
 /// The folder a project's folder is in; empty for a project at the top.
 fn parent_of(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
@@ -750,4 +866,19 @@ fn warn(ui: &mut Ui, text: &str) {
     ui.add(
         egui::Label::new(RichText::new(format!("{} {text}", icon::WARNING)).color(pal.warn)).wrap(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_few;
+
+    #[test]
+    fn a_few_projects_are_named_and_the_rest_counted() {
+        let names = |n: usize| (0..n).map(|i| format!("p{i}")).collect::<Vec<_>>();
+        assert_eq!(named_few(&names(1)), "p0");
+        assert_eq!(named_few(&names(2)), "p0 and p1");
+        assert_eq!(named_few(&names(3)), "p0, p1 and p2");
+        assert_eq!(named_few(&names(4)), "p0, p1, p2 and 1 more");
+        assert_eq!(named_few(&names(9)), "p0, p1, p2 and 6 more");
+    }
 }
