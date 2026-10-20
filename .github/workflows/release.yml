@@ -92,8 +92,17 @@ jobs:
               (cd portable && 7z a -tzip "../dist/$base-windows-x64.zip" .)
               ;;
             macos)
-              cargo packager --release -p klefki -f app,dmg --target universal-apple-darwin -o "$GITHUB_WORKSPACE/target/packages"
-              cp target/packages/*.dmg "dist/$base-macos-universal.dmg"
+              cargo packager --release -p klefki -f app --target universal-apple-darwin -o "$GITHUB_WORKSPACE/target/packages"
+              # Ad-hoc signature (free; no Apple account), inside out. Gatekeeper still asks once, since the app is
+              # not notarised, but without it macOS on Apple silicon can call the downloaded app damaged.
+              app=target/packages/Klefki.app
+              codesign --force --sign - "$app/Contents/MacOS/klefki-cli"
+              codesign --force --sign - "$app"
+              # The disk image is made here rather than by cargo-packager, which would rebuild the unsigned app.
+              mkdir dmg
+              ditto "$app" dmg/Klefki.app
+              ln -s /Applications dmg/Applications
+              hdiutil create -volname Klefki -srcfolder dmg -fs HFS+ -format UDZO "dist/$base-macos-universal.dmg"
               ;;
             linux)
               cargo packager --release -p klefki -f deb,appimage -o "$GITHUB_WORKSPACE/target/packages"
@@ -108,7 +117,17 @@ jobs:
           ls -l dist
 
       - name: Check the packages
-        run: python3 scripts/check-release.py ${{ matrix.system }} dist ${{ steps.version.outputs.version }} ${{ runner.os == 'macOS' && '--app target/packages/Klefki.app' || '' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [[ "${{ matrix.system }}" == macos ]]; then
+            # Checks the app as users get it: from inside the disk image.
+            hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/dmg" "dist/klefki-$VERSION-macos-universal.dmg"
+            trap 'hdiutil detach "$RUNNER_TEMP/dmg"' EXIT
+            python3 scripts/check-release.py macos dist "$VERSION" --app "$RUNNER_TEMP/dmg/Klefki.app"
+          else
+            python3 scripts/check-release.py ${{ matrix.system }} dist "$VERSION"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
