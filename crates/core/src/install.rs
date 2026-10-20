@@ -70,7 +70,10 @@ impl InstallKind {
                 }
             }
             "linux" => match appimage {
-                Some(path) if path.is_absolute() => InstallKind::AppImage(path.to_path_buf()),
+                // A Linux path, checked as text so the same rule holds wherever this runs.
+                Some(path) if path.to_string_lossy().starts_with('/') => {
+                    InstallKind::AppImage(path.to_path_buf())
+                }
                 _ => manual(
                     "Klefki was installed from the .deb package: update it with apt, as the release notes say.",
                 ),
