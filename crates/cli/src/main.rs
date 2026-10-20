@@ -282,6 +282,9 @@ fn warn(snapshot: &Snapshot) {
     for warning in &snapshot.warnings {
         eprintln!("warning: {warning}");
     }
+    for note in &snapshot.organisation_notes {
+        eprintln!("note: {note}");
+    }
 }
 
 fn usage(why: &str) -> u8 {

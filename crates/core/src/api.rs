@@ -30,15 +30,16 @@ pub fn project_key(path: &str) -> std::borrow::Cow<'_, str> {
     crate::config::inventory::project_key(path)
 }
 
+/// In the order lists show them: the organisation's first, as they win over every other of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Scope {
+    /// A server the organisation sets in the machine's managed settings. Read-only: only an administrator changes it.
+    Managed,
     User,
     Local,
     Project,
     /// A server a Claude Code plugin brings. Read-only: it is changed in the plugin.
     Plugin,
-    /// A server the organisation sets in the machine's managed settings. Read-only: only an administrator changes it.
-    Managed,
 }
 
 impl Scope {
@@ -290,6 +291,9 @@ pub struct Snapshot {
     /// The organisation's `managed-mcp.json`, as shown, when it exists: then Claude Code loads only the
     /// organisation's servers (decision 009).
     pub organisation_only: Option<String>,
+    /// What Claude Code ignores in the organisation's files. Only an administrator can change it, so it is said
+    /// apart from [`Snapshot::warnings`]. Already sanitised.
+    pub organisation_notes: Vec<String>,
 }
 
 /// A server definition Klefki kept in its private folder after a change removed the server and could not put it back

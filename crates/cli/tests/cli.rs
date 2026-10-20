@@ -335,7 +335,8 @@ fn list_and_status_show_what_the_organisation_sets_and_what_it_replaces() {
     let out = env.run(&["list"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
-    assert!(stdout.contains("\nOrganisation\n"), "{stdout}");
+    // First: these win over every other server of the same name.
+    assert!(stdout.starts_with("Organisation\n"), "{stdout}");
     let wiki = line_of(&stdout, "wiki");
     assert!(
         wiki.contains("https://wiki.example.com/sse") && wiki.contains("set by your organisation"),
@@ -345,7 +346,12 @@ fn list_and_status_show_what_the_organisation_sets_and_what_it_replaces() {
         .lines()
         .find(|l| l.contains("beta") && l.contains("127.0.0.1"))
         .unwrap_or_else(|| panic!("{stdout}"));
-    assert!(beta.contains("not loaded"), "{beta}");
+    // Said once, in the state column, with the reason as the note.
+    assert!(
+        beta.contains("  not loaded  ") && beta.contains("(Your organisation sets"),
+        "{beta}"
+    );
+    assert_eq!(beta.matches("not loaded").count(), 1, "{beta}");
 
     let out = env.run(&["list", "--json"]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");

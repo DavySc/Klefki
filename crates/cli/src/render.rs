@@ -144,14 +144,21 @@ fn by_chunks(x: &[(bool, String)], y: &[(bool, String)]) -> Ordering {
     x.len().cmp(&y.len())
 }
 
-/// The rows to show, in the order they are shown: user servers, then per project its local and project servers;
-/// by name within a group.
+/// The rows to show, in the order they are shown: the organisation's servers, the user's, then per project its local
+/// and project servers, then the plugins'; by name within a group.
 pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
     // Each name is split once, not at every comparison.
     let mut keyed: Vec<(&ServerRow, Vec<(bool, String)>)> =
         rows.into_iter().map(|r| (r, chunks(&r.name))).collect();
     keyed.sort_by(|(a, x), (b, y)| {
-        let group = |r: &'a ServerRow| (r.scope != Scope::User, &r.project, r.scope);
+        let group = |r: &'a ServerRow| {
+            (
+                r.scope != Scope::Managed,
+                r.scope != Scope::User,
+                &r.project,
+                r.scope,
+            )
+        };
         group(a)
             .cmp(&group(b))
             .then_with(|| by_chunks(x, y))
@@ -239,8 +246,9 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         Some(Approval::Rejected) => notes.push("rejected".to_owned()),
         Some(Approval::Approved) | None => {}
     }
+    // The state column says "not loaded"; the note says why.
     if let Some(why) = &row.not_loaded {
-        notes.push(format!("not loaded: {}", why.trim_end_matches('.')));
+        notes.push(why.trim_end_matches('.').to_owned());
     }
     if let Some(file) = &row.managed {
         notes.push(format!("set by your organisation in {file}"));
@@ -262,7 +270,14 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
             row.disabled_in
         ));
     }
-    if let Some(same) = row.plugin.as_ref().and_then(|p| p.same_as.as_deref()) {
+    // Not loaded at all: what else it would leave out or be hidden by does not matter.
+    let loaded = row.not_loaded.is_none();
+    if let Some(same) = row
+        .plugin
+        .as_ref()
+        .and_then(|p| p.same_as.as_deref())
+        .filter(|_| loaded)
+    {
         notes.push(if row.shadowed {
             format!("left out: same as {same}")
         } else {
@@ -271,13 +286,13 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
                 row.shadowed_in.len()
             )
         });
-    } else if row.shadowed {
+    } else if loaded && row.shadowed {
         notes.push(if row.scope == Scope::User {
             "shadowed in every project".to_owned()
         } else {
             "shadowed by a local server".to_owned()
         });
-    } else if !row.shadowed_in.is_empty() {
+    } else if loaded && !row.shadowed_in.is_empty() {
         notes.push(format!(
             "shadowed in {} of {project_count} projects",
             row.shadowed_in.len()
@@ -286,7 +301,7 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if row.casing_collision {
         notes.push("another server's name differs only in case".to_owned());
     }
-    if row.scope == Scope::User && !row.relative_paths.is_empty() && row.not_loaded.is_none() {
+    if row.scope == Scope::User && !row.relative_paths.is_empty() && loaded {
         notes.push(format!(
             "relative to each session's folder: {}",
             row.relative_paths.join(", ")
@@ -298,6 +313,23 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     notes
 }
 
+/// The state column: on, off, or not loaded wherever it is on.
+fn state(row: &ServerRow, project_count: usize) -> &'static str {
+    // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
+    let plugin_off = project_count > 0
+        && row
+            .plugin
+            .as_ref()
+            .is_some_and(|p| p.off_in.len() == project_count);
+    if !row.enabled || plugin_off {
+        "off"
+    } else if row.not_loaded.is_some() {
+        "not loaded"
+    } else {
+        "on"
+    }
+}
+
 pub const NOTHING: &str = "No MCP servers are configured.\n";
 
 pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -> String {
@@ -306,25 +338,12 @@ pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -
     }
     let name_w = width(rows.iter().map(|r| r.name.as_str()));
     let kind_w = width(rows.iter().map(|r| r.transport.label()));
+    let state_w = width(rows.iter().map(|r| state(r, snapshot.project_count)));
     let mut out = String::new();
     grouped(&mut out, rows, home, |out, row| {
         pad(out, &row.name, name_w);
         out.push_str("  ");
-        // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
-        let plugin_off = snapshot.project_count > 0
-            && row
-                .plugin
-                .as_ref()
-                .is_some_and(|p| p.off_in.len() == snapshot.project_count);
-        pad(
-            out,
-            if row.enabled && !plugin_off {
-                "on"
-            } else {
-                "off"
-            },
-            3,
-        );
+        pad(out, state(row, snapshot.project_count), state_w);
         out.push_str("  ");
         pad(out, row.transport.label(), kind_w);
         out.push_str("  ");
@@ -673,6 +692,7 @@ pub fn status_json(
         "claude_version": claude_version,
         "servers": servers,
         "warnings": snapshot.warnings,
+        "organisation_notes": snapshot.organisation_notes,
     }))
 }
 
@@ -682,7 +702,7 @@ mod tests {
     use klefki_core::api::fixture_snapshot;
 
     #[test]
-    fn groups_come_user_first_then_each_project_local_before_project() {
+    fn groups_come_organisation_and_user_first_then_each_project_local_before_project() {
         let s = fixture_snapshot();
         let rows = ordered(&s.servers);
         let heads: Vec<String> = rows.iter().map(|r| heading(r, None)).collect();
@@ -693,7 +713,7 @@ mod tests {
                 seen.push(h);
             }
         }
-        assert_eq!(seen[0], "User");
+        assert_eq!(seen[..2], ["Organisation", "User"]);
         for (i, h) in seen.iter().enumerate() {
             if let Some(project) = h.strip_prefix("Project in ") {
                 let local = format!("Local in {project}");
@@ -767,10 +787,14 @@ mod tests {
             ..rel.clone()
         };
         let said = notes(&replaced, 2);
-        assert_eq!(
-            said[0],
-            "not loaded: Your organisation sets a server of the same name"
-        );
+        assert_eq!(said[0], "Your organisation sets a server of the same name");
+        // Nor what a server Claude Code does not load would leave out or be hidden by (cross-review of #47).
+        let hidden_too = ServerRow {
+            shadowed: true,
+            shadowed_in: vec!["a".into(), "b".into()],
+            ..replaced.clone()
+        };
+        assert_eq!(notes(&hidden_too, 2), said);
         assert!(!said.iter().any(|n| n.contains("relative")), "{said:?}");
         assert_eq!(
             row_json(&rel, 2)["relative_paths"],
@@ -846,8 +870,12 @@ mod tests {
         let rows = ordered(&s.servers);
         let heads: Vec<String> = rows.iter().map(|r| heading(r, None)).collect();
         let first_plugin = heads.iter().position(|h| h == "Plugin").unwrap();
+        let organisation = heads.iter().take_while(|h| *h == "Organisation").count();
+        assert!(organisation > 0, "{heads:?}");
         assert!(
-            heads[..first_plugin].iter().all(|h| h == "User"),
+            heads[organisation..first_plugin]
+                .iter()
+                .all(|h| h == "User"),
             "{heads:?}"
         );
         let text = list_text(&s, &rows, None);

@@ -92,12 +92,13 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     let mut snap = Snapshot::default();
     let root = match text.and_then(|t| t.map(parse_claude_json).transpose()) {
         Ok(Some(v)) => v,
+        // Nothing configured by hand yet, but the organisation's and the plugins' servers still load.
         Ok(None) => {
             snap.warnings.push(format!(
-                "{} does not exist; no servers are configured yet.",
+                "{} does not exist; no servers are configured by hand yet.",
                 display_path(&paths.claude_json)
             ));
-            return snap;
+            Value::Object(serde_json::Map::new())
         }
         Err(e) => {
             snap.warnings.push(format!(
@@ -121,8 +122,15 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     // `managed-mcp.json` they are the only ones Claude Code loads.
     let mut managed_warnings = Vec::new();
     let org = managed::load(paths, &mut managed_warnings);
-    snap.warnings
-        .extend(managed_warnings.iter().map(|w| sanitize::sanitize_line(w)));
+    snap.organisation_notes = managed_warnings
+        .iter()
+        .map(|w| {
+            format!(
+                "{} Your administrator can change this.",
+                sanitize::sanitize_line(w)
+            )
+        })
+        .collect();
     let only = org.only.as_deref().map(display_path);
     snap.organisation_only.clone_from(&only);
     let replaced_by = |name: &str| -> Option<String> {
@@ -160,7 +168,8 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         .values()
         .map(|p| clip(&sanitize(&p.display)))
         .collect();
-    // The servers configured by hand, where each is loaded: a plugin's server that repeats one is left out.
+    // The servers configured by hand or by the organisation, where each is loaded: a plugin's server that repeats
+    // one is left out.
     let mut by_hand: Vec<ByHand> = Vec::new();
 
     // User rows by name as the file spells it, to mark the projects where a closer scope hides them.
@@ -320,6 +329,20 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
     }
 
     for server in &org.servers {
+        // Claude Code compares a plugin's server with the organisation's too, wherever those are on.
+        if let Some(key) = plugins::same_as_key(&server.entry) {
+            by_hand.push(ByHand {
+                key,
+                name: server.name.clone(),
+                project: None,
+                off_in: disabled_by_project
+                    .values()
+                    .zip(&shown_projects)
+                    .filter(|(d, _)| d.contains(&server.name))
+                    .map(|(_, p)| p.clone())
+                    .collect(),
+            });
+        }
         let (status, cached) = hints.status_of(&server.name);
         let mut r = row(
             &server.name,
@@ -2965,9 +2988,16 @@ mod tests {
             }),
         );
         let s = e.load();
-        // A settings file may not name a program to run: said, and not listed.
-        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
-        assert!(s.warnings[0].contains("\"run\""), "{:?}", s.warnings);
+        // A settings file may not name a program to run: said quietly, as only an administrator can change it, and
+        // not listed.
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let notes = &s.organisation_notes;
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("\"run\""), "{notes:?}");
+        assert!(
+            notes[0].ends_with("Your administrator can change this."),
+            "{notes:?}"
+        );
         assert!(!s.servers.iter().any(|r| r.name == "run"));
         let docs = find(&s, Scope::Managed, "docs");
         assert_eq!(docs.target, "https://docs.example.com/mcp");
@@ -3050,6 +3080,61 @@ mod tests {
             let why = r.not_loaded.as_deref().unwrap_or_else(|| panic!("{r:#?}"));
             assert!(why.contains("managed-mcp.json"), "{why}");
         }
+    }
+
+    #[test]
+    fn an_organisations_server_leaves_a_plugins_server_with_the_same_address_out() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.plugin(
+            "p2",
+            json!({"web2": {"type": "http", "url": "https://x.example.com/mcp"}}),
+        );
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"orgweb": {"type": "http", "url": "https://x.example.com/mcp"}}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}}),
+        );
+        let s = e.load();
+        let web2 = find(&s, Scope::Plugin, "plugin:p2:web2");
+        assert!(web2.shadowed, "{web2:#?}");
+        assert_eq!(plugin_info(web2).same_as.as_deref(), Some("orgweb"));
+
+        // Off in one project, the organisation's server leaves it out only in the other.
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"disabledMcpServers": ["orgweb"]},
+                b.to_string_lossy(): {}
+            }}),
+        );
+        let s = e.load();
+        let web2 = find(&s, Scope::Plugin, "plugin:p2:web2");
+        assert!(!web2.shadowed, "{web2:#?}");
+        assert_eq!(web2.shadowed_in, [b.to_string_lossy().replace('\\', "/")]);
+        assert_eq!(plugin_info(web2).same_as.as_deref(), Some("orgweb"));
+    }
+
+    #[test]
+    fn without_claude_json_the_organisations_and_plugins_servers_are_still_listed() {
+        let e = Env::new();
+        e.plugin("p1", json!({"s": {"command": "plug"}}));
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"docs": {"type": "http", "url": "https://docs.example.com/mcp"}}}),
+        );
+        let s = e.load();
+        assert!(find(&s, Scope::Managed, "docs").not_loaded.is_none());
+        assert!(find(&s, Scope::Plugin, "plugin:p1:s").not_loaded.is_none());
+        assert_eq!(s.warnings.len(), 1, "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("does not exist"), "{:?}", s.warnings);
+
+        // A broken one still lists nothing: Claude Code's own settings are unknown then.
+        e.write_raw(".claude.json", "{ broken");
+        assert!(e.load().servers.is_empty());
     }
 
     #[test]

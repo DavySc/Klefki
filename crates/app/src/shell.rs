@@ -1199,6 +1199,7 @@ impl ShellApp {
             .show(ui, |ui| match self.page {
                 Page::Connections => {
                     self.warnings(ui);
+                    self.organisation_notes(ui);
                     self.legacy_notice(ui);
                     self.kept_notice(ui);
                     self.toolbar(ui);
@@ -1458,6 +1459,25 @@ impl ShellApp {
                     );
                 }
             });
+        ui.add_space(6.0);
+    }
+
+    /// What Claude Code ignores in the organisation's files: one muted line each, whole on hover. Only an
+    /// administrator can change it, so it does not take the warnings' room.
+    fn organisation_notes(&self, ui: &mut Ui) {
+        let notes = &self.snapshot.organisation_notes;
+        if notes.is_empty() {
+            return;
+        }
+        let pal = theme::palette(ui.ctx());
+        for note in notes {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("{} {note}", icon::INFO)).color(pal.text_muted),
+                )
+                .truncate(),
+            );
+        }
         ui.add_space(6.0);
     }
 
@@ -4453,16 +4473,25 @@ impl ShellApp {
                         if let Some(approval) = s.approval {
                             kv("Approval", approval.label().to_owned());
                         }
-                        let shadowed = kv(
-                            if s.scope == Scope::Plugin {
-                                "Left out"
-                            } else {
-                                "Shadowed"
-                            },
-                            shadowed_text(s, self.snapshot.project_count),
-                        );
-                        if !s.shadowed_in.is_empty() {
-                            shadowed.on_hover_text(shadowed_paths(s));
+                        // The organisation's servers win over every other of their name: never hidden, and what
+                        // they hide is said where they are.
+                        if s.scope == Scope::Managed {
+                            let replaced = replaced_by_organisation(&self.snapshot.servers, s);
+                            if !replaced.is_empty() {
+                                kv("Replaces", replaced.join("; "));
+                            }
+                        } else {
+                            let shadowed = kv(
+                                if s.scope == Scope::Plugin {
+                                    "Left out"
+                                } else {
+                                    "Shadowed"
+                                },
+                                shadowed_text(s, self.snapshot.project_count),
+                            );
+                            if !s.shadowed_in.is_empty() {
+                                shadowed.on_hover_text(shadowed_paths(s));
+                            }
                         }
                         if replaces {
                             kv("Replaces", format!("the user server {}", s.name));
@@ -7801,10 +7830,8 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
         hover: hover.map(str::to_owned),
     };
     // Most important first: those that don't fit beside the name are the ones left to the "+N".
+    // "Not loaded" is the status column's to say: once per row.
     let mut badges = Vec::new();
-    if let Some(why) = &s.not_loaded {
-        badges.push(loud("not loaded", pal.warn, Some(why)));
-    }
     if s.transport == klefki_core::api::TransportKind::Invalid {
         badges.push(loud("invalid", pal.danger, None));
     }
@@ -8047,6 +8074,25 @@ const PLUGIN_NOT_CHECKED: &str =
     "Klefki does not check a plugin's servers. In Claude Code, /mcp shows their status.";
 /// Why Klefki has no status for the organisation's server, and where it is.
 const ORGANISATION_NOT_CHECKED: &str = "Klefki does not check the servers your organisation sets. In Claude Code, /mcp shows their status.";
+/// The servers of `org`'s name, configured by hand, that Claude Code does not load because the organisation sets it.
+fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|o| {
+            matches!(o.scope, Scope::User | Scope::Local | Scope::Project)
+                && o.name == org.name
+                && o.not_loaded.is_some()
+        })
+        .map(|o| {
+            let scope = o.scope.label().to_lowercase();
+            match &o.project {
+                None => format!("your {scope} server {}", o.name),
+                Some(p) => format!("the {scope} server {} in {p}", o.name),
+            }
+        })
+        .collect()
+}
+
 /// The status of a server Claude Code loads nowhere (decision 009).
 const NOT_LOADED: &str = "Not loaded";
 
@@ -8428,6 +8474,20 @@ mod tests {
         h.get_by_label_contains("Connections").click();
         h.run();
         assert_eq!(h.state().page, Page::Connections);
+    }
+
+    #[test]
+    fn what_only_an_administrator_can_change_is_said_quietly() {
+        let note = "Claude Code ignores the server \"run\" in /etc/claude-code/managed-settings.json: it names a \
+                    program to run. Your administrator can change this.";
+        let mut h = harness_with(Snapshot {
+            organisation_notes: vec![note.to_owned()],
+            ..Snapshot::default()
+        });
+        h.run();
+        // One muted line, not the warning frame: the user cannot act on it (cross-review of #47).
+        h.get_by_label_contains("Claude Code ignores the server \"run\"");
+        assert!(h.query_by_label_contains(icon::WARNING).is_none());
     }
 
     #[test]
@@ -11633,11 +11693,12 @@ mod tests {
             .send(snapshot_of(vec![mine, organisation_row("other")]))
             .unwrap();
         h.run();
-        h.get_by_label("not loaded").hover();
+        // Said once, in the status column (cross-review of #47): no badge beside the name.
+        assert!(h.query_by_label("not loaded").is_none());
+        h.get_by_label(NOT_LOADED).hover();
         h.run();
         // Where Claude Code starts it does not matter: it does not start it.
         assert!(h.query_by_label("relative path").is_none());
-        h.get_by_label(NOT_LOADED);
         h.get_by_label("mine").click();
         h.run();
         h.get_by_label(&format!("Claude Code does not load this server. {why}"));
@@ -11645,6 +11706,31 @@ mod tests {
         h.run();
         // No "Check now": the check would answer for the organisation's server.
         assert!(h.query_by_label("Check now").is_none());
+    }
+
+    #[test]
+    fn an_organisations_server_comes_first_and_says_what_it_replaces() {
+        let (mut h, engine) = live_harness();
+        let why = "Your organisation sets a server of the same name.";
+        let gone = |scope, project: Option<&str>| ServerRow {
+            not_loaded: Some(why.into()),
+            ..live_row("fs", scope, project)
+        };
+        engine
+            .events
+            .send(snapshot_of(vec![
+                live_row("alpha", Scope::User, None),
+                gone(Scope::User, None),
+                gone(Scope::Local, Some("/w/repo")),
+                organisation_row("fs"),
+            ]))
+            .unwrap();
+        h.run();
+        assert_eq!(h.state().visible().first(), Some(&3));
+        h.state_mut().selected = BTreeSet::from([3]);
+        h.run();
+        h.get_by_label("your user server fs; the local server fs in /w/repo");
+        assert!(h.query_by_label("Shadowed").is_none());
     }
 
     #[test]

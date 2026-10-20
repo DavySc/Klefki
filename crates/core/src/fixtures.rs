@@ -55,6 +55,7 @@ pub(crate) fn load() -> Snapshot {
         legacy_disabled: Vec::new(),
         kept: Vec::new(),
         organisation_only: None,
+        organisation_notes: Vec::new(),
         servers: raw
             .servers
             .into_iter()

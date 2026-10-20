@@ -31,10 +31,22 @@ Goal: roadmap item 2. List the MCP servers an administrator sets for the machine
   off in the only project, a stdio `bad` dropped. Both agree on what loads; Klefki warns about `bad`. With
   `managed-mcp.json` added, both show only the organisation's servers; Klefki marks the rest "not loaded".
 - Full verify on main `f2ee616` (#46 merged) + this change: exit 0; 352 + 20 + 26 + 778 passed, 0 failed; deny ok.
+- After the cross-review fixes: full verify exit 0; 354 + 20 + 26 + 780 passed, 0 failed; deny ok.
+
+## Cross-review of 723124a (fixed)
+- Blocking: an organisation's server leaves out a plugin's server with the same address (reviewer, against real
+  Claude Code). Reproducer `an_organisations_server_leaves_a_plugins_server_with_the_same_address_out`, with the
+  variant where it is off in one project; the organisation's servers now join the set plugin servers are compared with.
+- No `.claude.json`: the organisation's and plugins' servers are listed (Claude Code loads them); a broken one still
+  lists nothing. Test `without_claude_json_the_organisations_and_plugins_servers_are_still_listed`.
+- Polish: Organisation group first (app and CLI; `Scope` order); its details say what it replaces instead of
+  "Shadowed: no"; "not loaded" once per row (no app badge; CLI state column says `not loaded`, the note the reason, no
+  "left out"/"shadowed" note); what Claude Code ignores in the organisation's files is a muted note
+  (`Snapshot::organisation_notes`, CLI `note:`, JSON `organisation_notes`) ending "Your administrator can change this."
+- Decision 009 updated: project servers replaced (reviewer verified), findings 5a and 5b.
 
 ## Open
-- Not verified: Windows/macOS folders; a project server of the same name being replaced; whether an organisation's
-  server leaves a plugin duplicate out; no `.claude.json` means no rows at all.
+- Not verified: Windows/macOS folders; whether plugins load with no `.claude.json`.
 
 ## Next
 Blocked by policy (`deniedMcpServers`, `allowedMcpServers`, `allowManagedMcpServersOnly`), reusing `not_loaded`; then
