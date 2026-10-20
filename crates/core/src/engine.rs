@@ -280,6 +280,12 @@ pub struct PlanView {
     pub notes: Vec<String>,
     /// The configuration already looks like this; applying would write nothing.
     pub nothing_to_do: bool,
+    /// When [`Self::nothing_to_do`]: what is already so, one sentence per change that can say it, naming the servers
+    /// and where ("loc is already on in a."). Empty otherwise.
+    pub already: Vec<String>,
+    /// When [`Self::nothing_to_do`]: a profile was used without "only" where other servers are on, so using it with
+    /// "only" would change something.
+    pub others_on: bool,
 }
 
 /// One plain-language explanation of a common failure, in the parts a compiler error has.
@@ -1936,6 +1942,8 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 destructive,
                 reviews,
                 forget,
+                already,
+                others_on,
                 ..
             } = resolved;
             let mut notes = notes;
@@ -1983,6 +1991,8 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 reviews: if nothing_to_do { Vec::new() } else { reviews },
                 warnings,
                 nothing_to_do,
+                already: if nothing_to_do { already } else { Vec::new() },
+                others_on: nothing_to_do && others_on,
             };
             plans.stored.insert(
                 id,
@@ -5775,6 +5785,130 @@ mod tests {
             }
         )));
         assert!(!env.dir.path().join("backups").exists());
+        // Which server, and where, not only that nothing changes.
+        assert_eq!(plan.already, vec!["loc is already on in a.".to_owned()]);
+        let off = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: user_id("gw"),
+                enabled: false,
+            }],
+        );
+        assert!(!off.nothing_to_do && off.already.is_empty(), "{off:?}");
+    }
+
+    /// The owner's report: using one profile, then another, in the same project said only "The configuration already
+    /// looks like this" each time, since a profile used without "only" turns its servers on and they were on already.
+    /// The review says which servers are on where, for each profile.
+    #[test]
+    fn a_profile_already_in_effect_says_which_servers_are_on_where() {
+        let env = quiet_env(&two_projects("end"));
+        let core = env.start();
+        let profile = |name: &str, members: &[ServerId], project: Option<&str>, only: bool| {
+            Change::UseProfile {
+                name: name.to_owned(),
+                members: members
+                    .iter()
+                    .map(|m| {
+                        crate::model::ConnectionId::new(m.scope, m.project.as_deref(), &m.name)
+                    })
+                    .collect(),
+                project: project.map(str::to_owned),
+                only,
+            }
+        };
+        let work = plan_for(
+            &core,
+            vec![profile(
+                "Work",
+                &[user_id("gw"), local_id("loc", "/work/a")],
+                Some("/work/a"),
+                false,
+            )],
+        );
+        assert!(work.nothing_to_do, "{work:?}");
+        assert_eq!(
+            work.already,
+            vec![
+                "The servers of Work, gw and loc, are already on in a. Other servers there are left as they are."
+                    .to_owned()
+            ]
+        );
+        // Named in the profile's own order, as its card names them.
+        let reversed = plan_for(
+            &core,
+            vec![profile(
+                "Work",
+                &[local_id("loc", "/work/a"), user_id("gw")],
+                Some("/work/a"),
+                false,
+            )],
+        );
+        assert!(
+            reversed.already[0].starts_with("The servers of Work, loc and gw, "),
+            "{reversed:?}"
+        );
+        let docs = plan_for(
+            &core,
+            vec![profile("Docs", &[user_id("gw")], Some("/work/a"), false)],
+        );
+        assert_eq!(
+            docs.already,
+            vec![
+                "The server of Docs, gw, is already on in a. Other servers there are left as they are.".to_owned()
+            ]
+        );
+        // Work's servers are all a has: nothing else to turn off. Docs leaves loc on there.
+        assert!(!work.others_on && docs.others_on, "{work:?} {docs:?}");
+        // Reviewer's case: none of its servers loads there. Said why, with no hint to turn the others off.
+        let local = plan_for(
+            &core,
+            vec![profile(
+                "Local",
+                &[local_id("loc", "/work/a")],
+                Some("/work/b"),
+                false,
+            )],
+        );
+        assert!(local.nothing_to_do, "{local:?}");
+        assert_eq!(
+            local.already,
+            vec![
+                "None of the servers of Local loads in b, so there is nothing to turn on there.".to_owned(),
+                "In Local, these load only in a project of their own, so they stay as they are: loc (a).".to_owned()
+            ]
+        );
+        assert!(!local.others_on, "{local:?}");
+        // Alone: in b, gw is the only server, so it is already the only one on.
+        let alone = plan_for(
+            &core,
+            vec![profile("Docs", &[user_id("gw")], Some("/work/b"), true)],
+        );
+        assert!(alone.nothing_to_do, "{alone:?}");
+        assert!(!alone.others_on, "{alone:?}");
+        assert_eq!(
+            alone.already,
+            vec!["The server of Docs, gw, is already the only one on in b.".to_owned()]
+        );
+        // Every project: said so, not one project's name.
+        let everywhere = plan_for(&core, vec![profile("Docs", &[user_id("gw")], None, false)]);
+        assert_eq!(
+            everywhere.already,
+            vec![
+                "The server of Docs, gw, is already on in every project Claude Code knows. Other servers there are \
+                 left as they are."
+                    .to_owned()
+            ]
+        );
+        // Something to write: nothing said to be so already.
+        let changes = plan_for(
+            &core,
+            vec![profile("Docs", &[user_id("gw")], Some("/work/a"), true)],
+        );
+        assert!(
+            !changes.nothing_to_do && changes.already.is_empty(),
+            "{changes:?}"
+        );
     }
 
     fn update_found(core: &Core) -> crate::update::UpdateCheck {

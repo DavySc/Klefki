@@ -300,6 +300,9 @@ pub struct ShellApp {
     editor: Option<Editor>,
     /// The editor's draft was sent for review, and no plan or failure has come back yet.
     draft_asked: bool,
+    /// A profile's Use was sent for review, by name, and no plan or failure has come back yet: a plan that would
+    /// write nothing is said on its card, not in a review with nothing to save.
+    profile_asked: Option<String>,
     /// The plan that saves the editor's draft. Any other change applied leaves a draft's edits as they are.
     draft_plan: Option<u64>,
     /// Ctrl+K / ⌘K.
@@ -408,6 +411,7 @@ impl ShellApp {
             preparing: false,
             editor: None,
             draft_asked: false,
+            profile_asked: None,
             draft_plan: None,
             command: CommandPalette::default(),
             duplicate: None,
@@ -707,7 +711,15 @@ impl ShellApp {
             Event::PlanReady(plan) => {
                 self.preparing = false;
                 let saves_draft = std::mem::take(&mut self.draft_asked);
-                if self.plan.is_some() {
+                let profile = self.profile_asked.take();
+                // Said on the profile's card while the page is shown; once it is left, the review says it.
+                let card = profile
+                    .filter(|_| plan.nothing_to_do && self.plan.is_none())
+                    .and_then(|name| Some((name, self.profiles.as_mut()?)));
+                if let Some((name, page)) = card {
+                    page.unchanged(&name, plan.already, plan.warnings, plan.others_on);
+                    self.send(Command::Discard(plan.id));
+                } else if self.plan.is_some() {
                     // Only one dialog at a time; the one open (perhaps being saved) keeps it.
                     self.send(Command::Discard(plan.id));
                 } else {
@@ -718,6 +730,7 @@ impl ShellApp {
             Event::PlanFailed(why) => {
                 self.preparing = false;
                 self.draft_asked = false;
+                self.profile_asked = None;
                 self.adding.clear();
                 match self.add.as_mut().filter(|f| f.reviewing) {
                     // Said in the Add dialog, which comes back as it was, so nothing typed is lost.
@@ -1349,7 +1362,14 @@ impl ShellApp {
                         Some(crate::profiles::Asked::Delete(name)) => {
                             self.send(Command::DeleteProfile(name));
                         }
-                        Some(crate::profiles::Asked::Use(change)) => self.prepare(vec![*change]),
+                        Some(crate::profiles::Asked::Use(change)) => {
+                            if self.can_prepare()
+                                && let Change::UseProfile { name, .. } = change.as_ref()
+                            {
+                                self.profile_asked = Some(name.clone());
+                            }
+                            self.prepare(vec![*change]);
+                        }
                         None => {}
                     }
                 }
@@ -4413,9 +4433,15 @@ impl ShellApp {
                     }
                     ui.add_space(8.0);
                     if plan.nothing_to_do {
-                        ui.label(
-                            "The configuration already looks like this. Nothing would be written.",
-                        );
+                        // What is already so, by server and place: "already looks like this" alone does not say which.
+                        for line in &plan.already {
+                            ui.add(egui::Label::new(line.as_str()).wrap());
+                        }
+                        ui.label(if plan.already.is_empty() {
+                            "The configuration already looks like this. Nothing would be written."
+                        } else {
+                            "Nothing would be written."
+                        });
                     }
                     // Warnings first: what a change costs is read before the details (cross-review of the restore).
                     for warning in &plan.warnings {
@@ -11655,6 +11681,8 @@ mod tests {
             }],
             warnings: warnings.iter().map(|w| (*w).to_owned()).collect(),
             nothing_to_do,
+            already: Vec::new(),
+            others_on: false,
             reviews: Vec::new(),
             summary: Vec::new(),
             action: String::new(),
@@ -11951,6 +11979,24 @@ mod tests {
         h.get_by_label("Apply").click();
         h.run();
         assert!(drain(&engine).is_empty());
+    }
+
+    /// The owner's report: "already looks like this" alone did not say which server, or where.
+    #[test]
+    fn a_plan_that_changes_nothing_says_what_is_already_so() {
+        let (mut h, engine) = live_harness();
+        let (a, _) = two_rows();
+        engine.events.send(snapshot_of(vec![a])).unwrap();
+        let mut plan = plan_view(7, &[], &[], true);
+        plan.already = vec!["alpha is already on in app.".to_owned()];
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label("alpha is already on in app.");
+        h.get_by_label("Nothing would be written.");
+        assert!(
+            h.query_by_label_contains("already looks like this")
+                .is_none()
+        );
     }
 
     #[test]
@@ -19480,6 +19526,190 @@ mod tests {
             &sent(&engine)[..],
             [Command::Prepare(c)] if matches!(&c[..], [Change::UseProfile { project: None, only: true, .. }])
         ));
+    }
+
+    /// The owner's report: using profiles that were already in effect opened a review that only said "The
+    /// configuration already looks like this". Said on the profile's card instead, with which servers are on where.
+    #[test]
+    fn using_a_profile_that_changes_nothing_says_so_on_its_card() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_role_and_label(Role::ComboBox, "Use in").click();
+        h.run();
+        h.get_by_label_contains("app/work").click();
+        h.run();
+        h.get_by_label("Use profile…").click();
+        h.run();
+        assert!(matches!(&sent(&engine)[..], [Command::Prepare(_)]));
+        let mut plan = plan_view(
+            7,
+            &[],
+            &["alpha will still not load in app: the local server alpha has its name there."],
+            true,
+        );
+        plan.already = vec!["The server of Work, alpha, is already on in app. Other servers there are left as they are.".to_owned()];
+        plan.others_on = true;
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        // No review with nothing to save: the plan is let go.
+        assert!(h.query_by_label_contains("Review the change").is_none());
+        assert_eq!(sent(&engine), [Command::Discard(7)]);
+        h.get_by_label_contains("Nothing to change");
+        h.get_by_label("The server of Work, alpha, is already on in app. Other servers there are left as they are.");
+        h.get_by_label_contains("alpha will still not load in app");
+        h.get_by_label_contains("tick Only these servers there");
+        // Ticking it is a new way of using it: what was said goes, and the next Use is reviewed.
+        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
+            .click();
+        h.run();
+        assert!(h.query_by_label_contains("Nothing to change").is_none());
+        h.get_by_label("Use profile…").click();
+        h.run();
+        assert!(matches!(&sent(&engine)[..], [Command::Prepare(_)]));
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(8, &["+ beta"], &[], false)))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Review the change");
+    }
+
+    /// Uses Work in app (unticked) and has it said on the card, as the owner would.
+    fn work_said_unchanged(
+        h: &mut Harness<'static, ShellApp>,
+        engine: &klefki_core::api::Detached,
+        already: &str,
+        others_on: bool,
+    ) {
+        use egui::accesskit::Role;
+        h.get_by_role_and_label(Role::ComboBox, "Use in").click();
+        h.run();
+        h.get_by_label_contains("app/work").click();
+        h.run();
+        h.get_by_label("Use profile…").click();
+        h.run();
+        while engine.commands.try_recv().is_ok() {}
+        let mut plan = plan_view(7, &[], &[], true);
+        plan.already = vec![already.to_owned()];
+        plan.others_on = others_on;
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label_contains("Nothing to change");
+    }
+
+    /// Cross-review of #60: the card said "already on" after another change had turned those servers off. What a Use
+    /// found is true of the files then, so a new snapshot lets it go.
+    #[test]
+    fn what_a_profile_found_already_so_goes_when_the_files_change() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        work_said_unchanged(
+            &mut h,
+            &engine,
+            "The server of Work, alpha, is already on in app.",
+            true,
+        );
+        let mut alpha = live_row("alpha", Scope::User, None);
+        alpha.disabled_projects = vec!["/work/app".to_owned()];
+        alpha.disabled_in = 1;
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![alpha, live_row("beta", Scope::User, None)],
+                projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label_contains("Nothing to change").is_none());
+        assert!(h.query_by_label_contains("already on in app").is_none());
+    }
+
+    /// Cross-review of #60: where none of its servers loads, ticking "only" turns things off and nothing on, so the
+    /// card does not suggest it; the reason the engine gives is shown instead.
+    #[test]
+    fn the_hint_to_tick_only_is_given_only_when_other_servers_are_on() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        let why = "None of the servers of Work loads in app, so there is nothing to turn on there.";
+        work_said_unchanged(&mut h, &engine, why, false);
+        h.get_by_label(why);
+        assert!(
+            h.query_by_label_contains("tick Only these servers there")
+                .is_none()
+        );
+    }
+
+    /// Cross-review of #60: used alone where it is on alone, the card already says "Only these servers are on in
+    /// app" under its servers; the no-op does not say it again.
+    #[test]
+    fn a_profile_on_alone_is_not_said_twice() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        let mut beta = live_row("beta", Scope::User, None);
+        beta.disabled_projects = vec!["/work/app".to_owned()];
+        beta.disabled_in = 1;
+        engine
+            .events
+            .send(Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![live_row("alpha", Scope::User, None), beta],
+                projects: vec!["/work/app".to_owned(), "/home/notes".to_owned()],
+                project_count: 2,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_label_contains("Only these servers are on in app");
+        h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
+            .click();
+        h.run();
+        let again = "The server of Work, alpha, is already the only one on in app.";
+        work_said_unchanged(&mut h, &engine, again, false);
+        assert!(h.query_by_label(again).is_none());
+    }
+
+    /// The page was left before the answer came: the review says it, rather than nothing at all.
+    #[test]
+    fn a_profile_s_no_op_after_the_page_is_left_is_said_in_the_review() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_role_and_label(Role::ComboBox, "Use in").click();
+        h.run();
+        h.get_by_label_contains("app/work").click();
+        h.run();
+        h.get_by_label("Use profile…").click();
+        h.run();
+        h.state_mut().go(Page::Connections);
+        h.run();
+        let mut plan = plan_view(7, &[], &[], true);
+        plan.already = vec!["The server of Work, alpha, is already on in app.".to_owned()];
+        engine.events.send(Event::PlanReady(plan)).unwrap();
+        h.run();
+        h.get_by_label_contains("Review the change");
+        h.get_by_label("The server of Work, alpha, is already on in app.");
+    }
+
+    /// A no-op plan for any other change still opens its review, which says so.
+    #[test]
+    fn only_a_profile_s_no_op_is_said_on_its_card() {
+        let (mut h, engine) = profiles_harness();
+        open_profiles(&mut h, &engine, work_profile());
+        h.state_mut().prepare(vec![Change::SetEnabled {
+            id: ServerId::new(Scope::User, None, "alpha"),
+            enabled: true,
+        }]);
+        h.run();
+        engine
+            .events
+            .send(Event::PlanReady(plan_view(7, &[], &[], true)))
+            .unwrap();
+        h.run();
+        h.get_by_label_contains("Review the change");
+        assert!(h.query_by_label_contains("Nothing to change").is_none());
     }
 
     #[test]

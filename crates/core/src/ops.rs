@@ -48,6 +48,11 @@ pub(crate) struct Resolved {
     /// Definitions Klefki kept, to add back ([`Change::PutBack`]) or to forget ([`Change::ForgetKept`]).
     pub put_back: Vec<String>,
     pub forget: Vec<String>,
+    /// What is already so, one sentence per change that can say it ("loc is already on in a."): shown instead of
+    /// the change when it would write nothing.
+    pub already: Vec<String>,
+    /// A profile was used without `only` where other servers are on: using it with `only` would turn them off.
+    pub others_on: bool,
 }
 
 impl Resolved {
@@ -507,6 +512,15 @@ fn set_enabled(
 ) -> Result<(), String> {
     switch(id, enabled, snapshot, keys, out)?;
     if let Some(row) = snapshot.servers.iter().find(|r| r.is(id)) {
+        let place = match (row.scope, row.project.as_deref()) {
+            (Scope::Local | Scope::Project, Some(p)) => project_label(p, snapshot),
+            _ => "every project Claude Code knows".to_owned(),
+        };
+        out.already.push(format!(
+            "{} is already {} in {place}.",
+            row.name,
+            if enabled { "on" } else { "off" }
+        ));
         if enabled {
             stays_off(row, out);
         } else {
@@ -675,6 +689,10 @@ fn use_profile(
         ));
     }
     let mut found = Vec::new();
+    // The members that load in a place it is used in, as shown, once each, by their place in the profile.
+    let mut here_names: Vec<(usize, String)> = Vec::new();
+    // Without `only`: other servers on there now, by (project, name as the file spells it).
+    let mut others_on: Vec<(String, String)> = Vec::new();
     let mut elsewhere = Vec::new();
     let mut unapproved = Vec::new();
     let mut turned_off = BTreeSet::new();
@@ -713,12 +731,22 @@ fn use_profile(
                 }
             }
             // Said only when it is on there now: one already off is not turned off by this.
-            if !member && only && !off_now(row, scope, place) {
-                turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
+            if !member && !off_now(row, scope, place) {
+                if only {
+                    turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
+                } else {
+                    others_on.push(((*place).clone(), file_name.clone()));
+                }
             }
             if member {
                 loaded_here.push((row, *place));
             }
+        }
+        if let Some(at) = members.iter().position(|m| *m == row.connection)
+            && here_any
+            && !here_names.iter().any(|(_, n)| *n == row.name)
+        {
+            here_names.push((at, row.name.clone()));
         }
         if member && !here_any {
             elsewhere.push(format!(
@@ -792,6 +820,23 @@ fn use_profile(
             some_of(&elsewhere)
         ));
     }
+    // A server that shares a member's name is on as the member, and "only" would leave it on too.
+    // Not when none of its servers loads there: "only" would then turn everything off and nothing on.
+    out.others_on |= !here_names.is_empty()
+        && others_on
+            .iter()
+            .any(|key| !switches.iter().any(|(k, _)| k == key));
+    // None of its servers loads there: why, rather than a bare "nothing to change".
+    if here_names.is_empty() {
+        let place = match project {
+            Some(p) => project_label(p, snapshot),
+            None => "any project Claude Code knows".to_owned(),
+        };
+        out.already.push(format!(
+            "None of the servers of {shown_profile} loads in {place}, so there is nothing to turn on there."
+        ));
+        out.already.extend(out.notes.iter().cloned());
+    }
     for ((server, why), at) in &held {
         let at = if project.is_none() && at.len() == places.len() {
             "any project".to_owned()
@@ -826,6 +871,31 @@ fn use_profile(
             "Claude Code switches servers per project. This changes the {} it knows today; a project it first opens \
              later is not covered.",
             count(snapshot.projects.len(), "project")
+        ));
+    }
+    if !here_names.is_empty() {
+        here_names.sort();
+        let here_names: Vec<String> = here_names.into_iter().map(|(_, n)| n).collect();
+        let one = here_names.len() == 1;
+        let place = match project {
+            Some(p) => project_label(p, snapshot),
+            None => "every project Claude Code knows".to_owned(),
+        };
+        out.already.push(format!(
+            "The {} of {shown_profile}, {}, {} already {} in {place}.{}",
+            if one { "server" } else { "servers" },
+            some_of(&here_names),
+            if one { "is" } else { "are" },
+            match (only, one) {
+                (true, true) => "the only one on",
+                (true, false) => "the only ones on",
+                (false, _) => "on",
+            },
+            if only {
+                ""
+            } else {
+                " Other servers there are left as they are."
+            }
         ));
     }
     if found.is_empty() {

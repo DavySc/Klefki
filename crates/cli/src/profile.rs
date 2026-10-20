@@ -128,7 +128,14 @@ pub fn use_profile(profile: &api::Profile, project: Option<String>, only: bool, 
     };
     print!("{}", shown(&plan));
     if plan.nothing_to_do {
-        println!("Nothing to change: the configuration already looks like this.");
+        // Which servers are already so, and where: "already looks like this" alone does not say.
+        println!("Nothing to change.");
+        for line in &plan.already {
+            println!("{line}");
+        }
+        if plan.others_on {
+            println!("To turn the other servers there off, use it with --only.");
+        }
         return Used::Nothing;
     }
     // The question names what is decided: after a long list of changes, the summary is out of view.

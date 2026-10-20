@@ -34,6 +34,11 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   profile with none left is refused.
 - A server renamed or moved through Klefki stays in its profiles: the review of the rename or move says which
   profiles hold it, and once it is applied they hold it under its new name or place.
+- Using a profile that would change nothing opens no review: its card says so, naming which of its servers are
+  already on (or already the only ones on) where, with what would still keep one from loading. Unticked, it points to
+  "Only these servers there", since its servers are usually on already. A review that changes nothing, for any change,
+  names what is already so rather than only "the configuration already looks like this". "This also turns off" names
+  only servers that are on now.
 - Using a profile records nothing as "active": Klefki shows what is on from the files, so nothing can disagree with
   them. A profile's card names the projects where it is on alone: of the servers Claude Code switches there, its
   members are on and every other one is off, so using it there with "Only these servers there" would change nothing,

@@ -660,6 +660,10 @@ impl Rig {
 
     /// Prepares and applies `changes`, as the app does, and says how it ended.
     fn run(&self, changes: Vec<Change>) -> Outcome {
+        let switches = changes
+            .iter()
+            .filter(|c| matches!(c, Change::SetEnabled { .. }))
+            .count();
         self.core.send(Command::Prepare(changes));
         let plan = loop {
             match self.next() {
@@ -669,6 +673,15 @@ impl Rig {
             }
         };
         if plan.nothing_to_do {
+            // The owner's report: a switch that writes nothing says which server is already so, and where.
+            assert!(
+                plan.already.len() >= switches
+                    && plan
+                        .already
+                        .iter()
+                        .all(|l| sanitize(l) == *l && !l.is_empty()),
+                "a switch that changes nothing does not say what is already so: {plan:?}"
+            );
             self.core.send(Command::Discard(plan.id));
             return Outcome::Unchanged;
         }

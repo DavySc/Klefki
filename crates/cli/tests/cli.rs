@@ -1200,6 +1200,13 @@ fn use_shows_the_change_and_saves_it_only_when_told_to() {
         "{}",
         text(&out.stdout)
     );
+    // Which servers, and where (the owner's report: "already looks like this" alone did not say).
+    assert!(
+        text(&out.stdout).contains(" already the only ")
+            && !text(&out.stdout).contains("already looks like this"),
+        "{}",
+        text(&out.stdout)
+    );
     assert_eq!(
         std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap(),
         after

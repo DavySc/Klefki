@@ -44,6 +44,17 @@ pub struct ProfilesPage {
     new_asked: bool,
 }
 
+/// Using a profile would write nothing: what is already so, and what would still keep a server from loading.
+#[derive(Clone)]
+struct Unchanged {
+    already: Vec<String>,
+    warnings: Vec<String>,
+    /// Other servers are on there: "Only these servers there" would turn them off.
+    others_on: bool,
+    /// Not drawn yet: brought into view when it is.
+    fresh: bool,
+}
+
 /// A profile being made or edited.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Draft {
@@ -65,6 +76,8 @@ struct Choice {
     only: bool,
     /// Use profile… was pressed with no place chosen.
     asked: bool,
+    /// The last Use… would have changed nothing: said on the card until where or how it is used changes.
+    unchanged: Option<Unchanged>,
 }
 
 /// What the page's buttons asked the shell to do.
@@ -116,9 +129,35 @@ impl ProfilesPage {
         self.refused = None;
     }
 
-    /// A new snapshot is shown: where each profile is on alone is worked out again.
+    /// Using `profile` would change nothing: said on its card, rather than in a review with nothing to save.
+    /// `already` says what is already so; `warnings`, what still keeps a server from loading there; `others_on`, that
+    /// other servers there are on, which "Only these servers there" would turn off.
+    pub fn unchanged(
+        &mut self,
+        profile: &str,
+        already: Vec<String>,
+        warnings: Vec<String>,
+        others_on: bool,
+    ) {
+        self.choices
+            .entry(profile.to_owned())
+            .or_default()
+            .unchanged = Some(Unchanged {
+            already,
+            warnings,
+            others_on,
+            fresh: true,
+        });
+    }
+
+    /// A new snapshot is shown: where each profile is on alone is worked out again, and what a Use found already so is
+    /// let go.
     pub fn snapshot_changed(&mut self) {
         self.alone = None;
+        // What a Use found already so was true of the files then: another change may have made it false since.
+        for choice in self.choices.values_mut() {
+            choice.unchanged = None;
+        }
     }
 
     /// Starts a new profile once the profiles are read, unless one is being made or edited: that is not thrown away.
@@ -289,6 +328,11 @@ impl ProfilesPage {
                 }
                 for profile in shown {
                     let choice = self.choices.entry(profile.name.clone()).or_default();
+                    // Only when something is said, so drawing the cards copies nothing otherwise.
+                    let before = choice
+                        .unchanged
+                        .is_some()
+                        .then(|| (choice.place.clone(), choice.only));
                     let reveal = self.reveal.as_deref() == Some(profile.name.as_str());
                     if reveal {
                         self.reveal = None;
@@ -306,6 +350,13 @@ impl ProfilesPage {
                         &mut self.confirm,
                         &mut self.project_filter,
                     );
+                    // What was said is about the place and way it was used: gone once either changes, or the card
+                    // asks for something else.
+                    if let Some((place, only)) = before
+                        && (choice.place != place || choice.only != only || out.is_some())
+                    {
+                        choice.unchanged = None;
+                    }
                     match out {
                         Some(Card::Edit) => {
                             self.editing = Some(new(Some(profile)));
@@ -495,6 +546,18 @@ fn card(
             });
             if choice.asked && choice.place.is_none() {
                 warn(ui, "Choose a project to use it in first.");
+            }
+            if let Some(u) = &mut choice.unchanged {
+                // Said already, under its servers, when it is used alone where it is on alone.
+                let covered = choice.only
+                    && match &choice.place {
+                        Some(Some(p)) => cx.alone.contains(&shown_project(p, snapshot)),
+                        Some(None) => {
+                            !snapshot.projects.is_empty() && cx.alone.len() == snapshot.projects.len()
+                        }
+                        None => false,
+                    };
+                said_unchanged(ui, u, covered);
             }
             if snapshot.projects.is_empty() {
                 muted(
@@ -853,6 +916,45 @@ fn parent_of(path: &str) -> &str {
     match trimmed.rfind(['/', '\\']) {
         Some(cut) if cut + 1 < trimmed.len() => &trimmed[..cut],
         _ => "",
+    }
+}
+
+/// Next to the button that asked: nothing to save, what is already so (unless `covered`, said under its servers
+/// already), and how to turn the other servers off when some are on. Not a warning: nothing went wrong. Read out by a
+/// screen reader without moving the focus (WCAG 2.2, 4.1.3 Status Messages), and brought into view once.
+fn said_unchanged(ui: &mut Ui, unchanged: &mut Unchanged, covered: bool) {
+    let pal = theme::palette(ui.ctx());
+    ui.add_space(6.0);
+    let live = |ui: &Ui, id: egui::Id| {
+        ui.ctx()
+            .accesskit_node_builder(id, |node| node.set_live(egui::accesskit::Live::Polite));
+    };
+    let head = ui.add(
+        egui::Label::new(
+            RichText::new(format!("{} Nothing to change", icon::CHECK_CIRCLE))
+                .strong()
+                .color(pal.text),
+        )
+        .wrap(),
+    );
+    live(ui, head.id);
+    if std::mem::take(&mut unchanged.fresh) {
+        head.scroll_to_me(None);
+    }
+    if !covered {
+        for line in &unchanged.already {
+            let said = ui.add(egui::Label::new(line.as_str()).wrap());
+            live(ui, said.id);
+        }
+    }
+    if unchanged.others_on {
+        muted(
+            ui,
+            "To turn the other servers there off, tick Only these servers there and use the profile again.",
+        );
+    }
+    for warning in &unchanged.warnings {
+        warn(ui, warning);
     }
 }
 
