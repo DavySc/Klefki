@@ -375,8 +375,12 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         (r.not_loaded, r.blocked) = verdict(&places, &blocked, &shown_projects);
         // Each cause where it applies: the rest of the projects load a server of the same name instead.
         if let (Some(why), false) = (&mut r.not_loaded, r.shadowed_in.is_empty()) {
+            if !why.ends_with('.') {
+                why.push('.');
+            }
+            // Not "loads instead": that server may be held back too.
             why.push_str(&format!(
-                " In {}, a server of the same name in the project loads instead.",
+                " In {}, the project's own server of the same name takes its place.",
                 r.shadowed_in.join(", ")
             ));
         }
@@ -3483,7 +3487,7 @@ mod tests {
         );
         assert!(
             why.ends_with(&format!(
-                "In {}, a server of the same name in the project loads instead.",
+                r#"{{"serverName":"web"}}). In {}, the project's own server of the same name takes its place."#,
                 shown(&a)
             )),
             "{why}"

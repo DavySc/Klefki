@@ -26,8 +26,8 @@ Roadmap item 2, after plugins (008) and the organisation's servers (009): a serv
   also "not loaded" (`ServerRow::not_loaded`, decision 009): never checked, the status reads "Blocked by policy" (the
   CLI's state column `blocked`). In some projects only: a quiet badge "blocked in N/M" and a details row naming them.
   Counted like "left out": projects, or outside them when Claude Code knows none.
-- A server not loaded for two causes names each where it applies: "In b: <policy>. In a, a server of the same name in
-  the project loads instead."
+- A server not loaded for two causes names each where it applies: "In b: <policy>. In a, the project's own server of
+  the same name takes its place."
 - Project files are read only for a local absolute path, size-limited, like the plugin switches. All the files are
   already watched.
 - Text from the rules is untrusted: shown cleaned and cut.

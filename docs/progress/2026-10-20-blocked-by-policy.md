@@ -39,6 +39,8 @@ The reviewer compared it with real Claude Code and the docs (code.claude.com/doc
 - Live, Claude Code 2.1.304 vs `klefki-cli list` (user settings, 7 servers, /tmp/claude-0/s4): five rule sets (kinds,
   two-key entries, `*.example.com` ports and trailing dot, `:*`, no path, `*://`) give the same servers loaded.
 - Full verify after the fixes: exit 0; 356 + 21 + 26 + 804 passed, 0 failed; deny ok.
+- Reviewer OK at 8f4e281 (re-ran every case live). Folded in its two wording nits: "takes its place" (that server may be
+  blocked too) and the missing period; full verify exit 0, same counts.
 
 ## Open
 - Reviewer's side note: without `hasTrustDialogAccepted`, Claude Code loads the user's server instead of an approved
