@@ -26,6 +26,13 @@ change the configuration, through the same reviewed plan as the app. Decisions 0
 - By hand at a terminal (`script` pty, temp `CLAUDE_CONFIG_DIR` and `KLEFKI_DATA_DIR`): `n` saved nothing (exit
   4), `y` saved and named the backup (exit 0), a second run said "Nothing to change"; `profiles` then listed the
   project where each is on alone.
+- Review of #59 (75aca1f): (1, blocking) `use` in a folder inside a git repository refused the repository's
+  project, which Claude Code uses there; `use_in_a_folder_of_a_git_repository_uses_the_repositorys_project` (with
+  the variant of the same folder before it is a git repository, still refused) failed first. (2) The question now
+  names what is decided, e.g. "Use the profile Work in q, and turn off every other server there? [y/N]" (tried at a
+  pty). (4) Usage errors of `use` show its own usage line (`use_says_what_it_asks_about_and_its_own_usage`, failed
+  first). Left as follow-ups: (3) the diff repeats the JSON path per line (the app's review shares the format), (5)
+  say why a profile is never on alone.
 
 ## Next
 - Show on the Connections page which profiles a project is on alone in.

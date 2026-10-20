@@ -43,7 +43,8 @@ pub fn find<'a>(profiles: &'a Profiles, typed: &str) -> Result<&'a api::Profile,
 }
 
 /// The project `place` names, as the configuration spells it. A folder is matched as given, then with its links
-/// resolved (a temporary folder on macOS is reached through one).
+/// resolved (a temporary folder on macOS is reached through one). A folder inside a git repository that is not a
+/// project itself is the repository's: Claude Code takes the repository's root as the project there.
 pub fn project(snapshot: &Snapshot, place: &Place) -> Result<Option<String>, String> {
     let folder = match place {
         Place::Every => return Ok(None),
@@ -52,32 +53,54 @@ pub fn project(snapshot: &Snapshot, place: &Place) -> Result<Option<String>, Str
             format!("the current folder cannot be read ({e}); name one with --project")
         })?,
     };
+    if let Some(found) = known(snapshot, &folder) {
+        return Ok(Some(found));
+    }
+    if let Some(root) = git_root(&folder).filter(|root| *root != folder)
+        && let Some(found) = known(snapshot, &root)
+    {
+        return Ok(Some(found));
+    }
+    let given = folder.to_string_lossy().replace('\\', "/");
+    Err(format!(
+        "Claude Code does not know {given} as a project: start Claude Code there once, or name one with --project \
+         (`klefki-cli list` shows the projects)"
+    ))
+}
+
+/// The known project that is `folder`, as the configuration spells it.
+fn known(snapshot: &Snapshot, folder: &std::path::Path) -> Option<String> {
     let given = folder.to_string_lossy().replace('\\', "/");
     if let Some(p) = snapshot
         .projects
         .iter()
         .find(|p| api::same_project(p, &given))
     {
-        return Ok(Some(p.clone()));
+        return Some(p.clone());
     }
     let real = |path: &std::path::Path| {
         std::fs::canonicalize(path)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
     };
-    if let Some(real_given) = real(&folder) {
-        let found = snapshot.projects.iter().find(|p| {
+    let real_given = real(folder)?;
+    snapshot
+        .projects
+        .iter()
+        .find(|p| {
             api::same_project(p, &real_given)
                 || real(std::path::Path::new(p)).is_some_and(|r| api::same_project(&r, &real_given))
-        });
-        if let Some(p) = found {
-            return Ok(Some(p.clone()));
-        }
-    }
-    Err(format!(
-        "Claude Code does not know {given} as a project: start Claude Code there once, or name one with --project \
-         (`klefki-cli list` shows the projects)"
-    ))
+        })
+        .cloned()
+}
+
+/// The root of the git repository `folder` is in: the nearest folder, itself or above, that holds `.git` (a folder,
+/// or a file in a worktree).
+fn git_root(folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    folder
+        .ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .map(std::path::Path::to_path_buf)
 }
 
 /// Uses `profile` in `project` (every project when `None`): shows the plan on stdout, asks at a terminal unless
@@ -108,7 +131,8 @@ pub fn use_profile(profile: &api::Profile, project: Option<String>, only: bool, 
         println!("Nothing to change: the configuration already looks like this.");
         return Used::Nothing;
     }
-    if !yes && !confirmed(&plan.action) {
+    // The question names what is decided: after a long list of changes, the summary is out of view.
+    if !yes && !confirmed(&plan.summary.join("; ")) {
         return Used::NotSaved;
     }
     core.send(Command::Apply(plan.id));
@@ -174,15 +198,15 @@ fn shown(plan: &PlanView) -> String {
     out
 }
 
-/// Asks on the terminal; no when nobody is there to answer, and says how to save without asking.
-fn confirmed(action: &str) -> bool {
+/// Asks on the terminal whether to do `what`; no when nobody is there to answer, and says how to save without asking.
+fn confirmed(what: &str) -> bool {
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         eprintln!(
             "Nothing was saved: no one at a terminal to ask. Add --yes to save without asking."
         );
         return false;
     }
-    eprint!("\n{action}? [y/N] ");
+    eprint!("\n{what}? [y/N] ");
     let mut answer = String::new();
     let yes = std::io::stdin().read_line(&mut answer).is_ok()
         && matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");

@@ -23,6 +23,7 @@ const UNAVAILABLE: u8 = 3;
 const NOT_WRITTEN: u8 = 4;
 
 const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
+const USE_USAGE: &str = "Usage: klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]. See `klefki-cli help`.";
 
 fn main() -> ExitCode {
     let code = match args::parse(std::env::args_os().skip(1)) {
@@ -49,6 +50,10 @@ fn main() -> ExitCode {
         Err(Usage::NoCommand) => {
             eprint!("{}", args::HELP);
             USAGE
+        }
+        // `use` takes other options than the rest: its own usage is the one that helps.
+        Err(Usage::Bad(why)) if std::env::args_os().nth(1).is_some_and(|c| c == "use") => {
+            use_usage(&why)
         }
         Err(Usage::Bad(why)) => usage(&why),
     };
@@ -100,7 +105,7 @@ fn use_profile(typed: &str, place: &args::Place, only: bool, yes: bool) -> u8 {
         profile::find(&profiles, typed).and_then(|p| Ok((p, profile::project(&snapshot, place)?)));
     let (chosen, project) = match found {
         Ok(found) => found,
-        Err(why) => return usage(&why),
+        Err(why) => return use_usage(&why),
     };
     match profile::use_profile(chosen, project, only, yes) {
         profile::Used::Saved | profile::Used::Nothing => OK,
@@ -331,6 +336,12 @@ fn warn(snapshot: &Snapshot) {
     for note in &snapshot.organisation_notes {
         eprintln!("note: {note}");
     }
+}
+
+fn use_usage(why: &str) -> u8 {
+    eprintln!("klefki-cli: {why}");
+    eprintln!("{USE_USAGE}");
+    USAGE
 }
 
 fn usage(why: &str) -> u8 {

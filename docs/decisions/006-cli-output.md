@@ -59,7 +59,10 @@ Written for people first, with `--json` for scripts (clig.dev: "Human-readable o
   with nobody there it saves nothing and names `--yes` (clig.dev: "Confirm before doing anything dangerous", a flag
   for scripts). The profile is found by name, case aside, with the closest name suggested; the project is the current
   folder's unless `--project` or `--all` says otherwise, matched as given and then with links resolved. A folder
-  Claude Code does not know is a usage error, as is an unknown profile: both are checked before anything starts.
+  inside a git repository that is not a project itself is the repository's, as Claude Code takes the repository's
+  root there. A folder Claude Code does not know is a usage error, as is an unknown profile: both are checked before
+  anything starts, and the usage line shown is `use`'s own. The question names what is decided (the plan's summary),
+  since a long list of changes scrolls it out of view.
 - `use` exits 0 when saved or when nothing needs changing, 4 when nothing was saved (not confirmed), 1 when the plan
   could not be made or saved, 2 for a profile or folder that is not there. It runs no Claude Code command beyond the
   `--version` the engine asks for when it starts. `--json` is refused: the plan is for people.

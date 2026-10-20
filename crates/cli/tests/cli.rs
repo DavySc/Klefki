@@ -1264,3 +1264,70 @@ fn use_never_prints_a_secret_from_the_configuration() {
         assert!(!all.contains(secret), "{secret} printed:\n{all}");
     }
 }
+
+/// Found in review of PR #59: in a folder inside a git repository, Claude Code uses the repository's project, and so
+/// does `use`. A folder in a project that is not a git repository is a project of its own, unknown until Claude Code
+/// starts there.
+#[test]
+fn use_in_a_folder_of_a_git_repository_uses_the_repositorys_project() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    env.profiles(&[("Delta", &[(Scope::User, false, "delta")])]);
+    let sub = env.root().join("Repo").join("src").join("deep");
+    std::fs::create_dir_all(&sub).unwrap();
+    // Not yet a git repository: refused, nothing changed.
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(env.disabled_in_project(), ["delta"]);
+    std::fs::create_dir_all(env.root().join("Repo").join(".git")).unwrap();
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Use the profile Delta in Repo"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(
+        env.disabled_in_project().is_empty(),
+        "{:?}",
+        env.disabled_in_project()
+    );
+    // Named with --project, the same.
+    let sub_path = sub.to_string_lossy().into_owned();
+    let out = env.run(&["use", "Delta", "--project", &sub_path, "-y"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+}
+
+/// Found in review of PR #59: the question names what is being decided, and a usage error shows `use`'s own usage.
+#[test]
+fn use_says_what_it_asks_about_and_its_own_usage() {
+    let env = Env::new();
+    env.work();
+    let out = env.run(&["use", "Work", "--json"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("Usage: klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]"),
+        "{stderr}"
+    );
+    let out = env.run(&["use", "wrok", "--all"]);
+    assert!(
+        text(&out.stderr).contains("Usage: klefki-cli use PROFILE"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = env.run(&["list", "--frob"]);
+    assert!(
+        !text(&out.stderr).contains("use PROFILE"),
+        "{}",
+        text(&out.stderr)
+    );
+}
