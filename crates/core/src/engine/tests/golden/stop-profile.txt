@@ -1,0 +1,40 @@
+== review
+summary:
+  Stop using the profile Writing in designs
+notes:
+  memory and db go back on in designs, as before Writing was used.
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    projects["/work/designs"].disabledMcpServers
+  - memory
+    projects["/work/designs"].disabledMcpServers
+  - db
+button: Stop using
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "mcpServers": {
+    "gw": {
+      "command": "gw"
+    },
+    "memory": {
+      "command": "m"
+    },
+    "db": {
+      "command": "d"
+    }
+  },
+  "projects": {
+    "/work/designs": {
+      "allowedTools": [],
+      "disabledMcpServers": []
+    },
+    "/work/notes": {}
+  }
+}
+--- profile-uses.json
+{
+  "version": 1,
+  "uses": []
+}

@@ -15,4 +15,6 @@ klefki-core = { path = "../core" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
+# Golden files for the output tests (`tests/golden/`), as rust-analyzer uses it.
+expect-test = "1"
 tempfile = "3"

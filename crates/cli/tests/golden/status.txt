@@ -1,0 +1,20 @@
+$ klefki-cli status --claude <fake-claude>
+exit: Some(1)
+--- stdout
+User
+  alpha   Connected
+  beta    Failed            ECONNREFUSED: Unable to connect. Is the computer able to access the url?
+          beta: Nothing is listening at that address
+          - Check that the server is running.
+          - Check the host name and port in the URL.
+  delta   Off               not checked: it is off; turn it on first
+  remote  Connected
+
+Local in <project>
+  gamma   Needs auth
+
+Project in <project>
+  docs    Pending approval  not checked: it may run the repository's own command (node tools/docs-mcp.js); to check it: klefki-cli status docs
+
+2 connected, 1 failed, 1 needs auth, 2 not checked.
+--- stderr

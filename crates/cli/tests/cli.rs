@@ -117,6 +117,7 @@ impl Env {
             "claude"
         };
         std::fs::copy(fake_claude(), bin.join(exe)).unwrap();
+        runnable(&bin.join(exe));
         Self { dir }
     }
 
@@ -216,6 +217,35 @@ impl Env {
 
     fn any_run(&self) -> bool {
         self.root().join("log.jsonl").exists()
+    }
+}
+
+/// Waits until the just-copied program at `path` can be started. On Linux, a test on another thread that starts a
+/// process while this one writes the copy hands the open file to that child for a moment, and until the child has
+/// started its own program, starting the copy fails with "text file busy" (ETXTBSY). `klefki-cli` would then find
+/// no usable Claude CLI and exit 3.
+fn runnable(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match Command::new(path)
+            .arg("--version")
+            .env_remove("FAKE_CLAUDE_LOG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} stays busy",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("cannot start {}: {e}", path.display()),
+            Ok(_) => return,
+        }
     }
 }
 
@@ -1337,4 +1367,100 @@ fn use_says_what_it_asks_about_and_its_own_usage() {
         "{}",
         text(&out.stderr)
     );
+}
+
+// ---- golden output
+
+impl Env {
+    /// What `args` prints and how it ends, with this environment's folders as `<project>` and `<tmp>`, so the
+    /// output reads the same on every system.
+    fn transcript(&self, args: &[&str]) -> String {
+        let out = self.run(args);
+        let mut text = format!(
+            "$ klefki-cli {}\nexit: {:?}\n--- stdout\n{}--- stderr\n{}",
+            args.join(" "),
+            out.status.code(),
+            text(&out.stdout),
+            text(&out.stderr)
+        )
+        .replace("\r\n", "\n");
+        let fake = fake_claude().to_string_lossy().into_owned();
+        text = text.replace(&fake, "<fake-claude>");
+        // The full path first: the table may shorten it under the home folder, JSON never does.
+        text = text.replace(&self.project(), "<project>");
+        text = text.replace(&self.shown_project(self.home().as_deref()), "<project>");
+        let root = self.root().to_string_lossy().into_owned();
+        for form in [root.replace('\\', "\\\\"), root.replace('\\', "/"), root] {
+            text = text.replace(&form, "<tmp>");
+        }
+        stable_paths(&text)
+    }
+}
+
+/// `text` with paths under `<tmp>` spelled with `/`, and a backup's time stamp (`claude.json.<digits>-<n>.bak`) as
+/// `<stamp>`.
+fn stable_paths(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("<tmp>") {
+        out.push_str(&rest[..at]);
+        let end = rest[at..]
+            .find(|c: char| c.is_whitespace() || c == '"')
+            .map_or(rest.len(), |e| at + e);
+        let path = rest[at..end].replace('\\', "/");
+        match (path.find("claude.json."), path.rfind(".bak")) {
+            (Some(start), Some(stop)) if start < stop => {
+                out.push_str(&path[..start + "claude.json.".len()]);
+                out.push_str("<stamp>");
+                out.push_str(&path[stop..]);
+            }
+            _ => out.push_str(&path),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Every command's full output on the configuration with every kind of row, byte for byte, so the code behind it can
+/// be simplified without changing what users and their scripts read. When a change is meant, run the test with
+/// `UPDATE_EXPECT=1` and review `golden/*.txt` in the diff.
+#[test]
+fn golden_output_of_every_command() {
+    let env = Env::new();
+    env.work();
+    let project = env.project();
+    let fake = fake_claude().to_string_lossy().into_owned();
+    let runs: [(&str, Vec<&str>); 11] = [
+        ("list.txt", vec!["list"]),
+        ("list-json.txt", vec!["list", "--json"]),
+        ("status.txt", vec!["status", "--claude", &fake]),
+        (
+            "status-json.txt",
+            vec!["status", "--claude", &fake, "--json"],
+        ),
+        ("export.txt", vec!["export"]),
+        ("profiles.txt", vec!["profiles"]),
+        (
+            "use-nothing-to-do.txt",
+            vec!["use", "Work", "--project", &project],
+        ),
+        (
+            "use-only-unconfirmed.txt",
+            vec!["use", "Work", "--project", &project, "--only"],
+        ),
+        ("help.txt", vec!["--help"]),
+        ("usage-error.txt", vec!["lst"]),
+        ("unknown-name.txt", vec!["list", "ALPHA"]),
+    ];
+    for (file, args) in runs {
+        let expected = expect_test::expect_file![format!("golden/{file}")];
+        expected.assert_eq(&env.transcript(&args));
+    }
+    // Last, as it saves: the change, and the configuration it leaves.
+    let saved = env.transcript(&["use", "Work", "--project", &project, "--only", "--yes"]);
+    let after = std::fs::read_to_string(env.root().join("cfg").join(".claude.json")).unwrap();
+    let after = after.replace(&project, "<project>");
+    expect_test::expect_file!["golden/use-only-saved.txt"]
+        .assert_eq(&format!("{saved}--- .claude.json after\n{after}\n"));
 }

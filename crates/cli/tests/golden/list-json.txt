@@ -1,0 +1,110 @@
+$ klefki-cli list --json
+exit: Some(0)
+--- stdout
+{
+  "schema": 1,
+  "servers": [
+    {
+      "name": "alpha",
+      "scope": "user",
+      "project": null,
+      "transport": "stdio",
+      "target": "npx -y alpha-mcp --api-key … --token=… …",
+      "enabled": true,
+      "disabled_in": 0,
+      "disabled_projects": [],
+      "project_count": 1,
+      "approval": null,
+      "shadowed": false,
+      "shadowed_in": [],
+      "relative_paths": [],
+      "not_loaded": null,
+      "casing_collision": false,
+      "oauth": false
+    },
+    {
+      "name": "beta",
+      "scope": "user",
+      "project": null,
+      "transport": "http",
+      "target": "http://127.0.0.1:9/mcp",
+      "enabled": true,
+      "disabled_in": 0,
+      "disabled_projects": [],
+      "project_count": 1,
+      "approval": null,
+      "shadowed": false,
+      "shadowed_in": [],
+      "relative_paths": [],
+      "not_loaded": null,
+      "casing_collision": false,
+      "oauth": false
+    },
+    {
+      "name": "delta",
+      "scope": "user",
+      "project": null,
+      "transport": "sse",
+      "target": "https://delta.example.com/sse",
+      "enabled": false,
+      "disabled_in": 1,
+      "disabled_projects": [
+        "<project>"
+      ],
+      "project_count": 1,
+      "approval": null,
+      "shadowed": false,
+      "shadowed_in": [],
+      "relative_paths": [],
+      "not_loaded": null,
+      "casing_collision": false,
+      "oauth": false
+    },
+    {
+      "name": "remote",
+      "scope": "user",
+      "project": null,
+      "transport": "stdio",
+      "target": "npx mcp-remote https://r.example.com/mcp --header Authorization: Bearer …",
+      "enabled": true,
+      "disabled_in": 0,
+      "disabled_projects": [],
+      "project_count": 1,
+      "approval": null,
+      "shadowed": false,
+      "shadowed_in": [],
+      "relative_paths": [],
+      "not_loaded": null,
+      "casing_collision": false,
+      "oauth": false
+    },
+    {
+      "name": "gamma",
+      "scope": "local",
+      "project": "<project>",
+      "transport": "http",
+      "target": "https://gamma.example.com/mcp",
+      "enabled": true,
+      "approval": null,
+      "shadowed": false,
+      "not_loaded": null,
+      "casing_collision": false,
+      "oauth": false
+    },
+    {
+      "name": "docs",
+      "scope": "project",
+      "project": "<project>",
+      "transport": "stdio",
+      "target": "node tools/docs-mcp.js",
+      "enabled": true,
+      "approval": "pending",
+      "shadowed": false,
+      "not_loaded": null,
+      "casing_collision": false,
+      "oauth": false
+    }
+  ],
+  "warnings": []
+}
+--- stderr

@@ -1,0 +1,47 @@
+== review
+summary:
+  Move loc to the user
+notes:
+  As a user server, loc is on in every project, except where it is switched off.
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    mcpServers
+  + loc
+  + {
+  +   "type": "stdio",
+  +   "command": "x"
+  + }
+    projects["/work/a"].mcpServers
+  - loc
+button: Move
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    },
+    "loc": {
+      "type": "stdio",
+      "command": "x"
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {},
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}

@@ -1,0 +1,7 @@
+$ klefki-cli list ALPHA
+exit: Some(2)
+--- stdout
+--- stderr
+klefki-cli: no server is named "ALPHA"; did you mean "alpha"?
+`klefki-cli list` shows every server
+Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.

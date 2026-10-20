@@ -1,0 +1,57 @@
+== review
+summary:
+  Turn off gw and loc in a, as the old switch-off list says
+notes:
+  Older Claude Code versions kept this list; current ones ignore it, so these servers have been on since.
+  A running Claude Code session may need a restart before it notices this.
+diff .claude.json:
+    projects["/work/a"].mcpServersDisabled
+  - gw
+  - loc
+  - old
+    projects["/work/a"].disabledMcpServers
+  + gw
+    projects["/work/a"].disabledMcpServers
+  + loc
+button: Migrate
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": [
+        "old",
+        "gw",
+        "loc"
+      ],
+      "allowedTools": []
+    },
+    "/work/b": {
+      "mcpServersDisabled": [
+        "gw"
+      ]
+    },
+    "/work/c": {
+      "mcpServersDisabled": [
+        1
+      ]
+    }
+  }
+}

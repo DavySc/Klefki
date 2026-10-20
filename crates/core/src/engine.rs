@@ -12040,4 +12040,6 @@ mod tests {
             "plain is back too"
         );
     }
+
+    mod golden;
 }

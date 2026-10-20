@@ -1,0 +1,54 @@
+== review
+summary:
+  Restore servers as they were on <time>
+  Put back gw for the user
+notes:
+  Only servers and where they are switched off are restored. The rest of .claude.json, Claude Code's own settings and history, stays as it is now.
+  Klefki keeps a copy of the configuration as it is now before it restores, so the activity log can undo this restore too.
+  A running Claude Code session may need a restart before it notices this.
+review gw for the user would run:
+  Command: node
+  Environment: TOKEN=<hidden>
+diff .claude.json:
+    mcpServers
+  + gw
+  + {
+  +   "type": "stdio",
+  +   "command": "node",
+  +   "env": {
+  +     "TOKEN": "<hidden>"
+  +   }
+  + }
+button: Restore
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other"
+      ]
+    }
+  },
+  "tail": "end"
+}

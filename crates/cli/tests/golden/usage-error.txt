@@ -1,0 +1,6 @@
+$ klefki-cli lst
+exit: Some(2)
+--- stdout
+--- stderr
+klefki-cli: unknown command "lst"; did you mean "list"?
+Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.
