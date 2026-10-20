@@ -23,9 +23,12 @@ unidentified app (allowed once in System Settings) rather than a damaged one.
 - `check-release.py macos` on a synthetic universal app: without `_CodeSignature/CodeResources` it reports
   "not signed as a bundle" (exit 1); with it, OK (exit 0). The codesign part runs on macOS only.
 - Workflow YAML parses.
+- Trial release run 39371213528 on 67a9ad5 (manual, this branch): all three builds green. macOS: `codesign`
+  signed both programs, `hdiutil` made the `.dmg`, the check mounted it and passed on the app inside
+  ("check-release: macos 0.1.0 OK", so `codesign --verify --deep --strict` passed); disk image 15.7 MB zipped.
+  The publish job attested and verified every file; signing skipped (not main).
 
 ## Not verified / open
-- Trial release run on this branch: pending.
 - Gatekeeper's message for the ad-hoc signed download needs a person on a Mac.
 
 ## Next
