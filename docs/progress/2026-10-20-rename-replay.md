@@ -39,3 +39,4 @@ held `p` by then: a server moved or copied in since. The check then wrote that o
   variant `an_earlier_switch_offs_check_does_not_turn_off_a_server_moved_in_under_the_name_it_was_renamed_from`. Guard:
   `switching_a_server_on_again_before_its_rename_leaves_the_newcomer_under_its_old_name_alone` (passes before and after).
 - Not covered by the model test: `World` tracks only the plugin's switch-off state, not other servers'.
+- Merged main 1730401 (#50) in; full verify after the merge: exit 0 (380 + 846 + 26 + 21 passed, deny ok).
