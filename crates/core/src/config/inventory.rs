@@ -242,11 +242,9 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             };
             for (name, entry) in servers {
                 if seen_local.insert(name.clone()) {
-                    let not_loaded = replaced_by(name).or_else(|| {
-                        blocked_at(&policy, &[place], name, entry, false)
-                            .pop()
-                            .map(|b| b.1)
-                    });
+                    let held_back = blocked_at(&policy, &[place], name, entry, false).pop();
+                    let not_loaded =
+                        replaced_by(name).or_else(|| held_back.as_ref().map(|b| b.1.clone()));
                     // Names merge before policy: a blocked server still takes its name here.
                     if !disabled.contains(name) && replaced_by(name).is_none() {
                         hidden.extend(user_rows.get(name.as_str()));
@@ -267,6 +265,9 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                     );
                     r.connection = ConnectionId::new(Scope::Local, Some(key), name);
                     r.not_loaded = not_loaded.map(|w| clip(&sanitize::sanitize_line(&w)));
+                    if replaced_by(name).is_none() {
+                        r.blocked = held_back.map(|(_, why)| held_back_here(&why, project));
+                    }
                     keys.insert(
                         r.connection.clone(),
                         FileKey {
@@ -338,6 +339,11 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
                             by_hand.push(ByHand::in_project(key, &name, project));
                         }
                     }
+                    if replaced.is_none() {
+                        r.blocked = blocked
+                            .as_ref()
+                            .map(|(_, why)| held_back_here(why, project));
+                    }
                     r.not_loaded = replaced
                         .or(blocked.map(|b| b.1))
                         .map(|w| clip(&sanitize::sanitize_line(&w)));
@@ -363,15 +369,31 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
             .copied()
             .filter(|&p| p == 0 || !r.shadowed_in.contains(&shown_projects[p - 1]))
             .collect();
-        let (not_loaded, partly) = verdict(&places, &blocked, &shown_projects);
-        if r.not_loaded.is_none() {
-            r.not_loaded = not_loaded;
+        if r.not_loaded.is_some() {
+            continue;
         }
-        r.blocked = partly;
+        (r.not_loaded, r.blocked) = verdict(&places, &blocked, &shown_projects);
+        // Each cause where it applies: the rest of the projects load a server of the same name instead.
+        if let (Some(why), false) = (&mut r.not_loaded, r.shadowed_in.is_empty()) {
+            why.push_str(&format!(
+                " In {}, a server of the same name in the project loads instead.",
+                r.shadowed_in.join(", ")
+            ));
+        }
     }
 
     for server in &org.servers {
-        let blocked = blocked_at(&policy, &all_places, &server.name, &server.entry, true);
+        // The organisation's servers need no allowed rule, but one of `managed-mcp.json` that takes values from the
+        // environment (`${VAR}`) does: what it runs is not the file's alone.
+        let skips_allowed =
+            !(server.file.ends_with(managed::MCP_FILE) && uses_variables(&server.entry));
+        let blocked = blocked_at(
+            &policy,
+            &all_places,
+            &server.name,
+            &server.entry,
+            skips_allowed,
+        );
         // Claude Code compares a plugin's server with the organisation's too, wherever those are on and allowed.
         if let Some(key) = plugins::same_as_key(&server.entry) {
             by_hand.push(ByHand {
@@ -619,9 +641,29 @@ fn blocked_at(
         .collect()
 }
 
-/// What a row says about policy, from the places it would load in and where policy holds it back there: not loaded
-/// when held back in all of them, else the projects where it is. Counted like "left out": projects, or outside every
-/// project when Claude Code knows none.
+/// Where policy holds a local or project server back: its own project.
+fn held_back_here(why: &str, project: &Project<'_>) -> crate::api::Blocked {
+    crate::api::Blocked {
+        why: clip(&sanitize::sanitize_line(why)),
+        projects: vec![clip(&sanitize(&project.display))],
+    }
+}
+
+/// Whether a server's definition takes values from the environment (`${VAR}`) anywhere.
+fn uses_variables(entry: &Value) -> bool {
+    match entry {
+        Value::String(s) => s.contains("${"),
+        Value::Array(items) => items.iter().any(uses_variables),
+        Value::Object(map) => map
+            .iter()
+            .any(|(k, v)| k.contains("${") || uses_variables(v)),
+        _ => false,
+    }
+}
+
+/// What a row says about policy, from the places it would load in and where policy holds it back there: where it is
+/// held back, and not loaded too when that is all of them. Counted like "left out": projects, or outside every project
+/// when Claude Code knows none.
 fn verdict(
     places: &[usize],
     blocked: &[(usize, String)],
@@ -645,15 +687,20 @@ fn verdict(
         return (None, None);
     };
     let why = clip(&sanitize::sanitize_line(why));
-    if hit.len() == counted.len() {
-        return (Some(why), None);
-    }
-    let projects = hit
+    let projects: Vec<String> = hit
         .iter()
         .filter(|(p, _)| *p > 0)
         .map(|(p, _)| shown_projects[p - 1].clone())
         .collect();
-    (None, Some(crate::api::Blocked { why, projects }))
+    let not_loaded = (hit.len() == counted.len()).then(|| {
+        // Not loaded, but held back only in some projects (it is hidden in the others): say which.
+        if !projects.is_empty() && projects.len() < shown_projects.len() {
+            format!("In {}: {why}", projects.join(", "))
+        } else {
+            why.clone()
+        }
+    });
+    (not_loaded, Some(crate::api::Blocked { why, projects }))
 }
 
 /// Names `project` on the user rows at `hidden`: there, a server of the same name is loaded instead.
@@ -3341,14 +3388,19 @@ mod tests {
         );
         let s = e.load();
         assert!(s.warnings.is_empty(), "{:?}", s.warnings);
-        let why = blocked_why(find(&s, Scope::User, "x"));
+        let x = find(&s, Scope::User, "x");
+        let why = blocked_why(x);
         assert!(
-            why.starts_with("Blocked by policy") && why.contains("serverName \"x\""),
+            why.starts_with("A rule in your settings blocks the name x.")
+                && why.contains(r#"{"serverName":"x"}"#),
             "{why}"
         );
         assert!(why.contains("settings.json"), "{why}");
-        let why = blocked_why(find(&s, Scope::Local, "l"));
-        assert!(why.contains("serverCommand [\"loc\"]"), "{why}");
+        // Blocked as well as not loaded, so the list can say it is policy.
+        assert!(x.blocked.is_some(), "{x:#?}");
+        let l = find(&s, Scope::Local, "l");
+        assert!(blocked_why(l).contains("the command loc"), "{l:#?}");
+        assert!(l.blocked.is_some(), "{l:#?}");
         let ok = find(&s, Scope::User, "ok");
         assert!(ok.not_loaded.is_none() && ok.blocked.is_none(), "{ok:#?}");
     }
@@ -3387,8 +3439,76 @@ mod tests {
         );
         let s = e.load();
         let x = find(&s, Scope::User, "x");
-        assert!(x.blocked.is_none(), "{x:#?}");
-        assert!(blocked_why(x).contains("Blocked by policy"));
+        assert_eq!(
+            x.blocked.as_ref().map(|b| b.projects.len()),
+            Some(2),
+            "{x:#?}"
+        );
+        // Everywhere: no project to single out.
+        assert!(
+            blocked_why(x).starts_with("A rule in the project's"),
+            "{x:#?}"
+        );
+    }
+
+    #[test]
+    fn a_server_not_loaded_for_two_causes_names_each_where_it_applies() {
+        // Cross-review of #49: the user's web is replaced by the project's own web in a, and blocked in b.
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        let shown = |p: &PathBuf| p.to_string_lossy().replace('\\', "/");
+        e.write(
+            "projects/b/.claude/settings.local.json",
+            &json!({"deniedMcpServers": [{"serverName": "web"}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {"web": {"command": "userweb"}},
+                "projects": {
+                    a.to_string_lossy(): {"mcpServers": {"web": {"command": "localweb"}}},
+                    b.to_string_lossy(): {}
+                }
+            }),
+        );
+        let s = e.load();
+        let web = find(&s, Scope::User, "web");
+        let why = blocked_why(web);
+        assert!(
+            why.starts_with(&format!(
+                "In {}: A rule in the project's local settings",
+                shown(&b)
+            )),
+            "{why}"
+        );
+        assert!(
+            why.ends_with(&format!(
+                "In {}, a server of the same name in the project loads instead.",
+                shown(&a)
+            )),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn an_organisations_file_server_with_variables_needs_an_allowed_rule() {
+        let e = Env::new();
+        e.write(
+            "org/managed-mcp.json",
+            &json!({"mcpServers": {
+                "plain": {"command": "plain"},
+                "env": {"command": "run", "args": ["${HOME}/x"]}
+            }}),
+        );
+        e.write(
+            "org/managed-settings.json",
+            &json!({"allowedMcpServers": [{"serverCommand": ["other"]}]}),
+        );
+        e.write(".claude.json", &json!({}));
+        let s = e.load();
+        assert!(find(&s, Scope::Managed, "plain").not_loaded.is_none());
+        let env = find(&s, Scope::Managed, "env");
+        assert!(blocked_why(env).contains("not on the list"), "{env:#?}");
     }
 
     #[test]

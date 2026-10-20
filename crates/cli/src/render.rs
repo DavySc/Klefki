@@ -253,11 +253,17 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     if let Some(file) = &row.managed {
         notes.push(format!("set by your organisation in {file}"));
     }
-    if let Some(b) = &row.blocked {
-        notes.push(format!(
-            "blocked by policy in {} of {project_count} projects",
+    // Blocked everywhere is the state column's to say, with the reason above.
+    if let Some(b) = row.blocked.as_ref().filter(|_| row.not_loaded.is_none()) {
+        let mut note = format!(
+            "blocked by policy in {} of {project_count} projects: ",
             b.projects.len()
-        ));
+        );
+        note.push_str(&b.projects[..b.projects.len().min(PROJECTS_NAMED)].join(", "));
+        if b.projects.len() > PROJECTS_NAMED {
+            let _ = write!(note, " and {} more", b.projects.len() - PROJECTS_NAMED);
+        }
+        notes.push(note);
     }
     // A plugin's or the organisation's server, like a user server, is one row for every project.
     let everywhere = row.scope.is_everywhere();
@@ -319,7 +325,10 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
     notes
 }
 
-/// The state column: on, off, or not loaded wherever it is on.
+/// At most this many projects are named in a note.
+const PROJECTS_NAMED: usize = 3;
+
+/// The state column: on, off, or not loaded (blocked, by policy) wherever it is on.
 fn state(row: &ServerRow, project_count: usize) -> &'static str {
     // A plugin's server whose plugin is off in every project reads as off, like a user server off in all.
     let plugin_off = project_count > 0
@@ -329,6 +338,8 @@ fn state(row: &ServerRow, project_count: usize) -> &'static str {
             .is_some_and(|p| p.off_in.len() == project_count);
     if !row.enabled || plugin_off {
         "off"
+    } else if row.not_loaded.is_some() && row.blocked.is_some() {
+        "blocked"
     } else if row.not_loaded.is_some() {
         "not loaded"
     } else {
@@ -828,9 +839,22 @@ mod tests {
             ..user.clone()
         };
         assert!(
-            notes(&row, 3).contains(&"blocked by policy in 1 of 3 projects".to_owned()),
+            notes(&row, 3).contains(&"blocked by policy in 1 of 3 projects: /p".to_owned()),
             "{:?}",
             notes(&row, 3)
+        );
+        // Blocked everywhere: the state column says so, and no count.
+        let everywhere = ServerRow {
+            not_loaded: row.blocked.as_ref().map(|b| b.why.clone()),
+            ..row.clone()
+        };
+        assert_eq!(state(&everywhere, 3), "blocked");
+        assert!(
+            !notes(&everywhere, 3)
+                .iter()
+                .any(|n| n.contains("blocked by policy in")),
+            "{:?}",
+            notes(&everywhere, 3)
         );
         let json = row_json(&row, 3);
         assert_eq!(json["blocked"]["projects"], json!(["/p"]));
