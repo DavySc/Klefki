@@ -307,8 +307,13 @@ pub struct LegacyDisabled {
 /// `claude`, and runs live status checks in the background. `wake` is called whenever events are waiting, so the
 /// UI can repaint.
 pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
+    // A build without the release key never checks, so it carries no TLS code either (the key is a constant).
+    let releases: std::sync::Arc<dyn crate::update::Fetch> = match crate::update::RELEASE_KEY {
+        Some(_) => std::sync::Arc::new(crate::update::Https::default()),
+        None => std::sync::Arc::new(crate::update::Offline),
+    };
     let config = crate::engine::EngineConfig {
-        releases: std::sync::Arc::new(crate::update::Https::default()),
+        releases,
         release_key: crate::update::RELEASE_KEY.map(str::to_owned),
         ..real_config(None)
     };

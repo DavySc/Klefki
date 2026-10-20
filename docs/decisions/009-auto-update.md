@@ -23,8 +23,9 @@ GitHub only, and from slice 6b on will start an installer it downloaded.
 - **When.** Once a run, at least 3 seconds after the window opens (start-up never waits on it), and not within a day
   of the last answer. A failure is not an answer, so the next start tries again. "Check now" in Settings asks at any
   time. "Check for updates automatically" is on by default; off, Klefki contacts nobody unless asked.
-- **What the user sees.** A newer release shows as a button in the top bar ("Klefki 1.2.3") and in Settings ("1.2.3
-  is available", What's new). Both open the release's page. The found version is remembered until a check finds none,
+- **What the user sees.** A newer release shows as a button in the top bar ("Update: 1.2.3") and in Settings ("1.2.3
+  is available", What's new). Otherwise Settings says "Up to date · checked yesterday" (from the last answer, kept
+  between runs), or "No signed release is published yet" when GitHub has none. Both open the release's page. The found version is remembered until a check finds none,
   and dropped once Klefki is that version or newer. No dialog, no badge count: it waits until the user wants it.
 - **How.** ureq 3 (blocking, small) with rustls and the ring provider, trusting the system's certificates
   (`rustls-native-certs`, so a company proxy that the system trusts works), the proxy from the environment, a 30 s
@@ -32,6 +33,26 @@ GitHub only, and from slice 6b on will start an installer it downloaded.
   its own signature files and a manifest server. Not `rustls-platform-verifier`: its licence (through
   `webpki-root-certs`, on WebAssembly only) is not in `deny.toml`, which is protected.
 - The check runs on a thread of its own; the UI only sends `CheckForUpdates` and shows `Event::Update`.
+
+## Who can sign (cross-review of #48)
+The key is only as safe as the job that holds it. The `release` environment admits `v*` tags, and a tag can point at
+any commit, with any `release.yml`; that workflow could sign anything and publish it, and every Klefki would offer it.
+So, before the first signed release, the owner turns on a tag ruleset that lets only the owner create `v*` tags, and
+a required reviewer (the owner) on the environment, so every signing waits for the owner's approval in the run. Both
+are free on a public repository (`docs/RELEASING.md`). The `sign` job also refuses a commit that is not on main.
+
+## If the key is lost or must be replaced
+Every installed Klefki trusts one key, so a release signed with another is refused, and those installs stop updating.
+- **Planned change** (the key is still there): the last release signed with the old key carries the new key in
+  `minisign.pub`; after it, releases are signed with the new one. Installs move over by updating once in between.
+- **Lost or leaked key:** installs cannot be moved over safely. The release notes and the README say to download the
+  new version by hand once; a leaked key is also announced, and its releases withdrawn. Keep the key and its password
+  backed up offline (`docs/RELEASING.md`).
+
+## What GitHub sees
+Each check is two downloads from GitHub: GitHub sees the user's IP address, the time, and Klefki's version in the
+User-Agent, as with any download. Nothing about the user's servers or settings is sent. Settings says so next to the
+switch.
 
 ## Next (slice 6b)
 Download the right package, check it against the signed `SHA256SUMS`, and install it: the per-user Windows

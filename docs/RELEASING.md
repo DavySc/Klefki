@@ -35,13 +35,21 @@ The `sign` job signs `SHA256SUMS` with `scripts/sign-checksums.sh`. Committing `
 
 The key is a secret of the `release` **environment**, not a repository secret: any workflow on any branch can read repository secrets, while an environment secret reaches only jobs that use the environment, from the branches and tags it allows. The `sign` job is the only job that uses it, and runs only for tags and on main; manual runs from other branches still build, checksum and attest without it.
 
+Anyone who can run the `sign` job can sign a release that every installed Klefki offers as an update (decision 009). The environment lets `v*` tags in, and a tag can point at any commit, also one with a changed, unreviewed `release.yml`. So two repository settings are part of the trust, and must be on before the first signed release; both are free on a public repository:
+
+- **Tag ruleset:** Settings, Rules, Rulesets, **New tag ruleset**, target the pattern `v*`, turn on *Restrict creations* (and *Restrict updates* and *Restrict deletions*), with only the owner in the bypass list. Only the owner can then create a release tag.
+- **Required reviewer:** in the `release` environment, turn on *Required reviewers* with the owner. Every signing then waits until the owner approves it in the run.
+
+The `sign` job also refuses a commit that is not on main, which catches a tag set by mistake.
+
 To set it up (once, by the owner):
 
 1. `minisign -G -p minisign.pub -s klefki.key`, with a strong password. Keep `klefki.key` and the password backed up offline: losing them means users must move to a new key.
 2. Settings, Environments, **New environment** `release`. Under *Deployment branches and tags* choose *Selected branches and tags* and add the branch `main` and the tag pattern `v*`. Create it before the first run on main or a tag: otherwise GitHub creates it on that run with no rules.
 3. In that environment, add the secrets `MINISIGN_SECRET_KEY` (the whole content of `klefki.key`) and `MINISIGN_PASSWORD`. Do not add them as repository secrets.
 4. Commit `minisign.pub` through a pull request.
-5. Start the release workflow by hand on main: the `sign` job should print `Signature and comment signature verified`.
+5. Turn on the tag ruleset and the required reviewer above.
+6. Start the release workflow by hand on main, approve the `sign` job when it asks: it should print `Signature and comment signature verified`.
 
 ## Cutting a release
 

@@ -63,6 +63,8 @@ pub enum UpdateCheck {
     UpToDate,
     /// A newer release is out; its signature checked out.
     Available { version: Version, page: String },
+    /// GitHub answered, but has no signed release yet (before the first one, or a release without a signature).
+    NoRelease,
     /// The check could not finish, and why, in plain words. Nothing was trusted.
     Failed(String),
     /// This build has no release key, so it never checks (a build from source before the key existed).
@@ -71,7 +73,15 @@ pub enum UpdateCheck {
 
 /// Fetches a file over https, refusing anything longer than `limit` bytes.
 pub(crate) trait Fetch: Send + Sync {
-    fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, String>;
+    fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, FetchError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FetchError {
+    /// The server answered that there is no such file.
+    NotFound,
+    /// Anything else, in plain words.
+    Failed(String),
 }
 
 /// Asks GitHub for the latest release and checks its signature with `key`.
@@ -89,7 +99,10 @@ pub(crate) fn check(fetch: &dyn Fetch, current: Version, key: Option<&str>) -> U
         });
     let (sums, signature) = match fetched {
         Ok(files) => files,
-        Err(why) => return UpdateCheck::Failed(format!("Could not reach GitHub: {why}")),
+        Err(FetchError::NotFound) => return UpdateCheck::NoRelease,
+        Err(FetchError::Failed(why)) => {
+            return UpdateCheck::Failed(format!("Could not check for updates: {why}."));
+        }
     };
     match signed_version(&sums, &signature, key) {
         Ok(version) if version > current => UpdateCheck::Available {
@@ -138,8 +151,8 @@ fn release_in_comment(comment: &str) -> Option<Version> {
 pub(crate) struct Offline;
 
 impl Fetch for Offline {
-    fn get(&self, _url: &str, _limit: u64) -> Result<Vec<u8>, String> {
-        Err("offline".into())
+    fn get(&self, _url: &str, _limit: u64) -> Result<Vec<u8>, FetchError> {
+        Err(FetchError::Failed("offline".into()))
     }
 }
 
@@ -148,11 +161,11 @@ impl Fetch for Offline {
 pub(crate) fn test_release() -> (std::sync::Arc<dyn Fetch>, String) {
     struct Release;
     impl Fetch for Release {
-        fn get(&self, url: &str, _limit: u64) -> Result<Vec<u8>, String> {
+        fn get(&self, url: &str, _limit: u64) -> Result<Vec<u8>, FetchError> {
             match url.strip_prefix(LATEST) {
                 Some("SHA256SUMS") => Ok(include_bytes!("update/SHA256SUMS").to_vec()),
                 Some("SHA256SUMS.minisig") => Ok(include_bytes!("update/v0.2.0.minisig").to_vec()),
-                _ => Err("no such file".into()),
+                _ => Err(FetchError::NotFound),
             }
         }
     }
@@ -200,9 +213,9 @@ impl Https {
 }
 
 impl Fetch for Https {
-    fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, String> {
+    fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, FetchError> {
         if !url.starts_with("https://") {
-            return Err("only https is used".into());
+            return Err(FetchError::Failed("only https is used".into()));
         }
         let mut response = self.agent().get(url).call().map_err(|e| plain_error(&e))?;
         response
@@ -215,9 +228,9 @@ impl Fetch for Https {
 }
 
 /// A short reason for a failed request, without addresses or headers.
-fn plain_error(error: &ureq::Error) -> String {
-    match error {
-        ureq::Error::StatusCode(404) => "no release is published yet".into(),
+fn plain_error(error: &ureq::Error) -> FetchError {
+    FetchError::Failed(match error {
+        ureq::Error::StatusCode(404) => return FetchError::NotFound,
         ureq::Error::StatusCode(code) => format!("GitHub answered {code}"),
         ureq::Error::Timeout(_) => "it took too long".into(),
         ureq::Error::Io(_) | ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => {
@@ -227,7 +240,7 @@ fn plain_error(error: &ureq::Error) -> String {
         ureq::Error::BodyExceedsLimit(_) => "the answer was too large".into(),
         ureq::Error::RequireHttpsOnly(_) => "GitHub redirected to an address without https".into(),
         _ => "the request failed".into(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -251,7 +264,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeGitHub {
-        files: HashMap<String, Result<Vec<u8>, String>>,
+        files: HashMap<String, Result<Vec<u8>, FetchError>>,
         asked: Mutex<Vec<(String, u64)>>,
     }
 
@@ -267,12 +280,12 @@ mod tests {
     }
 
     impl Fetch for FakeGitHub {
-        fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, String> {
+        fn get(&self, url: &str, limit: u64) -> Result<Vec<u8>, FetchError> {
             self.asked.lock().unwrap().push((url.to_string(), limit));
             self.files
                 .get(url)
                 .cloned()
-                .unwrap_or_else(|| Err("no such file".into()))
+                .unwrap_or(Err(FetchError::NotFound))
         }
     }
 
@@ -387,11 +400,27 @@ mod tests {
         let mut github = FakeGitHub::serving(SUMS, signature("v0.2.0.minisig"));
         github.files.insert(
             format!("{LATEST}SHA256SUMS.minisig"),
-            Err("no connection".into()),
+            Err(FetchError::Failed("no connection".into())),
         );
         assert_eq!(
             check(&github, v("0.1.0"), Some(key())),
-            UpdateCheck::Failed("Could not reach GitHub: no connection".into())
+            UpdateCheck::Failed("Could not check for updates: no connection.".into())
+        );
+    }
+
+    #[test]
+    fn no_published_release_is_an_answer_not_a_failure() {
+        // Before the first signed release, GitHub answers 404 for both files; a release without a signature
+        // answers 404 for the signature only.
+        assert_eq!(
+            check(&FakeGitHub::default(), v("0.1.0"), Some(key())),
+            UpdateCheck::NoRelease
+        );
+        let mut github = FakeGitHub::serving(SUMS, Vec::new());
+        github.files.remove(&format!("{LATEST}SHA256SUMS.minisig"));
+        assert_eq!(
+            check(&github, v("0.1.0"), Some(key())),
+            UpdateCheck::NoRelease
         );
     }
 
@@ -431,7 +460,7 @@ mod tests {
     fn https_fetch_refuses_plain_http() {
         assert_eq!(
             Https::default().get("http://github.com/", 10),
-            Err("only https is used".to_string())
+            Err(FetchError::Failed("only https is used".into()))
         );
     }
 }

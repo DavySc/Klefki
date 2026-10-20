@@ -95,7 +95,7 @@ impl Updates {
                 self.available = Some(*version);
                 self.last_checked = Some(now);
             }
-            UpdateCheck::UpToDate => {
+            UpdateCheck::UpToDate | UpdateCheck::NoRelease => {
                 self.available = None;
                 self.last_checked = Some(now);
             }
@@ -108,6 +108,28 @@ impl Updates {
     /// A newer release, found this run or by an earlier one.
     pub fn available(&self) -> Option<Version> {
         self.available
+    }
+
+    /// "Up to date · checked …", when the last answer, this run or an earlier one, found nothing newer.
+    pub fn up_to_date(&self, now: u64) -> Option<String> {
+        if self.available.is_some() {
+            return None;
+        }
+        self.last_checked
+            .map(|at| format!("Up to date · checked {}", ago(at, now)))
+    }
+}
+
+/// How long ago `at` was, in words: "just now", "3 hours ago", "yesterday", "5 days ago".
+fn ago(at: u64, now: u64) -> String {
+    const HOUR: u64 = 60 * 60;
+    let elapsed = now.saturating_sub(at);
+    match elapsed {
+        e if e < HOUR => "just now".into(),
+        e if e < 2 * HOUR => "an hour ago".into(),
+        e if e < EVERY => format!("{} hours ago", e / HOUR),
+        e if e < 2 * EVERY => "yesterday".into(),
+        e => format!("{} days ago", e / EVERY),
     }
 }
 
@@ -219,6 +241,56 @@ mod tests {
         assert_eq!(Updates::load(Some(&storage)).available(), None);
         eframe::Storage::set_string(&mut storage, AVAILABLE_KEY, "garbage".into());
         assert_eq!(Updates::load(Some(&storage)).available(), None);
+    }
+
+    #[test]
+    fn says_when_it_last_found_nothing_newer() {
+        let mut storage = MemoryStorage::default();
+        let mut updates = Updates::default();
+        assert_eq!(updates.up_to_date(NOW), None, "never checked");
+        updates.answered(UpdateCheck::UpToDate, NOW);
+        updates.save(&mut storage);
+        // Shown on a later start too, from what was saved.
+        let later = Updates::load(Some(&storage));
+        assert_eq!(
+            later.up_to_date(NOW + 60).as_deref(),
+            Some("Up to date · checked just now")
+        );
+        assert_eq!(
+            later.up_to_date(NOW + 3 * 3600).as_deref(),
+            Some("Up to date · checked 3 hours ago")
+        );
+        assert_eq!(
+            later.up_to_date(NOW + DAY + 5).as_deref(),
+            Some("Up to date · checked yesterday")
+        );
+        assert_eq!(
+            later.up_to_date(NOW + 9 * DAY).as_deref(),
+            Some("Up to date · checked 9 days ago")
+        );
+        // A clock set back does not make it "in the future".
+        assert_eq!(
+            later.up_to_date(NOW - 100).as_deref(),
+            Some("Up to date · checked just now")
+        );
+        let mut found = later;
+        found.answered(
+            UpdateCheck::Available {
+                version: newer(),
+                page: String::new(),
+            },
+            NOW,
+        );
+        assert_eq!(found.up_to_date(NOW), None);
+    }
+
+    #[test]
+    fn no_published_release_is_an_answer() {
+        let mut updates = Updates::default();
+        assert!(updates.due(START_DELAY, NOW));
+        updates.answered(UpdateCheck::NoRelease, NOW);
+        assert!(!updates.checking);
+        assert!(updates.up_to_date(NOW).is_some());
     }
 
     #[test]

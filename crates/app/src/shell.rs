@@ -1298,7 +1298,7 @@ impl ShellApp {
                 if let Some(version) = self.updates.available()
                     && ui
                         .button(
-                            RichText::new(format!("{} Klefki {version}", icon::ARROW_CIRCLE_UP))
+                            RichText::new(format!("{} Update: {version}", icon::ARROW_CIRCLE_UP))
                                 .color(pal.primary),
                         )
                         .on_hover_text(format!(
@@ -3535,8 +3535,13 @@ impl ShellApp {
                         if ui.button("What's new").clicked() {
                             self.send(Command::OpenReleasePage(version));
                         }
-                    } else if let Some(UpdateCheck::UpToDate) = &self.updates.found {
-                        ui.label(RichText::new("Up to date").color(pal.text_muted));
+                    } else if let Some(UpdateCheck::NoRelease) = &self.updates.found {
+                        ui.label(
+                            RichText::new("No signed release is published yet")
+                                .color(pal.text_muted),
+                        );
+                    } else if let Some(text) = self.updates.up_to_date(crate::updates::now()) {
+                        ui.label(RichText::new(text).color(pal.text_muted));
                     }
                     if ui.button("Check now").clicked() {
                         self.check_for_updates_now();
@@ -3555,8 +3560,9 @@ impl ShellApp {
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Once a day, Klefki asks GitHub whether a newer version is out. Nothing about you or your \
-                     servers is sent. Every release is checked against Klefki's signature before it is offered.",
+                    "Once a day, Klefki asks GitHub whether a newer version is out. GitHub sees your IP address \
+                     and Klefki's version, as with any download; nothing about your servers or settings is sent. \
+                     A release is offered only if it carries Klefki's signature.",
                 )
                 .small()
                 .color(pal.text_muted),
@@ -17398,7 +17404,7 @@ mod tests {
             .unwrap();
         h.run();
         drain_all(&engine);
-        h.get_by_label_contains("Klefki 999.0.0").click();
+        h.get_by_label_contains("Update: 999.0.0").click();
         h.run();
         assert!(drain_all(&engine).contains(&Command::OpenReleasePage(version)));
         // Settings says the same, with the same way to it.
@@ -17417,7 +17423,7 @@ mod tests {
         h.state_mut().go(Page::Settings);
         h.run();
         assert!(
-            h.query_by_label_contains("Klefki 999").is_none(),
+            h.query_by_label_contains("Update: 999").is_none(),
             "no update shown before one is found"
         );
         h.get_by_label("Check now").click();
@@ -17428,11 +17434,11 @@ mod tests {
         engine
             .events
             .send(Event::Update(UpdateCheck::Failed(
-                "Could not reach GitHub: no connection".into(),
+                "Could not check for updates: no connection.".into(),
             )))
             .unwrap();
         h.run();
-        h.get_by_label("Could not reach GitHub: no connection");
+        h.get_by_label("Could not check for updates: no connection.");
         h.get_by_label("Check now").click();
         h.run_steps(2);
         engine
@@ -17440,8 +17446,16 @@ mod tests {
             .send(Event::Update(UpdateCheck::UpToDate))
             .unwrap();
         h.run();
-        h.get_by_label("Up to date");
-        assert!(h.query_by_label_contains("Could not reach").is_none());
+        h.get_by_label("Up to date · checked just now");
+        assert!(h.query_by_label_contains("Could not check").is_none());
+        h.get_by_label("Check now").click();
+        h.run_steps(2);
+        engine
+            .events
+            .send(Event::Update(UpdateCheck::NoRelease))
+            .unwrap();
+        h.run();
+        h.get_by_label("No signed release is published yet");
     }
 
     #[test]

@@ -38,6 +38,20 @@ release is out, and tell the user. Download and install follow in 6b. Design: `d
 - Memory, Linux under Xvfb, empty temp config, release builds: main 126.9 MB RSS at 2/6/10 s; with a test key
   128.4 MB at 2 s, 130.6 MB at 6 and 10 s (after the check). Threads 18 in both.
 
+- Cross-review (review 5581265151 on be552af), two blockers fixed:
+  - Trust chain: a `v*` tag on an unreviewed commit could sign and publish. Decision 009 and `docs/RELEASING.md` now
+    require a `v*` tag ruleset (only the owner creates tags) and the owner as required reviewer on `release` before the
+    first signed release; the `sign` job refuses a commit that is not on main; the CLAUDE.md invariant names both.
+    The owner's steps file lists them. These settings are the owner's to apply.
+  - Privacy text now says GitHub sees the IP address and Klefki's version; nothing about servers or settings.
+  Folded in: top bar says "Update: 1.2.3"; Settings shows "Up to date · checked …" from the saved last answer, and
+  "No signed release is published yet" (new `UpdateCheck::NoRelease`, from a 404, counted as an answer) in muted
+  text; other failures read "Could not check for updates: …"; key loss and rotation plan in 009; a build without a
+  key uses no fetcher, so it links no TLS code.
+  Checks after the fixes: fmt, clippy, `cargo test --workspace` (778 core lib, 364 app; 1187 total) and
+  `cargo deny check` all exit 0. Release build without a key: 18,534,728 bytes, `grep -c rustls` 0. The `sign` job's
+  main check first runs on main or a tag.
+
 ## Not verified / open
 - Real releases: none is published yet, and the release key is not committed (owner), so no real check has passed.
 - Windows and macOS: certificates from the system store and the proxy not tried.
