@@ -418,7 +418,8 @@ mod sys {
                 job.as_raw_handle() as HANDLE,
                 JobObjectExtendedLimitInformation,
                 (&raw const limits).cast(),
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .unwrap_or(u32::MAX),
             );
         }
         // SAFETY: both handles are open for the length of the call.
@@ -445,7 +446,7 @@ mod sys {
         let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as RawHandle) };
         let snapshot = snapshot.as_raw_handle() as HANDLE;
         let mut entry = THREADENTRY32 {
-            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(u32::MAX),
             ..Default::default()
         };
         let mut resumed = false;

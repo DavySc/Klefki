@@ -482,6 +482,13 @@ fn local_offset_secs(at: i64) -> i64 {
     if ok { tm.tm_gmtoff as i64 } else { 0 }
 }
 
+/// A calendar field as the 16-bit number a `SYSTEMTIME` holds; the fields here are in range, and 0 is not a valid
+/// date, so a surprise makes the lookup fail rather than wrap.
+#[cfg(windows)]
+fn word(n: i64) -> u16 {
+    u16::try_from(n).unwrap_or(0)
+}
+
 #[cfg(windows)]
 fn local_offset_secs(at: i64) -> i64 {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
@@ -489,13 +496,13 @@ fn local_offset_secs(at: i64) -> i64 {
     let (day, secs) = (at.div_euclid(86_400), at.rem_euclid(86_400));
     let (y, m, d) = civil(day);
     let utc = SYSTEMTIME {
-        wYear: y as u16,
-        wMonth: m as u16,
+        wYear: word(y),
+        wMonth: word(i64::from(m)),
         wDayOfWeek: 0,
-        wDay: d as u16,
-        wHour: (secs / 3600) as u16,
-        wMinute: (secs % 3600 / 60) as u16,
-        wSecond: (secs % 60) as u16,
+        wDay: word(i64::from(d)),
+        wHour: word(secs / 3600),
+        wMinute: word(secs % 3600 / 60),
+        wSecond: word(secs % 60),
         wMilliseconds: 0,
     };
     // SAFETY: both pointers are to live `SYSTEMTIME`s; a null zone means the current time zone.

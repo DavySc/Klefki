@@ -40,7 +40,7 @@ pub(crate) fn restrict(path: &Path, folder: bool) -> io::Result<()> {
     // A list returned is ours to free with `LocalFree`.
     let error = unsafe { SetEntriesInAclW(1, &access, std::ptr::null(), &mut acl) };
     if error != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(error as i32));
+        return Err(io::Error::from_raw_os_error(error.cast_signed()));
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
     // SAFETY: `wide` is a NUL-terminated path and `acl` the list just built; owner, group and audit list are left
@@ -59,7 +59,7 @@ pub(crate) fn restrict(path: &Path, folder: bool) -> io::Result<()> {
     // SAFETY: allocated by `SetEntriesInAclW` above and not used after this.
     unsafe { LocalFree(acl.cast()) };
     if error != ERROR_SUCCESS {
-        return Err(io::Error::from_raw_os_error(error as i32));
+        return Err(io::Error::from_raw_os_error(error.cast_signed()));
     }
     Ok(())
 }
@@ -92,7 +92,7 @@ fn current_user() -> io::Result<User> {
             token,
             TokenUser,
             buffer.as_mut_ptr().cast(),
-            (buffer.len() * 8) as u32,
+            u32::try_from(buffer.len() * 8).unwrap_or(u32::MAX),
             &mut len,
         )
     };
@@ -145,7 +145,7 @@ pub(crate) mod tests {
                 && GetAclInformation(
                     dacl,
                     (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
-                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
                     AclSizeInformation,
                 ) != 0
                 && size.AceCount == 1
