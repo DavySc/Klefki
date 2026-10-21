@@ -2210,6 +2210,7 @@ version = "0.2.0"
 dependencies = [
  "expect-test",
  "klefki-core",
+ "portable-pty",
  "serde_json",
  "tempfile",
 ]
