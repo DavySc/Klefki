@@ -1,8 +1,9 @@
 //! The Duplicate dialog: a copy of a server under another name or in other places, its address and sign-in
 //! fields changed in the same step.
 
+use super::add::{field_note, field_row, field_warning};
 use super::places::Places;
-use super::{ShellApp, closed_on_purpose, field_note, field_row, field_warning, name_problem};
+use super::{ShellApp, closed_on_purpose, name_problem};
 use crate::theme::{self, Palette};
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
