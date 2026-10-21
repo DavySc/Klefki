@@ -43,24 +43,6 @@ const PLUGIN_NOT_CHECKED: &str =
 const CONNECTOR_NOT_CHECKED: &str =
     "Klefki does not check claude.ai connectors. In Claude Code, /mcp shows their status.";
 const ORGANISATION_NOT_CHECKED: &str = "Klefki does not check the servers your organisation sets. In Claude Code, /mcp shows their status.";
-/// The servers of `org`'s name, configured by hand, that Claude Code does not load because the organisation sets it.
-pub(super) fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<String> {
-    servers
-        .iter()
-        .filter(|o| {
-            matches!(o.scope, Scope::User | Scope::Local | Scope::Project)
-                && o.name == org.name
-                && o.not_loaded.is_some()
-        })
-        .map(|o| {
-            let scope = o.scope.label().to_lowercase();
-            match &o.project {
-                None => format!("your {scope} server {}", o.name),
-                Some(p) => format!("the {scope} server {} in {p}", o.name),
-            }
-        })
-        .collect()
-}
 
 /// The status of a server Claude Code loads nowhere (decision 009).
 pub(super) const NOT_LOADED: &str = "Not loaded";
@@ -80,14 +62,6 @@ pub(super) const ABOUT_CONNECTORS: &str = "Claude Code fetches your connectors f
      ones Claude Code has connected before, so one you have since removed on claude.ai may still be here, and one you \
      have never used is not. A server you add yourself at the same address takes the connector's place; Klefki cannot \
      see a connector's address, so it cannot say when that happens.";
-
-/// What the details say under a plugin's server.
-pub(super) fn managed_read_only(file: &str) -> String {
-    format!(
-        "Your organisation sets this server, in {file}. Klefki switches it on and off; only an administrator can \
-         change it."
-    )
-}
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
 const SHADOWED_NAMED: usize = 5;
@@ -504,6 +478,33 @@ pub(super) fn not_checked(s: &ServerRow) -> Option<String> {
         Scope::ClaudeAi => Some(CONNECTOR_NOT_CHECKED.to_owned()),
         _ => None,
     }
+}
+
+/// The servers of `org`'s name, configured by hand, that Claude Code does not load because the organisation sets it.
+pub(super) fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -> Vec<String> {
+    servers
+        .iter()
+        .filter(|o| {
+            matches!(o.scope, Scope::User | Scope::Local | Scope::Project)
+                && o.name == org.name
+                && o.not_loaded.is_some()
+        })
+        .map(|o| {
+            let scope = o.scope.label().to_lowercase();
+            match &o.project {
+                None => format!("your {scope} server {}", o.name),
+                Some(p) => format!("the {scope} server {} in {p}", o.name),
+            }
+        })
+        .collect()
+}
+
+/// What the details say under a plugin's server.
+pub(super) fn managed_read_only(file: &str) -> String {
+    format!(
+        "Your organisation sets this server, in {file}. Klefki switches it on and off; only an administrator can \
+         change it."
+    )
 }
 
 /// Whether the pointer has been over `rect` for `delay` seconds, moving or not, with no button down. Asks for the
