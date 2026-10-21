@@ -9,7 +9,7 @@ use egui::{
 };
 use std::sync::Arc;
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "each shift leaves one byte of the colour; `try_from` is not const"
 )]

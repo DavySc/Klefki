@@ -247,7 +247,7 @@ impl Explanation {
                 .size()
                 .x
                 .max(1.0);
-            #[allow(
+            #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "a float width, never negative here, as a whole column count"

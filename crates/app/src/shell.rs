@@ -6019,7 +6019,7 @@ fn search_id() -> egui::Id {
 
 /// Room kept free at the right of the detail panel's content: its scroll bar floats over the content and, at its
 /// widest when the pointer is on it, takes the clicks there.
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "a few pixels; `as` saturates for a float"
 )]
@@ -9037,7 +9037,7 @@ fn hovered_for(ui: &Ui, id: egui::Id, rect: egui::Rect, delay: f64) -> bool {
     let since = ctx.data_mut(|d| *d.get_temp_mut_or(key, now));
     let left = delay - (now - since);
     if left > 0.0 {
-        #[allow(
+        #[expect(
             clippy::cast_possible_truncation,
             reason = "a repaint delay in seconds needs no more than f32"
         )]

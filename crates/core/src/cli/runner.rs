@@ -606,7 +606,7 @@ mod tests {
     /// Does nothing in a normal test run. Run by `pipes_left_open_after_the_child_ends_are_waited_for_once` as
     /// "parent", it starts itself again as "child", which keeps the same output pipes open for a while, and ends.
     #[test]
-    #[allow(
+    #[expect(
         clippy::print_stdout,
         clippy::print_stderr,
         reason = "the output on both pipes is what the parent test waits for"
