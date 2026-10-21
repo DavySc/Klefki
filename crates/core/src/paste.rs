@@ -2033,6 +2033,19 @@ mod tests {
             ("claude mcp add -t http x ftp://a.example", "url"),
             ("claude mcp add -e NOEQUALS x node", "NOEQUALS"),
             ("claude mcp add -H nocolon x node", "nocolon"),
+            ("claude mcp add -e =v x node", "-e takes KEY=value"),
+            (
+                r#"claude mcp add -t http -H " : v" x https://a.example"#,
+                "-H takes",
+            ),
+            (
+                "claude mcp add -t http --callback-port 0 x https://a.example",
+                "from 1 to 65535",
+            ),
+            (
+                "claude mcp add -t http -e K=v x https://a.example",
+                "sets the environment",
+            ),
         ] {
             let s = one(text);
             let problem = s.problem.unwrap_or_default();
