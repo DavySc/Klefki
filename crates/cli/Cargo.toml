@@ -19,5 +19,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 expect-test = "1"
 tempfile = "3"
 
+# A terminal for the tests of what `klefki-cli` does when someone is there to answer (the same crate as core's
+# sign-in uses, so nothing new is built).
+[target.'cfg(unix)'.dev-dependencies]
+portable-pty = "0.9"
+
 [lints]
 workspace = true
