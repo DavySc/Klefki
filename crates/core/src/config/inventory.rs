@@ -4312,4 +4312,118 @@ mod tests {
         assert!(find(&s, Scope::Managed, "docs").not_loaded.is_none());
         assert!(blocked_why(find(&s, Scope::Managed, "gone")).contains("serverUrl"));
     }
+
+    // ------------------------------------------------------------ edges no other test reached (A4 part 8)
+
+    #[test]
+    fn a_projects_own_rules_block_its_local_server() {
+        let e = Env::new();
+        let a = e.project("a");
+        e.write(
+            "projects/a/.claude/settings.local.json",
+            &json!({"deniedMcpServers": [{"serverName": "l"}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"projects": {a.to_string_lossy(): {"mcpServers": {"l": {"command": "l"}}}}}),
+        );
+        let s = e.load();
+        let l = find(&s, Scope::Local, "l");
+        assert!(blocked_why(l).contains("settings.local.json"), "{l:#?}");
+    }
+
+    #[test]
+    fn with_no_project_known_nothing_counts_as_off_or_hidden_everywhere() {
+        let e = Env::new();
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"docs": {"type": "http", "url": "https://docs.example.com/mcp"}}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"mcpServers": {"x": {"command": "x"}}}),
+        );
+        let s = e.load();
+        let x = find(&s, Scope::User, "x");
+        assert!(x.enabled && !x.shadowed, "{x:#?}");
+        let docs = find(&s, Scope::Managed, "docs");
+        assert!(docs.enabled, "{docs:#?}");
+    }
+
+    #[test]
+    fn an_organisations_server_off_in_every_project_is_off() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"docs": {"type": "http", "url": "https://docs.example.com/mcp"}}}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"disabledMcpServers": ["docs"]},
+                b.to_string_lossy(): {"disabledMcpServers": ["docs"]}
+            }}),
+        );
+        let s = e.load();
+        let docs = find(&s, Scope::Managed, "docs");
+        assert_eq!((docs.enabled, docs.disabled_in), (false, 2), "{docs:#?}");
+    }
+
+    #[test]
+    fn an_organisations_server_off_in_one_project_and_held_back_in_the_other_loads_nowhere() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            "org/managed-settings.json",
+            &json!({"managedMcpServers": {"docs": {"type": "http", "url": "https://docs.example.com/mcp"}}}),
+        );
+        e.write(
+            "projects/b/.claude/settings.local.json",
+            &json!({"deniedMcpServers": [{"serverName": "docs"}]}),
+        );
+        e.write(
+            ".claude.json",
+            &json!({"projects": {
+                a.to_string_lossy(): {"disabledMcpServers": ["docs"]},
+                b.to_string_lossy(): {}
+            }}),
+        );
+        let s = e.load();
+        let docs = find(&s, Scope::Managed, "docs");
+        let why = blocked_why(docs);
+        assert!(
+            why.starts_with(&format!("In {}: ", shown_path(&b))),
+            "{why}"
+        );
+        assert!(
+            why.ends_with(&format!("In {}, it is off.", shown_path(&a))),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_connector_held_back_by_a_setting_that_is_not_policy_says_so() {
+        let e = Env::new();
+        let (a, b) = (e.project("a"), e.project("b"));
+        e.write(
+            ".claude.json",
+            &json!({
+                "claudeAiMcpEverConnected": ["claude.ai Gmail"],
+                "projects": {a.to_string_lossy(): {}, b.to_string_lossy(): {}}
+            }),
+        );
+        e.write(
+            "projects/b/.claude/settings.local.json",
+            &json!({"disableClaudeAiConnectors": true}),
+        );
+        let s = e.load();
+        let gmail = connector(&s, "Gmail");
+        let blocked = gmail
+            .blocked
+            .as_ref()
+            .unwrap_or_else(|| panic!("{gmail:#?}"));
+        assert_eq!(blocked.projects, [shown_path(&b)], "{gmail:#?}");
+        assert!(!blocked.policy, "{gmail:#?}");
+    }
 }
