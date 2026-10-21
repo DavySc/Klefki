@@ -2553,6 +2553,7 @@ mod tests {
             pasted.servers.iter().all(|s| s.problem.is_none()),
             "{pasted:?}"
         );
+        assert_eq!(json_of(&pasted.servers[0])["args"], json!(["a"]));
         assert_eq!(json_of(&pasted.servers[2])["args"], json!(["c d"]));
         assert_eq!(pasted.servers[1].scope, Some(Scope::User));
         // Every command on a line is read, and a mistyped one is named.
@@ -2566,11 +2567,42 @@ mod tests {
             pasted.notes,
             ["Skipped a line that is not a claude mcp add command: claude mcp ad c -- npx c"]
         );
+        // Nearby: more text between the two than in the first.
+        let pasted = Pasted::parse(
+            "Run `claude mcp add a -- x`, and once that is done and Claude Code has restarted, `claude mcp add b -- y`.",
+        )
+        .unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"], "{pasted:?}");
+        // A line of text that starts with a character that does not show is still text, and said to be skipped.
+        let pasted = Pasted::parse("\u{1b}[1mThen:\u{1b}[0m\nclaude mcp add y -- npx y").unwrap();
+        assert_eq!(
+            pasted.notes,
+            ["Skipped a line of other text."],
+            "{pasted:?}"
+        );
         // Shell inside the code is still the shell, and other code is other text.
         let s = one("`claude mcp add x -- node a.js | tee log`");
         assert!(s.problem.is_some_and(|p| p.contains("|")) && s.json.is_empty());
         let pasted = Pasted::parse("`npm install -g x`\nclaude mcp add y -- npx y").unwrap();
         assert_eq!(pasted.notes, ["Skipped a line of other text."]);
+    }
+
+    #[test]
+    fn what_ends_a_word_only_at_its_start_stays_inside_one() {
+        // A `#` starts a comment and a long dash is typography only where a word starts; inside a word both are
+        // characters of it.
+        let s = one("claude mcp add x -- node a#b a\u{2013}b");
+        assert_eq!(s.problem, None, "{s:?}");
+        assert_eq!(json_of(&s)["args"], json!(["a#b", "a\u{2013}b"]));
+        // Parentheses need a shell, like a pipe.
+        let s = one("claude mcp add x -- node (a)");
+        assert!(
+            s.problem
+                .as_deref()
+                .is_some_and(|p| p.contains("parentheses")),
+            "{s:?}"
+        );
     }
 
     #[test]

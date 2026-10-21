@@ -54,9 +54,19 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    Mutants on the changed lines: main 45 (5 missed); the branch before the tests 49 (the same 5 missed): an `-e`
    with nothing before `=`, an `-H` with no name, `--callback-port 0` (two), and `-e` on a remote server. A test now
    refuses each; with them 43 caught, 6 unviable, 0 missed. Merged in #87.
+6. `paste::lex_with` (215 lines, splitting pasted text into commands and words) becomes a `Lexer` with named steps:
+   `code_ended` (the end of Markdown inline code or a table cell), `pasted_line` and `not_claude` (what a pasted
+   line that is not a claude command becomes), `read` (one character), `single_quoted`, `double_quoted`, `plain`,
+   `needs_shell` and `finish`. The same steps in the same order. The paste speed tests take the same time as on main
+   (five runs each, 1.52 s and 1.50 s on average). Mutants on the changed lines: main 88 (8 missed), branch 103 (the
+   same 8, and one more that main's run counted as caught but is missed there too when tried by hand:
+   `from + start` to `from - start`). Tests now catch seven: the arguments of inline code, two commands with more
+   text between them than in the first, a line of text starting with an escape that does not show, `#` and a long
+   dash inside a word, and parentheses. Two are equivalent: `end + 1` to `end - 1` or `end * 1` where the next command
+   on the line is searched for, since its start is counted from wherever the search begins.
 
 ## Next
-6. The rest, file by file: `paste::lex_with`, `ops::use_profile`,
+7. The rest, file by file: `ops::use_profile`,
    `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
 
 ## Follow-ups for the owner (not in this slice)
