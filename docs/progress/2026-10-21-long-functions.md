@@ -27,12 +27,18 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    Duplicate; `applied`'s `signs_in && changed` and the "to each" guard (three mutants); `take_snapshot`'s
    `live_gen += 1` (a check cut off by a snapshot left the old explanation). Two are equivalent: `kept.is_empty()`
    guard (both arms give "Saved." for an empty `kept`), and `editor.moved` guard to `true` (an editor that did not
-   move only gets its own definition again, which rebases to the same text). Review: a comment repeating
-   `editor_after_change`'s doc dropped.
+   move only gets its own definition again, which rebases to the same text unless the file changed in between). Review: a comment repeating
+   `editor_after_change`'s doc dropped. Merged in #83 (8fdfb6c).
+3. `klefki-cli`'s `args::parse` (167 lines) in named steps: `parse` reads the command (33 lines),
+   `Options::read` the options and names after it (`None` when the help is asked for, so `-h` still answers at
+   once), `Options::into_cmd` checks they fit the command, `use_cmd` builds `use`. The same checks in the same
+   order with the same messages. Mutants on `args.rs`: main 76 (3 missed), branch the same three: an option given
+   as the command, `--force` on a command other than export, an empty `--project=`. A test now refuses each
+   (`list --force` added in review: the first version tested `list --output=x.json`, another line).
 
 ## Next
-3. Core's long functions, file by file: `inventory::build`, `ops::use_profile`, `paste::add`, `paste::lex_with`,
-   `restore::compare`, `cli args::parse`, `swap::run` last; the engine ideas from A2's review where they stay moves.
+4. The rest, file by file: `restore::compare`, `paste::add`, `paste::lex_with`, `ops::use_profile`,
+   `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
 
 ## Follow-ups for the owner (not in this slice)
 - From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…

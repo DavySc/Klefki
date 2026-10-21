@@ -158,148 +158,194 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usa
             ));
         }
     };
-    let status = kind == Kind::Status;
-    let mut names = Vec::new();
-    let mut json = false;
-    let mut claude = None;
-    let mut only_names = false;
-    let mut output = None;
-    let mut force = false;
-    let export = kind == Kind::Export;
-    let using = kind == Kind::Use;
-    let mut project = None;
-    let mut every = false;
-    let mut only = false;
-    let mut yes = false;
-    while let Some(arg) = args.next() {
-        // A path may not be text the platform can show; it is kept as given.
-        if !only_names
-            && status
-            && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--claude="))
-        {
-            claude = Some(claude_path(Some(path.into()))?);
-            continue;
-        }
-        if !only_names
-            && export
-            && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--output="))
-        {
-            set_output(&mut output, Some(path.into()))?;
-            continue;
-        }
-        if !only_names
-            && using
-            && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--project="))
-        {
-            set_project(&mut project, Some(path.into()))?;
-            continue;
-        }
-        let arg = text(arg)?;
-        match arg.as_str() {
-            _ if only_names => names.push(arg),
-            "--" => only_names = true,
-            "--json" if kind == Kind::Export => {
-                return Err(bad("export always prints JSON; leave out --json".to_owned()));
-            }
-            "--json" if using => {
-                return Err(bad(
-                    "use prints the change for people; leave out --json".to_owned()
-                ));
-            }
-            "--json" => json = true,
-            "--project" if using => set_project(&mut project, args.next())?,
-            "--all" if using => every = true,
-            "--only" if using => only = true,
-            "-y" | "--yes" if using => yes = true,
-            "--project" | "--all" | "--only" | "-y" | "--yes" => {
-                return Err(bad(format!(
-                    "{arg} is only for use: {command} changes no project"
-                )));
-            }
-            "-h" | "--help" => return Ok(Cmd::Help),
-            "--claude" if status => claude = Some(claude_path(args.next())?),
-            "--claude" => {
-                return Err(bad(format!(
-                    "--claude is only for status: {command} starts no program"
-                )));
-            }
-            "-o" | "--output" if export => set_output(&mut output, args.next())?,
-            "--force" if export => force = true,
-            "-o" | "--output" | "--force" => {
-                let option = if arg == "--force" {
-                    "--force"
-                } else {
-                    "--output"
-                };
-                return Err(bad(format!(
-                    "{option} is only for export: {command} writes nothing"
-                )));
-            }
-            option if option.starts_with('-') && option.len() > 1 => {
-                return Err(bad(format!("unknown option {option}")));
-            }
-            _ => names.push(arg),
-        }
+    match Options::read(kind, &command, args)? {
+        // `-h` or `--help`: the help is the answer, whatever else is on the line after it.
+        None => Ok(Cmd::Help),
+        Some(options) => options.into_cmd(kind),
     }
-    Ok(match kind {
-        Kind::Status => Cmd::Status {
+}
+
+/// What follows the command on the line, before it is checked against the command.
+#[derive(Default)]
+struct Options {
+    names: Vec<String>,
+    json: bool,
+    claude: Option<PathBuf>,
+    output: Option<PathBuf>,
+    force: bool,
+    project: Option<PathBuf>,
+    every: bool,
+    only: bool,
+    yes: bool,
+}
+
+impl Options {
+    /// Reads the options and names after `command`; an option the command does not take is refused here. `None`
+    /// when the help is asked for.
+    fn read(
+        kind: Kind,
+        command: &str,
+        mut args: impl Iterator<Item = OsString>,
+    ) -> Result<Option<Self>, Usage> {
+        let status = kind == Kind::Status;
+        let export = kind == Kind::Export;
+        let using = kind == Kind::Use;
+        let mut o = Self::default();
+        let mut only_names = false;
+        while let Some(arg) = args.next() {
+            // A path may not be text the platform can show; it is kept as given.
+            if !only_names
+                && status
+                && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--claude="))
+            {
+                o.claude = Some(claude_path(Some(path.into()))?);
+                continue;
+            }
+            if !only_names
+                && export
+                && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--output="))
+            {
+                set_output(&mut o.output, Some(path.into()))?;
+                continue;
+            }
+            if !only_names
+                && using
+                && let Some(path) = arg.to_str().and_then(|a| a.strip_prefix("--project="))
+            {
+                set_project(&mut o.project, Some(path.into()))?;
+                continue;
+            }
+            let arg = text(arg)?;
+            match arg.as_str() {
+                _ if only_names => o.names.push(arg),
+                "--" => only_names = true,
+                "--json" if kind == Kind::Export => {
+                    return Err(bad("export always prints JSON; leave out --json".to_owned()));
+                }
+                "--json" if using => {
+                    return Err(bad(
+                        "use prints the change for people; leave out --json".to_owned()
+                    ));
+                }
+                "--json" => o.json = true,
+                "--project" if using => set_project(&mut o.project, args.next())?,
+                "--all" if using => o.every = true,
+                "--only" if using => o.only = true,
+                "-y" | "--yes" if using => o.yes = true,
+                "--project" | "--all" | "--only" | "-y" | "--yes" => {
+                    return Err(bad(format!(
+                        "{arg} is only for use: {command} changes no project"
+                    )));
+                }
+                "-h" | "--help" => return Ok(None),
+                "--claude" if status => o.claude = Some(claude_path(args.next())?),
+                "--claude" => {
+                    return Err(bad(format!(
+                        "--claude is only for status: {command} starts no program"
+                    )));
+                }
+                "-o" | "--output" if export => set_output(&mut o.output, args.next())?,
+                "--force" if export => o.force = true,
+                "-o" | "--output" | "--force" => {
+                    let option = if arg == "--force" {
+                        "--force"
+                    } else {
+                        "--output"
+                    };
+                    return Err(bad(format!(
+                        "{option} is only for export: {command} writes nothing"
+                    )));
+                }
+                option if option.starts_with('-') && option.len() > 1 => {
+                    return Err(bad(format!("unknown option {option}")));
+                }
+                _ => o.names.push(arg),
+            }
+        }
+        Ok(Some(o))
+    }
+
+    /// The command, once what was read fits together.
+    fn into_cmd(self, kind: Kind) -> Result<Cmd, Usage> {
+        let Self {
             names,
             json,
             claude,
-        },
-        Kind::List => Cmd::List { names, json },
-        Kind::Export if force && output.is_none() => {
-            return Err(bad(
-                "--force is only with --output: it lets the file be replaced".to_owned(),
-            ));
-        }
-        Kind::Export => Cmd::Export {
-            names,
             output,
             force,
-        },
-        Kind::Profiles if !names.is_empty() => {
+            project,
+            every,
+            only,
+            yes,
+        } = self;
+        Ok(match kind {
+            Kind::Status => Cmd::Status {
+                names,
+                json,
+                claude,
+            },
+            Kind::List => Cmd::List { names, json },
+            Kind::Export if force && output.is_none() => {
+                return Err(bad(
+                    "--force is only with --output: it lets the file be replaced".to_owned(),
+                ));
+            }
+            Kind::Export => Cmd::Export {
+                names,
+                output,
+                force,
+            },
+            Kind::Profiles if !names.is_empty() => {
+                return Err(bad(
+                    "profiles takes no names: it lists every profile".to_owned()
+                ));
+            }
+            Kind::Profiles => Cmd::Profiles { json },
+            Kind::Use => use_cmd(names, project, every, only, yes)?,
+        })
+    }
+}
+
+/// `use`: one profile, and one place to use it in.
+fn use_cmd(
+    names: Vec<String>,
+    project: Option<PathBuf>,
+    every: bool,
+    only: bool,
+    yes: bool,
+) -> Result<Cmd, Usage> {
+    let profile = match <[String; 1]>::try_from(names) {
+        Ok([profile]) => profile,
+        Err(names) if names.is_empty() => {
             return Err(bad(
-                "profiles takes no names: it lists every profile".to_owned()
+                "use needs the name of a profile; `klefki-cli profiles` lists them".to_owned(),
             ));
         }
-        Kind::Profiles => Cmd::Profiles { json },
-        Kind::Use => {
-            let profile = match <[String; 1]>::try_from(names) {
-                Ok([profile]) => profile,
-                Err(names) if names.is_empty() => {
-                    return Err(bad(
-                        "use needs the name of a profile; `klefki-cli profiles` lists them"
-                            .to_owned(),
-                    ));
-                }
-                Err(_) => {
-                    return Err(bad(
-                        "use takes one profile; put a name with spaces in quotes".to_owned(),
-                    ));
-                }
-            };
-            let place = match (project, every) {
-                (Some(_), true) => {
-                    return Err(bad(
-                        "--project or --all, not both: one project, or every one".to_owned(),
-                    ));
-                }
-                (Some(path), false) => Place::Project(path),
-                (None, true) => Place::Every,
-                (None, false) => Place::Here,
-            };
-            Cmd::Use {
-                profile,
-                place,
-                only,
-                yes,
-            }
+        Err(_) => {
+            return Err(bad(
+                "use takes one profile; put a name with spaces in quotes".to_owned(),
+            ));
         }
+    };
+    let place = match (project, every) {
+        (Some(_), true) => {
+            return Err(bad(
+                "--project or --all, not both: one project, or every one".to_owned(),
+            ));
+        }
+        (Some(path), false) => Place::Project(path),
+        (None, true) => Place::Every,
+        (None, false) => Place::Here,
+    };
+    Ok(Cmd::Use {
+        profile,
+        place,
+        only,
+        yes,
     })
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     List,
     Status,
@@ -530,5 +576,25 @@ mod tests {
         ] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_option_where_it_does_not_belong_is_named_in_the_refusal() {
+        let refused = |args: &[&str], why: &str| {
+            assert_eq!(p(args), Err(Usage::Bad(why.to_owned())), "{args:?}");
+        };
+        refused(&["-x"], "unknown option -x");
+        refused(
+            &["list", "--output=x.json"],
+            "unknown option --output=x.json",
+        );
+        refused(
+            &["list", "--force"],
+            "--force is only for export: list writes nothing",
+        );
+        refused(
+            &["use", "Writing", "--project="],
+            "--project needs the path of a project folder",
+        );
     }
 }
