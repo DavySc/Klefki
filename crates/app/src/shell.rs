@@ -4,12 +4,12 @@ use crate::command::{self, CommandPalette, Entry, shortcut};
 use crate::explain::Explanation;
 use crate::sign_in::{self, SignInView};
 use crate::theme::{self, ThemeChoice, Tone};
-use egui::{Align, Frame, Layout, Margin, RichText, Sense, Ui};
+use egui::{Frame, Margin, RichText, Sense, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
     Approval, Change, Command, ConnectionId, CopyFields, Core, Definition, Diagnosis, Event,
-    FileChoice, Hint, ImportFile, LegacyDisabled, PlanView, SaveError, Scope, Secret, ServerId,
-    ServerName, ServerRow, Snapshot, Status, Target, TransportKind, UpdateDownload, same_project,
+    FileChoice, Hint, ImportFile, PlanView, SaveError, Scope, Secret, ServerId, ServerName,
+    ServerRow, Snapshot, Status, Target, TransportKind, UpdateDownload, same_project,
     words::{self, capitalized},
 };
 use std::collections::{BTreeSet, HashMap};
@@ -23,6 +23,7 @@ mod editor;
 mod export;
 mod list;
 mod move_dialog;
+mod notices;
 mod outcome;
 mod places;
 mod review;
@@ -38,6 +39,7 @@ use editor::{Editor, EditorState, SecretView};
 use export::{ExportView, Saving};
 use list::{GridRow, group_of};
 use move_dialog::MoveForm;
+use notices::LegacyNotice;
 use outcome::{Outcome, OutcomeChoice};
 use places::places_in_words;
 use review::DiffTops;
@@ -1360,143 +1362,6 @@ impl ShellApp {
         ui.add_space(6.0);
     }
 
-    /// Projects with the switch-off list of older Claude Code versions: what is on because Claude Code no longer
-    /// reads it, and a button that moves it into the list it does read. Read-only until the user reviews the plan.
-    fn legacy_notice(&mut self, ui: &mut Ui) {
-        if self.snapshot.legacy_disabled.is_empty() {
-            return;
-        }
-        // Built once per snapshot, not every frame.
-        let notice = match &self.legacy_cache {
-            Some((for_snapshot, built)) if Arc::ptr_eq(for_snapshot, &self.snapshot) => {
-                built.clone()
-            }
-            _ => {
-                let built = Arc::new(LegacyNotice::new(&self.snapshot.legacy_disabled));
-                self.legacy_cache = Some((self.snapshot.clone(), built.clone()));
-                built
-            }
-        };
-        let pal = theme::palette(ui.ctx());
-        let can_migrate = self.core.is_some() && self.can_prepare() && notice.migratable;
-        let mut migrate = false;
-        Frame::new()
-            .stroke(egui::Stroke::new(1.0, pal.warn))
-            .corner_radius(6)
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(notice.title.as_str()).color(pal.warn));
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(
-                            "Older Claude Code versions kept switched-off servers in mcpServersDisabled. Claude Code no longer reads that list, so servers on it can be on again. Migrating moves them to the list it reads now.",
-                        )
-                        .color(pal.text_muted),
-                    )
-                    .wrap(),
-                );
-                for (line, path) in &notice.lines {
-                    ui.add(egui::Label::new(line.as_str()).wrap())
-                        .on_hover_text(path.as_str());
-                }
-                if let Some(more) = &notice.more {
-                    ui.label(RichText::new(more.as_str()).color(pal.text_muted));
-                }
-                migrate = ui
-                    .add_enabled(can_migrate, egui::Button::new("Migrate…"))
-                    .on_hover_text("Review the change before anything is written")
-                    .on_disabled_hover_text(if self.core.is_none() {
-                        "Not connected to the configuration"
-                    } else if !notice.migratable {
-                        "Only lists of server names can be migrated"
-                    } else {
-                        "Wait for the open change to finish"
-                    })
-                    .clicked();
-            });
-        ui.add_space(6.0);
-        if migrate {
-            self.migrate_legacy();
-        }
-    }
-
-    /// Servers a change took out and could not put back (Claude Code's command failed twice): Klefki kept their
-    /// definitions, and offers to add each back where it was, or to forget it.
-    fn kept_notice(&mut self, ui: &mut Ui) {
-        if self.snapshot.kept.is_empty() {
-            return;
-        }
-        let pal = theme::palette(ui.ctx());
-        let can = self.core.is_some() && self.can_prepare();
-        let mut chosen = None;
-        let out = self.snapshot.kept.iter().filter(|k| !k.back).count();
-        Frame::new()
-            .stroke(egui::Stroke::new(1.0, pal.warn))
-            .corner_radius(6)
-            .inner_margin(Margin::same(10))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let (title, body) = match out {
-                    0 => (
-                        "Klefki keeps settings Claude Code left out".to_owned(),
-                        "The server is back, but Claude Code did not keep all of its settings. Klefki keeps the whole definition until you forget it.",
-                    ),
-                    1 => (
-                        "A server is out of the configuration".to_owned(),
-                        "A change took it out and Claude Code could not put it back. Klefki kept its definition, with its client secret, so you can add it back where it was.",
-                    ),
-                    n => (
-                        format!("{n} servers are out of the configuration"),
-                        "A change took them out and Claude Code could not put them back. Klefki kept each definition, with its client secret, so you can add it back where it was.",
-                    ),
-                };
-                ui.label(RichText::new(title).color(pal.warn));
-                ui.add(egui::Label::new(RichText::new(body).color(pal.text_muted)).wrap());
-                let wait = "Wait for the open change to finish";
-                for kept in &self.snapshot.kept {
-                    ui.horizontal(|ui| {
-                        // The server first, then what can be done with it.
-                        let mut what = format!("{} {}", kept.name, kept.place);
-                        if kept.back {
-                            what.push_str(" is back without some settings");
-                        } else if kept.signs_in {
-                            what.push_str(" (signs in with OAuth)");
-                        }
-                        ui.add(egui::Label::new(what).truncate());
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if ui
-                                .add_enabled(can, egui::Button::new("Forget\u{2026}"))
-                                .on_hover_text("Delete Klefki's copy; the review says what is lost")
-                                .on_disabled_hover_text(wait)
-                                .clicked()
-                            {
-                                chosen = Some(Change::ForgetKept {
-                                    kept: kept.id.clone(),
-                                });
-                            }
-                            // Back already: only its fuller definition is left to forget.
-                            if !kept.back
-                                && ui
-                                .add_enabled(can, egui::Button::new("Put back"))
-                                .on_hover_text("Add it back where it was, after a review")
-                                .on_disabled_hover_text(wait)
-                                .clicked()
-                            {
-                                chosen = Some(Change::PutBack {
-                                    kept: kept.id.clone(),
-                                });
-                            }
-                        });
-                    });
-                }
-            });
-        ui.add_space(6.0);
-        if let Some(change) = chosen {
-            self.prepare(vec![change]);
-        }
-    }
-
     /// Everything the command palette offers right now: actions on the selection first, then the rest.
     pub(crate) fn commands(&self) -> Vec<Entry> {
         let mut out = Vec::new();
@@ -1822,22 +1687,6 @@ impl ShellApp {
                     self.start_sign_in(&s);
                 }
             }
-        }
-    }
-
-    /// Asks for one plan that moves every old switch-off list that can be moved.
-    fn migrate_legacy(&mut self) {
-        let changes: Vec<Change> = self
-            .snapshot
-            .legacy_disabled
-            .iter()
-            .filter(|l| !l.malformed)
-            .map(|l| Change::MigrateLegacyDisabled {
-                project: l.project.clone(),
-            })
-            .collect();
-        if self.core.is_some() && !changes.is_empty() {
-            self.prepare(changes);
         }
     }
 
@@ -2333,56 +2182,6 @@ fn names_in_a_line(names: &[&str]) -> String {
     words::and_list_upto(names, SHOWN, SHOWN)
 }
 
-/// What the notice about old switch-off lists says, for one snapshot.
-struct LegacyNotice {
-    title: String,
-    /// One line per project shown, with its full path for the hover.
-    lines: Vec<(String, String)>,
-    /// "… and N more" when there are more projects than lines.
-    more: Option<String>,
-    /// At least one list can be migrated (holds only names).
-    migratable: bool,
-}
-
-impl LegacyNotice {
-    fn new(lists: &[LegacyDisabled]) -> Self {
-        const SHOWN: usize = 4;
-        let title = if lists.len() == 1 {
-            "Old switch-off list in 1 project".to_owned()
-        } else {
-            format!("Old switch-off lists in {} projects", lists.len())
-        };
-        let lines = lists
-            .iter()
-            .take(SHOWN)
-            .map(|l| {
-                let folder = folder_name(&l.shown);
-                let line = if l.malformed {
-                    format!(
-                        "{folder}: holds something other than server names; edit it in .claude.json by hand"
-                    )
-                } else if l.names.is_empty() {
-                    format!("{folder}: an empty list")
-                } else {
-                    let state = match l.turns_off.as_slice() {
-                        [] => "already off".to_owned(),
-                        [one] => format!("{one} is on"),
-                        many => format!("{} are on", some_names(many)),
-                    };
-                    format!("{folder}: {} ({state})", some_names(&l.names))
-                };
-                (line, l.shown.clone())
-            })
-            .collect();
-        Self {
-            title: format!("{} {title}", icon::CLOCK_COUNTER_CLOCKWISE),
-            lines,
-            more: (lists.len() > SHOWN).then(|| format!("… and {} more", lists.len() - SHOWN)),
-            migratable: lists.iter().any(|l| !l.malformed),
-        }
-    }
-}
-
 /// Names joined with commas; past six, the first five and how many more, so a long list stays readable. Core's
 /// `ops::some_of` cuts the review's summary at the same count; keep the two alike.
 fn some_names(names: &[String]) -> String {
@@ -2533,97 +2332,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_cli_version_is_not_shown_as_a_claim() {
-        let mut h = harness_with(Snapshot::default());
-        h.run();
-        assert!(h.query_by_label_contains("Claude CLI").is_none());
-    }
-
-    #[test]
     fn sanitised_fixture_text_reaches_the_ui() {
         let mut h = harness();
         h.run();
         // The fixture target contains ANSI escapes; the UI must only see the clean text.
         h.get_by_label("missing command");
-    }
-
-    #[test]
-    fn theme_dropdown_offers_every_theme_and_switches_the_palette() {
-        use ThemeChoice::{Dark, Light, System};
-        let shown = |o: ThemeOption| format!("{} {}", o.icon(), o.label());
-        let mut h = harness();
-        h.run();
-        assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
-        let cool_dark = ThemeOption::new(Dark, Tone::Cool);
-
-        // Closed, the dropdown shows the current theme only (its value, in words: the icon is drawn but not read).
-        h.get_by_value(cool_dark.label());
-        assert!(h.query_by_label_contains("Light").is_none());
-        assert!(h.query_by_label_contains("System").is_none());
-
-        // Open, every theme is offered, each with its own icon, and the pick closes the list.
-        h.get_by_value(cool_dark.label()).click();
-        h.run();
-        for o in ThemeOption::ALL {
-            h.query_by_label_contains(&shown(o))
-                .unwrap_or_else(|| panic!("{} is not offered", o.label()));
-        }
-        h.get_by_label(&shown(ThemeOption::new(Light, Tone::Cool)))
-            .click();
-        h.run();
-        assert_eq!(h.state().theme, Light);
-        assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
-        assert!(
-            h.query_by_label_contains("Dark (warm)").is_none(),
-            "the list stays open after a pick"
-        );
-
-        // A warm one sets the greys too.
-        let warm_light = ThemeOption::new(Light, Tone::Warm);
-        h.get_by_value(ThemeOption::new(Light, Tone::Cool).label())
-            .click();
-        h.run();
-        h.get_by_label_contains(&shown(warm_light)).click();
-        h.run();
-        assert_eq!((h.state().theme, h.state().tone), (Light, Tone::Warm));
-        assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
-
-        // System with warm greys is one pick, and the closed dropdown says so.
-        h.get_by_value(warm_light.label()).click();
-        h.run();
-        let system_warm = ThemeOption::new(System, Tone::Warm);
-        h.get_by_label_contains(&shown(system_warm)).click();
-        h.run();
-        assert_eq!((h.state().theme, h.state().tone), (System, Tone::Warm));
-        h.get_by_value(system_warm.label());
-
-        // ... and back to cool greys in one pick.
-        h.get_by_value(system_warm.label()).click();
-        h.run();
-        h.get_by_label_contains(&shown(ThemeOption::new(System, Tone::Cool)))
-            .click();
-        h.run();
-        assert_eq!((h.state().theme, h.state().tone), (System, Tone::Cool));
-    }
-
-    #[test]
-    fn only_the_current_theme_has_a_check_mark() {
-        let current = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
-        let mut h = harness();
-        h.run();
-        h.get_by_value(current.label()).click();
-        h.run();
-        let checked = format!("{} {}  {}", current.icon(), current.label(), icon::CHECK);
-        h.get_by_label(&checked);
-        assert_eq!(
-            ThemeOption::ALL
-                .iter()
-                .filter(|o| h
-                    .query_by_label_contains(&format!("{}  {}", o.label(), icon::CHECK))
-                    .is_some())
-                .count(),
-            1
-        );
     }
 
     #[test]
@@ -2634,15 +2347,6 @@ mod tests {
         click(&mut h, "issue-tracker");
         h.get_by_label_contains("Secrets");
         assert_eq!(h.get_all_by_label("https://it.example.com/mcp").count(), 2);
-    }
-
-    #[test]
-    fn the_theme_choice_is_saved() {
-        use eframe::App as _;
-        let mut storage = crate::theme::tests::MemoryStorage::default();
-        let mut app = ShellApp::new(fixture_snapshot(), ThemeChoice::Light);
-        app.save(&mut storage);
-        assert_eq!(storage.0.get("theme").map(String::as_str), Some("light"));
     }
 
     #[test]
@@ -2657,22 +2361,6 @@ mod tests {
             h.run();
             let after = h.get_by_label(tab).rect();
             assert_eq!(before, after, "tab {tab} moved or resized on hover");
-        }
-    }
-
-    #[test]
-    fn dropdown_options_do_not_change_size_on_hover() {
-        let dark = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
-        let mut h = harness();
-        h.run();
-        h.get_by_value(dark.label()).click();
-        h.run();
-        for option in ["System (cool)", "Light (cool)", "Dark (warm)"] {
-            let before = h.get_by_label_contains(option).rect();
-            h.get_by_label_contains(option).hover();
-            h.run();
-            let after = h.get_by_label_contains(option).rect();
-            assert_eq!(before, after, "option {option} moved or resized on hover");
         }
     }
 
@@ -4802,132 +4490,6 @@ mod tests {
   "oauth": {"clientId": "acme-1", "callbackPort": 8123, "authServerMetadataUrl": "https://mcp.acme.com/v1/.well-known/oauth-authorization-server"}
 }"#;
 
-    // ---- the old switch-off list
-
-    fn legacy(
-        project: &str,
-        names: &[&str],
-        turns_off: &[&str],
-        malformed: bool,
-    ) -> LegacyDisabled {
-        LegacyDisabled {
-            project: project.to_owned(),
-            shown: project.to_owned(),
-            names: names.iter().map(|n| (*n).to_owned()).collect(),
-            turns_off: turns_off.iter().map(|n| (*n).to_owned()).collect(),
-            malformed,
-        }
-    }
-
-    fn legacy_harness(
-        lists: Vec<LegacyDisabled>,
-    ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
-        let (mut h, engine) = live_harness();
-        engine
-            .events
-            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
-                servers: vec![live_row("gw", Scope::User, None)],
-                projects: lists.iter().map(|l| l.project.clone()).collect(),
-                legacy_disabled: lists,
-                ..Snapshot::default()
-            })))
-            .unwrap();
-        h.run();
-        (h, engine)
-    }
-
-    #[test]
-    fn no_old_list_shows_no_notice() {
-        let (h, _engine) = legacy_harness(vec![]);
-        assert!(h.query_by_label_contains("old switch-off list").is_none());
-        assert!(h.query_by_label("Migrate…").is_none());
-    }
-
-    #[test]
-    fn the_old_list_is_shown_with_what_is_on_because_of_it() {
-        let (h, _engine) = legacy_harness(vec![
-            legacy("C:/Repos/WebApp", &["gw", "old"], &["gw"], false),
-            legacy("/home/x/api", &["a"], &[], false),
-            legacy("/srv/empty", &[], &[], false),
-        ]);
-        h.get_by_label_contains("Old switch-off lists in 3 projects");
-        h.get_by_label_contains("empty: an empty list");
-        h.get_by_label_contains("Claude Code no longer reads");
-        h.get_by_label_contains("WebApp: gw, old (gw is on)");
-        h.get_by_label_contains("api: a (already off)");
-    }
-
-    #[test]
-    fn migrating_asks_for_one_plan_covering_every_list_that_can_move() {
-        let (mut h, engine) = legacy_harness(vec![
-            legacy("C:/Repos/WebApp", &["gw", "x"], &["gw", "x"], false),
-            legacy("/bad", &["a"], &["a"], true),
-            legacy("/home/x/api", &["a"], &[], false),
-        ]);
-        h.get_by_label_contains("bad: holds something other than server names");
-        click(&mut h, "Migrate…");
-        let changes = duplicate_requested(&engine);
-        assert_eq!(
-            changes,
-            vec![
-                Change::MigrateLegacyDisabled {
-                    project: "C:/Repos/WebApp".into()
-                },
-                Change::MigrateLegacyDisabled {
-                    project: "/home/x/api".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn the_notice_is_built_once_per_snapshot() {
-        // Review of #16: its lines were formatted every frame.
-        let (mut h, engine) = legacy_harness(vec![legacy("/p", &["gw"], &["gw"], false)]);
-        let first = h.state().legacy_cache.as_ref().unwrap().1.clone();
-        h.run();
-        assert!(Arc::ptr_eq(
-            &first,
-            &h.state().legacy_cache.as_ref().unwrap().1
-        ));
-        engine
-            .events
-            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
-                legacy_disabled: vec![legacy("/q", &["x"], &[], false)],
-                ..Snapshot::default()
-            })))
-            .unwrap();
-        h.run();
-        let now = &h.state().legacy_cache.as_ref().unwrap().1;
-        assert!(!Arc::ptr_eq(&first, now));
-        h.get_by_label_contains("q: x (already off)");
-    }
-
-    #[test]
-    fn only_malformed_lists_cannot_be_migrated() {
-        let (h, _engine) = legacy_harness(vec![legacy("/bad", &["a"], &["a"], true)]);
-        assert!(h.get_by_label("Migrate…").accesskit_node().is_disabled());
-    }
-
-    #[test]
-    fn the_palette_offers_the_migration() {
-        let (mut h, engine) = legacy_harness(vec![legacy("/p", &["gw"], &["gw"], false)]);
-        let titles: Vec<String> = h.state().commands().into_iter().map(|e| e.title).collect();
-        assert!(
-            titles.iter().any(|t| t == "Migrate old switch-off lists"),
-            "{titles:?}"
-        );
-        h.state_mut()
-            .run(&egui::Context::default(), command::Action::MigrateLegacy);
-        assert_eq!(
-            duplicate_requested(&engine),
-            vec![Change::MigrateLegacyDisabled {
-                project: "/p".into()
-            }]
-        );
-        h.run();
-    }
-
     // ---- fix casing
 
     /// Gateway (user) and gateway (local in WebApp) differ only in case; `other` is fine.
@@ -5846,159 +5408,6 @@ mod tests {
         h.get_by_label(&format!("Move {name}"));
     }
 
-    // ---- kept
-
-    fn kept_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
-        let (mut h, engine) = live_harness();
-        let (a, _) = two_rows();
-        engine
-            .events
-            .send(Event::Snapshot(Arc::new(Snapshot {
-                servers: vec![a],
-                kept: vec![klefki_core::api::Kept {
-                    id: "1760000000000-0".into(),
-                    name: "sso".into(),
-                    place: "in WebApp".into(),
-                    signs_in: true,
-                    back: false,
-                }],
-                ..Snapshot::default()
-            })))
-            .unwrap();
-        h.run();
-        (h, engine)
-    }
-
-    #[test]
-    fn a_server_that_could_not_be_put_back_is_shown_and_can_be_put_back() {
-        let (mut h, engine) = kept_harness();
-        h.get_by_label("A server is out of the configuration");
-        h.get_by_label("sso in WebApp (signs in with OAuth)");
-        click(&mut h, "Put back");
-        assert_eq!(
-            duplicate_requested(&engine),
-            vec![Change::PutBack {
-                kept: "1760000000000-0".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn one_kept_server_is_spoken_of_as_one() {
-        let (h, _engine) = kept_harness();
-        h.get_by_label_contains("A change took it out and Claude Code could not put it back.");
-        assert!(h.query_by_label_contains("took them out").is_none());
-    }
-
-    #[test]
-    fn a_server_back_without_some_settings_offers_only_forget() {
-        // Cross-review round 2: the notice said it was out of the configuration while it was in the list, and Put
-        // back failed with "already exists there".
-        let (mut h, engine) = live_harness();
-        let (a, _) = two_rows();
-        engine
-            .events
-            .send(Event::Snapshot(Arc::new(Snapshot {
-                servers: vec![a],
-                kept: vec![klefki_core::api::Kept {
-                    id: "1760000000000-0".into(),
-                    name: "sso".into(),
-                    place: "in WebApp".into(),
-                    signs_in: true,
-                    back: true,
-                }],
-                ..Snapshot::default()
-            })))
-            .unwrap();
-        h.run();
-        h.get_by_label("Klefki keeps settings Claude Code left out");
-        h.get_by_label("sso in WebApp is back without some settings");
-        assert!(h.query_by_label("Put back").is_none());
-        assert!(
-            h.query_by_label_contains("out of the configuration")
-                .is_none()
-        );
-        // Forgetting it says what was let go of.
-        click(&mut h, "Forget\u{2026}");
-        assert_eq!(
-            duplicate_requested(&engine),
-            vec![Change::ForgetKept {
-                kept: "1760000000000-0".into()
-            }]
-        );
-        engine
-            .events
-            .send(Event::PlanReady(plan_view(7, &["- sso"], &[], false)))
-            .unwrap();
-        h.run();
-        engine
-            .events
-            .send(Event::Applied {
-                plan: 7,
-                changed: true,
-                backup: None,
-                notes: Vec::new(),
-            })
-            .unwrap();
-        h.run();
-        h.get_by_label("Klefki no longer keeps the definition of sso in WebApp.");
-    }
-
-    #[test]
-    fn a_kept_server_can_be_forgotten_after_a_review() {
-        let (mut h, engine) = kept_harness();
-        click(&mut h, "Forget\u{2026}");
-        assert_eq!(
-            duplicate_requested(&engine),
-            vec![Change::ForgetKept {
-                kept: "1760000000000-0".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn nothing_kept_shows_no_notice() {
-        let (h, _engine) = duplicate_harness();
-        assert!(
-            h.query_by_label_contains("out of the configuration")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn a_copy_is_selected_and_the_message_says_copied() {
-        let (mut h, engine) = duplicate_harness();
-        open_duplicate_of(&mut h, "beta");
-        click(&mut h, "Review");
-        engine
-            .events
-            .send(Event::PlanReady(plan_view(7, &["+ beta_copy"], &[], false)))
-            .unwrap();
-        h.run();
-        let mut rows = h.state().snapshot.servers.clone();
-        rows.push(live_row("beta_copy", Scope::Local, Some("C:/Repos/WebApp")));
-        engine
-            .events
-            .send(Event::Snapshot(Arc::new(Snapshot {
-                servers: rows,
-                projects: vec!["C:/Repos/WebApp".into(), "/home/me/notes".into()],
-                ..Snapshot::default()
-            })))
-            .unwrap();
-        engine
-            .events
-            .send(Event::Applied {
-                plan: 7,
-                changed: true,
-                backup: None,
-                notes: Vec::new(),
-            })
-            .unwrap();
-        h.run();
-        assert_eq!(h.state().selected, BTreeSet::from([3]));
-        h.get_by_label("Copied beta_copy in WebApp.");
-    }
-
     // ---- import
 
     /// An export of three servers: alpha (the user has one), docs (needs a variable) and notion (OAuth).
@@ -6906,6 +6315,7 @@ mod tests {
     mod export;
     mod list;
     mod move_dialog;
+    mod notices;
     mod outcome;
     mod review;
     mod settings;
