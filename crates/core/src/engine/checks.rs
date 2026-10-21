@@ -88,6 +88,14 @@ impl Queue {
         self.jobs.insert(at, Job { now: true, ..job });
     }
 
+    /// Drops the background checks still waiting of the servers in `edited`: they may not have said they were
+    /// checking, and a new check replaces each.
+    pub(super) fn drop_background_checks(&mut self, edited: &HashSet<crate::model::ConnectionId>) {
+        self.jobs.retain(|q| {
+            !(q.background && q.kind == JobKind::Check && edited.contains(&q.id.connection))
+        });
+    }
+
     /// Takes the other background checks waiting to run in `cwd`, to be answered by one `claude mcp list`. None when
     /// there are too few for a list to pay off: it starts every server of the folder, those not asked about too.
     fn take_mates(&mut self, cwd: &Path) -> Vec<Job> {

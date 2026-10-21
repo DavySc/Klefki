@@ -190,3 +190,20 @@ fn nothing_is_read_again_while_nothing_changes() {
     }
     assert!(snapshots(&later).is_empty(), "{later:#?}");
 }
+
+#[test]
+fn with_no_configuration_found_the_snapshot_says_so() {
+    let env = quiet_env(&serde_json::json!({}));
+    let core = start_with(
+        EngineConfig {
+            paths: None,
+            ..env.config()
+        },
+        || {},
+    );
+    let events = collect(&core, |e| !snapshots(e).is_empty());
+    assert_eq!(
+        snapshots(&events)[0].warnings,
+        ["Could not determine where Claude Code keeps its configuration."]
+    );
+}

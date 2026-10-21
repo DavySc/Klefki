@@ -272,9 +272,7 @@ fn queue_checks(
         .collect();
     if !jobs.is_empty() {
         let mut queue = lock(&shared.queue);
-        queue.jobs.retain(|q| {
-            !(q.background && q.kind == JobKind::Check && checking.contains(&q.id.connection))
-        });
+        queue.drop_background_checks(&checking);
         queue.add(jobs);
         drop(queue);
         shared.wake_workers.notify_all();
