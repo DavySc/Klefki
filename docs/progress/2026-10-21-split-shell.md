@@ -20,8 +20,14 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
 1. Export dialog: `shell/export.rs` (state, `export_dialog`, `open_export`, `can_export`, `export_rows`, the
    file-name selection, the live-region helper) and `shell/tests/export.rs` (16 tests and their three helpers).
    `shell.rs` 19,982 to 18,724 lines.
+   Merged in #73 (efee4bd).
+2. Move, Fix casing and the places list: `shell/move_dialog.rs` (`MoveForm`, `open_move`, `move_dialog`),
+   `shell/casing.rs` (`CasingForm`, `open_casing`, `casing_dialog`), `shell/places.rs` (`Places`, `Taken`, the tick
+   and radio rows Add, Import, Duplicate and Move share), and the tests of the move and fix casing sections.
+   `casing_harness` and `open_move_of` stay in `shell::tests`: the add and edit-form sections use them too.
+   `shell.rs` 18,724 to 17,690 lines.
 
-Next, one pull request each: Move and Fix casing, Duplicate, Add and Import, the review and outcome, the detail
+Next, one pull request each: Duplicate, Add and Import, the review and outcome, the detail
 panel, the server list, the top bar and toolbar.
 
 ## Checks
