@@ -19,7 +19,7 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
 ## Modules
 1. Export dialog: `shell/export.rs` (state, `export_dialog`, `open_export`, `can_export`, `export_rows`, the
    file-name selection, the live-region helper) and `shell/tests/export.rs` (18 tests and their two helpers).
-   `shell.rs` 19,982 to 18724 lines.
+   `shell.rs` 19,982 to 18,724 lines.
 
 Next, one pull request each: Move and Fix casing, Duplicate, Add and Import, the review and outcome, the detail
 panel, the server list, the top bar and toolbar.
