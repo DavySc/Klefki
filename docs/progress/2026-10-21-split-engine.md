@@ -31,8 +31,16 @@ moves, no golden file or look picture may change.
   compared each, whitespace, `pub(super)` and trailing commas aside, with the items of the new files: 430 and 430,
   the only differences the two doc links and the three closures above.
 
+## Review (#75, approved, no blocking findings)
+Non-blocking, each more than a move, so for a later slice:
+- `changes.rs` takes `kept_list`, `profiles_changed` and `reload_after_change` from `command_loop.rs`, which takes
+  `prepare` and `apply` from `changes.rs`: the reload helpers might sit better in a `reload.rs` or in `engine.rs`.
+- `claude_program` is in `checks.rs`, but `changes`, `diagnose` and `sign_in` use it too: perhaps `engine.rs`.
+- A `Plans::forget(id)` would let `Plans`' fields and `Stored` be private again.
+
 ## Checks
-See the pull request description.
+See the pull request description. After merging main (8f8b88f, B2): fmt, clippy `-D warnings`, `cargo test
+--workspace` (app 440, core 965, cli 25 + 43) and `cargo deny check`, all exit 0; no golden file or picture changed.
 
 ## Not run
 - Mutants: a pure move (docs/quality.md: rely on the unchanged tests and golden files).
