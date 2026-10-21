@@ -592,6 +592,8 @@ mod tests {
                 .0
                 .starts_with("https://github.com/DavySc/Klefki/releases/download/v0.2.0/")
         );
+        // Far above a real package (about 25 MB), and stopped there.
+        assert_eq!(asked[0].1, 256 * 1024 * 1024);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
