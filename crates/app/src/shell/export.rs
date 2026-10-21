@@ -1,6 +1,7 @@
 //! The Export dialog: the servers' definitions as a block to copy or save to a file.
 
-use super::{ShellApp, closed_on_purpose, keep_the_end, matches_search, names_in_a_line};
+use super::list::keep_the_end;
+use super::{ShellApp, closed_on_purpose, matches_search, names_in_a_line};
 use crate::theme;
 use egui::{RichText, Ui};
 use klefki_core::api::{Command, Exported};
