@@ -145,7 +145,8 @@ pub(crate) mod tests {
                 && GetAclInformation(
                     dacl,
                     (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
-                    u32::try_from(size_of::<ACL_SIZE_INFORMATION>()).unwrap_or(u32::MAX),
+                    u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
+                        .expect("a Win32 structure is far smaller than 4 GiB"),
                     AclSizeInformation,
                 ) != 0
                 && size.AceCount == 1

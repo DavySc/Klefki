@@ -709,7 +709,7 @@ impl Rig {
         }
     }
 
-    #[allow(clippy::print_stderr, reason = "opt-in test tracing, MACHINE_DEBUG=1")]
+    #[expect(clippy::print_stderr, reason = "opt-in test tracing, MACHINE_DEBUG=1")]
     fn next(&self) -> Event {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {

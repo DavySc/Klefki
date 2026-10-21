@@ -446,7 +446,8 @@ mod sys {
         let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot as RawHandle) };
         let snapshot = snapshot.as_raw_handle() as HANDLE;
         let mut entry = THREADENTRY32 {
-            dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(u32::MAX),
+            dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>())
+                .expect("a Win32 structure is far smaller than 4 GiB"),
             ..Default::default()
         };
         let mut resumed = false;
