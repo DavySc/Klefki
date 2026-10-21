@@ -804,14 +804,19 @@ fn profile_places<'s>(
 }
 
 /// What using a profile finds, server by server, in the places it is used in.
+#[derive(Default)]
 struct ProfileWalk<'s> {
+    /// The members still in the configuration.
     found: Vec<&'s crate::model::ConnectionId>,
     /// The members that load in a place it is used in, as shown, once each, by their place in the profile.
     here_names: Vec<(usize, String)>,
     /// Without `only`: other servers on there now, by (project, name as the file spells it).
     others_on: Vec<(String, String)>,
+    /// The members that load in none of the places, as "name (folder)".
     elsewhere: Vec<String>,
+    /// The members that are project servers not approved in a place they load in, as shown.
     unapproved: Vec<String>,
+    /// With `only`: other servers on there now, by (name as shown, project, name as the file spells it).
     turned_off: BTreeSet<(String, String, String)>,
     /// (project, name as the file spells it) and whether it goes off, in the order the servers are listed.
     switches: Vec<((String, String), bool)>,
@@ -828,17 +833,7 @@ impl<'s> ProfileWalk<'s> {
         only: bool,
         snapshot: &'s Snapshot,
     ) -> Self {
-        let mut walk = Self {
-            found: Vec::new(),
-            here_names: Vec::new(),
-            others_on: Vec::new(),
-            elsewhere: Vec::new(),
-            unapproved: Vec::new(),
-            turned_off: BTreeSet::new(),
-            switches: Vec::new(),
-            off_before: Vec::new(),
-            loaded_here: Vec::new(),
-        };
+        let mut walk = Self::default();
         for row in &snapshot.servers {
             walk.server(row, members, places, only);
         }
