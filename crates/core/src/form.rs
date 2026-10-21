@@ -4,6 +4,7 @@ use crate::api::TransportKind;
 use crate::config::entry;
 use crate::paste::{self, PastedServer};
 use crate::sanitize::sanitize;
+use crate::words::sentence;
 use serde_json::{Map, Value};
 
 /// A new server's parts, as typed. Empty rows of `env` and `headers` are left out.
@@ -350,19 +351,6 @@ fn address_problem(entry: &Map<String, Value>) -> Result<(), String> {
         return Err("Start the address with https://.".to_owned());
     }
     entry::validate(&Value::Object(entry.clone())).map_err(|why| sentence(&why))
-}
-
-pub(crate) fn sentence(why: &str) -> String {
-    let mut c = why.chars();
-    let mut out: String = c
-        .next()
-        .map(|f| f.to_uppercase().collect())
-        .unwrap_or_default();
-    out.push_str(c.as_str());
-    if !out.ends_with('.') {
-        out.push('.');
-    }
-    out
 }
 
 /// The label of the host that names the service: `linear` in `mcp.linear.app`, `githubcopilot` in

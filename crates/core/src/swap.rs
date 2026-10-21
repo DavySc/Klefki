@@ -118,7 +118,7 @@ impl Spot {
 pub(crate) fn place(project: Option<&str>) -> String {
     match project {
         None => "for the user".to_owned(),
-        Some(p) => format!("in {}", sanitize(&crate::ops::folder_name(p))),
+        Some(p) => format!("in {}", sanitize(crate::words::folder_name(p))),
     }
 }
 
@@ -248,7 +248,7 @@ fn dropped(entry: &Value) -> Vec<String> {
 /// gone, or (on Unix) the key reaches the folder through a link, and Claude Code files a server under the folder
 /// itself, so the server would land under another key.
 fn folder_problem(project: &str) -> Option<String> {
-    let folder = sanitize(&crate::ops::folder_name(project));
+    let folder = sanitize(crate::words::folder_name(project));
     let path = Path::new(project);
     if !path.is_dir() {
         return Some(format!(

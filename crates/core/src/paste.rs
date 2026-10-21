@@ -375,16 +375,11 @@ fn shell_named(verb: &str, rest: &[&str]) -> String {
 
 /// `names`, each written by `show`, for a note: a long list names the first few and counts the rest.
 pub(crate) fn listed(names: &[String], show: impl Fn(&str) -> String) -> String {
-    let shown = named(names.len(), MAX_NAMES_SHOWN);
-    let mut text = names[..shown]
+    let shown: Vec<String> = names[..named(names.len(), MAX_NAMES_SHOWN)]
         .iter()
         .map(|n| show(n))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.len() > shown {
-        text.push_str(&format!(" and {} more", names.len() - shown));
-    }
-    text
+        .collect();
+    crate::words::and_more(&shown, names.len())
 }
 
 /// Whether a skipped command starts with claude, or has `claude mcp` in it (`sudo claude mcp add …`): most likely a
