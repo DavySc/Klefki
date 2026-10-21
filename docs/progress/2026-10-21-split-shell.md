@@ -57,11 +57,21 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
    Merged in #79 (2315e63).
 7. Server list: `shell/list.rs` (`GridRow`, `Group`, `Badge`, the row wording constants and functions such as
    `status_cell`, `badge`, `keep_the_end`, `shadowed_text`, `in_projects_text`, then `grid_rows`,
-   `cached_grid_rows`, `grid`) and the section "the toggle is per project; project servers have an approval" as
-   `shell/tests/list.rs` (13 tests, its heading now the file comment). Detail and Export take the names they use from
-   `super::list`. `shell.rs` 9,422 to 8,336 lines.
+   `cached_grid_rows`, `grid`) and `shell/tests/list.rs` (13 tests: the section "the toggle is per project; project
+   servers have an approval", whose heading is now the file comment, and three grid tests from earlier in
+   `shell::tests`). Detail and Export take the names they use from `super::list`. `shell.rs` 9,422 to 8,336 lines.
+   Merged in #80 (b1f0282). Review: `replaced_by_organisation` and `managed_read_only`, which had come along with the
+   constants, now sit beside `not_checked` (in part 8's pull request). For A4: `managed_read_only`'s doc comment says
+   "a plugin's server" where it means the organisation's, as on main.
+8. Top bar, toolbar and Settings: `shell/top_bar.rs` (`bar_frame`, `search_id`, `top_bar` and the update
+   methods), `shell/toolbar.rs` (`Tool`, `toolbar`) and `shell/settings.rs` (`settings`, `update_settings`), with
+   their tests (14, 6 and 5). The headings "settings: appearance" and "updates (decision 009)" are now the test
+   files' comments. Test lines one indent shallower that now fit are joined by `cargo fmt`. `shell.rs` 8,336 to
+   6,914 lines: `ShellApp`, its routing (`apply_event`, `show`, the commands) and the shared helpers and tests.
 
-Next, one pull request: the top bar, toolbar and Settings.
+This is the last part of A1. Left for A4 or later, from the reviews: moving each dialog's `apply_event` arm into its
+module so its fields can be private again; `outcome_toast`'s two stacked doc comments; `managed_read_only`'s doc
+comment; the Fix casing rename that is refused when both spellings are in one place.
 
 ## Checks
 See each pull request description.
