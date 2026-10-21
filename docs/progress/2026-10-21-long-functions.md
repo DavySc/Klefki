@@ -66,9 +66,17 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    next command on the line is searched for, are not equivalent (a panic inside a two-byte character; the closing
    backtick read as opening code) and gave a test for both, so all 9 are caught. Merged in #88.
 
+7. `ops::use_profile` (293 lines, using a profile) in named steps: `profile_places` (the project, or every one),
+   `ProfileWalk::of` and `server` (what each server is in each place: its switch, whether it is on now, held back,
+   elsewhere or not approved), `held`, `remember` (what stopping the profile puts back), `really_off`,
+   `left_as_they_are`, `not_approved` and `already_on`; `use_profile` (89 lines) writes the review in the same
+   order with the same words. Mutants on the changed lines: main 34 (3 missed), branch 64 (the same 3): whether a
+   switch that goes off hides a duplicate (two) and grouping the places of a member held back. Tests now catch each:
+   `a_duplicate_stays_out_while_what_it_repeats_stays_on`, `two_members_held_back_are_each_named`.
+
 ## Next
-7. The rest, file by file: `ops::use_profile`,
-   `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
+8. The rest, file by file: `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay
+   moves.
 
 ## Follow-ups for the owner (not in this slice)
 - From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…
