@@ -170,21 +170,27 @@ impl Env {
         }
     }
 
-    fn command(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_klefki-cli"));
-        cmd.args(args)
-            .env("CLAUDE_CONFIG_DIR", self.root().join("cfg"))
+    /// The environment every command runs with.
+    fn vars(&self) -> [(&'static str, PathBuf); 7] {
+        let root = self.root();
+        [
+            ("CLAUDE_CONFIG_DIR", root.join("cfg")),
             // The organisation's folder, not the machine's: empty unless a test writes `org/…`.
-            .env("KLEFKI_MANAGED_DIR", self.root().join("org"))
+            ("KLEFKI_MANAGED_DIR", root.join("org")),
             // Klefki's own folder (backups, profiles), not the machine's.
-            .env("KLEFKI_DATA_DIR", self.root().join("data"))
+            ("KLEFKI_DATA_DIR", root.join("data")),
             // Redirects the home folder on Linux and macOS. Windows finds it through the registry; a changed
             // `USERPROFILE` only breaks that lookup (CI: every user server "not checked: no home folder").
-            .env("HOME", self.root().join("home"))
-            .env("PATH", self.root().join("home").join(".local").join("bin"))
-            .env("FAKE_CLAUDE_SCENARIO", self.root().join("scenario.json"))
-            .env("FAKE_CLAUDE_LOG", self.root().join("log.jsonl"))
-            .stdin(Stdio::null());
+            ("HOME", root.join("home")),
+            ("PATH", root.join("home").join(".local").join("bin")),
+            ("FAKE_CLAUDE_SCENARIO", root.join("scenario.json")),
+            ("FAKE_CLAUDE_LOG", root.join("log.jsonl")),
+        ]
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_klefki-cli"));
+        cmd.args(args).envs(self.vars()).stdin(Stdio::null());
         cmd
     }
 
@@ -1463,4 +1469,363 @@ fn golden_output_of_every_command() {
     let after = after.replace(&project, "<project>");
     expect_test::expect_file!["golden/use-only-saved.txt"]
         .assert_eq(&format!("{saved}--- .claude.json after\n{after}\n"));
+}
+
+// ---- found by cargo-mutants (docs/quality.md): what no test checked before
+
+/// `program args` at a terminal: a pseudo-terminal is its stdin, stdout and stderr, so all it prints is one stream.
+#[cfg(unix)]
+struct Terminal {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn std::io::Write + Send>,
+    shown: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: std::thread::JoinHandle<()>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+#[cfg(unix)]
+impl Terminal {
+    /// Starts `program args` in `env`'s environment, from its folder.
+    fn start(env: &Env, program: &Path, args: &[&str]) -> Self {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::io::Read;
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 50,
+                cols: 400,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(args);
+        cmd.cwd(env.root());
+        for (name, value) in env.vars() {
+            cmd.env(name, value);
+        }
+        cmd.env("TERM", "dumb");
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        // Only the child holds the other end now, so the output ends when it does.
+        drop(pair.slave);
+        let shown = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut from = pair.master.try_clone_reader().unwrap();
+        let into = std::sync::Arc::clone(&shown);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = from.read(&mut buf) {
+                into.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let writer = pair.master.take_writer().unwrap();
+        Self {
+            child,
+            writer,
+            shown,
+            reader,
+            _master: pair.master,
+        }
+    }
+
+    /// Everything shown so far, with the terminal's line ends as `\n`.
+    fn shown(&self) -> String {
+        String::from_utf8_lossy(&self.shown.lock().unwrap()).replace("\r\n", "\n")
+    }
+
+    fn type_in(&mut self, text: &str) {
+        self.writer.write_all(text.as_bytes()).unwrap();
+        self.writer.flush().unwrap();
+    }
+
+    /// Waits until `text` is shown.
+    fn wait_for(&self, text: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !self.shown().contains(text) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{text:?} was never shown:\n{}",
+                self.shown()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Waits for the program to end: its exit code and everything it showed, line ends and all.
+    fn finish(mut self) -> (u32, String) {
+        let code = self.child.wait().unwrap().exit_code();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.reader.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let shown = String::from_utf8_lossy(&self.shown.lock().unwrap()).into_owned();
+        (code, shown)
+    }
+}
+
+#[cfg(unix)]
+fn klefki_cli() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_klefki-cli"))
+}
+
+/// At a terminal, `export --output` asks before it replaces a file, and replaces it only on a yes.
+#[cfg(unix)]
+#[test]
+fn export_at_a_terminal_asks_before_replacing_a_file() {
+    let env = Env::new();
+    let file = env.root().join("servers.json");
+    let path = file.to_string_lossy().into_owned();
+    for (answer, code, kept) in [("n", 4, true), ("", 4, true), ("Yes", 0, false)] {
+        std::fs::write(&file, "old").unwrap();
+        let mut term = Terminal::start(&env, klefki_cli(), &["export", "alpha", "-o", &path]);
+        term.wait_for(&format!("{path} is there already. Replace it? [y/N] "));
+        term.type_in(&format!("{answer}\r"));
+        let (got, shown) = term.finish();
+        assert_eq!(got, code, "{answer:?}: {shown}");
+        let now = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(now == "old", kept, "{answer:?}: {now}\n{shown}");
+        if kept {
+            assert!(shown.contains("add --force to replace it"), "{shown}");
+        } else {
+            assert!(shown.contains(&format!("Saved alpha to {path}")), "{shown}");
+        }
+    }
+}
+
+/// Asked only when someone can both read the question and answer it: with only the input at a terminal, an answer
+/// typed ahead is not taken for a yes.
+#[cfg(unix)]
+#[test]
+fn export_does_not_ask_when_only_the_input_is_a_terminal() {
+    let env = Env::new();
+    let file = env.root().join("servers.json");
+    std::fs::write(&file, "old").unwrap();
+    let path = file.to_string_lossy().into_owned();
+    // The shell sends stderr to a file and starts klefki-cli in its place.
+    let script = "exec \"$0\" \"$@\" 2>err.txt";
+    let cli = klefki_cli().to_string_lossy().into_owned();
+    let mut term = Terminal::start(
+        &env,
+        Path::new("/bin/sh"),
+        &["-c", script, &cli, "export", "alpha", "-o", &path],
+    );
+    term.type_in("y\r");
+    let (code, shown) = term.finish();
+    let err = std::fs::read_to_string(env.root().join("err.txt")).unwrap();
+    assert_eq!(code, 4, "{shown}\n{err}");
+    assert!(!err.contains("Replace it?"), "{err}");
+    assert!(err.contains("add --force to replace it"), "{err}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "old");
+}
+
+/// At a terminal, `status` shows how far the checks are on one line, and clears it before the table.
+#[cfg(unix)]
+#[test]
+fn status_at_a_terminal_shows_its_progress_then_clears_it() {
+    let env = Env::new();
+    let fake = fake_claude().to_string_lossy().into_owned();
+    let term = Terminal::start(
+        &env,
+        klefki_cli(),
+        &["status", "--claude", &fake, "alpha", "beta"],
+    );
+    let (code, shown) = term.finish();
+    assert_eq!(code, 1, "{shown:?}");
+    assert!(
+        shown.contains("\rChecking 2 servers, waiting for "),
+        "{shown:?}"
+    );
+    assert!(shown.contains("Checked 2 of 2."), "{shown:?}");
+    // The clearing: spaces over the whole line, between two returns, before the table.
+    let cleared = shown
+        .find("Checked 2 of 2.")
+        .and_then(|at| shown[at..].find("\r ").map(|r| at + r))
+        .unwrap_or_else(|| panic!("never cleared: {shown:?}"));
+    let rest = &shown[cleared + 1..];
+    let spaces = rest.len() - rest.trim_start_matches(' ').len();
+    assert!(spaces >= "Checked 2 of 2.".len(), "{shown:?}");
+    assert!(rest[spaces..].starts_with('\r'), "{shown:?}");
+    assert!(
+        line_of(&rest.replace("\r\n", "\n"), "alpha").contains("Connected"),
+        "{shown:?}"
+    );
+
+    // One server: "server", not "servers".
+    let term = Terminal::start(&env, klefki_cli(), &["status", "--claude", &fake, "alpha"]);
+    let (code, shown) = term.finish();
+    assert_eq!(code, 0, "{shown:?}");
+    assert!(
+        shown.contains("\rChecking 1 server, waiting for alpha…"),
+        "{shown:?}"
+    );
+
+    // Nothing to check: no progress, and nothing to clear.
+    let term = Terminal::start(&env, klefki_cli(), &["status", "--claude", &fake, "delta"]);
+    let (code, shown) = term.finish();
+    assert_eq!(code, 0, "{shown:?}");
+    assert!(!shown.contains("Check"), "{shown:?}");
+    assert!(
+        !shown.contains("\r\r") && !shown.contains("\r "),
+        "{shown:?}"
+    );
+}
+
+/// At a terminal, `use` asks with the summary; a configuration changed while it waits is not overwritten, and says
+/// so at once.
+#[cfg(unix)]
+#[test]
+fn use_at_a_terminal_saves_on_yes_and_never_over_a_changed_file() {
+    let env = Env::new();
+    env.work();
+    let project = env.project();
+    let claude_json = env.root().join("cfg").join(".claude.json");
+    let args = ["use", "Work", "--project", &project, "--only"];
+
+    let mut term = Terminal::start(&env, klefki_cli(), &args);
+    term.wait_for("[y/N] ");
+    // Changed outside Klefki while the question is open, in what the change would do.
+    let mut changed = env.claude_json();
+    changed["projects"][&project]["disabledMcpServers"] = serde_json::json!(["delta", "beta"]);
+    let changed = serde_json::to_vec_pretty(&changed).unwrap();
+    std::fs::write(&claude_json, &changed).unwrap();
+    let asked = std::time::Instant::now();
+    term.type_in("y\r");
+    let (code, shown) = term.finish();
+    assert_eq!(code, 1, "{shown}");
+    assert!(shown.contains("klefki-cli: nothing was saved: "), "{shown}");
+    assert!(
+        asked.elapsed() < std::time::Duration::from_secs(30),
+        "the failure is told when it happens, not after a deadline: {shown}"
+    );
+    assert_eq!(std::fs::read(&claude_json).unwrap(), changed);
+
+    let mut term = Terminal::start(&env, klefki_cli(), &args);
+    term.wait_for("and turn off every other server there? [y/N] ");
+    term.type_in("y\r");
+    let (code, shown) = term.finish();
+    assert_eq!(code, 0, "{shown}");
+    assert!(
+        shown.contains("Saved. The files as they were are kept in "),
+        "{shown}"
+    );
+    assert_eq!(
+        env.disabled_in_project(),
+        ["beta", "delta", "docs", "remote"]
+    );
+}
+
+/// Everything means everything Klefki can export: the organisation's servers come with the machine and are left
+/// out unnamed. Named, one is tried, left out with the reason, and the exit code says so.
+#[test]
+fn export_leaves_the_organisations_servers_out_unless_named() {
+    let env = Env::new();
+    let org = env.root().join("org");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(
+        org.join("managed-settings.json"),
+        r#"{"managedMcpServers": {"wiki": {"type": "sse", "url": "https://wiki.example.com/sse"}}}"#,
+    )
+    .unwrap();
+    let out = env.run(&["export"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let block: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(block["mcpServers"].get("wiki").is_none(), "{block:#}");
+    assert!(block["mcpServers"].get("alpha").is_some(), "{block:#}");
+    assert!(!text(&out.stderr).contains("wiki"), "{}", text(&out.stderr));
+
+    let file = env.root().join("wiki.json");
+    let out = env.run(&["export", "wiki", "-o", &file.to_string_lossy()]);
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("note: Left out wiki: "), "{stderr}");
+    // Saved, though it holds none: not "Saved wiki".
+    assert!(stderr.contains("Saved 0 servers to"), "{stderr}");
+    let out = env.run(&["export", "wiki", "alpha"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+}
+
+/// What is wrong with the configuration is said on stderr, before the output.
+#[test]
+fn warnings_about_the_configuration_go_to_stderr() {
+    let env = Env::new();
+    std::fs::write(
+        env.root().join("Repo").join(".mcp.json"),
+        r#"{"mcpServers": {"docs": {"command": "a"}, "docs": {"command": "b"}}}"#,
+    )
+    .unwrap();
+    for args in [&["list"][..], &["export"], &["profiles"]] {
+        let out = env.run(args);
+        let stderr = text(&out.stderr);
+        assert!(
+            stderr.contains("warning: ") && stderr.contains("defines \"docs\" more than once"),
+            "{args:?}: {stderr}"
+        );
+        assert!(!text(&out.stdout).contains("warning"), "{args:?}");
+    }
+}
+
+/// Only a reader that went away is quiet; any other failure to write the output is an error.
+#[cfg(target_os = "linux")]
+#[test]
+fn output_that_cannot_be_written_is_an_error() {
+    let env = Env::new();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let out = env.command(&["list"]).stdout(full).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("klefki-cli: could not write the output: "),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// A name close to none: with no profiles yet, where to make one; otherwise, where to see them.
+#[test]
+fn use_with_an_unknown_profile_says_where_profiles_are() {
+    let env = Env::new();
+    let out = env.run(&["use", "Zzzzzzzzzz", "--all", "-y"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("there are none yet; make one on Klefki's Profiles page"),
+        "{stderr}"
+    );
+    env.work();
+    let out = env.run(&["use", "Zzzzzzzzzz", "--all", "-y"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(
+        stderr.contains("no profile is named \"Zzzzzzzzzz\"; `klefki-cli profiles` lists them"),
+        "{stderr}"
+    );
+}
+
+/// A project Claude Code knows by a link is found from the folder the link leads to.
+#[cfg(unix)]
+#[test]
+fn use_finds_a_project_known_by_a_link_from_its_real_folder() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    let link = env.root().join("Linked");
+    std::os::unix::fs::symlink(env.root().join("Repo"), &link).unwrap();
+    let link = link.to_string_lossy().into_owned();
+    // The configuration names the project by the link.
+    let mut config = env.claude_json();
+    let entry = config["projects"][env.project()].take();
+    config["projects"] = serde_json::json!({ link.clone(): entry });
+    std::fs::write(
+        env.root().join("cfg").join(".claude.json"),
+        serde_json::to_vec_pretty(&config).unwrap(),
+    )
+    .unwrap();
+    env.profiles(&[("Delta", &[(Scope::User, false, "delta")])]);
+    let out = env.run(&["use", "Delta", "--project", &env.project(), "-y"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let config = env.claude_json();
+    assert_eq!(
+        config["projects"][&link]["disabledMcpServers"],
+        serde_json::json!([]),
+        "{config:#}"
+    );
 }
