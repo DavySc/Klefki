@@ -1098,219 +1098,300 @@ pub(crate) fn lex(text: &str) -> Lexed {
 /// [`lex`], and with `pasted`, a line that does not start with `claude` is kept whole as one word, unread: it is
 /// prose or another program's command, and read, an apostrophe (`Don't`) would open a quote running to the end.
 fn lex_with(text: &str, pasted: bool) -> Lexed {
-    let mut commands: Vec<Words> = Vec::new();
-    let mut variables: Vec<String> = Vec::new();
-    let mut current = Words::default();
-    let mut word = String::new();
-    let mut in_word = false;
-    let mut chars = Cursor { rest: text };
-    // When pasting: where the line being read ends, found once per line (a line may hold many commands), and whether
-    // no command has started on it yet.
-    let mut line_end = 0;
-    let mut fresh = true;
-    // Where the Markdown inline code or table cell holding the command being read ends (`` `claude mcp add …` ``,
-    // `| claude mcp add … |`), and whether it is in a table.
-    let mut code_end: Option<(usize, bool)> = None;
-    let end_word = |current: &mut Words, word: &mut String, in_word: &mut bool| {
-        if *in_word {
-            current.words.push(std::mem::take(word));
-            *in_word = false;
-        }
+    let mut lexer = Lexer {
+        text,
+        pasted,
+        chars: Cursor { rest: text },
+        commands: Vec::new(),
+        variables: Vec::new(),
+        current: Words::default(),
+        word: String::new(),
+        in_word: false,
+        line_end: 0,
+        fresh: true,
+        code_end: None,
     };
-    let end_command = |commands: &mut Vec<Words>, current: &mut Words| {
-        if !current.words.is_empty() {
-            commands.push(std::mem::take(current));
-        }
-    };
-    while let Some(c) = chars.next() {
-        if let Some((end, table)) = code_end
-            && end == text.len() - chars.rest.len() - c.len_utf8()
-        {
-            // The command ends with its code or cell. The rest of the line is read for another one (a table's next
-            // cell starts at this pipe); the prose around them is not.
-            code_end = None;
-            end_word(&mut current, &mut word, &mut in_word);
-            end_command(&mut commands, &mut current);
-            let from = if table { end } else { end + c.len_utf8() };
-            chars.rest = match chained_claude(&text[from..line_end], table) {
-                Some((_, start, Chained::Enclosed(end))) => {
-                    code_end = Some((from + end, table));
-                    &text[from + start..]
-                }
-                _ => &text[line_end..],
-            };
+    while let Some(c) = lexer.chars.next() {
+        if lexer.code_ended(c) || lexer.pasted_line(c) {
             continue;
         }
-        if pasted && !in_word && current.words.is_empty() && !c.is_whitespace() {
-            // Slices of the text, never copies: a line is looked at once per command in it.
-            let at = text.len() - chars.rest.len() - c.len_utf8();
-            if at >= line_end {
-                line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
-            }
-            let line = &text[at..line_end];
-            if fresh {
-                if let Some(skip) = marker_len(line) {
-                    chars.rest = &text[at + skip..];
-                    continue;
-                }
-                let shows = |s: &str| !sanitize_line(s).trim().is_empty();
-                if is_fence(line) || !(shows(&line[..c.len_utf8()]) || shows(line)) {
-                    chars.rest = &text[line_end..];
-                    continue;
-                }
-                fresh = false;
-            }
-            if c == '`'
-                && let Some(end) = inline_claude(&line[1..])
-            {
-                code_end = Some((at + 1 + end, false));
-                continue;
-            }
-            if !"$#'\"\\`^".contains(c) && !is_claude(first_word(line)) {
-                if let Some(start) = run_by_package(line) {
-                    // `npx @anthropic-ai/claude-code mcp add …` is `claude mcp add …`.
-                    current.words.push("claude".to_owned());
-                    chars.rest = &text[at + start..];
-                    continue;
-                }
-                // Up to a claude command chained after it (`cd app && claude mcp add …`), which is read.
-                let table = c == '|';
-                let (skipped, next) = match chained_claude(line, table) {
-                    Some((end, start, Chained::Then)) => (&line[..end], at + start),
-                    Some((_, start, Chained::Shell(what))) => {
-                        // Read, so that it is refused saying why.
-                        current.shell = Some(what);
-                        chars.rest = &text[at + start..];
-                        continue;
-                    }
-                    Some((_, start, Chained::Enclosed(end))) => {
-                        // The text around it explains it: not a line of its own.
-                        code_end = Some((at + end, table));
-                        chars.rest = &text[at + start..];
-                        continue;
-                    }
-                    None => (line, line_end),
-                };
-                chars.rest = &text[next..];
-                let skipped = skipped.trim_end();
-                if !skipped.is_empty() {
-                    current.words.push(skipped.to_owned());
-                }
-                end_command(&mut commands, &mut current);
-                continue;
-            }
+        if let Some(what) = lexer.read(c) {
+            lexer.needs_shell(what);
         }
-        let shell: Option<&'static str> = match c {
+    }
+    lexer.finish()
+}
+
+/// What [`lex_with`] has read so far.
+struct Lexer<'a> {
+    text: &'a str,
+    pasted: bool,
+    chars: Cursor<'a>,
+    commands: Vec<Words>,
+    variables: Vec<String>,
+    current: Words,
+    word: String,
+    in_word: bool,
+    /// When pasting: where the line being read ends, found once per line (a line may hold many commands), and whether
+    /// no command has started on it yet.
+    line_end: usize,
+    fresh: bool,
+    /// Where the Markdown inline code or table cell holding the command being read ends (`` `claude mcp add …` ``,
+    /// `| claude mcp add … |`), and whether it is in a table.
+    code_end: Option<(usize, bool)>,
+}
+
+impl<'a> Lexer<'a> {
+    fn end_word(&mut self) {
+        if self.in_word {
+            self.current.words.push(std::mem::take(&mut self.word));
+            self.in_word = false;
+        }
+    }
+
+    fn end_command(&mut self) {
+        if !self.current.words.is_empty() {
+            self.commands.push(std::mem::take(&mut self.current));
+        }
+    }
+
+    /// Where `c`, just read, is in the text.
+    fn at(&self, c: char) -> usize {
+        self.text.len() - self.chars.rest.len() - c.len_utf8()
+    }
+
+    /// Whether `c` ends the Markdown code or table cell holding the command, which then ends too.
+    fn code_ended(&mut self, c: char) -> bool {
+        let Some((end, table)) = self.code_end else {
+            return false;
+        };
+        if end != self.at(c) {
+            return false;
+        }
+        // The command ends with its code or cell. The rest of the line is read for another one (a table's next
+        // cell starts at this pipe); the prose around them is not.
+        self.code_end = None;
+        self.end_word();
+        self.end_command();
+        let text = self.text;
+        let from = if table { end } else { end + c.len_utf8() };
+        self.chars.rest = match chained_claude(&text[from..self.line_end], table) {
+            Some((_, start, Chained::Enclosed(end))) => {
+                self.code_end = Some((from + end, table));
+                &text[from + start..]
+            }
+            _ => &text[self.line_end..],
+        };
+        true
+    }
+
+    /// When pasting, at the start of a command: whether `c` starts something skipped or kept unread (a list marker,
+    /// a fence, a blank line, prose, another program's command) or where a claude command starts later on the line.
+    fn pasted_line(&mut self, c: char) -> bool {
+        if !self.pasted || self.in_word || !self.current.words.is_empty() || c.is_whitespace() {
+            return false;
+        }
+        let text = self.text;
+        // Slices of the text, never copies: a line is looked at once per command in it.
+        let at = self.at(c);
+        if at >= self.line_end {
+            self.line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+        }
+        let line = &text[at..self.line_end];
+        if self.fresh {
+            if let Some(skip) = marker_len(line) {
+                self.chars.rest = &text[at + skip..];
+                return true;
+            }
+            let shows = |s: &str| !sanitize_line(s).trim().is_empty();
+            if is_fence(line) || !(shows(&line[..c.len_utf8()]) || shows(line)) {
+                self.chars.rest = &text[self.line_end..];
+                return true;
+            }
+            self.fresh = false;
+        }
+        if c == '`'
+            && let Some(end) = inline_claude(&line[1..])
+        {
+            self.code_end = Some((at + 1 + end, false));
+            return true;
+        }
+        if "$#'\"\\`^".contains(c) || is_claude(first_word(line)) {
+            return false;
+        }
+        self.not_claude(c, at, line);
+        true
+    }
+
+    /// A pasted line at `at` that does not start with `claude`: kept as one word, up to a claude command in it.
+    fn not_claude(&mut self, c: char, at: usize, line: &'a str) {
+        let text = self.text;
+        if let Some(start) = run_by_package(line) {
+            // `npx @anthropic-ai/claude-code mcp add …` is `claude mcp add …`.
+            self.current.words.push("claude".to_owned());
+            self.chars.rest = &text[at + start..];
+            return;
+        }
+        // Up to a claude command chained after it (`cd app && claude mcp add …`), which is read.
+        let table = c == '|';
+        let (skipped, next) = match chained_claude(line, table) {
+            Some((end, start, Chained::Then)) => (&line[..end], at + start),
+            Some((_, start, Chained::Shell(what))) => {
+                // Read, so that it is refused saying why.
+                self.current.shell = Some(what);
+                self.chars.rest = &text[at + start..];
+                return;
+            }
+            Some((_, start, Chained::Enclosed(end))) => {
+                // The text around it explains it: not a line of its own.
+                self.code_end = Some((at + end, table));
+                self.chars.rest = &text[at + start..];
+                return;
+            }
+            None => (line, self.line_end),
+        };
+        self.chars.rest = &text[next..];
+        let skipped = skipped.trim_end();
+        if !skipped.is_empty() {
+            self.current.words.push(skipped.to_owned());
+        }
+        self.end_command();
+    }
+
+    /// Reads `c` and what it starts; what in it needs a shell to run, if anything.
+    fn read(&mut self, c: char) -> Option<&'static str> {
+        match c {
             ' ' | '\t' | '\r' | '\u{a0}' | '\u{202f}' => {
-                end_word(&mut current, &mut word, &mut in_word);
+                self.end_word();
                 None
             }
             '\n' | ';' => {
-                end_word(&mut current, &mut word, &mut in_word);
-                end_command(&mut commands, &mut current);
-                fresh |= c == '\n';
+                self.end_word();
+                self.end_command();
+                self.fresh |= c == '\n';
                 None
             }
-            '&' if chars.next_if_eq(&'&').is_some() => {
-                end_word(&mut current, &mut word, &mut in_word);
-                end_command(&mut commands, &mut current);
+            '&' if self.chars.next_if_eq(&'&').is_some() => {
+                self.end_word();
+                self.end_command();
                 None
             }
             '&' => Some("&"),
             '|' => Some("a pipe, |"),
             '<' | '>' => Some("a redirect"),
             '(' | ')' => Some("parentheses"),
-            '#' if !in_word => {
-                while chars.next_if(|&n| n != '\n').is_some() {}
+            '#' if !self.in_word => {
+                while self.chars.next_if(|&n| n != '\n').is_some() {}
                 None
             }
-            '$' if !in_word && current.words.is_empty() && chars.peek() == Some(' ') => {
+            '$' if !self.in_word
+                && self.current.words.is_empty()
+                && self.chars.peek() == Some(' ') =>
+            {
                 // A prompt copied with the command.
                 None
             }
-            '\\' | '`' | '^' if continues_line(&mut chars) => None,
+            '\\' | '`' | '^' if continues_line(&mut self.chars) => None,
             '`' => Some("a substitution, `"),
             '\\' => {
-                in_word = true;
-                match chars.next_if(|n| " \t\"'\\$`&|;<>()#".contains(*n)) {
-                    Some(n) => word.push(n),
-                    None => word.push('\\'),
+                self.in_word = true;
+                match self.chars.next_if(|n| " \t\"'\\$`&|;<>()#".contains(*n)) {
+                    Some(n) => self.word.push(n),
+                    None => self.word.push('\\'),
                 }
                 None
             }
-            '\'' => {
-                in_word = true;
-                loop {
-                    match chars.next() {
-                        Some('\'') => break None,
-                        Some(n) => word.push(n),
-                        None => break Some("a quote that is not closed"),
-                    }
-                }
-            }
-            '"' => {
-                in_word = true;
-                loop {
-                    match chars.next() {
-                        Some('"') => break None,
-                        Some('\\') if continues_line(&mut chars) => {}
-                        Some('\\') => match chars.next_if(|n| "\"\\$`".contains(*n)) {
-                            Some(n) => word.push(n),
-                            None => word.push('\\'),
-                        },
-                        Some('`') => break Some("a substitution, `"),
-                        Some('$') => {
-                            if let Err(what) = variable(&mut chars, &mut word, &mut variables) {
-                                break Some(what);
-                            }
-                        }
-                        Some(n) => word.push(n),
-                        None => break Some("a quote that is not closed"),
-                    }
-                }
-            }
+            '\'' => self.single_quoted(),
+            '"' => self.double_quoted(),
             '$' => {
-                in_word = true;
-                variable(&mut chars, &mut word, &mut variables).err()
+                self.in_word = true;
+                variable(&mut self.chars, &mut self.word, &mut self.variables).err()
             }
             _ => {
-                // A single curly quote inside a word is an apostrophe (`O’Brien`).
-                let found = match c {
-                    '\u{201c}' | '\u{201d}' => Some(Typography::CurlyQuote),
-                    '\u{2018}' | '\u{2019}' if !in_word || word.ends_with('=') => {
-                        Some(Typography::CurlyQuote)
-                    }
-                    '\u{2013}' | '\u{2014}' if !in_word => Some(Typography::LongDash),
-                    _ => None,
-                };
-                if let Some(found) = found {
-                    current
-                        .typography
-                        .get_or_insert((found, current.words.len()));
-                }
-                in_word = true;
-                word.push(c);
+                self.plain(c);
                 None
             }
-        };
-        if let Some(what) = shell {
-            current.shell.get_or_insert(what);
-            while chars.next_if(|&n| n != '\n').is_some() {}
-            end_word(&mut current, &mut word, &mut in_word);
-            // Kept even without words, so a line that is only shell is skipped with a note, not silently.
-            if current.words.is_empty() {
-                current.words.push(String::new());
-            }
-            end_command(&mut commands, &mut current);
         }
     }
-    end_word(&mut current, &mut word, &mut in_word);
-    end_command(&mut commands, &mut current);
-    let mut seen = HashSet::new();
-    variables.retain(|v| seen.insert(v.clone()));
-    Lexed {
-        commands,
-        variables,
+
+    /// After `'`: the quoted text, as it is.
+    fn single_quoted(&mut self) -> Option<&'static str> {
+        self.in_word = true;
+        loop {
+            match self.chars.next() {
+                Some('\'') => break None,
+                Some(n) => self.word.push(n),
+                None => break Some("a quote that is not closed"),
+            }
+        }
+    }
+
+    /// After `"`: the quoted text, with its escapes and variables.
+    fn double_quoted(&mut self) -> Option<&'static str> {
+        self.in_word = true;
+        loop {
+            match self.chars.next() {
+                Some('"') => break None,
+                Some('\\') if continues_line(&mut self.chars) => {}
+                Some('\\') => match self.chars.next_if(|n| "\"\\$`".contains(*n)) {
+                    Some(n) => self.word.push(n),
+                    None => self.word.push('\\'),
+                },
+                Some('`') => break Some("a substitution, `"),
+                Some('$') => {
+                    if let Err(what) =
+                        variable(&mut self.chars, &mut self.word, &mut self.variables)
+                    {
+                        break Some(what);
+                    }
+                }
+                Some(n) => self.word.push(n),
+                None => break Some("a quote that is not closed"),
+            }
+        }
+    }
+
+    /// A character of a word, noting typography a web page put in place of a plain one.
+    fn plain(&mut self, c: char) {
+        // A single curly quote inside a word is an apostrophe (`O’Brien`).
+        let found = match c {
+            '\u{201c}' | '\u{201d}' => Some(Typography::CurlyQuote),
+            '\u{2018}' | '\u{2019}' if !self.in_word || self.word.ends_with('=') => {
+                Some(Typography::CurlyQuote)
+            }
+            '\u{2013}' | '\u{2014}' if !self.in_word => Some(Typography::LongDash),
+            _ => None,
+        };
+        if let Some(found) = found {
+            self.current
+                .typography
+                .get_or_insert((found, self.current.words.len()));
+        }
+        self.in_word = true;
+        self.word.push(c);
+    }
+
+    /// The command needs a shell to run (`what`): the rest of its line is not read.
+    fn needs_shell(&mut self, what: &'static str) {
+        self.current.shell.get_or_insert(what);
+        while self.chars.next_if(|&n| n != '\n').is_some() {}
+        self.end_word();
+        // Kept even without words, so a line that is only shell is skipped with a note, not silently.
+        if self.current.words.is_empty() {
+            self.current.words.push(String::new());
+        }
+        self.end_command();
+    }
+
+    fn finish(mut self) -> Lexed {
+        self.end_word();
+        self.end_command();
+        let mut seen = HashSet::new();
+        self.variables.retain(|v| seen.insert(v.clone()));
+        Lexed {
+            commands: self.commands,
+            variables: self.variables,
+        }
     }
 }
 
