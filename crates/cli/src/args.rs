@@ -581,4 +581,20 @@ mod tests {
             assert!(p(bad).is_err(), "{bad:?}");
         }
     }
+
+    #[test]
+    fn an_option_where_it_does_not_belong_is_named_in_the_refusal() {
+        let refused = |args: &[&str], why: &str| {
+            assert_eq!(p(args), Err(Usage::Bad(why.to_owned())), "{args:?}");
+        };
+        refused(&["-x"], "unknown option -x");
+        refused(
+            &["list", "--output=x.json"],
+            "unknown option --output=x.json",
+        );
+        refused(
+            &["use", "Writing", "--project="],
+            "--project needs the path of a project folder",
+        );
+    }
 }
