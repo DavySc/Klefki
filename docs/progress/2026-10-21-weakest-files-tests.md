@@ -51,7 +51,8 @@ file or look picture changed.
 ## Checks
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny
   check` on 3bacd8d: exit 0 (app 438, core 960, cli 25 + 43 tests). Again after merging main b88c21a (A3 wording
-  helpers): exit 0 (app 440, core 965, cli 25 + 43).
+  helpers): exit 0 (app 440, core 965, cli 25 + 43). After the review polish and merging main efee4bd (A1 split of
+  shell.rs): exit 0, same counts.
 - No file under `crates/core/src/engine/tests/golden`, `crates/cli/tests/golden` or
   `crates/app/src/shell/tests/look` differs from main.
 
