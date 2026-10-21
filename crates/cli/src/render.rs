@@ -2,7 +2,7 @@
 //! functions of the snapshot and the answers, so they are tested without running anything. All text in a snapshot
 //! and in the engine's answers is already sanitised by core.
 use klefki_core::api::{
-    Approval, Hint, NameError, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind,
+    Approval, Hint, NameError, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind, words,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -369,11 +369,7 @@ const PROJECTS_NAMED: usize = 3;
 
 /// `projects`, at most [`PROJECTS_NAMED`] of them by name, the rest counted.
 fn named(projects: &[String]) -> String {
-    let mut text = projects[..projects.len().min(PROJECTS_NAMED)].join(", ");
-    if projects.len() > PROJECTS_NAMED {
-        let _ = write!(text, " and {} more", projects.len() - PROJECTS_NAMED);
-    }
-    text
+    words::comma_list_upto(projects, PROJECTS_NAMED, PROJECTS_NAMED)
 }
 
 /// The state column: on, off, or not loaded (blocked, by policy, or connectors off, by the user's settings) wherever

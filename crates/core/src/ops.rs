@@ -10,6 +10,7 @@ use crate::profile_uses::Switch;
 use crate::sanitize::sanitize;
 use crate::secrets::Secret;
 use crate::swap::{self, Spot, Swap};
+use crate::words::{self, and_list, count, folder_name};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -336,7 +337,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             let (scope, project, old) = shown(id);
             let place = match (scope, project.as_deref()) {
                 (Scope::User, _) => " (user server)".to_owned(),
-                (_, Some(project)) => format!(" in {}", sanitize(&folder_name(project))),
+                (_, Some(project)) => format!(" in {}", sanitize(folder_name(project))),
                 (_, None) => String::new(),
             };
             return format!("Rename {old} to {}{place}", sanitize(name));
@@ -346,7 +347,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
                 .legacy_disabled
                 .iter()
                 .find(|l| l.project == *project);
-            let folder = sanitize(&folder_name(project));
+            let folder = sanitize(folder_name(project));
             return match legacy.map(|l| l.turns_off.as_slice()) {
                 Some([]) | None => format!("Remove the old switch-off list in {folder}"),
                 Some(names) => format!(
@@ -418,7 +419,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
         Change::Move { id, to } => {
             let to = match to {
                 Target::User => "the user".to_owned(),
-                Target::Local(p) => sanitize(&folder_name(p)),
+                Target::Local(p) => sanitize(folder_name(p)),
             };
             return format!("Move {} to {to}", shown(id).2);
         }
@@ -442,7 +443,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             }
             _ => " (user server)".to_owned(),
         },
-        (_, Some(project)) => format!(" in {}", sanitize(&folder_name(project))),
+        (_, Some(project)) => format!(" in {}", sanitize(folder_name(project))),
         (_, None) => String::new(),
     };
     format!("{verb} {name}{place}")
@@ -454,7 +455,7 @@ fn places(targets: &[Target]) -> String {
     let folders: Vec<String> = targets
         .iter()
         .filter_map(|t| match t {
-            Target::Local(p) => Some(sanitize(&folder_name(p))),
+            Target::Local(p) => Some(sanitize(folder_name(p))),
             Target::User => None,
         })
         .collect();
@@ -465,46 +466,11 @@ fn places(targets: &[Target]) -> String {
     }
 }
 
-/// `a`, `a and b`, `a, b and c`.
-pub(crate) fn and_list(items: &[String]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
-}
-
 /// Like [`and_list`], naming the first few and counting the rest, so a long list keeps the summary one line.
-/// The app's notice cuts names the same way (`shell::some_names`, which cannot call this); keep the two alike.
+/// The app's notice cuts names the same way (`shell::some_names`); keep the two alike.
 pub(crate) fn some_of(items: &[String]) -> String {
     const NAMED: usize = 5;
-    if items.len() <= NAMED + 1 {
-        return and_list(items);
-    }
-    format!(
-        "{} and {} more",
-        items[..NAMED].join(", "),
-        items.len() - NAMED
-    )
-}
-
-/// `1 project`, `3 projects`.
-pub(crate) fn count(n: usize, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
-    }
-}
-
-/// The last part of a project path: `C:/work/app` -> `app`.
-pub(crate) fn folder_name(path: &str) -> String {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    match trimmed.rsplit(['/', '\\']).next() {
-        Some(last) if !last.is_empty() => last.to_owned(),
-        // The root itself.
-        _ => path.to_owned(),
-    }
+    words::and_list_upto(items, NAMED + 1, NAMED)
 }
 
 /// The row `id` names and how the file spells it. Messages use the row's own (shown) name, never the caller's
@@ -604,7 +570,7 @@ fn stays_off(row: &ServerRow, out: &mut Resolved) {
     let mut named: Vec<String> = off
         .iter()
         .take(PROJECTS_NAMED)
-        .map(|p| sanitize(&folder_name(p)))
+        .map(|p| sanitize(folder_name(p)))
         .collect();
     if off.len() > PROJECTS_NAMED {
         named.push(count(off.len() - PROJECTS_NAMED, "more project"));
@@ -817,7 +783,7 @@ fn use_profile(
                 row.name,
                 row.project
                     .as_deref()
-                    .map(|p| sanitize(&folder_name(p)))
+                    .map(|p| sanitize(folder_name(p)))
                     .unwrap_or_default()
             ));
         }
@@ -1177,7 +1143,7 @@ pub(crate) fn no_longer_put_back(
             let at = if snapshot.projects.contains(&place) {
                 project_label(&place, snapshot)
             } else {
-                sanitize(&folder_name(&place))
+                sanitize(folder_name(&place))
             };
             format!(
                 "{profile} switched {} in {at}; after this, stopping {profile} leaves {} as you set {}.",
@@ -1274,7 +1240,7 @@ fn stop_profile(
         let at = if snapshot.projects.contains(&place) {
             project_label(&place, snapshot)
         } else {
-            sanitize(&folder_name(&place))
+            sanitize(folder_name(&place))
         };
         let one = servers.len() == 1;
         let names = and_list(&servers);
@@ -1339,7 +1305,7 @@ fn project_label(path: &str, snapshot: &Snapshot) -> String {
     if shared && !parent.is_empty() {
         sanitize(&format!("{name} ({parent})"))
     } else {
-        sanitize(&name)
+        sanitize(name)
     }
 }
 
@@ -1527,13 +1493,13 @@ fn move_server(
                 .projects
                 .iter()
                 .filter(|p| inventory::normalise_project(p) != inventory::normalise_project(there))
-                .map(|p| sanitize(&folder_name(p)))
+                .map(|p| sanitize(folder_name(p)))
                 .collect();
             if !others.is_empty() {
                 out.warnings.push(format!(
                     "{} will only be in {}: it is no longer there for you in {}.",
                     row.name,
-                    sanitize(&folder_name(there)),
+                    sanitize(folder_name(there)),
                     some_of(&others)
                 ));
             }
@@ -1597,7 +1563,7 @@ fn rename(
         .map_err(|e| format!("{:?} cannot be used as a server name: {e}.", sanitize(name)))?;
     let place = match &file.project {
         None => "for the user".to_owned(),
-        Some(p) => format!("in {}", sanitize(&folder_name(p))),
+        Some(p) => format!("in {}", sanitize(folder_name(p))),
     };
     if name == file.name {
         return Err(format!("{shown} is already called {new}."));
@@ -1626,7 +1592,7 @@ fn rename(
         let folder = other
             .project
             .as_deref()
-            .map(|p| sanitize(&folder_name(p)))
+            .map(|p| sanitize(folder_name(p)))
             .unwrap_or_default();
         match (&file.project, other.scope) {
             (None, Scope::Local | Scope::Project) => out.warnings.push(format!(
@@ -1639,7 +1605,7 @@ fn rename(
             )),
             (Some(p), Scope::User) => out.warnings.push(format!(
                 "In {}, {new} is used instead of the user server {new}.",
-                sanitize(&folder_name(p))
+                sanitize(folder_name(p))
             )),
             (Some(p), Scope::Project) if same_project(k, p) => {
                 out.warnings.push(format!(
@@ -1676,7 +1642,7 @@ fn rename(
 
 /// Moves a project's old switch-off list into the one Claude Code reads.
 fn migrate_legacy(project: &str, snapshot: &Snapshot, out: &mut Resolved) -> Result<(), String> {
-    let folder = sanitize(&folder_name(project));
+    let folder = sanitize(folder_name(project));
     let legacy = snapshot
         .legacy_disabled
         .iter()
@@ -1857,7 +1823,7 @@ fn new_places(
         };
         let place = match &to {
             None => "for the user".to_owned(),
-            Some(p) => format!("in {}", sanitize(&folder_name(p))),
+            Some(p) => format!("in {}", sanitize(folder_name(p))),
         };
         let same_place = |(r, k): &(&ServerRow, &FileKey)| match &to {
             None => r.scope == Scope::User,
@@ -1871,7 +1837,7 @@ fn new_places(
             let folder = other
                 .project
                 .as_deref()
-                .map(|p| sanitize(&folder_name(p)))
+                .map(|p| sanitize(folder_name(p)))
                 .unwrap_or_default();
             let scope = match other.scope {
                 Scope::User => "user",
@@ -1887,7 +1853,7 @@ fn new_places(
                 )),
                 (Some(p), Scope::User) => out.warnings.push(format!(
                     "In {}, {what} is used instead of the user server {new}.",
-                    sanitize(&folder_name(p))
+                    sanitize(folder_name(p))
                 )),
                 (Some(p), Scope::Project) if same_project(k.project.as_deref(), p) => {
                     out.warnings.push(format!(
@@ -1982,7 +1948,7 @@ fn add(
         {
             return Err(format!(
                 "The folder of {} is not there, and Claude Code adds a project's server from inside it.",
-                sanitize(&folder_name(project))
+                sanitize(folder_name(project))
             ));
         }
         // Shown as Claude Code writes it.
@@ -3431,26 +3397,6 @@ mod tests {
         )
         .unwrap();
         assert!(ignored_by_git(dir.path()));
-    }
-
-    #[test]
-    fn counts_read_naturally() {
-        assert_eq!(count(1, "project"), "1 project");
-        assert_eq!(count(0, "project"), "0 projects");
-        assert_eq!(count(3, "project"), "3 projects");
-    }
-
-    #[test]
-    fn folder_names_come_from_any_spelling() {
-        for (path, want) in [
-            ("C:/work/app", "app"),
-            ("c:\\work\\app\\", "app"),
-            ("/home/u/repo/", "repo"),
-            ("/", "/"),
-            ("C:/", "C:"),
-        ] {
-            assert_eq!(folder_name(path), want, "{path}");
-        }
     }
 }
 

@@ -233,8 +233,8 @@ fn compare(
                 let names: Vec<String> = project.servers.iter().map(|(n, _)| sanitize(n)).collect();
                 left_out.push(format!(
                     "{} in {}",
-                    ops::and_list(&names),
-                    sanitize(&ops::folder_name(&project.key))
+                    crate::words::and_list(&names),
+                    sanitize(crate::words::folder_name(&project.key))
                 ));
             }
             None => {}
@@ -259,7 +259,7 @@ fn compare(
             .map(|(n, _)| n.as_str())
             .filter(|n| before.is_none_or(|b| find(&b.servers, n).is_none()))
             .collect();
-        let folder = sanitize(&ops::folder_name(&project.key));
+        let folder = sanitize(crate::words::folder_name(&project.key));
         added.extend(
             new_local
                 .iter()
@@ -474,7 +474,7 @@ fn server(
                 out.warnings.push(format!(
                     "{} is {} now; putting it back {} keeps both.",
                     sanitize(name),
-                    ops::and_list(elsewhere),
+                    crate::words::and_list(elsewhere),
                     swap::place(project)
                 ));
             }
@@ -500,7 +500,7 @@ fn server(
                 "Change {} back {}: its {}",
                 sanitize(name),
                 swap::place(project),
-                ops::and_list(&differences(entry, current))
+                crate::words::and_list(&differences(entry, current))
             ));
             out.warnings.extend(secrets_lost(&words, entry, current));
         }

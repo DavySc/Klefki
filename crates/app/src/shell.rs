@@ -12,6 +12,7 @@ use klefki_core::api::{
     Exported, FileChoice, Hint, ImportFile, LegacyDisabled, Part, Pasted, PastedServer, PlanView,
     SaveError, Scope, Secret, ServerFields, ServerId, ServerName, ServerRow, Snapshot, Status,
     Target, TransportKind, UpdateCheck, UpdateDownload, same_project, secret_reference,
+    words::{self, capitalized, parent_folder},
 };
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -5822,7 +5823,7 @@ impl ShellApp {
             return;
         };
         if let Some(problem) = problem {
-            ui.add(egui::Label::new(RichText::new(sentence(problem)).color(pal.danger)).wrap());
+            ui.add(egui::Label::new(RichText::new(capitalized(problem)).color(pal.danger)).wrap());
         }
         let edited = text != original;
         let ready = edited && problem.is_none() && can_prepare;
@@ -7732,24 +7733,15 @@ fn nudged(ctx: &egui::Context, id: egui::Id) -> bool {
 fn name_problem(name: &str) -> Option<String> {
     ServerName::parse(name)
         .err()
-        .map(|e| sentence(&e.to_string()))
-}
-
-/// `text` with its first letter made upper case, as a sentence starts.
-fn sentence(text: &str) -> String {
-    let mut c = text.chars();
-    c.next()
-        .map(|f| f.to_uppercase().chain(c).collect())
-        .unwrap_or_default()
+        .map(|e| capitalized(&e.to_string()))
 }
 
 /// `a`, `a and b`, `a, b and c`; more than three are counted: `5 projects`.
 fn list_in_words(items: &[&str], noun: &str) -> String {
-    match items {
-        [] => String::new(),
-        [one] => (*one).to_owned(),
-        [rest @ .., last] if items.len() <= 3 => format!("{} and {last}", rest.join(", ")),
-        _ => format!("{} {noun}s", items.len()),
+    if items.len() <= 3 {
+        words::and_list(items)
+    } else {
+        words::count(items.len(), noun)
     }
 }
 
@@ -7852,19 +7844,7 @@ const COPIED_SECS: f64 = 4.0;
 /// `a, b and c`; past eight names, `a, b, … and 12 more`.
 fn names_in_a_line(names: &[&str]) -> String {
     const SHOWN: usize = 8;
-    match names {
-        [] => String::new(),
-        [one] => (*one).to_owned(),
-        _ if names.len() <= SHOWN => {
-            let (last, rest) = names.split_last().expect("not empty");
-            format!("{} and {last}", rest.join(", "))
-        }
-        _ => format!(
-            "{} and {} more",
-            names[..SHOWN].join(", "),
-            names.len() - SHOWN
-        ),
-    }
+    words::and_list_upto(names, SHOWN, SHOWN)
 }
 
 /// Width of the labels of the Duplicate dialog's address and sign-in fields.
@@ -8560,15 +8540,6 @@ fn place_mark(
     response
 }
 
-/// Where a project folder lives: `C:/work/app` -> `C:/work`. Empty for a root.
-fn parent_folder(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    match trimmed.rfind(['/', '\\']) {
-        Some(cut) if cut + 1 < trimmed.len() => &trimmed[..cut],
-        _ => "",
-    }
-}
-
 /// What the notice about old switch-off lists says, for one snapshot.
 struct LegacyNotice {
     title: String,
@@ -8619,26 +8590,20 @@ impl LegacyNotice {
     }
 }
 
-/// Names joined with commas; past the first few, only counted, so a long list stays readable. The app cannot use
-/// core's `ops::some_of`, which cuts the review's summary the same way; keep the two alike.
+/// Names joined with commas; past six, the first five and how many more, so a long list stays readable. Core's
+/// `ops::some_of` cuts the review's summary at the same count; keep the two alike.
 fn some_names(names: &[String]) -> String {
     const NAMED: usize = 5;
-    if names.len() <= NAMED + 1 {
-        return names.join(", ");
-    }
-    format!(
-        "{} and {} more",
-        names[..NAMED].join(", "),
-        names.len() - NAMED
-    )
+    words::comma_list_upto(names, NAMED + 1, NAMED)
 }
 
-/// The last part of a project path: `C:/work/app` -> `app`.
-fn folder_name(path: &str) -> &str {
+/// The last part of a project path: `C:/work/app` -> `app`. Unlike core's `words::folder_name`, a root gives an empty
+/// name, as the app has always shown it (the owner's call, 2026-10-21).
+pub(crate) fn folder_name(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
     match trimmed.rfind(['/', '\\']) {
-        Some(cut) if cut + 1 < trimmed.len() => &trimmed[cut + 1..],
-        _ => trimmed,
+        Some(cut) => &trimmed[cut + 1..],
+        None => trimmed,
     }
 }
 
@@ -8654,11 +8619,7 @@ fn group_of(s: &ServerRow) -> Group {
     }
     match (&s.scope, &s.project) {
         (scope, Some(p)) => {
-            let trimmed = p.trim_end_matches(['/', '\\']);
-            let (parent, folder) = match trimmed.rfind(['/', '\\']) {
-                Some(cut) if cut + 1 < trimmed.len() => (&trimmed[..cut], &trimmed[cut + 1..]),
-                _ => ("", trimmed),
-            };
+            let (parent, folder) = (parent_folder(p), folder_name(p));
             Group {
                 title: format!("{} · {folder}", scope.label()),
                 location: (!parent.is_empty()).then(|| parent.to_owned()),
@@ -9229,15 +9190,11 @@ fn plugin_on_text(p: &klefki_core::api::PluginInfo, project_count: usize) -> Str
         .iter()
         .map(|p| folder_name(p))
         .collect();
-    let mut text = format!(
+    format!(
         "in {} of {project_count} projects; off in {}",
         project_count.saturating_sub(off),
-        named.join(", ")
-    );
-    if off > SHADOWED_NAMED {
-        text.push_str(&format!(" and {} more", off - SHADOWED_NAMED));
-    }
-    text
+        words::and_more(&named, off)
+    )
 }
 
 /// At most this many projects are named where a server is shadowed; the rest are counted.
@@ -9285,10 +9242,7 @@ fn in_projects_text(projects: &[String], project_count: usize, all: bool) -> Str
         .iter()
         .map(|p| folder_name(p))
         .collect();
-    text.push_str(&named.join(", "));
-    if count > SHADOWED_NAMED {
-        text.push_str(&format!(" and {} more", count - SHADOWED_NAMED));
-    }
+    text.push_str(&words::and_more(&named, count));
     text
 }
 
@@ -11316,7 +11270,7 @@ mod tests {
             else {
                 panic!("an empty command is a problem");
             };
-            let problem = sentence(problem);
+            let problem = capitalized(problem);
             let rect = h.get_by_label(&problem).rect();
             let window = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
             assert!(
@@ -16669,6 +16623,58 @@ mod tests {
             names_in_a_line(&many),
             "s1, s2, s3, s4, s5, s6, s7, s8 and 2 more"
         );
+    }
+
+    #[test]
+    fn each_list_keeps_its_own_cut_off() {
+        let names = |n: usize| (0..n).map(|i| format!("s{i}")).collect::<Vec<_>>();
+        fn refs(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
+        assert_eq!(
+            names_in_a_line(&refs(&names(8))),
+            "s0, s1, s2, s3, s4, s5, s6 and s7"
+        );
+        assert_eq!(
+            names_in_a_line(&refs(&names(9))),
+            "s0, s1, s2, s3, s4, s5, s6, s7 and 1 more"
+        );
+        assert_eq!(some_names(&names(6)), "s0, s1, s2, s3, s4, s5");
+        assert_eq!(some_names(&names(7)), "s0, s1, s2, s3, s4 and 2 more");
+        assert_eq!(list_in_words(&refs(&names(3)), "server"), "s0, s1 and s2");
+        assert_eq!(list_in_words(&refs(&names(4)), "server"), "4 servers");
+        assert_eq!(
+            in_projects_text(&names(5), 9, false),
+            "in 5 of 9 projects: s0, s1, s2, s3, s4"
+        );
+        assert_eq!(
+            in_projects_text(&names(6), 9, true),
+            "in all 6 projects: s0, s1, s2, s3, s4 and 1 more"
+        );
+    }
+
+    #[test]
+    fn a_project_at_the_root_keeps_an_empty_name() {
+        let projects = vec!["/".to_owned(), "/home/me/app/".to_owned()];
+        assert_eq!(
+            in_projects_text(&projects, 3, false),
+            "in 2 of 3 projects: , app"
+        );
+        let group = group_of(&live_row("s", Scope::Local, Some("/")));
+        assert_eq!(group.title, "Local \u{b7} ");
+        assert_eq!(group.location, None);
+        let group = group_of(&live_row("s", Scope::Local, Some("C:\\work\\app\\")));
+        assert_eq!(group.title, "Local \u{b7} app");
+        assert_eq!(group.location.as_deref(), Some("C:\\work"));
+        for (path, folder) in [
+            ("/", ""),
+            ("\\", ""),
+            ("C:\\", "C:"),
+            ("a/b/", "b"),
+            ("", ""),
+        ] {
+            assert_eq!(folder_name(path), folder, "{path:?}");
+        }
     }
 
     /// Opens Export on `rows` (nothing selected) and fills it with `block`; the commands sent so far are drained.
