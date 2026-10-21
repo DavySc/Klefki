@@ -2028,7 +2028,14 @@ mod tests {
             entry["env"] = json!({"PAD": "x".repeat(bytes)});
             json!({"name": "a", "project": null, "entry": entry})
         };
-        world.keep("0000000000000001-0", &big(2 * entry::MAX_ENTRY_BYTES));
+        // Just under the limit, with the rest of the record around it.
+        world.keep("0000000000000001-0", &big(4 * entry::MAX_ENTRY_BYTES - 200));
+        let size =
+            std::fs::metadata(recovery_dir(&world.backup_dir).join("0000000000000001-0.json"))
+                .unwrap()
+                .len();
+        assert!(size <= MAX_RECOVERY_BYTES, "{size}");
+        assert!(size > 3 * entry::MAX_ENTRY_BYTES as u64, "{size}");
         assert!(Recovery::find(&world.backup_dir, "0000000000000001-0").is_ok());
         world.keep("0000000000000002-0", &big(4 * entry::MAX_ENTRY_BYTES));
         assert!(Recovery::find(&world.backup_dir, "0000000000000002-0").is_err());

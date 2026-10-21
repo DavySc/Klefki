@@ -1590,11 +1590,11 @@ fn export_at_a_terminal_asks_before_replacing_a_file() {
     }
 }
 
-/// Asked only when someone can both read the question and answer it: with only the input at a terminal, an answer
-/// typed ahead is not taken for a yes.
+/// Asked only when someone can both read the question and answer it: with stderr, where the question goes, not a
+/// terminal, an answer typed ahead is not taken for a yes.
 #[cfg(unix)]
 #[test]
-fn export_does_not_ask_when_only_the_input_is_a_terminal() {
+fn export_does_not_ask_when_its_question_would_not_be_seen() {
     let env = Env::new();
     let file = env.root().join("servers.json");
     std::fs::write(&file, "old").unwrap();
@@ -1639,6 +1639,17 @@ fn status_at_a_terminal_shows_its_progress_then_clears_it() {
         .find("Checked 2 of 2.")
         .and_then(|at| shown[at..].find("\r ").map(|r| at + r))
         .unwrap_or_else(|| panic!("never cleared: {shown:?}"));
+    // Each line covers the longer one before it: no leftover characters while it runs.
+    let lines: Vec<usize> = shown[..cleared]
+        .split('\r')
+        .filter(|l| !l.is_empty())
+        .map(|l| l.chars().count())
+        .collect();
+    assert!(lines.len() >= 3, "{shown:?}");
+    assert!(
+        lines.windows(2).all(|w| w[0] <= w[1]),
+        "{lines:?}: {shown:?}"
+    );
     let rest = &shown[cleared + 1..];
     let spaces = rest.len() - rest.trim_start_matches(' ').len();
     assert!(spaces >= "Checked 2 of 2.".len(), "{shown:?}");

@@ -43,6 +43,11 @@ file or look picture changed.
 - install and jsonspan: seen failing by hand against the mutants (`256 * 1024 + 1024` for the cap; `<=` in
   `value_end`).
 
+- Review (Opus cross-review, no blocking findings) polish folded in: the status progress line pads over a longer
+  earlier line (mutant `pad = 0` now fails `status_at_a_terminal_shows_its_progress_then_clears_it`), a kept
+  definition just under 4x the largest entry is read (mutant `3 *` in `MAX_RECOVERY_BYTES` now fails), and the
+  stderr-not-a-terminal test is named for what it shows. Both seen failing by hand.
+
 ## Checks
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny
   check` on 3bacd8d: exit 0 (app 438, core 960, cli 25 + 43 tests). Again after merging main b88c21a (A3 wording
