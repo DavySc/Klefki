@@ -499,7 +499,7 @@ pub(super) fn replaced_by_organisation(servers: &[ServerRow], org: &ServerRow) -
         .collect()
 }
 
-/// What the details say under a plugin's server.
+/// What the details say under a server the organisation's managed settings set.
 pub(super) fn managed_read_only(file: &str) -> String {
     format!(
         "Your organisation sets this server, in {file}. Klefki switches it on and off; only an administrator can \

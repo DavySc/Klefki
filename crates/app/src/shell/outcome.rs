@@ -67,7 +67,6 @@ fn outcome_frame(pal: &Palette, color: Color32) -> Frame {
 }
 
 impl ShellApp {
-    /// The banner for the last change.
     /// The outcome of the last change, as a small card in the bottom-right corner: it does not push the list
     /// around, a success fades after a few seconds, and a problem stays until dismissed.
     pub(super) fn outcome_toast(&mut self, ctx: &egui::Context) {

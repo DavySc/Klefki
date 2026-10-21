@@ -400,3 +400,114 @@ fn turning_automatic_checks_off_is_remembered() {
     eframe::App::save(h.state_mut(), &mut storage);
     assert!(!crate::updates::Updates::load(Some(&storage)).auto);
 }
+
+#[test]
+fn unknown_cli_version_is_not_shown_as_a_claim() {
+    let mut h = harness_with(Snapshot::default());
+    h.run();
+    assert!(h.query_by_label_contains("Claude CLI").is_none());
+}
+
+#[test]
+fn theme_dropdown_offers_every_theme_and_switches_the_palette() {
+    use ThemeChoice::{Dark, Light, System};
+    let shown = |o: ThemeOption| format!("{} {}", o.icon(), o.label());
+    let mut h = harness();
+    h.run();
+    assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
+    let cool_dark = ThemeOption::new(Dark, Tone::Cool);
+
+    // Closed, the dropdown shows the current theme only (its value, in words: the icon is drawn but not read).
+    h.get_by_value(cool_dark.label());
+    assert!(h.query_by_label_contains("Light").is_none());
+    assert!(h.query_by_label_contains("System").is_none());
+
+    // Open, every theme is offered, each with its own icon, and the pick closes the list.
+    h.get_by_value(cool_dark.label()).click();
+    h.run();
+    for o in ThemeOption::ALL {
+        h.query_by_label_contains(&shown(o))
+            .unwrap_or_else(|| panic!("{} is not offered", o.label()));
+    }
+    h.get_by_label(&shown(ThemeOption::new(Light, Tone::Cool)))
+        .click();
+    h.run();
+    assert_eq!(h.state().theme, Light);
+    assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
+    assert!(
+        h.query_by_label_contains("Dark (warm)").is_none(),
+        "the list stays open after a pick"
+    );
+
+    // A warm one sets the greys too.
+    let warm_light = ThemeOption::new(Light, Tone::Warm);
+    h.get_by_value(ThemeOption::new(Light, Tone::Cool).label())
+        .click();
+    h.run();
+    h.get_by_label_contains(&shown(warm_light)).click();
+    h.run();
+    assert_eq!((h.state().theme, h.state().tone), (Light, Tone::Warm));
+    assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
+
+    // System with warm greys is one pick, and the closed dropdown says so.
+    h.get_by_value(warm_light.label()).click();
+    h.run();
+    let system_warm = ThemeOption::new(System, Tone::Warm);
+    h.get_by_label_contains(&shown(system_warm)).click();
+    h.run();
+    assert_eq!((h.state().theme, h.state().tone), (System, Tone::Warm));
+    h.get_by_value(system_warm.label());
+
+    // ... and back to cool greys in one pick.
+    h.get_by_value(system_warm.label()).click();
+    h.run();
+    h.get_by_label_contains(&shown(ThemeOption::new(System, Tone::Cool)))
+        .click();
+    h.run();
+    assert_eq!((h.state().theme, h.state().tone), (System, Tone::Cool));
+}
+
+#[test]
+fn only_the_current_theme_has_a_check_mark() {
+    let current = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
+    let mut h = harness();
+    h.run();
+    h.get_by_value(current.label()).click();
+    h.run();
+    let checked = format!("{} {}  {}", current.icon(), current.label(), icon::CHECK);
+    h.get_by_label(&checked);
+    assert_eq!(
+        ThemeOption::ALL
+            .iter()
+            .filter(|o| h
+                .query_by_label_contains(&format!("{}  {}", o.label(), icon::CHECK))
+                .is_some())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn the_theme_choice_is_saved() {
+    use eframe::App as _;
+    let mut storage = crate::theme::tests::MemoryStorage::default();
+    let mut app = ShellApp::new(fixture_snapshot(), ThemeChoice::Light);
+    app.save(&mut storage);
+    assert_eq!(storage.0.get("theme").map(String::as_str), Some("light"));
+}
+
+#[test]
+fn dropdown_options_do_not_change_size_on_hover() {
+    let dark = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
+    let mut h = harness();
+    h.run();
+    h.get_by_value(dark.label()).click();
+    h.run();
+    for option in ["System (cool)", "Light (cool)", "Dark (warm)"] {
+        let before = h.get_by_label_contains(option).rect();
+        h.get_by_label_contains(option).hover();
+        h.run();
+        let after = h.get_by_label_contains(option).rect();
+        assert_eq!(before, after, "option {option} moved or resized on hover");
+    }
+}
