@@ -30,11 +30,11 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    move only gets its own definition again, which rebases to the same text unless the file changed in between). Review: a comment repeating
    `editor_after_change`'s doc dropped. Merged in #83 (8fdfb6c).
 3. `klefki-cli`'s `args::parse` (167 lines) in named steps: `parse` reads the command (33 lines),
-   `Options::read` the options and names after it, `Options::into_cmd` checks they fit the command, `use_cmd`
-   builds `use`. The same checks in the same order with the same messages; `-h` still answers at once (`read`
-   returns with `help` set, and `parse` answers Help before any later check).
-   Mutants on `args.rs`: main 76 (3 missed), branch 79 (3 missed, the same three); a test now kills each (an
-   option given as the command, `--output=` on `list`, an empty `--project=`).
+   `Options::read` the options and names after it (`None` when the help is asked for, so `-h` still answers at
+   once), `Options::into_cmd` checks they fit the command, `use_cmd` builds `use`. The same checks in the same
+   order with the same messages. Mutants on `args.rs`: main 76 (3 missed), branch the same three: an option given
+   as the command, `--force` on a command other than export, an empty `--project=`. A test now refuses each
+   (`list --force` added in review: the first version tested `list --output=x.json`, another line).
 
 ## Next
 4. The rest, file by file: `restore::compare`, `paste::add`, `paste::lex_with`, `ops::use_profile`,
