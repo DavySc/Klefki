@@ -201,45 +201,7 @@ fn compare(
     };
     out.summary
         .push(format!("Restore servers as they were on {when}"));
-    for (name, entry) in &then.user {
-        server(
-            None,
-            name,
-            entry,
-            find(&here.user, name),
-            &here.places_of(name, None),
-            folder_exists,
-            &mut out,
-        );
-    }
-    let mut left_out = Vec::new();
-    for project in &then.projects {
-        match here.project(&project.normal) {
-            Some(now) => {
-                for (name, entry) in &project.servers {
-                    let current = find(&now.servers, name);
-                    server(
-                        Some(&now.key),
-                        name,
-                        entry,
-                        current,
-                        &here.places_of(name, Some(&now.normal)),
-                        folder_exists,
-                        &mut out,
-                    );
-                }
-            }
-            None if !project.servers.is_empty() => {
-                let names: Vec<String> = project.servers.iter().map(|(n, _)| sanitize(n)).collect();
-                left_out.push(format!(
-                    "{} in {}",
-                    crate::words::and_list(&names),
-                    sanitize(crate::words::folder_name(&project.key))
-                ));
-            }
-            None => {}
-        }
-    }
+    let left_out = put_back(&then, &here, folder_exists, &mut out);
     // Added since: left as they are, switches included.
     let new_user: Vec<&str> = here
         .user
@@ -268,70 +230,142 @@ fn compare(
         let Some(before) = before else {
             continue;
         };
-        // Only the switches of servers the backup defines go back: one it does not (a repository's own server, say)
-        // was switched since by someone who meant it.
-        let keeps = |n: &String| {
-            !new_user.contains(&n.as_str())
-                && !new_local.contains(&n.as_str())
-                && (find(&then.user, n).is_some() || find(&before.servers, n).is_some())
-        };
-        let undefined: Vec<String> = before
-            .off
-            .iter()
-            .filter(|n| !project.off.contains(n))
-            .chain(project.off.iter().filter(|n| !before.off.contains(n)))
-            .filter(|n| find(&then.user, n).is_none() && find(&before.servers, n).is_none())
-            .filter(|n| !new_user.contains(&n.as_str()) && !new_local.contains(&n.as_str()))
-            .map(|n| sanitize(n))
-            .collect();
-        let off: Vec<&String> = before
-            .off
-            .iter()
-            .filter(|n| !project.off.contains(n))
-            .filter(|n| keeps(n))
-            .collect();
-        let on: Vec<&String> = project
-            .off
-            .iter()
-            .filter(|n| !before.off.contains(n))
-            .filter(|n| keeps(n))
-            .collect();
-        for (names, disabled) in [(&off, true), (&on, false)] {
-            out.claude.extend(names.iter().map(|n| Op::SetDisabled {
-                project: project.key.clone(),
-                name: (*n).clone(),
-                disabled,
-            }));
-        }
-        let shown = |names: &[&String]| {
-            ops::some_of(&names.iter().map(|n| sanitize(n)).collect::<Vec<_>>())
-        };
-        match (off.is_empty(), on.is_empty()) {
-            (true, true) => {}
-            (false, true) => out
-                .summary
-                .push(format!("Turn off {} in {folder}", shown(&off))),
-            (true, false) => out
-                .summary
-                .push(format!("Turn on {} in {folder}", shown(&on))),
-            (false, false) => out.summary.push(format!(
-                "Turn off {} in {folder}, and turn on {} there",
-                shown(&off),
-                shown(&on)
-            )),
-        }
-        match undefined.len() {
-            0 => {}
-            1 => out.summary.push(format!(
-                "Leave the switch of {} in {folder} as it is: the backup does not define that server",
-                undefined[0]
-            )),
-            _ => out.summary.push(format!(
-                "Leave the switches of {} in {folder} as they are: the backup does not define those servers",
-                ops::some_of(&undefined)
-            )),
+        switches(
+            &then, before, project, &new_user, &new_local, &folder, &mut out,
+        );
+    }
+    leave_added(&added, &mut out);
+    closing_notes(&left_out, &mut out);
+    Ok(out)
+}
+
+/// The servers the backup defines, put back or changed back where they were; what is left out because Claude Code no
+/// longer lists its project, said as `a and b in app`.
+fn put_back(
+    then: &Servers,
+    here: &Servers,
+    folder_exists: &dyn Fn(&str) -> bool,
+    out: &mut Resolved,
+) -> Vec<String> {
+    for (name, entry) in &then.user {
+        server(
+            None,
+            name,
+            entry,
+            find(&here.user, name),
+            &here.places_of(name, None),
+            folder_exists,
+            out,
+        );
+    }
+    let mut left_out = Vec::new();
+    for project in &then.projects {
+        match here.project(&project.normal) {
+            Some(now) => {
+                for (name, entry) in &project.servers {
+                    let current = find(&now.servers, name);
+                    server(
+                        Some(&now.key),
+                        name,
+                        entry,
+                        current,
+                        &here.places_of(name, Some(&now.normal)),
+                        folder_exists,
+                        out,
+                    );
+                }
+            }
+            None if !project.servers.is_empty() => {
+                let names: Vec<String> = project.servers.iter().map(|(n, _)| sanitize(n)).collect();
+                left_out.push(format!(
+                    "{} in {}",
+                    crate::words::and_list(&names),
+                    sanitize(crate::words::folder_name(&project.key))
+                ));
+            }
+            None => {}
         }
     }
+    left_out
+}
+
+/// The switches in one project the backup also has: those of servers the backup defines go back as they were; the
+/// others are said to stay.
+fn switches(
+    then: &Servers,
+    before: &Project,
+    project: &Project,
+    new_user: &[&str],
+    new_local: &[&str],
+    folder: &str,
+    out: &mut Resolved,
+) {
+    // Only the switches of servers the backup defines go back: one it does not (a repository's own server, say)
+    // was switched since by someone who meant it.
+    let keeps = |n: &String| {
+        !new_user.contains(&n.as_str())
+            && !new_local.contains(&n.as_str())
+            && (find(&then.user, n).is_some() || find(&before.servers, n).is_some())
+    };
+    let undefined: Vec<String> = before
+        .off
+        .iter()
+        .filter(|n| !project.off.contains(n))
+        .chain(project.off.iter().filter(|n| !before.off.contains(n)))
+        .filter(|n| find(&then.user, n).is_none() && find(&before.servers, n).is_none())
+        .filter(|n| !new_user.contains(&n.as_str()) && !new_local.contains(&n.as_str()))
+        .map(|n| sanitize(n))
+        .collect();
+    let off: Vec<&String> = before
+        .off
+        .iter()
+        .filter(|n| !project.off.contains(n))
+        .filter(|n| keeps(n))
+        .collect();
+    let on: Vec<&String> = project
+        .off
+        .iter()
+        .filter(|n| !before.off.contains(n))
+        .filter(|n| keeps(n))
+        .collect();
+    for (names, disabled) in [(&off, true), (&on, false)] {
+        out.claude.extend(names.iter().map(|n| Op::SetDisabled {
+            project: project.key.clone(),
+            name: (*n).clone(),
+            disabled,
+        }));
+    }
+    let shown =
+        |names: &[&String]| ops::some_of(&names.iter().map(|n| sanitize(n)).collect::<Vec<_>>());
+    match (off.is_empty(), on.is_empty()) {
+        (true, true) => {}
+        (false, true) => out
+            .summary
+            .push(format!("Turn off {} in {folder}", shown(&off))),
+        (true, false) => out
+            .summary
+            .push(format!("Turn on {} in {folder}", shown(&on))),
+        (false, false) => out.summary.push(format!(
+            "Turn off {} in {folder}, and turn on {} there",
+            shown(&off),
+            shown(&on)
+        )),
+    }
+    match undefined.len() {
+        0 => {}
+        1 => out.summary.push(format!(
+            "Leave the switch of {} in {folder} as it is: the backup does not define that server",
+            undefined[0]
+        )),
+        _ => out.summary.push(format!(
+            "Leave the switches of {} in {folder} as they are: the backup does not define those servers",
+            ops::some_of(&undefined)
+        )),
+    }
+}
+
+/// Servers added since the backup: left as they are, which the summary says.
+fn leave_added(added: &[String], out: &mut Resolved) {
     match added.len() {
         0 => {}
         1 => out.summary.push(format!(
@@ -340,9 +374,13 @@ fn compare(
         )),
         _ => out.summary.push(format!(
             "Leave {} as they are: they were added after this backup",
-            ops::some_of(&added)
+            ops::some_of(added)
         )),
     }
+}
+
+/// What a restore leaves out or does not touch, said once each.
+fn closing_notes(left_out: &[String], out: &mut Resolved) {
     if !left_out.is_empty() {
         out.notes.push(format!(
             "Not restored: {}. Claude Code no longer lists {}.",
@@ -372,7 +410,6 @@ fn compare(
         let mut seen = std::collections::HashSet::new();
         said.retain(|s| seen.insert(s.clone()));
     }
-    Ok(out)
 }
 
 /// Brings one server back to `entry`, its definition in the backup, from `current`, its definition now (`None` when
@@ -661,6 +698,69 @@ mod tests {
         let out = restore(&both, &both);
         assert!(out.claude.is_empty() && out.cli.is_empty() && out.swaps.is_empty());
         assert_eq!(out.summary.len(), 1);
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    #[test]
+    fn what_a_restore_leaves_is_said_whenever_it_writes_anything() {
+        let said = [
+            "Only servers and where they are switched off are restored.",
+            "Klefki keeps a copy of the configuration as it is now before it restores",
+            "A running Claude Code session may need a restart",
+        ];
+        let mut changed = sso();
+        changed["url"] = json!("https://sso.example.com/v2/mcp");
+        for (what, backup, now) in [
+            (
+                "written by Klefki",
+                json!({"mcpServers": {"gw": stdio("gw")}}),
+                json!({}),
+            ),
+            (
+                "added through Claude Code",
+                json!({"mcpServers": {"gone": sso()}}),
+                json!({}),
+            ),
+            (
+                "changed through Claude Code",
+                json!({"mcpServers": {"sso": sso()}}),
+                json!({"mcpServers": {"sso": changed}}),
+            ),
+        ] {
+            let out = restore(&backup, &now);
+            for note in said {
+                assert!(
+                    out.notes.iter().any(|n| n.starts_with(note)),
+                    "{what}: {note}: {:?}",
+                    out.notes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_server_added_since_is_left_as_it_is() {
+        let out = restore(
+            &json!({}),
+            &json!({"mcpServers": {"newer": stdio("newer")}}),
+        );
+        assert_eq!(
+            out.summary[1..],
+            ["Leave newer for the user as it is: it was added after this backup".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_project_gone_since_is_named_only_when_it_had_servers() {
+        let backup = json!({"projects": {
+            "/gone/empty": {"disabledMcpServers": ["gw"]},
+            "/gone/full": {"mcpServers": {"old": stdio("old")}}
+        }});
+        let out = restore(&backup, &json!({}));
+        assert_eq!(
+            out.notes,
+            ["Not restored: old in full. Claude Code no longer lists that project.".to_owned()]
+        );
     }
 
     #[test]
@@ -703,6 +803,15 @@ mod tests {
             out.summary
         );
         assert!(out.summary.contains(&"Turn on tool in b".to_owned()));
+        // The project's own server is named once, alone; newer, added since, is not among those left as they are.
+        assert!(
+            out.summary.contains(
+                &"Leave the switch of repo-server in a as it is: the backup does not define that server"
+                    .to_owned()
+            ),
+            "{:?}",
+            out.summary
+        );
         assert!(
             !out.claude
                 .iter()
