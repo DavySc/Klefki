@@ -49,7 +49,8 @@ pub fn count(n: usize, noun: &str) -> String {
     }
 }
 
-/// The last part of a project path: `C:/work/app` -> `app`. A root is named as it is written: `/`.
+/// The last part of a project path: `C:/work/app` -> `app`. A root is named as it is written: `/`. The app names
+/// a root project with its own copy, `shell::folder_name`, which leaves it empty (the owner's call): use that there.
 pub fn folder_name(path: &str) -> &str {
     let trimmed = path.trim_end_matches(['/', '\\']);
     match trimmed.rfind(['/', '\\']) {

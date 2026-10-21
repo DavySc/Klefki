@@ -467,7 +467,7 @@ fn places(targets: &[Target]) -> String {
 }
 
 /// Like [`and_list`], naming the first few and counting the rest, so a long list keeps the summary one line.
-/// The app's notice cuts names the same way (`shell::some_names`); keep the two alike.
+/// The app's notice cuts names at the same count, with commas only (`shell::some_names`); keep the two alike.
 pub(crate) fn some_of(items: &[String]) -> String {
     const NAMED: usize = 5;
     words::and_list_upto(items, NAMED + 1, NAMED)

@@ -24,8 +24,13 @@ approved).
   `a_project_at_the_root_keeps_an_empty_name`. `each_list_keeps_its_own_cut_off` passes on main and here: no
   cut-off moved.
 
+## Review (#71, approved, no blocking findings)
+- Folded in the two optional notes: `ops::some_of`'s doc says the app cuts at the same count with commas only;
+  `words::folder_name`'s doc points the app to `shell::folder_name` for a root project.
+
 ## Checks
-See the pull request description.
+See the pull request description. After the review fixes: fmt, clippy `-D warnings`, `cargo test --workspace`
+(app 440, core 942, cli 25 + 34) and `cargo doc` for core, all clean; main had not moved (3d1c88f).
 
 ## Next
-Cross-review, then A2 (split `engine.rs`) and A1 (split `shell.rs`).
+Merge, then A2 (split `engine.rs`) and A1 (split `shell.rs`).
