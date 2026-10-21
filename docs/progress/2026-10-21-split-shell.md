@@ -54,8 +54,14 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
    `scroll_gutter`, `bring_focus_into_view`) and `shell/editor.rs` (`Editor`, `EditorState`, `SecretView`, the
    form, the JSON editor, values, client secret and save bar), with their tests (28 and 30). The client-secret test
    heading, left with no tests under it in `shell::tests`, is dropped. `shell.rs` 12,390 to 9,422 lines.
+   Merged in #79 (2315e63).
+7. Server list: `shell/list.rs` (`GridRow`, `Group`, `Badge`, the row wording constants and functions such as
+   `status_cell`, `badge`, `keep_the_end`, `shadowed_text`, `in_projects_text`, then `grid_rows`,
+   `cached_grid_rows`, `grid`) and the section "the toggle is per project; project servers have an approval" as
+   `shell/tests/list.rs` (13 tests, its heading now the file comment). Detail and Export take the names they use from
+   `super::list`. `shell.rs` 9,422 to 8,336 lines.
 
-Next, one pull request each: the server list, the top bar, toolbar and Settings.
+Next, one pull request: the top bar, toolbar and Settings.
 
 ## Checks
 See each pull request description.

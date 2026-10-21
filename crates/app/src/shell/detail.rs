@@ -1,12 +1,12 @@
 //! The detail panel: the selected server's name, tabs and what each tab shows, its status and diagnosis among them.
 
 use super::editor::EditorState;
-use super::{
-    ABOUT_CONNECTORS, CONNECTOR_READ_ONLY, DetailTab, NOT_LOADED, PLUGIN_STATUS, ShellApp,
-    flat_items, in_projects_text, managed_read_only, not_checked, plugin_off_everywhere,
-    plugin_on_text, plugin_read_only, projects_paths, relative_job, replaced_by_organisation,
-    shadowed_paths, shadowed_text,
+use super::list::{
+    ABOUT_CONNECTORS, CONNECTOR_READ_ONLY, NOT_LOADED, PLUGIN_STATUS, in_projects_text,
+    managed_read_only, not_checked, plugin_off_everywhere, plugin_on_text, plugin_read_only,
+    projects_paths, relative_job, replaced_by_organisation, shadowed_paths, shadowed_text,
 };
+use super::{DetailTab, ShellApp, flat_items};
 use crate::command::shortcut;
 use crate::explain::Explanation;
 use crate::sign_in;
