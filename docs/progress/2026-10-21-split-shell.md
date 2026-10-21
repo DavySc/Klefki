@@ -15,6 +15,9 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
 - Each move is done by a script that cuts whole items by name (doc comments and attributes included) and pastes
   them unchanged; the only edits after it are visibility, imports and `cargo fmt` joining a line that now fits.
   Checked per pull request: the removed and added lines are the same lines, apart from those.
+- Before each push, besides CLAUDE.md's verify: `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+  --document-private-items --workspace`, as CI runs it. A moved doc comment can link a name its new file does not
+  import.
 
 ## Modules
 1. Export dialog: `shell/export.rs` (state, `export_dialog`, `open_export`, `can_export`, `export_rows`, the
@@ -25,10 +28,18 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
    `shell/casing.rs` (`CasingForm`, `open_casing`, `casing_dialog`), `shell/places.rs` (`Places`, `Taken`, the tick
    and radio rows Add, Import, Duplicate and Move share), and the tests of the move and fix casing sections.
    `casing_harness` and `open_move_of` stay in `shell::tests`: the add and edit-form sections use them too.
-   `shell.rs` 18,724 to 17,690 lines.
+   `shell.rs` 18,724 to 17,690 lines. Review: `Taken` moved to right after `impl Places`. Merged in #74 (aaef3d4).
+   A Fix casing bug the reviewer found (both spellings in one place: the dialog offers a rename that is then refused)
+   is older than A1 and left for a follow-up.
+3. Duplicate: `shell/duplicate.rs` (`DuplicateForm`, `CopyRead`, `copy_fields`, `COPY_LABEL_WIDTH`, `duplicable`,
+   `open_duplicate`, `duplicate_dialog`) and the duplicate section's tests. `duplicate_harness` and
+   `duplicate_requested` stay in `shell::tests`: other sections use them. `field_row`, `field_note` and
+   `field_warning` stay in `shell.rs` until Add moves. `shell.rs` 17,690 to 16,839 lines. CI's `cargo doc` failed
+   on a moved comment linking `Event`, which the new file does not import: the link now names its full path. Review:
+   the types now come before `copy_fields`.
 
-Next, one pull request each: Duplicate, Add and Import, the review and outcome, the detail
-panel, the server list, the top bar and toolbar.
+Next, one pull request each: Add and Import, the review and outcome, the detail panel and editor, the server list,
+the top bar, toolbar and Settings.
 
 ## Checks
 See each pull request description.
