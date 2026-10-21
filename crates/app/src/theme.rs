@@ -9,11 +9,15 @@ use egui::{
 };
 use std::sync::Arc;
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "each shift leaves one byte of the colour; `try_from` is not const"
+)]
 const fn hex(rgb: u32) -> Color32 {
     Color32::from_rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
-pub struct Palette {
+pub(crate) struct Palette {
     /// Text fields and code. In the dark themes one step lighter than `panel` (between base and
     /// surface0), not a well darker than it: a field is a place to type, so it should sit up, not recede.
     pub field: Color32,
@@ -48,7 +52,7 @@ pub struct Palette {
     pub on_bright: Color32,
 }
 
-pub const DARK: Palette = Palette {
+pub(crate) const DARK: Palette = Palette {
     field: hex(0x282839),
     chrome: hex(0x181825),
     panel: hex(0x1E1E2E),
@@ -73,7 +77,7 @@ pub const DARK: Palette = Palette {
 
 /// Catppuccin Latte surfaces and text. Latte's own pastel accents are too light to read as text on a
 /// light background, so the accents here are deeper variants of the same hues.
-pub const LIGHT: Palette = Palette {
+pub(crate) const LIGHT: Palette = Palette {
     field: hex(0xFFFFFF),
     chrome: hex(0xE6E9EF),
     panel: hex(0xEFF1F5),
@@ -97,7 +101,7 @@ pub const LIGHT: Palette = Palette {
 };
 
 /// Warm gray, dark: less saturated than Mocha's blue-violet, warm without going muddy. Same accents.
-pub const WARM_DARK: Palette = Palette {
+pub(crate) const WARM_DARK: Palette = Palette {
     field: hex(0x262422),
     chrome: hex(0x181716),
     panel: hex(0x1D1C1A),
@@ -121,7 +125,7 @@ pub const WARM_DARK: Palette = Palette {
 };
 
 /// Warm gray, light.
-pub const WARM_LIGHT: Palette = Palette {
+pub(crate) const WARM_LIGHT: Palette = Palette {
     field: hex(0xFFFFFF),
     chrome: hex(0xEFEDEA),
     panel: hex(0xF7F6F3),
@@ -146,27 +150,27 @@ pub const WARM_LIGHT: Palette = Palette {
 
 /// The family of greys: Catppuccin's cool blue-violet (the default), or a warmer, calmer grey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tone {
+pub(crate) enum Tone {
     #[default]
     Cool,
     Warm,
 }
 
 impl Tone {
-    pub const ALL: [Self; 2] = [Self::Cool, Self::Warm];
+    pub(crate) const ALL: [Self; 2] = [Self::Cool, Self::Warm];
 
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Cool => "cool",
             Self::Warm => "warm",
         }
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|t| t.as_str() == s)
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Cool => "Cool (Catppuccin)",
             Self::Warm => "Warm gray",
@@ -186,12 +190,12 @@ fn tone_id() -> egui::Id {
 }
 
 /// The tone in use.
-pub fn tone(ctx: &egui::Context) -> Tone {
+pub(crate) fn tone(ctx: &egui::Context) -> Tone {
     ctx.data(|d| d.get_temp(tone_id())).unwrap_or_default()
 }
 
 /// The palette for the theme and tone egui is currently showing.
-pub fn palette(ctx: &egui::Context) -> &'static Palette {
+pub(crate) fn palette(ctx: &egui::Context) -> &'static Palette {
     let (dark, light) = tone(ctx).palettes();
     match ctx.theme() {
         egui::Theme::Dark => dark,
@@ -200,7 +204,7 @@ pub fn palette(ctx: &egui::Context) -> &'static Palette {
 }
 
 /// Switches the greys of both themes.
-pub fn set_tone(ctx: &egui::Context, tone: Tone) {
+pub(crate) fn set_tone(ctx: &egui::Context, tone: Tone) {
     ctx.data_mut(|d| d.insert_temp(tone_id(), tone));
     let (dark, light) = tone.palettes();
     ctx.set_visuals_of(egui::Theme::Dark, visuals(dark, true));
@@ -209,29 +213,29 @@ pub fn set_tone(ctx: &egui::Context, tone: Tone) {
 
 const TONE_KEY: &str = "tone";
 
-pub fn load_tone(storage: Option<&dyn eframe::Storage>) -> Tone {
+pub(crate) fn load_tone(storage: Option<&dyn eframe::Storage>) -> Tone {
     storage
         .and_then(|s| s.get_string(TONE_KEY))
         .and_then(|v| Tone::parse(&v))
         .unwrap_or_default()
 }
 
-pub fn save_tone(storage: &mut dyn eframe::Storage, tone: Tone) {
+pub(crate) fn save_tone(storage: &mut dyn eframe::Storage, tone: Tone) {
     storage.set_string(TONE_KEY, tone.as_str().to_owned());
 }
 
 /// What the user picked. `System` follows the operating system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThemeChoice {
+pub(crate) enum ThemeChoice {
     System,
     Light,
     Dark,
 }
 
 impl ThemeChoice {
-    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
+    pub(crate) const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 
-    pub fn icon(self) -> &'static str {
+    pub(crate) fn icon(self) -> &'static str {
         match self {
             Self::System => egui_phosphor::regular::DESKTOP,
             Self::Light => egui_phosphor::regular::SUN,
@@ -239,7 +243,7 @@ impl ThemeChoice {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
             Self::Light => "light",
@@ -247,11 +251,11 @@ impl ThemeChoice {
         }
     }
 
-    pub fn parse(s: &str) -> Option<Self> {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|c| c.as_str() == s)
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
@@ -270,14 +274,14 @@ impl ThemeChoice {
 
 /// One entry of the theme dropdown: a mode and a family of greys, the two things that can be set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThemeOption {
+pub(crate) struct ThemeOption {
     pub choice: ThemeChoice,
     pub tone: Tone,
 }
 
 impl ThemeOption {
     /// One group per tone, each in the order of the Settings page.
-    pub const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::new(ThemeChoice::System, Tone::Cool),
         Self::new(ThemeChoice::Light, Tone::Cool),
         Self::new(ThemeChoice::Dark, Tone::Cool),
@@ -286,16 +290,16 @@ impl ThemeOption {
         Self::new(ThemeChoice::Dark, Tone::Warm),
     ];
 
-    pub const fn new(choice: ThemeChoice, tone: Tone) -> Self {
+    pub(crate) const fn new(choice: ThemeChoice, tone: Tone) -> Self {
         Self { choice, tone }
     }
 
     /// A moon for dark, a sun for light; System has the desktop icon, as it is neither.
-    pub fn icon(self) -> &'static str {
+    pub(crate) fn icon(self) -> &'static str {
         self.choice.icon()
     }
 
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match (self.choice, self.tone) {
             (ThemeChoice::System, Tone::Cool) => "System (cool)",
             (ThemeChoice::Light, Tone::Cool) => "Light (cool)",
@@ -311,11 +315,11 @@ const FONT_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regula
 const FONT_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
 
 /// Family for emphasised text; JetBrains Mono Bold.
-pub fn bold_family() -> FontFamily {
+pub(crate) fn bold_family() -> FontFamily {
     FontFamily::Name("jetbrains-mono-bold".into())
 }
 
-pub fn fonts() -> FontDefinitions {
+pub(crate) fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     fonts.font_data.insert(
@@ -346,7 +350,7 @@ pub fn fonts() -> FontDefinitions {
     fonts
 }
 
-pub fn visuals(p: &Palette, dark: bool) -> Visuals {
+pub(crate) fn visuals(p: &Palette, dark: bool) -> Visuals {
     let rounding = CornerRadius::same(6);
     let mut v = if dark {
         Visuals::dark()
@@ -404,10 +408,10 @@ pub fn visuals(p: &Palette, dark: bool) -> Visuals {
 
 /// How round a tick box's corners are. Square-ish, unlike a radio button's circle: round reads as "pick one", square
 /// as "pick any". The widgets' rounding would make a box this small nearly round.
-pub const CHECKBOX_RADIUS: u8 = 2;
+pub(crate) const CHECKBOX_RADIUS: u8 = 2;
 
 /// A tick box, square whatever the widgets' rounding. Use it for every tick box.
-pub fn checkbox(
+pub(crate) fn checkbox(
     ui: &mut egui::Ui,
     checked: &mut bool,
     text: impl Into<egui::WidgetText>,
@@ -423,7 +427,7 @@ pub fn checkbox(
 }
 
 /// Sizes are generous on purpose: this is a desktop tool used with a mouse, not a dense data grid.
-pub fn style(style: &mut egui::Style) {
+pub(crate) fn style(style: &mut egui::Style) {
     use FontFamily::{Monospace, Proportional};
     style.text_styles = [
         (TextStyle::Small, FontId::new(12.0, Proportional)),
@@ -442,7 +446,7 @@ pub fn style(style: &mut egui::Style) {
 }
 
 /// Fonts, sizing and both themes' visuals. Done once at start-up.
-pub fn apply(ctx: &egui::Context, choice: ThemeChoice) {
+pub(crate) fn apply(ctx: &egui::Context, choice: ThemeChoice) {
     ctx.set_fonts(fonts());
     for (theme, palette, dark) in [
         (egui::Theme::Dark, &DARK, true),
@@ -457,18 +461,18 @@ pub fn apply(ctx: &egui::Context, choice: ThemeChoice) {
 const STORAGE_KEY: &str = "theme";
 
 /// The remembered choice, or Dark when nothing valid was saved.
-pub fn load_choice(storage: Option<&dyn eframe::Storage>) -> ThemeChoice {
+pub(crate) fn load_choice(storage: Option<&dyn eframe::Storage>) -> ThemeChoice {
     storage
         .and_then(|s| s.get_string(STORAGE_KEY))
         .and_then(|v| ThemeChoice::parse(&v))
         .unwrap_or(ThemeChoice::Dark)
 }
 
-pub fn save_choice(storage: &mut dyn eframe::Storage, choice: ThemeChoice) {
+pub(crate) fn save_choice(storage: &mut dyn eframe::Storage, choice: ThemeChoice) {
     storage.set_string(STORAGE_KEY, choice.as_str().to_owned());
 }
 
-pub fn set_choice(ctx: &egui::Context, choice: ThemeChoice) {
+pub(crate) fn set_choice(ctx: &egui::Context, choice: ThemeChoice) {
     ctx.set_theme(choice.preference());
 }
 

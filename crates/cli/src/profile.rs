@@ -11,7 +11,7 @@ const PREPARE: Duration = Duration::from_secs(30);
 const APPLY: Duration = Duration::from_secs(60);
 
 /// What `use` ended with.
-pub enum Used {
+pub(crate) enum Used {
     Saved,
     /// The files already look like this.
     Nothing,
@@ -22,7 +22,7 @@ pub enum Used {
 }
 
 /// The profile named `typed`: its own name, case aside. Otherwise a sentence that suggests the closest name.
-pub fn find<'a>(profiles: &'a Profiles, typed: &str) -> Result<&'a api::Profile, String> {
+pub(crate) fn find<'a>(profiles: &'a Profiles, typed: &str) -> Result<&'a api::Profile, String> {
     if let Some(p) = profiles
         .profiles
         .iter()
@@ -45,7 +45,7 @@ pub fn find<'a>(profiles: &'a Profiles, typed: &str) -> Result<&'a api::Profile,
 /// The project `place` names, as the configuration spells it. A folder is matched as given, then with its links
 /// resolved (a temporary folder on macOS is reached through one). A folder inside a git repository that is not a
 /// project itself is the repository's: Claude Code takes the repository's root as the project there.
-pub fn project(snapshot: &Snapshot, place: &Place) -> Result<Option<String>, String> {
+pub(crate) fn project(snapshot: &Snapshot, place: &Place) -> Result<Option<String>, String> {
     let folder = match place {
         Place::Every => return Ok(None),
         Place::Project(path) => path.clone(),
@@ -105,7 +105,12 @@ fn git_root(folder: &std::path::Path) -> Option<std::path::PathBuf> {
 
 /// Uses `profile` in `project` (every project when `None`): shows the plan on stdout, asks at a terminal unless
 /// `yes`, and saves it.
-pub fn use_profile(profile: &api::Profile, project: Option<String>, only: bool, yes: bool) -> Used {
+pub(crate) fn use_profile(
+    profile: &api::Profile,
+    project: Option<String>,
+    only: bool,
+    yes: bool,
+) -> Used {
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     // The engine the app uses, without background checks or watching: only what is asked for here runs.
     let core = api::start_headless(None, move || {

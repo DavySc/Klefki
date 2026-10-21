@@ -1,6 +1,20 @@
 //! `klefki-cli`: Klefki without a window. `list` shows the configured MCP servers, `status` asks Claude Code whether
 //! they connect, `export` prints their definitions, `profiles` and `use` list and use Klefki's profiles. Output and
 //! exit codes: docs/decisions/006-cli-output.md.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "tests build sizes and seeded values with `as`; the casts in product code are checked"
+    )
+)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line program: its output is the product"
+)]
 mod args;
 mod check;
 mod profile;

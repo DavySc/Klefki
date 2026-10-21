@@ -1,6 +1,15 @@
 // A release build is a GUI program on Windows: no console window opens next to it. Debug builds keep the
 // console so panics and logs stay visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "tests build sizes and seeded values with `as`; the casts in product code are checked"
+    )
+)]
 
 mod activity;
 mod command;

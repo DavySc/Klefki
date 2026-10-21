@@ -10,7 +10,7 @@ use klefki_core::api::{
 };
 
 #[derive(Default)]
-pub struct SecretsPage {
+pub(crate) struct SecretsPage {
     /// `None` until the engine answers.
     pub report: Option<Secrets>,
     /// What the top bar's filter box holds on this page: it filters the servers shown here.
@@ -23,7 +23,7 @@ pub struct SecretsPage {
 
 /// What the page's buttons asked the shell to do.
 #[derive(Debug, PartialEq)]
-pub enum Asked {
+pub(crate) enum Asked {
     /// Show this server on the Connections page, at the tab where its secrets are.
     Open(ServerId, Tab),
     /// Delete this unused client secret from the system's store (the user said yes).
@@ -34,14 +34,14 @@ pub enum Asked {
 
 /// The detail tab a server's secrets are edited in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
+pub(crate) enum Tab {
     General,
     Env,
     Auth,
 }
 
 /// What the system's secret store is called here, as the system itself calls it.
-pub fn store_name() -> &'static str {
+pub(crate) fn store_name() -> &'static str {
     if cfg!(windows) {
         "Windows Credential Manager"
     } else if cfg!(target_os = "macos") {
@@ -53,7 +53,7 @@ pub fn store_name() -> &'static str {
 
 impl SecretsPage {
     /// Draws the page. `live` is false for sample data, which has no files to read.
-    pub fn show(&mut self, ui: &mut Ui, live: bool) -> Option<Asked> {
+    pub(crate) fn show(&mut self, ui: &mut Ui, live: bool) -> Option<Asked> {
         let pal = theme::palette(ui.ctx());
         let Self {
             report,

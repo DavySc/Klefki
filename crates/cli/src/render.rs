@@ -13,7 +13,7 @@ const SCHEMA: u32 = 1;
 
 /// The live answer for one server.
 #[derive(Debug, Clone)]
-pub struct Checked {
+pub(crate) struct Checked {
     pub status: Status,
     pub detail: Option<String>,
     pub hint: Option<Hint>,
@@ -37,7 +37,7 @@ impl Checked {
 
 /// What `status` has to say about one server.
 #[derive(Debug, Clone)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     Checked(Checked),
     /// Switched off: Claude Code does not start it, so it is not checked, even when named.
     Off,
@@ -59,7 +59,7 @@ pub enum Outcome {
 
 impl Outcome {
     /// Whether this server counts against `status`'s exit code: it was to be checked and is not connected.
-    pub fn is_problem(&self) -> bool {
+    pub(crate) fn is_problem(&self) -> bool {
         match self {
             Outcome::Checked(c) => c.status != Status::Connected,
             Outcome::NoAnswer => true,
@@ -74,7 +74,7 @@ impl Outcome {
     }
 
     /// Whether the check itself broke down, saying nothing about the server.
-    pub fn tool_failed(&self) -> bool {
+    pub(crate) fn tool_failed(&self) -> bool {
         match self {
             Outcome::Checked(c) => c.failed(),
             Outcome::NoAnswer => true,
@@ -88,13 +88,13 @@ impl Outcome {
         }
     }
 
-    pub fn was_checked(&self) -> bool {
+    pub(crate) fn was_checked(&self) -> bool {
         matches!(self, Outcome::Checked(_) | Outcome::NoAnswer)
     }
 }
 
 /// Why `status` leaves this row out, if it does. Named servers are checked unless Claude Code would not run them.
-pub fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
+pub(crate) fn skip(row: &ServerRow, named: bool) -> Option<Outcome> {
     if let Some(why) = &row.not_loaded {
         Some(Outcome::NotLoaded(why.clone()))
     } else if row.scope == Scope::Plugin {
@@ -152,7 +152,7 @@ fn by_chunks(x: &[(bool, String)], y: &[(bool, String)]) -> Ordering {
 
 /// The rows to show, in the order they are shown: the organisation's servers, the user's, then per project its local
 /// and project servers, then the plugins'; by name within a group.
-pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
+pub(crate) fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a ServerRow> {
     // Each name is split once, not at every comparison.
     let mut keyed: Vec<(&ServerRow, Vec<(bool, String)>)> =
         rows.into_iter().map(|r| (r, chunks(&r.name))).collect();
@@ -174,7 +174,7 @@ pub fn ordered<'a>(rows: impl IntoIterator<Item = &'a ServerRow>) -> Vec<&'a Ser
 }
 
 /// A path as shown in a heading: `~/…` under the home folder, which keeps lines short. JSON keeps the full path.
-pub fn short_path(path: &str, home: Option<&str>) -> String {
+pub(crate) fn short_path(path: &str, home: Option<&str>) -> String {
     let Some(home) = home else {
         return path.to_owned();
     };
@@ -400,9 +400,9 @@ fn state(row: &ServerRow, project_count: usize) -> &'static str {
     }
 }
 
-pub const NOTHING: &str = "No MCP servers are configured.\n";
+pub(crate) const NOTHING: &str = "No MCP servers are configured.\n";
 
-pub fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -> String {
+pub(crate) fn list_text(snapshot: &Snapshot, rows: &[&ServerRow], home: Option<&str>) -> String {
     if rows.is_empty() {
         return NOTHING.to_owned();
     }
@@ -458,7 +458,7 @@ fn approval_key(approval: Approval) -> &'static str {
     }
 }
 
-pub fn status_key(status: Status) -> &'static str {
+pub(crate) fn status_key(status: Status) -> &'static str {
     match status {
         Status::Connected => "connected",
         Status::Degraded => "degraded",
@@ -514,7 +514,7 @@ fn row_json(row: &ServerRow, project_count: usize) -> serde_json::Map<String, Va
     o
 }
 
-pub fn list_json(snapshot: &Snapshot, rows: &[&ServerRow]) -> String {
+pub(crate) fn list_json(snapshot: &Snapshot, rows: &[&ServerRow]) -> String {
     let servers: Vec<Value> = rows
         .iter()
         .map(|r| Value::Object(row_json(r, snapshot.project_count)))
@@ -535,7 +535,7 @@ fn members<'a>(
 }
 
 /// `profiles`: each profile with its servers and where they are the only ones on.
-pub fn profiles_text(
+pub(crate) fn profiles_text(
     profiles: &klefki_core::api::Profiles,
     snapshot: &Snapshot,
     home: Option<&str>,
@@ -587,7 +587,7 @@ pub fn profiles_text(
     out
 }
 
-pub fn profiles_json(profiles: &klefki_core::api::Profiles, snapshot: &Snapshot) -> String {
+pub(crate) fn profiles_json(profiles: &klefki_core::api::Profiles, snapshot: &Snapshot) -> String {
     let list: Vec<Value> = profiles
         .profiles
         .iter()
@@ -632,7 +632,7 @@ const NO_ANSWER: &str = "Claude Code did not answer in time";
 
 /// A name as it would be typed: quoted when a shell would split or expand it (names are checked to be
 /// `[A-Za-z0-9_-]` before they are passed to Claude, but a configuration can hold anything).
-pub fn command_word(name: &str) -> String {
+pub(crate) fn command_word(name: &str) -> String {
     let plain = !name.is_empty()
         && !name.starts_with('-')
         && name
@@ -726,7 +726,7 @@ fn status_cells(row: &ServerRow, outcome: &Outcome) -> (String, String) {
     }
 }
 
-pub fn status_text(rows: &[(&ServerRow, Outcome)], home: Option<&str>) -> String {
+pub(crate) fn status_text(rows: &[(&ServerRow, Outcome)], home: Option<&str>) -> String {
     if rows.is_empty() {
         return NOTHING.to_owned();
     }
@@ -813,7 +813,7 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
     }
 }
 
-pub fn status_json(
+pub(crate) fn status_json(
     snapshot: &Snapshot,
     claude_version: Option<&str>,
     rows: &[(&ServerRow, Outcome)],

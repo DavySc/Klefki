@@ -4,7 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Cmd {
+pub(crate) enum Cmd {
     List {
         names: Vec<String>,
         json: bool,
@@ -41,7 +41,7 @@ pub enum Cmd {
 
 /// Where `use` uses a profile.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Place {
+pub(crate) enum Place {
     /// The project of the current folder.
     Here,
     Project(PathBuf),
@@ -51,7 +51,7 @@ pub enum Place {
 
 /// What was wrong with the command line.
 #[derive(Debug, PartialEq, Eq)]
-pub enum Usage {
+pub(crate) enum Usage {
     /// Nothing at all: the help is the answer.
     NoCommand,
     /// Said as a sentence.
@@ -62,7 +62,7 @@ fn bad(why: String) -> Usage {
     Usage::Bad(why)
 }
 
-pub const HELP: &str = "\
+pub(crate) const HELP: &str = "\
 klefki-cli: list Claude Code's MCP servers, check whether they connect, export them,
 and use Klefki's profiles.
 
@@ -131,7 +131,7 @@ Exit status:
 Reads CLAUDE_CONFIG_DIR like Claude Code does.
 ";
 
-pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
+pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usage> {
     let mut args = args.into_iter();
     let command = match args.next() {
         None => return Err(Usage::NoCommand),

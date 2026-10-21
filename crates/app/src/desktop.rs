@@ -12,7 +12,7 @@ use std::sync::Arc;
 const COPIED_SECONDS: f64 = 2.0;
 
 #[derive(Default)]
-pub struct DesktopPage {
+pub(crate) struct DesktopPage {
     /// `None` until the engine answers.
     pub desktop: Option<Desktop>,
     /// What the top bar's filter box holds on this page: it filters these servers, not Claude Code's.
@@ -24,13 +24,13 @@ pub struct DesktopPage {
 }
 
 impl DesktopPage {
-    pub fn set(&mut self, desktop: Desktop) {
+    pub(crate) fn set(&mut self, desktop: Desktop) {
         self.desktop = Some(desktop);
         self.in_code = None;
     }
 
     /// Draws the page. `snapshot` is Claude Code's servers, to say which Claude Desktop servers it has too.
-    pub fn show(&mut self, ui: &mut Ui, snapshot: &Arc<Snapshot>) {
+    pub(crate) fn show(&mut self, ui: &mut Ui, snapshot: &Arc<Snapshot>) {
         let now = ui.input(|i| i.time);
         if self.copied.is_some_and(|at| now - at >= COPIED_SECONDS) {
             self.copied = None;

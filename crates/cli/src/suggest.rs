@@ -2,7 +2,10 @@
 
 /// The candidate closest to `typed`, if it is close enough to be what was meant: at most two edits, and at most a
 /// third of the longer word, so `gama` finds `gamma` but `x` does not find `y`. Case does not count as an edit.
-pub fn closest<'a>(typed: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+pub(crate) fn closest<'a>(
+    typed: &str,
+    candidates: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
     let typed_lower = typed.to_lowercase();
     candidates
         .into_iter()

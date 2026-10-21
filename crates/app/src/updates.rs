@@ -9,11 +9,11 @@ const LAST_KEY: &str = "updates.last_checked";
 const AVAILABLE_KEY: &str = "updates.available";
 
 /// How long after the window first shows the automatic check waits, so starting never competes with it.
-pub const START_DELAY: f64 = 3.0;
+pub(crate) const START_DELAY: f64 = 3.0;
 /// The automatic check runs at most this often, in seconds.
-pub const EVERY: u64 = 24 * 60 * 60;
+pub(crate) const EVERY: u64 = 24 * 60 * 60;
 
-pub struct Updates {
+pub(crate) struct Updates {
     /// Klefki looks for updates by itself. On unless the user turned it off.
     pub auto: bool,
     /// When a check last got an answer, in seconds since 1970.
@@ -49,7 +49,7 @@ impl Default for Updates {
 }
 
 impl Updates {
-    pub fn load(storage: Option<&dyn eframe::Storage>) -> Updates {
+    pub(crate) fn load(storage: Option<&dyn eframe::Storage>) -> Updates {
         let get = |key| storage.and_then(|s| s.get_string(key));
         let remembered = get(AVAILABLE_KEY).and_then(|v| Version::parse(&v));
         Updates {
@@ -61,7 +61,7 @@ impl Updates {
         }
     }
 
-    pub fn save(&self, storage: &mut dyn eframe::Storage) {
+    pub(crate) fn save(&self, storage: &mut dyn eframe::Storage) {
         storage.set_string(AUTO_KEY, if self.auto { "on" } else { "off" }.to_owned());
         match self.last_checked {
             Some(at) => storage.set_string(LAST_KEY, at.to_string()),
@@ -75,7 +75,7 @@ impl Updates {
 
     /// Whether the automatic check should start now. `uptime` is how long the window has been open and `now` the
     /// time, both in seconds. Answers yes at most once a run, and not again within [`EVERY`] of the last answer.
-    pub fn due(&mut self, uptime: f64, now: u64) -> bool {
+    pub(crate) fn due(&mut self, uptime: f64, now: u64) -> bool {
         if !self.auto || self.considered || self.checking || uptime < START_DELAY {
             return false;
         }
@@ -94,11 +94,11 @@ impl Updates {
     }
 
     /// The user asked to check now.
-    pub fn check_now(&mut self) {
+    pub(crate) fn check_now(&mut self) {
         self.checking = true;
     }
 
-    pub fn answered(&mut self, found: UpdateCheck, now: u64) {
+    pub(crate) fn answered(&mut self, found: UpdateCheck, now: u64) {
         self.checking = false;
         match &found {
             UpdateCheck::Available { version, .. } => {
@@ -120,22 +120,22 @@ impl Updates {
     }
 
     /// The download should start now: a release was found and [`Updates::auto`] is on, and this run has not tried yet.
-    pub fn download_due(&self) -> bool {
+    pub(crate) fn download_due(&self) -> bool {
         self.auto && self.available.is_some() && self.download.is_none() && !self.downloading
     }
 
     /// The download was asked for.
-    pub fn downloading(&mut self) {
+    pub(crate) fn downloading(&mut self) {
         self.downloading = true;
     }
 
-    pub fn downloaded(&mut self, done: UpdateDownload) {
+    pub(crate) fn downloaded(&mut self, done: UpdateDownload) {
         self.downloading = false;
         self.download = Some(done);
     }
 
     /// A version downloaded and checked this run, ready to install.
-    pub fn ready(&self) -> Option<Version> {
+    pub(crate) fn ready(&self) -> Option<Version> {
         match self.download {
             Some(UpdateDownload::Ready(version)) => Some(version),
             _ => None,
@@ -143,7 +143,7 @@ impl Updates {
     }
 
     /// The download failed; why.
-    pub fn download_failed(&self) -> Option<&str> {
+    pub(crate) fn download_failed(&self) -> Option<&str> {
         match &self.download {
             Some(UpdateDownload::Failed(why)) => Some(why),
             _ => None,
@@ -151,12 +151,12 @@ impl Updates {
     }
 
     /// A newer release, found this run or by an earlier one.
-    pub fn available(&self) -> Option<Version> {
+    pub(crate) fn available(&self) -> Option<Version> {
         self.available
     }
 
     /// "Up to date · checked …", when the last answer, this run or an earlier one, found nothing newer.
-    pub fn up_to_date(&self, now: u64) -> Option<String> {
+    pub(crate) fn up_to_date(&self, now: u64) -> Option<String> {
         if self.available.is_some() {
             return None;
         }
@@ -179,7 +179,7 @@ fn ago(at: u64, now: u64) -> String {
 }
 
 /// The time now, in seconds since 1970; 0 if the clock is before that.
-pub fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
