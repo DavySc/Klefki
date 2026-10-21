@@ -1414,4 +1414,708 @@ mod tests {
         assert_eq!(store.get(&from.connection()).unwrap(), None);
         assert_eq!(store.get(&to.connection()).unwrap(), Some(secret));
     }
+
+    // ---- found by cargo-mutants (docs/quality.md): what no test checked before
+
+    use std::cell::RefCell;
+    use std::sync::Mutex;
+
+    fn plain(url: &str) -> Value {
+        json!({"type": "http", "url": url})
+    }
+
+    fn oauth(url: &str) -> Value {
+        json!({"type": "http", "url": url, "oauth": {"clientId": "c"}})
+    }
+
+    fn user(name: &str) -> Spot {
+        Spot {
+            project: None,
+            name: name.into(),
+        }
+    }
+
+    fn local(project: &str, name: &str) -> Spot {
+        Spot {
+            project: Some(project.into()),
+            name: name.into(),
+        }
+    }
+
+    fn swap(from: Spot, to: Spot, remove: bool) -> Swap {
+        Swap {
+            from,
+            remove,
+            to,
+            edited: None,
+            adjust: crate::adjust::Adjust::default(),
+        }
+    }
+
+    /// What the fake Claude Code's `mcp add-json` does.
+    #[derive(Clone)]
+    enum Adds {
+        /// Writes what it is given, without the settings it does not keep, and succeeds.
+        AsClaude,
+        /// Writes these settings instead, and succeeds.
+        Other(Value),
+        /// Writes nothing and ends with this code and error output.
+        Fails(i32, &'static str),
+    }
+
+    /// Claude Code's `mcp remove` and `mcp add-json` on the configuration file, as far as these tests need them.
+    struct FakeClaude {
+        claude_json: PathBuf,
+        adds: Mutex<Adds>,
+        /// Each command's arguments, and whether a client secret came with it.
+        runs: Mutex<Vec<(Vec<String>, Option<String>)>>,
+    }
+
+    impl Claude for FakeClaude {
+        fn run(
+            &self,
+            args: &[&str],
+            cwd: Option<&Path>,
+            secret: Option<&Secret>,
+        ) -> io::Result<RunOutput> {
+            self.runs.lock().unwrap().push((
+                args.iter().map(|a| (*a).to_owned()).collect(),
+                secret.map(|s| s.expose().to_owned()),
+            ));
+            let ok = |exit_code, stderr: &str| RunOutput {
+                stdout: String::new(),
+                stderr: stderr.to_owned(),
+                exit_code: Some(exit_code),
+                timed_out: false,
+                truncated: false,
+            };
+            let name = args[args.iter().position(|a| *a == "--").unwrap() + 1];
+            let mut root = read_root(&self.claude_json).unwrap();
+            let servers = if args[3] == "local" {
+                let key = cwd.unwrap().to_string_lossy().into_owned();
+                &mut root["projects"][key]["mcpServers"]
+            } else {
+                &mut root["mcpServers"]
+            };
+            match args[1] {
+                "remove" => {
+                    servers.as_object_mut().unwrap().remove(name);
+                }
+                _ => {
+                    let given: Value = serde_json::from_str(args.last().unwrap()).unwrap();
+                    let written = match self.adds.lock().unwrap().clone() {
+                        Adds::AsClaude => as_claude_writes(&given),
+                        Adds::Other(other) => other,
+                        Adds::Fails(code, why) => return Ok(ok(code, why)),
+                    };
+                    servers[name] = written;
+                }
+            }
+            std::fs::write(&self.claude_json, root.to_string())?;
+            Ok(ok(0, ""))
+        }
+    }
+
+    /// A configuration in a temporary folder, with a project folder `proj`, a fake Claude Code and a secret store.
+    struct World {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        claude_json: PathBuf,
+        backup_dir: PathBuf,
+        claude: FakeClaude,
+        store: Arc<MemoryStore>,
+        backups: RefCell<Vec<PathBuf>>,
+    }
+
+    impl World {
+        /// `config(project)` is the configuration, given the project's folder as the file spells it.
+        fn new(config: impl FnOnce(&str) -> Value) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            // The folder itself, not a link to it (macOS's temporary folder is one): Claude Code files a project
+            // server under the real folder. Not on Windows, where that would be a `\\?\` path.
+            let root = if cfg!(windows) {
+                dir.path().to_owned()
+            } else {
+                std::fs::canonicalize(dir.path()).unwrap()
+            };
+            std::fs::create_dir_all(root.join("proj")).unwrap();
+            let claude_json = root.join(".claude.json");
+            let world = Self {
+                claude: FakeClaude {
+                    claude_json: claude_json.clone(),
+                    adds: Mutex::new(Adds::AsClaude),
+                    runs: Mutex::new(Vec::new()),
+                },
+                backup_dir: root.join("data").join("backups"),
+                claude_json,
+                root,
+                _dir: dir,
+                store: Arc::new(MemoryStore::default()),
+                backups: RefCell::new(Vec::new()),
+            };
+            std::fs::write(&world.claude_json, config(&world.project()).to_string()).unwrap();
+            world
+        }
+
+        fn project(&self) -> String {
+            self.root.join("proj").to_string_lossy().into_owned()
+        }
+
+        fn run(&self, swap: &Swap) -> Result<Done, String> {
+            let ctx = Ctx {
+                claude_json: &self.claude_json,
+                backup_dir: &self.backup_dir,
+                claude: &self.claude,
+                store: Some(&*self.store),
+                home: Some(&self.root),
+                progress: &|_| {},
+                backups: &self.backups,
+            };
+            run(&ctx, swap)
+        }
+
+        fn config(&self) -> Value {
+            read_root(&self.claude_json).unwrap()
+        }
+
+        /// The commands Claude Code was asked to run: `remove` or `add-json`, and the client secret given.
+        fn commands(&self) -> Vec<(String, Option<String>)> {
+            self.claude
+                .runs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(args, secret)| (args[1].clone(), secret.clone()))
+                .collect()
+        }
+
+        /// A kept definition of `name` (`project`), on its way to `next`.
+        fn keep(&self, id: &str, body: &Value) {
+            let dir = recovery_dir(&self.backup_dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{id}.json")), body.to_string()).unwrap();
+        }
+
+        fn listed(&self) -> usize {
+            let store: Arc<dyn SecretStore> = self.store.clone();
+            Recovery::list(&self.backup_dir, &self.claude_json, &|| {
+                Some(Arc::clone(&store))
+            })
+            .len()
+        }
+    }
+
+    #[test]
+    fn a_change_that_cannot_be_made_says_whether_it_was_a_save_a_move_or_a_copy() {
+        let world = World::new(|_| json!({"mcpServers": {"a": plain("https://p.example/mcp")}}));
+        let project = world.project();
+        let not_usable = json!({"type": "http"});
+        for (to, remove, verb) in [
+            (user("a"), true, "saved"),
+            (user("b"), true, "moved"),
+            (local(&project, "a"), true, "moved"),
+            (user("b"), false, "copied"),
+            (local(&project, "a"), false, "copied"),
+        ] {
+            let mut change = swap(user("a"), to.clone(), remove);
+            change.edited = Some(not_usable.clone());
+            let err = world.run(&change).unwrap_err();
+            assert!(
+                err.starts_with(&format!(
+                    "a for the user was not {verb}: the definition is not usable"
+                )),
+                "{to:?} {remove}: {err}"
+            );
+        }
+        assert!(world.commands().is_empty());
+    }
+
+    #[test]
+    fn a_server_is_never_copied_or_moved_onto_one_that_is_there() {
+        let world = World::new(
+            |_| json!({"mcpServers": {"a": plain("https://p.example/mcp"), "b": plain("https://q.example/mcp")}}),
+        );
+        let before = std::fs::read(&world.claude_json).unwrap();
+        // A copy onto itself is not an edit.
+        let err = world.run(&swap(user("a"), user("a"), false)).unwrap_err();
+        assert_eq!(
+            err,
+            "a for the user was not copied: there is already a server called a for the user."
+        );
+        let err = world.run(&swap(user("a"), user("b"), true)).unwrap_err();
+        assert_eq!(
+            err,
+            "a for the user was not moved: there is already a server called b for the user."
+        );
+        assert_eq!(std::fs::read(&world.claude_json).unwrap(), before);
+    }
+
+    #[test]
+    fn a_plain_server_is_moved_by_klefki_with_a_backup_for_each_write() {
+        let world = World::new(
+            |project| json!({"mcpServers": {"a": plain("https://p.example/mcp")}, "projects": {project: {}}}),
+        );
+        let project = world.project();
+        world
+            .run(&swap(user("a"), local(&project, "a"), true))
+            .unwrap();
+        let config = world.config();
+        assert_eq!(config["mcpServers"].get("a"), None);
+        assert_eq!(
+            config["projects"][&project]["mcpServers"]["a"],
+            plain("https://p.example/mcp")
+        );
+        assert!(world.commands().is_empty(), "Claude Code is not needed");
+        // The copy kept first, then the backups of the remove and of the add, for the activity log.
+        assert_eq!(world.backups.borrow().len(), 3, "{:?}", world.backups);
+    }
+
+    #[test]
+    fn a_plain_server_leaves_a_project_whose_folder_is_gone() {
+        // Klefki writes it itself: only Claude Code's commands need the project's folder.
+        let world = World::new(|project| {
+            let gone = Path::new(project).with_file_name("gone");
+            let gone = gone.to_string_lossy();
+            json!({"projects": {gone: {"mcpServers": {"a": plain("https://p.example/mcp")}}}})
+        });
+        let gone = world.root.join("gone").to_string_lossy().into_owned();
+        world
+            .run(&swap(local(&gone, "a"), user("a"), true))
+            .unwrap();
+        assert_eq!(
+            world.config()["mcpServers"]["a"],
+            plain("https://p.example/mcp")
+        );
+        // One that signs in goes through Claude Code, which cannot run there.
+        let world = World::new(|project| {
+            let gone = Path::new(project).with_file_name("gone");
+            let gone = gone.to_string_lossy();
+            json!({"projects": {gone: {"mcpServers": {"a": oauth("https://o.example/mcp")}}}})
+        });
+        let gone = world.root.join("gone").to_string_lossy().into_owned();
+        let err = world
+            .run(&swap(local(&gone, "a"), user("a"), true))
+            .unwrap_err();
+        assert!(err.contains("the folder of gone is not there"), "{err}");
+        assert!(err.ends_with("Nothing was changed."), "{err}");
+    }
+
+    #[test]
+    fn settings_claude_code_leaves_out_are_noted_only_when_there_are_some() {
+        let world = World::new(|_| json!({"mcpServers": {"a": oauth("https://o.example/mcp")}}));
+        let project = world.project();
+        let done = world
+            .run(&swap(user("a"), local(&project, "a"), true))
+            .unwrap();
+        assert!(done.notes.is_empty(), "{:?}", done.notes);
+        assert_eq!(
+            world.commands(),
+            [("remove".into(), None), ("add-json".into(), None)]
+        );
+
+        let mut entry = oauth("https://o.example/mcp");
+        entry["alwaysAllow"] = json!(["read"]);
+        let world = World::new(|_| json!({"mcpServers": {"a": entry}}));
+        let project = world.project();
+        let done = world
+            .run(&swap(user("a"), local(&project, "a"), true))
+            .unwrap();
+        assert_eq!(
+            done.notes,
+            [
+                "Claude Code left out settings it does not use: alwaysAllow. The copy Klefki kept of the configuration still has them."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_copy_claude_code_does_not_add_leaves_the_original_alone() {
+        let world = World::new(|_| json!({"mcpServers": {"a": oauth("https://o.example/mcp")}}));
+        *world.claude.adds.lock().unwrap() = Adds::Fails(1, "boom");
+        let err = world.run(&swap(user("a"), user("b"), false)).unwrap_err();
+        assert_eq!(
+            err,
+            "a for the user was not copied: Claude Code said: boom."
+        );
+        // Nothing was removed, so nothing is put back.
+        assert_eq!(world.commands(), [("add-json".into(), None)]);
+        assert_eq!(
+            world.config()["mcpServers"]["a"],
+            oauth("https://o.example/mcp")
+        );
+    }
+
+    #[test]
+    fn what_claude_code_wrote_counts_not_what_it_said() {
+        let world = World::new(|_| json!({"mcpServers": {"a": oauth("https://o.example/mcp")}}));
+        // Said yes, wrote nothing.
+        *world.claude.adds.lock().unwrap() = Adds::Fails(0, "");
+        let err = world.run(&swap(user("a"), user("b"), false)).unwrap_err();
+        assert_eq!(
+            err,
+            "a for the user was not copied: Claude Code said it added it, but it is not there."
+        );
+        // Wrote something else.
+        *world.claude.adds.lock().unwrap() = Adds::Other(oauth("https://elsewhere.example/mcp"));
+        let err = world.run(&swap(user("a"), user("c"), false)).unwrap_err();
+        assert_eq!(
+            err,
+            "a for the user was not copied: Claude Code added it with other settings than Klefki gave it."
+        );
+    }
+
+    #[test]
+    fn a_project_spelled_another_way_still_finds_its_client_secret() {
+        // The change names the project with a trailing slash; the file and Klefki's secret store spell it without.
+        let world = World::new(
+            |project| json!({"projects": {project: {"mcpServers": {"a": oauth("https://o.example/mcp")}}}}),
+        );
+        let project = world.project();
+        let secret = Secret::new("sec-a".to_owned());
+        world
+            .store
+            .set(&local(&project, "a").connection(), &secret)
+            .unwrap();
+        world
+            .run(&swap(local(&format!("{project}/"), "a"), user("a"), true))
+            .unwrap();
+        assert_eq!(
+            world.commands(),
+            [
+                ("remove".into(), None),
+                ("add-json".into(), Some("sec-a".into()))
+            ]
+        );
+        assert_eq!(
+            world.store.get(&user("a").connection()).unwrap(),
+            Some(secret)
+        );
+        assert_eq!(
+            world.store.get(&local(&project, "a").connection()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn what_claude_code_said_is_kept_short_and_ends_a_sentence() {
+        let out = |stdout: &str, stderr: &str| RunOutput {
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            exit_code: Some(1),
+            timed_out: false,
+            truncated: false,
+        };
+        assert_eq!(said(&out("out", "  err  ")), "err.");
+        assert_eq!(said(&out(" out ", " \n")), "out.");
+        assert_eq!(said(&out("", "Not found!")), "Not found!");
+        assert_eq!(said(&out("", "")), ".");
+        let exactly = "x".repeat(200);
+        assert_eq!(said(&out("", &exactly)), format!("{exactly}."));
+        let long = "y".repeat(201);
+        assert_eq!(said(&out("", &long)), format!("{}…", "y".repeat(200)));
+    }
+
+    #[test]
+    fn claude_codes_own_settings_count_as_the_same() {
+        let stdio = json!({"type": "stdio", "command": "x", "args": ["-y"]});
+        assert!(same_settings(&stdio, &stdio));
+        let http = oauth("https://o.example/mcp");
+        assert!(same_settings(&http, &http));
+        let mut more = http.clone();
+        more["alwaysAllow"] = json!(["read"]);
+        assert!(same_settings(&http, &more), "a setting left out");
+        assert!(!same_settings(&more, &http), "a setting added");
+        assert!(!same_settings(&oauth("https://other.example/mcp"), &http));
+        assert!(same_settings(&json!("x"), &json!("x")));
+        assert!(!same_settings(&json!("x"), &json!("y")));
+    }
+
+    // -- review
+
+    #[test]
+    fn a_copy_that_does_not_fit_is_refused_in_the_review_and_an_edit_waits_for_the_run() {
+        use crate::adjust::{Adjust, Rebase};
+        let root = json!({"mcpServers": {"a": oauth("https://o.example/mcp")}});
+        let mut copy = swap(user("a"), user("b"), false);
+        copy.adjust = Adjust {
+            base: Some(Rebase {
+                from: "https://other.example".into(),
+                to: "https://x.example".into(),
+            }),
+            ..Adjust::default()
+        };
+        assert_eq!(
+            review(&root, &copy, true),
+            Err("a cannot be copied that way: the address of a has changed since; review the copy again.".into())
+        );
+        // An edit whose hidden value is gone, or that is not usable: the run says why.
+        let mut edit = swap(user("a"), user("a"), true);
+        edit.edited = Some(
+            json!({"type": "http", "url": "https://o.example/mcp", "headers": {"X": entry::MASK}}),
+        );
+        assert!(review(&root, &edit, true).is_ok());
+        edit.edited = Some(json!({"type": "http"}));
+        assert!(review(&root, &edit, true).is_ok());
+    }
+
+    #[test]
+    fn only_removing_a_server_that_signs_in_signs_it_out() {
+        let root = json!({"mcpServers": {"a": oauth("https://o.example/mcp"), "p": plain("https://p.example/mcp")}});
+        let said = review(&root, &swap(user("p"), user("q"), true), true).unwrap();
+        assert_eq!(said, Said::default());
+        let said = review(&root, &swap(user("a"), user("b"), false), true).unwrap();
+        assert_eq!(said, Said::default());
+        let said = review(&root, &swap(user("a"), user("b"), true), true).unwrap();
+        assert_eq!(
+            said.warnings,
+            [
+                "Claude Code removes a and adds it again, so you will need to sign in to it again afterwards."
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_sign_in_that_another_server_of_that_name_has_is_refused() {
+        let world = World::new(|_| json!({}));
+        let project = world.project();
+        let refused = |to: &str, place: &str| {
+            Err(format!(
+                "{to} {place} has the same name and address, and Claude Code keeps one sign-in for both, so its client secret would be replaced. Use another name or address."
+            ))
+        };
+        // A copy under another name.
+        let root = json!({
+            "mcpServers": {"a": oauth("https://o.example/mcp")},
+            "projects": {&project: {"mcpServers": {"b": oauth("https://o.example/mcp")}}},
+        });
+        let copy = swap(user("a"), user("b"), false);
+        assert_eq!(review(&root, &copy, true), refused("b", "in proj"));
+        // Another address there: nothing shared.
+        let root = json!({
+            "mcpServers": {"a": oauth("https://o.example/mcp")},
+            "projects": {&project: {"mcpServers": {"b": oauth("https://other.example/mcp")}}},
+        });
+        assert!(review(&root, &copy, true).is_ok());
+
+        // A server that starts signing in, where another of its name signs in at that address.
+        let root = json!({
+            "mcpServers": {"a": plain("https://o.example/mcp")},
+            "projects": {&project: {"mcpServers": {"a": oauth("https://o.example/mcp")}}},
+        });
+        let mut edit = swap(user("a"), user("a"), true);
+        edit.edited = Some(oauth("https://o.example/mcp"));
+        assert_eq!(review(&root, &edit, true), refused("a", "in proj"));
+
+        // A new address that another server of its name signs in at.
+        let root = json!({
+            "mcpServers": {"a": oauth("https://o.example/mcp")},
+            "projects": {&project: {"mcpServers": {"a": oauth("https://new.example/mcp")}}},
+        });
+        edit.edited = Some(oauth("https://new.example/mcp"));
+        assert_eq!(review(&root, &edit, true), refused("a", "in proj"));
+
+        // Moved away under another name, where the server of that name signs in at its address.
+        let root = json!({
+            "mcpServers": {"a": oauth("https://o.example/mcp"), "b": oauth("https://o.example/mcp")},
+            "projects": {&project: {"mcpServers": {}}},
+        });
+        let moved = swap(user("a"), local(&project, "b"), true);
+        assert_eq!(review(&root, &moved, true), refused("b", "for the user"));
+    }
+
+    #[test]
+    fn without_klefkis_copy_of_the_client_secret_the_review_says_what_happens_to_it() {
+        let world = World::new(|_| json!({}));
+        let project = world.project();
+        let root = json!({
+            "mcpServers": {"a": oauth("https://o.example/mcp"), "p": plain("https://p.example/mcp")},
+            "projects": {&project: {"mcpServers": {}}},
+        });
+        let note = "Klefki has no copy of a's client secret, so Claude Code keeps none for b. If the server needs one, enter it on a's Auth tab first, then review again.";
+        // A copy under another name gets none.
+        let copy = swap(user("a"), user("b"), false);
+        assert_eq!(review(&root, &copy, false).unwrap().notes, [note]);
+        // With Klefki's copy, nothing to say.
+        assert_eq!(review(&root, &copy, true).unwrap(), Said::default());
+        // A server that does not sign in has no client secret.
+        let copy = swap(user("p"), user("q"), false);
+        assert_eq!(review(&root, &copy, false).unwrap(), Said::default());
+        // The same name and address in another place: Claude Code shares the one it has.
+        let copy = swap(user("a"), local(&project, "a"), false);
+        assert_eq!(review(&root, &copy, false).unwrap(), Said::default());
+        // A move removes it: a warning.
+        let moved = swap(user("a"), local(&project, "a"), true);
+        let said = review(&root, &moved, false).unwrap();
+        assert!(said.notes.is_empty(), "{said:?}");
+        assert!(
+            said.warnings[1].starts_with(
+                "Klefki has no copy of a's client secret. If it has one, Claude Code forgets it"
+            ),
+            "{said:?}"
+        );
+    }
+
+    // -- putting a kept definition back
+
+    #[test]
+    fn put_back_warns_only_about_settings_claude_code_drops() {
+        let kept = |entry: Value| Recovery {
+            id: "1-0".into(),
+            path: PathBuf::new(),
+            name: "a".into(),
+            project: None,
+            entry,
+            next: None,
+        };
+        let (_, warning) = preview_put_back(&kept(oauth("https://o.example/mcp")));
+        assert_eq!(warning, None);
+        let mut more = oauth("https://o.example/mcp");
+        more["alwaysAllow"] = json!(["read"]);
+        let (op, warning) = preview_put_back(&kept(more));
+        assert_eq!(
+            warning.as_deref(),
+            Some(
+                "Claude Code keeps only the settings it uses, so a loses alwaysAllow; Klefki keeps the whole definition until you forget it."
+            )
+        );
+        assert_eq!(
+            op,
+            Op::AddServer {
+                project: None,
+                name: "a".into(),
+                entry: oauth("https://o.example/mcp"),
+            }
+        );
+    }
+
+    #[test]
+    fn putting_back_what_is_there_already_only_forgets_the_kept_copy() {
+        let world = World::new(|_| json!({"mcpServers": {"a": plain("https://p.example/mcp")}}));
+        world.keep(
+            "0000000000000001-0",
+            &json!({"name": "a", "project": null, "entry": plain("https://p.example/mcp")}),
+        );
+        let ctx = Ctx {
+            claude_json: &world.claude_json,
+            backup_dir: &world.backup_dir,
+            claude: &world.claude,
+            store: Some(&*world.store),
+            home: Some(&world.root),
+            progress: &|_| {},
+            backups: &world.backups,
+        };
+        put_back(&ctx, "0000000000000001-0").unwrap();
+        assert!(Recovery::files(&world.backup_dir).is_empty());
+        // Something else there: refused, and kept.
+        world.keep(
+            "0000000000000002-0",
+            &json!({"name": "a", "project": null, "entry": plain("https://other.example/mcp")}),
+        );
+        let err = put_back(&ctx, "0000000000000002-0").unwrap_err();
+        assert!(
+            err.contains("there is a server by that name there now"),
+            "{err}"
+        );
+        assert_eq!(Recovery::files(&world.backup_dir).len(), 1);
+        assert!(world.commands().is_empty());
+    }
+
+    #[test]
+    fn a_kept_definition_is_read_up_to_four_times_the_largest_entry() {
+        let world = World::new(|_| json!({}));
+        let big = |bytes: usize| {
+            let mut entry = plain("https://p.example/mcp");
+            entry["env"] = json!({"PAD": "x".repeat(bytes)});
+            json!({"name": "a", "project": null, "entry": entry})
+        };
+        world.keep("0000000000000001-0", &big(2 * entry::MAX_ENTRY_BYTES));
+        assert!(Recovery::find(&world.backup_dir, "0000000000000001-0").is_ok());
+        world.keep("0000000000000002-0", &big(4 * entry::MAX_ENTRY_BYTES));
+        assert!(Recovery::find(&world.backup_dir, "0000000000000002-0").is_err());
+    }
+
+    #[test]
+    fn a_kept_definition_with_a_project_that_is_not_a_local_folder_is_not_read() {
+        let world = World::new(|_| json!({}));
+        let project = world.project();
+        for (id, at, readable) in [
+            ("0000000000000001-0", json!(project), true),
+            ("0000000000000002-0", json!("relative/folder"), false),
+            ("0000000000000003-0", json!(7), false),
+        ] {
+            world.keep(
+                id,
+                &json!({"name": "a", "project": at, "entry": plain("https://p.example/mcp")}),
+            );
+            assert_eq!(
+                Recovery::find(&world.backup_dir, id).is_ok(),
+                readable,
+                "{at}"
+            );
+        }
+    }
+
+    #[test]
+    fn definitions_kept_at_once_each_get_their_own_file() {
+        // Many in the same millisecond: each takes the next free number.
+        let world = World::new(|_| json!({}));
+        let ctx = Ctx {
+            claude_json: &world.claude_json,
+            backup_dir: &world.backup_dir,
+            claude: &world.claude,
+            store: Some(&*world.store),
+            home: Some(&world.root),
+            progress: &|_| {},
+            backups: &world.backups,
+        };
+        let ids: std::collections::BTreeSet<String> = (0..40)
+            .map(|_| {
+                Recovery::save(&ctx, &user("a"), &plain("https://p.example/mcp"), None)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        assert_eq!(ids.len(), 40);
+        assert_eq!(Recovery::files(&world.backup_dir).len(), 40);
+    }
+
+    #[test]
+    fn a_rename_got_through_only_once_the_old_name_is_gone() {
+        let kept = json!({"name": "a", "project": null, "entry": oauth("https://o.example/mcp"),
+            "next": {"name": "b", "project": null, "entry": oauth("https://o.example/mcp")}});
+        // Both there: Klefki stopped between the add and the remove.
+        let world = World::new(
+            |_| json!({"mcpServers": {"a": oauth("https://o.example/mcp"), "b": oauth("https://o.example/mcp")}}),
+        );
+        world.keep("0000000000000001-0", &kept);
+        assert_eq!(world.listed(), 1);
+        // Only the new one there: done.
+        let world = World::new(|_| json!({"mcpServers": {"b": oauth("https://o.example/mcp")}}));
+        world.keep("0000000000000001-0", &kept);
+        assert_eq!(world.listed(), 0);
+    }
+
+    #[test]
+    fn a_kept_definition_whose_change_got_through_without_a_secret_of_its_own_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backup_dir, claude_json, _, _) = got_through(dir.path());
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        let open = || Some(Arc::clone(&store));
+        assert!(Recovery::list(&backup_dir, &claude_json, &open).is_empty());
+    }
+
+    #[test]
+    fn a_kept_definition_stays_while_another_secret_is_where_its_server_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let (backup_dir, claude_json, from, to) = got_through(dir.path());
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        let kept = Secret::new("sec-a".to_owned());
+        store.set(&from.connection(), &kept).unwrap();
+        store
+            .set(&to.connection(), &Secret::new("sec-other".to_owned()))
+            .unwrap();
+        let open = || Some(Arc::clone(&store));
+        assert_eq!(Recovery::list(&backup_dir, &claude_json, &open).len(), 1);
+        assert_eq!(store.get(&from.connection()).unwrap(), Some(kept));
+    }
 }
