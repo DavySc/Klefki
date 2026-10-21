@@ -9715,6 +9715,26 @@ mod tests {
         (h, engine)
     }
 
+    fn duplicate_harness_with_many_projects()
+    -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        let projects = (0..40)
+            .map(|i| format!("C:/Users/me/source/Repos/project-{i:02}"))
+            .chain(["C:/Repos/WebApp".into(), "/home/me/notes".into()])
+            .collect();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
+                servers: vec![a, b],
+                projects,
+                ..Snapshot::default()
+            })))
+            .unwrap();
+        h.run();
+        (h, engine)
+    }
+
     fn duplicate_requested(engine: &klefki_core::api::Detached) -> Vec<Change> {
         drain(engine)
             .into_iter()
