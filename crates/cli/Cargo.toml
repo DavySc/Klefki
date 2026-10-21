@@ -23,3 +23,6 @@ tempfile = "3"
 # sign-in uses, so nothing new is built).
 [target.'cfg(unix)'.dev-dependencies]
 portable-pty = "0.9"
+
+[lints]
+workspace = true

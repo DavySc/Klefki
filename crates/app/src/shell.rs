@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Page {
+pub(crate) enum Page {
     Connections,
     Profiles,
     Desktop,
@@ -38,7 +38,7 @@ impl Page {
         (Page::ActivityLog, icon::LIST_BULLETS, "Activity log"),
     ];
 
-    pub fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         Self::ALL
             .iter()
             .find(|(p, ..)| *p == self)
@@ -83,7 +83,7 @@ impl Page {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DetailTab {
+pub(crate) enum DetailTab {
     General,
     Auth,
     HeadersEnv,
@@ -231,9 +231,9 @@ enum OutcomeChoice {
 }
 
 /// The size Klefki opens at.
-pub const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
+pub(crate) const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
 /// The smallest it can be made; also the room the opening size gives at 150 % zoom.
-pub const SMALLEST_SIZE: egui::Vec2 = egui::vec2(800.0, 480.0);
+pub(crate) const SMALLEST_SIZE: egui::Vec2 = egui::vec2(800.0, 480.0);
 
 enum GridRow {
     Group(Group),
@@ -250,7 +250,7 @@ struct Group {
     count: usize,
 }
 
-pub struct ShellApp {
+pub(crate) struct ShellApp {
     snapshot: Arc<Snapshot>,
     /// The engine. `None` for demo data and tests that feed the UI directly.
     core: Option<Core>,
@@ -385,7 +385,7 @@ pub struct ShellApp {
 }
 
 impl ShellApp {
-    pub fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
+    pub(crate) fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
         Self {
             core: None,
             live: vec![None; snapshot.servers.len()],
@@ -458,7 +458,7 @@ impl ShellApp {
     }
 
     /// The app driven by the engine: the snapshot and every status arrive as events.
-    pub fn with_core(core: Core, theme: ThemeChoice) -> Self {
+    pub(crate) fn with_core(core: Core, theme: ThemeChoice) -> Self {
         let mut app = Self::new(Arc::new(Snapshot::default()), theme);
         app.updated_by_hand = core.updated_by_hand().map(str::to_owned);
         app.checks_for_updates = core.checks_for_updates();
@@ -1112,7 +1112,7 @@ impl ShellApp {
     }
 
     /// Indices into the snapshot matching the search, ordered by scope, project and name.
-    pub fn visible(&self) -> Vec<usize> {
+    pub(crate) fn visible(&self) -> Vec<usize> {
         let q = self.search.trim().to_lowercase();
         let idx: Vec<usize> = (0..self.snapshot.servers.len())
             .filter(|&i| matches_search(&self.snapshot.servers[i], &q))
@@ -1424,11 +1424,11 @@ impl ShellApp {
             );
             ui.label(RichText::new(self.page.title()).color(pal.text_muted));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui
+                let refresh = ui
                     .button(icon::ARROWS_CLOCKWISE)
-                    .on_hover_text("Refresh and re-check all (F5)")
-                    .clicked()
-                {
+                    .on_hover_text("Refresh and re-check all (F5)");
+                name_for_screen_readers(&refresh, "Refresh and re-check all");
+                if refresh.clicked() {
                     self.refresh();
                 }
                 if let Some(version) = self.updates.available() {
@@ -1450,7 +1450,7 @@ impl ShellApp {
                 }
                 let current = ThemeOption::new(self.theme, self.tone);
                 let mut picked = None;
-                egui::ComboBox::from_id_salt("theme")
+                let theme_menu = egui::ComboBox::from_id_salt("theme")
                     .selected_text(format!("{} {}", current.icon(), current.label()))
                     .width(140.0)
                     // All six and the separator fit without a scroll bar (the default is 200 px).
@@ -1485,57 +1485,72 @@ impl ShellApp {
                     })
                     .response
                     .on_hover_text("Theme");
+                // Named, and its value in words: what it shows starts with an icon.
+                theme_menu
+                    .ctx
+                    .accesskit_node_builder(theme_menu.id, |node| {
+                        node.set_label("Theme");
+                        node.set_value(current.label());
+                    });
                 if let Some(option) = picked {
                     self.theme = option.choice;
                     self.tone = option.tone;
                     theme::set_choice(ui.ctx(), option.choice);
                     theme::set_tone(ui.ctx(), option.tone);
                 }
-                if ui
+                let commands = ui
                     .button(
                         RichText::new(format!("{} {}", icon::COMMAND, shortcut("K")))
                             .color(pal.text_muted),
                     )
-                    .on_hover_text("Commands: everything Klefki can do, by name")
-                    .clicked()
-                {
+                    .on_hover_text("Commands: everything Klefki can do, by name");
+                // The shortcut it shows is part of its name (WCAG 2.5.3, label in name).
+                name_for_screen_readers(&commands, &format!("Commands ({})", shortcut("K")));
+                if commands.clicked() {
                     self.command.open();
                 }
                 // On the Activity log it filters the changes, and says so: a box that filtered the hidden list of
                 // servers would find nothing there.
                 // The shortcut is left out there, so the longer words fit the box.
-                let (query, hint) = if let Some(page) = &mut self.activity {
+                let (query, hint, name) = if let Some(page) = &mut self.activity {
                     (
                         &mut page.filter,
                         format!("{} Filter changes", icon::MAGNIFYING_GLASS),
+                        "Filter changes",
                     )
                 } else if let Some(page) = &mut self.secrets {
                     (
                         &mut page.filter,
                         format!("{} Filter secrets", icon::MAGNIFYING_GLASS),
+                        "Filter secrets",
                     )
                 } else if let Some(page) = &mut self.desktop {
                     (
                         &mut page.filter,
                         format!("{} Filter servers", icon::MAGNIFYING_GLASS),
+                        "Filter servers",
                     )
                 } else if let Some(page) = &mut self.profiles {
                     (
                         &mut page.filter,
                         format!("{} Filter profiles", icon::MAGNIFYING_GLASS),
+                        "Filter profiles",
                     )
                 } else {
                     (
                         &mut self.search,
                         format!("{} Filter  {}", icon::MAGNIFYING_GLASS, shortcut("F")),
+                        "Filter servers",
                     )
                 };
-                ui.add(
+                // A hint in the box is no name: it is gone once something is typed.
+                let filter = ui.add(
                     egui::TextEdit::singleline(query)
                         .id(search_id())
                         .hint_text(hint)
                         .desired_width(220.0),
                 );
+                name_for_screen_readers(&filter, name);
                 if let Some(version) = self.shown_cli_version() {
                     // Only where it fits: in a narrow window it would be drawn over the title. Where the whole
                     // of it does not, the number alone, named in full on hover.
@@ -1941,64 +1956,66 @@ impl ShellApp {
             });
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
-            for (glyph, tip) in ACTIONS {
-                let tip = if glyph == icon::EXPORT {
+            for tool in Tool::ALL {
+                let tip = if tool == Tool::Export {
                     export_tip
                 } else {
-                    tip
+                    tool.tip()
                 };
-                let button = egui::Button::new(RichText::new(glyph).size(16.0))
+                let button = egui::Button::new(RichText::new(tool.glyph()).size(16.0))
                     .min_size(egui::vec2(44.0, 38.0));
-                let (enabled, needs) = match glyph {
+                let (enabled, needs) = match tool {
                     _ if read_only
-                        && ![
-                            icon::PLUS,
-                            icon::TRAY_ARROW_DOWN,
-                            icon::TOGGLE_RIGHT,
-                            icon::TOGGLE_LEFT,
-                        ]
-                        .contains(&glyph) =>
+                        && ![Tool::Add, Tool::Import, Tool::TurnOn, Tool::TurnOff]
+                            .contains(&tool) =>
                     {
                         (false, read_only_hint.as_deref().unwrap_or_default())
                     }
-                    g if g == icon::TOGGLE_RIGHT || g == icon::TOGGLE_LEFT || g == icon::TRASH => {
+                    Tool::TurnOn | Tool::TurnOff | Tool::Delete => {
                         (can_toggle, "select a server first")
                     }
-                    g if g == icon::COPY || g == icon::ARROW_FAT_LINES_RIGHT => {
+                    Tool::Duplicate | Tool::Move => {
                         (can_duplicate, "select one user or local server")
                     }
-                    g if g == icon::SIGN_IN => {
-                        (can_sign_in, "select one server that needs you to sign in")
-                    }
-                    g if g == icon::PLUS => (can_add, "wait for the change under way"),
-                    g if g == icon::TRAY_ARROW_DOWN => (
+                    Tool::SignIn => (can_sign_in, "select one server that needs you to sign in"),
+                    Tool::Add => (can_add, "wait for the change under way"),
+                    Tool::Import => (
                         can_add && !self.import_waiting,
                         "wait for the change under way",
                     ),
-                    g if g == icon::EXPORT => (can_export, "no server to export"),
-                    _ => (can_edit, "select one server"),
+                    Tool::Export => (can_export, "no server to export"),
+                    Tool::Edit => (can_edit, "select one server"),
                 };
-                let clicked = ui
+                let hover = if enabled {
+                    tip.to_owned()
+                } else {
+                    format!("{tip}: {needs}")
+                };
+                let response = ui
                     .add_enabled(enabled, button)
                     .on_hover_text(tip)
-                    .on_disabled_hover_text(format!("{tip}: {needs}"))
-                    .clicked();
-                if clicked {
-                    match glyph {
-                        g if g == icon::TOGGLE_RIGHT => self.prepare_toggle(true),
-                        g if g == icon::TOGGLE_LEFT => self.prepare_toggle(false),
-                        g if g == icon::TRASH => self.prepare_delete(),
-                        g if g == icon::COPY => self.open_duplicate(),
-                        g if g == icon::ARROW_FAT_LINES_RIGHT => self.open_move(),
-                        g if g == icon::PLUS => self.open_add(),
-                        g if g == icon::TRAY_ARROW_DOWN => self.ask_import(),
-                        g if g == icon::EXPORT => self.open_export(),
-                        g if g == icon::SIGN_IN => {
+                    .on_disabled_hover_text(&hover);
+                name_for_screen_readers(&response, tool.name());
+                // The hover text, why it is off included, without hovering: its shortcut, or what to select.
+                response
+                    .ctx
+                    .accesskit_node_builder(response.id, |node| node.set_description(hover));
+                if response.clicked() {
+                    match tool {
+                        Tool::TurnOn => self.prepare_toggle(true),
+                        Tool::TurnOff => self.prepare_toggle(false),
+                        Tool::Delete => self.prepare_delete(),
+                        Tool::Duplicate => self.open_duplicate(),
+                        Tool::Move => self.open_move(),
+                        Tool::Add => self.open_add(),
+                        Tool::Import => self.ask_import(),
+                        Tool::Export => self.open_export(),
+                        Tool::SignIn => {
                             if let Some(s) = self.single_selected().cloned() {
                                 self.start_sign_in(&s);
                             }
                         }
-                        _ => self.edit_selected(),
+                        Tool::Edit => self.edit_selected(),
                     }
                 }
             }
@@ -4083,7 +4100,7 @@ impl ShellApp {
         let next = match at {
             None if step > 0 => 0,
             None => order.len() - 1,
-            Some(p) => (p as i32 + step).clamp(0, order.len() as i32 - 1) as usize,
+            Some(p) => p.saturating_add_signed(step as isize).min(order.len() - 1),
         };
         self.selected.clear();
         self.selected.insert(order[next]);
@@ -6019,6 +6036,10 @@ fn search_id() -> egui::Id {
 
 /// Room kept free at the right of the detail panel's content: its scroll bar floats over the content and, at its
 /// widest when the pointer is on it, takes the clicks there.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a few pixels; `as` saturates for a float"
+)]
 fn scroll_gutter(style: &egui::Style) -> i8 {
     let bar = &style.spacing.scroll;
     (bar.bar_width + bar.bar_outer_margin).ceil() as i8
@@ -8075,19 +8096,84 @@ impl DuplicateForm {
 }
 
 /// The toolbar's buttons: icon and hover text. Only what works today: a button that can never be pressed is noise.
-const ACTIONS: [(&str, &str); 10] = [
-    (icon::PLUS, "Add (Ctrl+N)"),
-    (icon::TRAY_ARROW_DOWN, "Import from a file (Ctrl+O)"),
-    (icon::PENCIL_SIMPLE, "Edit (Ctrl+E)"),
-    (icon::COPY, "Duplicate (Ctrl+D)"),
-    (icon::ARROW_FAT_LINES_RIGHT, "Move (Ctrl+Shift+M)"),
-    (icon::SIGN_IN, "Sign in"),
-    (icon::TOGGLE_RIGHT, "Turn on"),
-    (icon::TOGGLE_LEFT, "Turn off"),
-    (icon::TRASH, "Delete (Del)"),
-    // Last: it changes nothing. Its hover text says what it exports: the selection, or the whole list.
-    (icon::EXPORT, ""),
-];
+/// The toolbar's buttons, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tool {
+    Add,
+    Import,
+    Edit,
+    Duplicate,
+    Move,
+    SignIn,
+    TurnOn,
+    TurnOff,
+    Delete,
+    /// Last: it changes nothing.
+    Export,
+}
+
+impl Tool {
+    const ALL: [Tool; 10] = [
+        Tool::Add,
+        Tool::Import,
+        Tool::Edit,
+        Tool::Duplicate,
+        Tool::Move,
+        Tool::SignIn,
+        Tool::TurnOn,
+        Tool::TurnOff,
+        Tool::Delete,
+        Tool::Export,
+    ];
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Tool::Add => icon::PLUS,
+            Tool::Import => icon::TRAY_ARROW_DOWN,
+            Tool::Edit => icon::PENCIL_SIMPLE,
+            Tool::Duplicate => icon::COPY,
+            Tool::Move => icon::ARROW_FAT_LINES_RIGHT,
+            Tool::SignIn => icon::SIGN_IN,
+            Tool::TurnOn => icon::TOGGLE_RIGHT,
+            Tool::TurnOff => icon::TOGGLE_LEFT,
+            Tool::Delete => icon::TRASH,
+            Tool::Export => icon::EXPORT,
+        }
+    }
+
+    /// What a screen reader calls the button, which shows only its icon (WCAG 4.1.2). Not the bare verb: a dialog's
+    /// own button says "Turn off" or "Sign in", and the two must not read the same.
+    fn name(self) -> &'static str {
+        match self {
+            Tool::Add => "Add server",
+            Tool::Import => "Import from a file",
+            Tool::Edit => "Edit server",
+            Tool::Duplicate => "Duplicate server",
+            Tool::Move => "Move server",
+            Tool::SignIn => "Sign in to server",
+            Tool::TurnOn => "Turn on servers",
+            Tool::TurnOff => "Turn off servers",
+            Tool::Delete => "Delete servers",
+            Tool::Export => "Export servers",
+        }
+    }
+
+    /// The hover text. Export's says what it exports, the selection or the whole list, so the toolbar writes it.
+    fn tip(self) -> &'static str {
+        match self {
+            Tool::Add => "Add (Ctrl+N)",
+            Tool::Import => "Import from a file (Ctrl+O)",
+            Tool::Edit => "Edit (Ctrl+E)",
+            Tool::Duplicate => "Duplicate (Ctrl+D)",
+            Tool::Move => "Move (Ctrl+Shift+M)",
+            Tool::SignIn => "Sign in",
+            Tool::TurnOn => "Turn on",
+            Tool::TurnOff => "Turn off",
+            Tool::Delete => "Delete (Del)",
+            Tool::Export => "",
+        }
+    }
+}
 
 /// What the Move dialog holds: the one place the server goes.
 struct MoveForm {
@@ -9033,7 +9119,12 @@ fn hovered_for(ui: &Ui, id: egui::Id, rect: egui::Rect, delay: f64) -> bool {
     let since = ctx.data_mut(|d| *d.get_temp_mut_or(key, now));
     let left = delay - (now - since);
     if left > 0.0 {
-        ctx.request_repaint_after_secs(left as f32);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a repaint delay in seconds needs no more than f32"
+        )]
+        let left = left as f32;
+        ctx.request_repaint_after_secs(left);
         return false;
     }
     true
@@ -9217,6 +9308,14 @@ fn projects_paths(projects: &[String]) -> String {
         text.push_str(&format!("\nand {} more", count - SHADOWED_PATHS));
     }
     text
+}
+
+/// Names `response` for assistive technology where what it shows, an icon or a hint in a box, is no name (WCAG 2.2
+/// SC 4.1.2). Only the accessibility tree changes, nothing drawn.
+fn name_for_screen_readers(response: &egui::Response, name: &str) {
+    response
+        .ctx
+        .accesskit_node_builder(response.id, |node| node.set_label(name));
 }
 
 /// A small icon button that reads as `label` to assistive technology.
@@ -9429,8 +9528,7 @@ mod tests {
     fn clicking_a_row_selects_it_and_shows_detail() {
         let mut h = harness();
         h.run();
-        h.get_by_label("issue-tracker").click();
-        h.run();
+        click(&mut h, "issue-tracker");
         assert_eq!(h.state().selected.len(), 1);
         // Once in the grid and once in the detail panel.
         assert_eq!(h.get_all_by_label("https://it.example.com/mcp").count(), 2);
@@ -9472,7 +9570,7 @@ mod tests {
         let nav = h.get_by_label_contains("Secrets").rect();
         assert!(nav.height() >= 40.0, "nav item {nav:?}");
         // (Was the Add button; the toolbar now shows only actions that work, so the check uses Edit.)
-        let add = h.get_by_label(icon::PENCIL_SIMPLE).rect();
+        let add = tool(&h, Tool::Edit).rect();
         assert!(
             add.width() >= 40.0 && add.height() >= 34.0,
             "toolbar button {add:?}"
@@ -9532,13 +9630,13 @@ mod tests {
         assert_eq!(theme::palette(&h.ctx).panel, theme::DARK.panel);
         let cool_dark = ThemeOption::new(Dark, Tone::Cool);
 
-        // Closed, the dropdown shows the current theme only.
-        h.get_by_value(&shown(cool_dark));
+        // Closed, the dropdown shows the current theme only (its value, in words: the icon is drawn but not read).
+        h.get_by_value(cool_dark.label());
         assert!(h.query_by_label_contains("Light").is_none());
         assert!(h.query_by_label_contains("System").is_none());
 
         // Open, every theme is offered, each with its own icon, and the pick closes the list.
-        h.get_by_value(&shown(cool_dark)).click();
+        h.get_by_value(cool_dark.label()).click();
         h.run();
         for o in ThemeOption::ALL {
             h.query_by_label_contains(&shown(o))
@@ -9556,7 +9654,7 @@ mod tests {
 
         // A warm one sets the greys too.
         let warm_light = ThemeOption::new(Light, Tone::Warm);
-        h.get_by_value(&shown(ThemeOption::new(Light, Tone::Cool)))
+        h.get_by_value(ThemeOption::new(Light, Tone::Cool).label())
             .click();
         h.run();
         h.get_by_label_contains(&shown(warm_light)).click();
@@ -9565,16 +9663,16 @@ mod tests {
         assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_LIGHT.panel);
 
         // System with warm greys is one pick, and the closed dropdown says so.
-        h.get_by_value(&shown(warm_light)).click();
+        h.get_by_value(warm_light.label()).click();
         h.run();
         let system_warm = ThemeOption::new(System, Tone::Warm);
         h.get_by_label_contains(&shown(system_warm)).click();
         h.run();
         assert_eq!((h.state().theme, h.state().tone), (System, Tone::Warm));
-        h.get_by_value(&shown(system_warm));
+        h.get_by_value(system_warm.label());
 
         // ... and back to cool greys in one pick.
-        h.get_by_value(&shown(system_warm)).click();
+        h.get_by_value(system_warm.label()).click();
         h.run();
         h.get_by_label_contains(&shown(ThemeOption::new(System, Tone::Cool)))
             .click();
@@ -9587,8 +9685,7 @@ mod tests {
         let current = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
         let mut h = harness();
         h.run();
-        h.get_by_value(&format!("{} {}", current.icon(), current.label()))
-            .click();
+        h.get_by_value(current.label()).click();
         h.run();
         let checked = format!("{} {}  {}", current.icon(), current.label(), icon::CHECK);
         h.get_by_label(&checked);
@@ -9608,8 +9705,7 @@ mod tests {
         let mut h = harness_themed((*fixture_snapshot()).clone(), ThemeChoice::Light);
         h.run();
         assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
-        h.get_by_label("issue-tracker").click();
-        h.run();
+        click(&mut h, "issue-tracker");
         h.get_by_label_contains("Secrets");
         assert_eq!(h.get_all_by_label("https://it.example.com/mcp").count(), 2);
     }
@@ -9627,8 +9723,7 @@ mod tests {
     fn detail_tabs_do_not_change_size_on_hover() {
         let mut h = harness();
         h.run();
-        h.get_by_label("issue-tracker").click();
-        h.run();
+        click(&mut h, "issue-tracker");
         // (The Env tab was called "Headers/Env" when this test was written.)
         for tab in ["Auth", "Env", "General"] {
             let before = h.get_by_label(tab).rect();
@@ -9642,10 +9737,9 @@ mod tests {
     #[test]
     fn dropdown_options_do_not_change_size_on_hover() {
         let dark = ThemeOption::new(ThemeChoice::Dark, Tone::Cool);
-        let shown = format!("{} {}", dark.icon(), dark.label());
         let mut h = harness();
         h.run();
-        h.get_by_value(&shown).click();
+        h.get_by_value(dark.label()).click();
         h.run();
         for option in ["System (cool)", "Light (cool)", "Dark (warm)"] {
             let before = h.get_by_label_contains(option).rect();
@@ -9694,6 +9788,33 @@ mod tests {
 
     fn live_harness() -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         live_harness_from(Harness::builder())
+    }
+
+    /// Sends the engine's snapshot of `rows` and lets the frame settle.
+    fn show_rows(
+        h: &mut Harness<'static, ShellApp>,
+        engine: &klefki_core::api::Detached,
+        rows: Vec<ServerRow>,
+    ) {
+        engine.events.send(snapshot_of(rows)).unwrap();
+        h.run();
+    }
+
+    /// Clicks what is named `label`, exactly, and lets the frame settle.
+    fn click(h: &mut Harness<'static, ShellApp>, label: &str) {
+        h.get_by_label(label).click();
+        h.run();
+    }
+
+    /// The toolbar's button for `tool`, found by its name as a screen reader hears it.
+    fn tool<'h>(h: &'h Harness<'static, ShellApp>, tool: Tool) -> egui_kittest::Node<'h> {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, tool.name())
+    }
+
+    /// Presses the toolbar's button for `tool` and lets the frame settle.
+    fn press(h: &mut Harness<'static, ShellApp>, which: Tool) {
+        tool(h, which).click();
+        h.run();
     }
 
     /// Frames 1/60 s apart, as on a screen, so a delay is seen as it is and not skipped in quarter seconds.
@@ -9755,8 +9876,7 @@ mod tests {
         engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
         engine.events.send(unknown_host_event(&row)).unwrap();
         h.run();
-        h.get_by_label("acme-prod").click();
-        h.run();
+        click(&mut h, "acme-prod");
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
         h.get_by_label_contains("Can't reach the server's host");
@@ -9773,8 +9893,7 @@ mod tests {
         engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
         engine.events.send(unknown_host_event(&row)).unwrap();
         h.run();
-        h.get_by_label("acme-prod").click();
-        h.run();
+        click(&mut h, "acme-prod");
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
         h.get_by_label_contains("Can't reach the server's host");
@@ -9810,8 +9929,7 @@ mod tests {
             .unwrap();
         h.run();
         h.state_mut().selected.insert(0);
-        engine.events.send(snapshot_of(rows)).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows);
         assert_eq!(h.state().selected.iter().copied().collect::<Vec<_>>(), [0]);
         assert_eq!(
             h.state().effective(0).0,
@@ -9839,13 +9957,8 @@ mod tests {
         engine.events.send(unknown_host_event(&row)).unwrap();
         h.run();
         // A new snapshot, with the row at a different position, carries live results over by identity.
-        engine
-            .events
-            .send(snapshot_of(vec![other, row.clone()]))
-            .unwrap();
-        h.run();
-        h.get_by_label("acme-prod").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![other, row.clone()]);
+        click(&mut h, "acme-prod");
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
         h.get_by_label_contains("Can't reach the server's host");
@@ -9912,8 +10025,7 @@ mod tests {
         let (mut h, engine) = live_harness();
         h.run();
         let row = live_row("azure-devops", Scope::User, None);
-        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![row.clone()]);
         h.get_by_label("azure-devops");
         h.get_by_label_contains("Not checked");
 
@@ -9941,8 +10053,7 @@ mod tests {
         let mut row = live_row("known", Scope::User, None);
         row.status = Status::Connected;
         row.status_cached = true;
-        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![row.clone()]);
         h.get_by_label("\u{25CB} Connected");
         h.state_mut().selected.insert(0);
         h.state_mut().tab = DetailTab::Status;
@@ -9976,8 +10087,7 @@ mod tests {
             row.status_cached = cached;
             rows.push(row);
         }
-        engine.events.send(snapshot_of(rows)).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows);
         assert_eq!(h.query_all_by_label("\u{25CB} Needs auth").count(), 1);
         assert_eq!(h.query_all_by_label("\u{25CF} Needs auth").count(), 1);
         h.get_by_label("\u{25CB} Failed");
@@ -9991,8 +10101,7 @@ mod tests {
         let rows: Vec<ServerRow> = (0..60)
             .map(|i| live_row(&format!("s{i:02}"), Scope::User, None))
             .collect();
-        engine.events.send(snapshot_of(rows.clone())).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows.clone());
         let told = visible_sent(&engine);
         assert_eq!(told.len(), 1, "once, not every frame: {told:?}");
         let shown = &told[0];
@@ -10057,8 +10166,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("Checking");
         // A refresh replaced the world; the running check's answer will be dropped by the engine.
-        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![row.clone()]);
         assert!(h.query_by_label_contains("Checking").is_none());
         h.get_by_label_contains("Not checked");
     }
@@ -10227,8 +10335,7 @@ mod tests {
                 )))
                 .unwrap();
             h.run();
-            h.get_by_label("Settings").click();
-            h.run();
+            click(&mut h, "Settings");
             assert!(settings_cli_row_says(&h, size, "2.1.303"), "{size:?}");
         }
     }
@@ -10237,8 +10344,7 @@ mod tests {
     fn settings_says_when_claude_code_is_not_found_or_not_known_yet() {
         let (mut h, engine) = live_harness();
         h.set_size(OPENING_SIZE);
-        h.get_by_label("Settings").click();
-        h.run();
+        click(&mut h, "Settings");
         assert!(settings_cli_row_says(&h, OPENING_SIZE, "Not known yet"));
         engine
             .events
@@ -10269,8 +10375,7 @@ mod tests {
         for size in [OPENING_SIZE, SMALLEST_SIZE] {
             let (mut h, engine) = live_harness();
             h.set_size(size);
-            h.get_by_label("Settings").click();
-            h.run();
+            click(&mut h, "Settings");
             engine
                 .events
                 .send(klefki_core::api::Event::CliProblem(
@@ -10382,8 +10487,7 @@ mod tests {
             ))
             .unwrap();
         h.run();
-        h.get_by_label("docs").click();
-        h.run();
+        click(&mut h, "docs");
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
         h.get_by_label_contains("CONNECTION_CLOSED: Connection closed");
@@ -10402,10 +10506,8 @@ mod tests {
         let (mut h, engine) = live_harness();
         let mut row = live_row("gateway", Scope::User, None);
         row.transport = klefki_core::api::TransportKind::Http;
-        engine.events.send(snapshot_of(vec![row])).unwrap();
-        h.run();
-        h.get_by_label("gateway").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![row]);
+        click(&mut h, "gateway");
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
         assert!(
@@ -10419,8 +10521,7 @@ mod tests {
     fn the_refresh_button_and_f5_ask_for_a_full_recheck() {
         let (mut h, engine) = live_harness();
         h.run();
-        h.get_by_label(icon::ARROWS_CLOCKWISE).click();
-        h.run();
+        click(&mut h, "Refresh and re-check all");
         assert_eq!(
             engine.commands.try_recv().unwrap(),
             klefki_core::api::Command::Refresh { live_all: true }
@@ -10511,8 +10612,7 @@ mod tests {
             h.query_by_label("shadowed").is_none(),
             "still used in 15 projects"
         );
-        h.get_by_label("gateway").click();
-        h.run();
+        click(&mut h, "gateway");
         // Named as their groups are; the whole paths on hover.
         h.get_by_label("in 2 of 17 projects: WebApp, Api").hover();
         h.run();
@@ -10540,14 +10640,12 @@ mod tests {
             "sessions in other folders can't \
              find a file its command names",
         );
-        h.get_by_label("docs").click();
-        h.run();
+        click(&mut h, "docs");
         h.get_by_label(
             "Use full paths: sessions in other folders can't find build/index.js or ./c.json (in CFG).",
         );
         h.get_by_label_contains("so the check can pass here");
-        h.get_by_label("tools").click();
-        h.run();
+        click(&mut h, "tools");
         assert!(h.query_by_label_contains("Use full paths").is_none());
     }
 
@@ -10564,8 +10662,7 @@ mod tests {
         h.run();
         h.get_by_label("shadowed");
         assert!(h.query_by_label_contains("shadowed in").is_none());
-        h.get_by_label("gateway").click();
-        h.run();
+        click(&mut h, "gateway");
         h.get_by_label("in all 2 projects: WebApp, Api");
     }
 
@@ -10579,8 +10676,7 @@ mod tests {
             .send(snapshot_with_projects(40, vec![row]))
             .unwrap();
         h.run();
-        h.get_by_label("gateway").click();
-        h.run();
+        click(&mut h, "gateway");
         h.get_by_label("in 9 of 40 projects: p1, p2, p3, p4, p5 and 4 more");
     }
 
@@ -10680,11 +10776,9 @@ mod tests {
             .send(snapshot_with_projects(17, vec![user, project]))
             .unwrap();
         h.run();
-        h.get_by_label("gateway").click();
-        h.run();
+        click(&mut h, "gateway");
         h.get_by_label("disabled in 3 of 17 projects");
-        h.get_by_label("docs").click();
-        h.run();
+        click(&mut h, "docs");
         h.get_by_label("Pending approval");
         assert!(h.query_by_label_contains("of 17 projects").is_none());
     }
@@ -10918,8 +11012,7 @@ mod tests {
         open_status_tab(&mut h, "first-stdio");
         let (first, scrolled) = wheel_the_detail_panel_to(&mut h, OPENING_SIZE, "Copy report");
         assert!(scrolled.top() < first.top());
-        h.get_by_label("second-stdio").click();
-        h.run();
+        click(&mut h, "second-stdio");
         let rect = h.get_by_label("Copy report").rect();
         assert!(
             (rect.top() - first.top()).abs() < 1.0,
@@ -10935,8 +11028,7 @@ mod tests {
     ) -> (egui::Rect, egui::Rect) {
         let (mut h, engine) = long_diagnosis_shown(OPENING_SIZE, rows, 30);
         let (_, before) = wheel_the_detail_panel_to(&mut h, OPENING_SIZE, "Copy report");
-        engine.events.send(snapshot_of(then)).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, then);
         (before, h.get_by_label("Copy report").rect())
     }
 
@@ -11068,8 +11160,7 @@ mod tests {
             })
             .unwrap();
         h.run();
-        h.get_by_label("b-stdio").click();
-        h.run();
+        click(&mut h, "b-stdio");
         let view = detail_view(&h, OPENING_SIZE);
         let diagnose = h.get_by_label("Diagnose").rect();
         assert!(view.contains_rect(diagnose), "Diagnose at {diagnose:?}");
@@ -11199,12 +11290,10 @@ mod tests {
                         !toast.intersects(rect),
                         "{size:?} {kind}: the message at {toast:?} covers Add argument at {rect:?}"
                     );
-                    h.get_by_label("Dismiss").click();
-                    h.run();
+                    click(&mut h, "Dismiss");
                     assert_eq!(h.state().outcome, None, "{size:?} {kind}: Dismiss works");
                 }
-                h.get_by_label("Revert").click();
-                h.run();
+                click(&mut h, "Revert");
                 assert_eq!(form(&mut h).command, "node", "{size:?} {kind}");
             }
         }
@@ -11341,10 +11430,8 @@ mod tests {
         let (mut h, engine) = live_harness();
         h.set_size(size);
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
+        click(&mut h, "alpha");
         ask(&mut h);
         h.run();
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
@@ -11423,25 +11510,17 @@ mod tests {
         let (mut h, engine) = live_harness();
         h.set_size(SMALLEST_SIZE);
         let (a, b) = two_rows();
-        engine
-            .events
-            .send(snapshot_of(vec![a.clone(), b.clone()]))
-            .unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label("Edit definition").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone(), b.clone()]);
+        click(&mut h, "alpha");
+        click(&mut h, "Edit definition");
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
-        h.get_by_label("beta").click();
-        h.run();
+        click(&mut h, "beta");
         engine
             .events
             .send(entry_event(&a, SHORT_DEFINITION, true))
             .unwrap();
         h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        click(&mut h, "alpha");
         let tab = h.get_by_role_and_label(Role::Button, "General").rect();
         let scope = h
             .get_all_by_label("Scope")
@@ -11510,11 +11589,9 @@ mod tests {
     fn diagnose_asks_the_engine_and_waits_while_a_check_runs() {
         let (mut h, engine) = live_harness();
         let row = live_row("bad-stdio", Scope::User, None);
-        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![row.clone()]);
         open_status_tab(&mut h, "bad-stdio");
-        h.get_by_label("Diagnose").click();
-        h.run();
+        click(&mut h, "Diagnose");
         assert_eq!(
             next_command(&engine).unwrap(),
             klefki_core::api::Command::Diagnose(row.id())
@@ -11569,11 +11646,7 @@ mod tests {
             })
             .unwrap();
         engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        engine
-            .events
-            .send(snapshot_of(vec![a.clone(), b.clone()]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone(), b.clone()]);
         open_status_tab(&mut h, "b");
         assert!(
             h.query_by_label_contains("B-SAID-THIS").is_none(),
@@ -11652,13 +11725,8 @@ mod tests {
     fn a_very_long_target_wraps_instead_of_widening_the_panel() {
         let short = {
             let (mut h, engine) = live_harness();
-            engine
-                .events
-                .send(snapshot_of(vec![live_row("srv", Scope::User, None)]))
-                .unwrap();
-            h.run();
-            h.get_by_label("srv").click();
-            h.run();
+            show_rows(&mut h, &engine, vec![live_row("srv", Scope::User, None)]);
+            click(&mut h, "srv");
             detail_left_edge(&h, "Scope")
         };
         let long = {
@@ -11668,10 +11736,8 @@ mod tests {
                 "https://example.com/{}",
                 "very-long-path-segment/".repeat(20)
             );
-            engine.events.send(snapshot_of(vec![row])).unwrap();
-            h.run();
-            h.get_by_label("srv").click();
-            h.run();
+            show_rows(&mut h, &engine, vec![row]);
+            click(&mut h, "srv");
             detail_left_edge(&h, "Scope")
         };
         assert_eq!(short, long, "a long target made the detail panel wider");
@@ -11778,10 +11844,8 @@ mod tests {
     fn enable_and_disable_need_a_selection() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a])).unwrap();
-        h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a]);
+        press(&mut h, Tool::TurnOff);
         assert!(drain(&engine).is_empty(), "nothing selected, nothing asked");
     }
 
@@ -11789,15 +11853,9 @@ mod tests {
     fn disable_asks_the_engine_for_a_plan_for_each_selected_server() {
         let (mut h, engine) = live_harness();
         let (a, b) = two_rows();
-        engine
-            .events
-            .send(snapshot_of(vec![a.clone(), b.clone()]))
-            .unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone(), b.clone()]);
+        click(&mut h, "alpha");
+        press(&mut h, Tool::TurnOff);
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::SetEnabled {
@@ -11811,12 +11869,9 @@ mod tests {
     fn enable_asks_for_the_opposite() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label(icon::TOGGLE_RIGHT).click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
+        click(&mut h, "alpha");
+        press(&mut h, Tool::TurnOn);
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::SetEnabled {
@@ -11988,18 +12043,15 @@ mod tests {
     #[test]
     fn apply_sends_the_plan_once_even_if_pressed_twice() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
-        h.get_by_label("Apply").click();
-        h.run();
-        h.get_by_label("Apply").click();
-        h.run();
+        click(&mut h, "Apply");
+        click(&mut h, "Apply");
         assert_eq!(drain(&engine), vec![Command::Apply(7)]);
     }
 
     #[test]
     fn cancel_discards_the_plan_and_closes_the_dialog() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert_eq!(drain(&engine), vec![Command::Discard(7)]);
         assert!(h.query_by_label_contains("Review the change").is_none());
     }
@@ -12017,8 +12069,7 @@ mod tests {
     fn a_plan_that_changes_nothing_cannot_be_applied() {
         let (mut h, engine) = with_plan(&[], &[], true);
         h.get_by_label_contains("Nothing would be written");
-        h.get_by_label("Apply").click();
-        h.run();
+        click(&mut h, "Apply");
         assert!(drain(&engine).is_empty());
     }
 
@@ -12072,8 +12123,7 @@ mod tests {
         h.run();
         assert!(h.query_by_label_contains("Review the change").is_none());
         h.get_by_label_contains("Claude Code is writing its configuration");
-        h.get_by_label("Dismiss").click();
-        h.run();
+        click(&mut h, "Dismiss");
         assert!(
             h.query_by_label_contains("writing its configuration")
                 .is_none()
@@ -12114,17 +12164,14 @@ mod tests {
     fn the_toggle_buttons_do_not_start_a_second_plan_while_one_is_open() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a]);
+        click(&mut h, "alpha");
         engine
             .events
             .send(Event::PlanReady(plan_view(8, &["+ alpha"], &[], false)))
             .unwrap();
         h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
         // A click outside the dialog closes it (and drops the plan); it never starts a second plan.
         let sent = drain(&engine);
         assert!(
@@ -12136,8 +12183,7 @@ mod tests {
     #[test]
     fn escape_does_not_close_the_dialog_while_the_change_is_being_saved() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
-        h.get_by_label("Apply").click();
-        h.run();
+        click(&mut h, "Apply");
         h.key_press(egui::Key::Escape);
         h.run();
         // The engine writes the plan whatever comes after Apply; saying it was dropped would be a lie.
@@ -12159,10 +12205,8 @@ mod tests {
     #[test]
     fn cancel_does_nothing_while_the_change_is_being_saved() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
-        h.get_by_label("Apply").click();
-        h.run();
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Apply");
+        click(&mut h, "Cancel");
         assert_eq!(drain(&engine), vec![Command::Apply(7)]);
         h.get_by_label_contains("Review the change");
     }
@@ -12171,15 +12215,11 @@ mod tests {
     fn a_double_click_on_disable_asks_for_one_plan() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a]);
+        click(&mut h, "alpha");
         // The engine has not answered the first click yet.
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
+        press(&mut h, Tool::TurnOff);
         let prepares = drain(&engine)
             .into_iter()
             .filter(|c| matches!(c, Command::Prepare(_)))
@@ -12191,19 +12231,15 @@ mod tests {
     fn the_toggle_works_again_once_a_plan_could_not_be_made() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a]);
+        click(&mut h, "alpha");
+        press(&mut h, Tool::TurnOff);
         engine
             .events
             .send(Event::PlanFailed("alpha is gone.".to_owned()))
             .unwrap();
         h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
         let prepares = drain(&engine)
             .into_iter()
             .filter(|c| matches!(c, Command::Prepare(_)))
@@ -12214,8 +12250,7 @@ mod tests {
     #[test]
     fn a_plan_arriving_while_another_is_open_is_discarded_not_shown() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
-        h.get_by_label("Apply").click();
-        h.run();
+        click(&mut h, "Apply");
         engine
             .events
             .send(Event::PlanReady(plan_view(9, &["+ zeta"], &[], false)))
@@ -12257,8 +12292,7 @@ mod tests {
         for approval in [Pending, Rejected] {
             let (mut h, engine) = live_harness();
             let row = project_row("docs", Some(approval));
-            engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-            h.run();
+            show_rows(&mut h, &engine, vec![row.clone()]);
             open_general(&mut h, "docs");
             h.get_by_label_contains("Review and approve").click();
             h.run();
@@ -12273,8 +12307,7 @@ mod tests {
     fn a_double_click_on_review_and_approve_asks_for_one_plan() {
         let (mut h, engine) = live_harness();
         let row = project_row("docs", Some(klefki_core::api::Approval::Pending));
-        engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![row.clone()]);
         open_general(&mut h, "docs");
         h.get_by_label_contains("Review and approve").click();
         h.run();
@@ -12291,11 +12324,7 @@ mod tests {
         let (mut h, engine) = live_harness();
         let approved = project_row("done", Some(klefki_core::api::Approval::Approved));
         let user = live_row("mine", Scope::User, None);
-        engine
-            .events
-            .send(snapshot_of(vec![approved, user]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![approved, user]);
         for name in ["done", "mine"] {
             open_general(&mut h, name);
             assert!(
@@ -12333,8 +12362,7 @@ mod tests {
         h.get_by_label_contains("trust the repository");
         assert!(drain(&engine).is_empty());
         // The button says what it does, and sends the plan.
-        h.get_by_label("Approve").click();
-        h.run();
+        click(&mut h, "Approve");
         assert_eq!(drain(&engine), vec![Command::Apply(3)]);
     }
 
@@ -12369,8 +12397,7 @@ mod tests {
             let rect = h.get_by_label(button).rect();
             assert!(window.contains_rect(rect), "{button} at {rect:?}");
         }
-        h.get_by_label("Add").click();
-        h.run();
+        click(&mut h, "Add");
         assert_eq!(drain(&engine), vec![Command::Apply(4)]);
     }
 
@@ -12405,14 +12432,9 @@ mod tests {
             .send(status_event(&b, Status::Failed, Some("beta broke")))
             .unwrap();
         h.run();
-        h.get_by_label("beta").click();
-        h.run();
+        click(&mut h, "beta");
         // Same rows, another order, one more in front.
-        engine
-            .events
-            .send(snapshot_of(vec![c, b.clone(), a.clone()]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![c, b.clone(), a.clone()]);
         assert_eq!(h.state().selected.len(), 1);
         let selected = *h.state().selected.iter().next().unwrap();
         assert_eq!(h.state().snapshot.servers[selected].name, "beta");
@@ -12431,20 +12453,16 @@ mod tests {
     #[test]
     fn the_grid_follows_a_new_snapshot_and_a_new_search() {
         let (mut h, engine) = live_harness();
-        engine
-            .events
-            .send(snapshot_of(vec![live_row("alpha", Scope::User, None)]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![live_row("alpha", Scope::User, None)]);
         h.get_by_label("alpha");
-        engine
-            .events
-            .send(snapshot_of(vec![
+        show_rows(
+            &mut h,
+            &engine,
+            vec![
                 live_row("alpha", Scope::User, None),
                 live_row("omega", Scope::User, None),
-            ]))
-            .unwrap();
-        h.run();
+            ],
+        );
         h.get_by_label("omega");
         h.state_mut().search = "alp".to_owned();
         h.run();
@@ -12460,18 +12478,11 @@ mod tests {
     fn delete_asks_the_engine_for_a_plan_for_each_selected_server() {
         let (mut h, engine) = live_harness();
         let (a, b) = two_rows();
-        engine
-            .events
-            .send(snapshot_of(vec![a.clone(), b.clone()]))
-            .unwrap();
-        h.run();
-        h.get_by_label(icon::TRASH).click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone(), b.clone()]);
+        press(&mut h, Tool::Delete);
         assert!(drain(&engine).is_empty(), "nothing selected, nothing asked");
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label(icon::TRASH).click();
-        h.run();
+        click(&mut h, "alpha");
+        press(&mut h, Tool::Delete);
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::Delete { id: a.id() }])]
@@ -12497,36 +12508,28 @@ mod tests {
         use egui::accesskit::Role;
         let (mut h, engine) = live_harness();
         let p = plugin_row("plugin:docs:search", None);
-        engine.events.send(snapshot_of(vec![p.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![p.clone()]);
         // Under its plugin, by its own name; the details give the name Claude Code uses.
         h.get_by_label("Plugin · docs, from team");
-        h.get_by_label("search").click();
-        h.run();
+        click(&mut h, "search");
         drain(&engine);
         h.get_by_label("plugin:docs:search");
         h.get_by_label("docs, from team");
         h.get_by_label_contains("Claude Code reads this server from the plugin docs.");
         // No form to edit it in.
         assert!(h.query_by_label("Review and save…").is_none());
-        for glyph in [icon::TOGGLE_RIGHT, icon::TOGGLE_LEFT] {
-            assert!(
-                !h.get_by_label(glyph).accesskit_node().is_disabled(),
-                "{glyph}"
-            );
+        for t in [Tool::TurnOn, Tool::TurnOff] {
+            assert!(!tool(&h, t).accesskit_node().is_disabled(), "{t:?}");
         }
-        for glyph in [
-            icon::TRASH,
-            icon::PENCIL_SIMPLE,
-            icon::COPY,
-            icon::ARROW_FAT_LINES_RIGHT,
-            icon::EXPORT,
-            icon::SIGN_IN,
+        for t in [
+            Tool::Delete,
+            Tool::Edit,
+            Tool::Duplicate,
+            Tool::Move,
+            Tool::Export,
+            Tool::SignIn,
         ] {
-            assert!(
-                h.get_by_label(glyph).accesskit_node().is_disabled(),
-                "{glyph}"
-            );
+            assert!(tool(&h, t).accesskit_node().is_disabled(), "{t:?}");
         }
         // The list says where its status is.
         h.get_by_label("See /mcp");
@@ -12567,8 +12570,7 @@ mod tests {
         assert!(h.query_by_label("Diagnose").is_none());
         assert_eq!(drain(&engine), Vec::<Command>::new());
         // Switched like a user server, through a review.
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::SetEnabled {
@@ -12583,8 +12585,7 @@ mod tests {
         let (mut h, engine) = live_harness();
         let user = live_row("events", Scope::User, None);
         let p = plugin_row("plugin:docs:events", Some("events"));
-        engine.events.send(snapshot_of(vec![user, p])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![user, p]);
         h.get_by_label("left out");
         h.get_by_label("Plugin · docs, from team");
         h.get_all_by_label("events").nth(1).unwrap().click();
@@ -12611,8 +12612,7 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label("plugin off in 2/3");
-        h.get_by_label("search").click();
-        h.run();
+        click(&mut h, "search");
         h.get_by_label("Plugin on");
         h.get_by_label("in 1 of 3 projects; off in app, web");
         h.get_by_label("yes");
@@ -12634,8 +12634,7 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label("plugin off in 2/2");
-        h.get_by_label("search").click();
-        h.run();
+        click(&mut h, "search");
         h.get_by_label("yes, but its plugin is off in every project");
     }
 
@@ -12654,24 +12653,17 @@ mod tests {
             target: "on claude.ai".into(),
             ..live_row("claude.ai Slack", Scope::ClaudeAi, None)
         };
-        engine.events.send(snapshot_of(vec![slack])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![slack]);
         h.get_by_label(PLUGIN_STATUS);
         // Under the claude.ai group, without the prefix it already says.
         assert!(h.query_by_label("claude.ai Slack").is_none());
-        h.get_by_label("Slack").click();
-        h.run();
+        click(&mut h, "Slack");
         h.get_by_label_contains("A connector of your claude.ai account");
         h.get_by_label("About claude.ai connectors");
-        assert!(
-            h.get_by_label(icon::PENCIL_SIMPLE)
-                .accesskit_node()
-                .is_disabled()
-        );
-        assert!(h.get_by_label(icon::TRASH).accesskit_node().is_disabled());
+        assert!(tool(&h, Tool::Edit).accesskit_node().is_disabled());
+        assert!(tool(&h, Tool::Delete).accesskit_node().is_disabled());
         drain(&engine);
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
         let sent = drain(&engine);
         assert!(
             matches!(sent.as_slice(), [Command::Prepare(changes)] if matches!(
@@ -12717,15 +12709,13 @@ mod tests {
         assert!(h.query_by_label("+1").is_none() && h.query_by_label("+2").is_none());
         assert!(h.query_by_label_contains("blocked in").is_none());
         h.get_by_label("may not load");
-        h.get_by_label("Gmail").click();
-        h.run();
+        click(&mut h, "Gmail");
         h.get_by_label("Connectors off");
         h.get_by_label("disabled in 1 of 3 projects: p1");
         // The type is "claude.ai" (as are the scope and the group), not a guessed "http".
         assert!(h.query_by_label("http").is_none());
         assert!(h.query_all_by_label("on claude.ai").count() >= 2);
-        h.get_by_label("Drive").click();
-        h.run();
+        click(&mut h, "Drive");
         h.get_by_label("May not load");
     }
 
@@ -12743,8 +12733,7 @@ mod tests {
             }),
             ..live_row("claude.ai Slack", Scope::ClaudeAi, None)
         };
-        engine.events.send(snapshot_of(vec![slack])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![slack]);
         h.get_by_label(TURNED_OFF);
         assert!(h.query_by_label(BLOCKED_BY_POLICY).is_none());
     }
@@ -12752,30 +12741,20 @@ mod tests {
     #[test]
     fn an_organisations_server_is_read_only_and_switches() {
         let (mut h, engine) = live_harness();
-        engine
-            .events
-            .send(snapshot_of(vec![organisation_row("docs")]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![organisation_row("docs")]);
         // Not checked here: where its status is.
         h.get_by_label(PLUGIN_STATUS);
-        h.get_by_label("docs").click();
-        h.run();
+        click(&mut h, "docs");
         h.get_by_label_contains(
             "Your organisation sets this server, in /etc/claude-code/managed-settings.json",
         );
         h.get_by_label("Set in");
         // Nothing to edit, and no values or sign-in tabs.
         assert!(h.query_by_label("Env").is_none());
-        assert!(
-            h.get_by_label(icon::PENCIL_SIMPLE)
-                .accesskit_node()
-                .is_disabled()
-        );
-        assert!(h.get_by_label(icon::TRASH).accesskit_node().is_disabled());
+        assert!(tool(&h, Tool::Edit).accesskit_node().is_disabled());
+        assert!(tool(&h, Tool::Delete).accesskit_node().is_disabled());
         drain(&engine);
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
         let sent = drain(&engine);
         assert!(
             matches!(sent.as_slice(), [Command::Prepare(changes)] if matches!(
@@ -12808,8 +12787,7 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label("blocked in 1/3");
-        h.get_by_label("mine").click();
-        h.run();
+        click(&mut h, "mine");
         h.get_by_label("Blocked");
         // Named like "Shadowed" (cross-review of #49).
         h.get_by_label(&format!("in 1 of 3 projects: p. {why}"));
@@ -12829,8 +12807,7 @@ mod tests {
             }),
             ..live_row("x", Scope::Local, Some("/home/me/p"))
         };
-        engine.events.send(snapshot_of(vec![x])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![x]);
         // The cause in the status, not only "Not loaded"; no "blocked in" badge for the whole of it.
         h.get_by_label(BLOCKED_BY_POLICY);
         assert!(h.query_by_label(NOT_LOADED).is_none());
@@ -12847,19 +12824,14 @@ mod tests {
             relative_paths: vec!["mine.js".into()],
             ..live_row("mine", Scope::User, None)
         };
-        engine
-            .events
-            .send(snapshot_of(vec![mine, organisation_row("other")]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![mine, organisation_row("other")]);
         // Said once, in the status column (cross-review of #47): no badge beside the name.
         assert!(h.query_by_label("not loaded").is_none());
         h.get_by_label(NOT_LOADED).hover();
         h.run();
         // Where Claude Code starts it does not matter: it does not start it.
         assert!(h.query_by_label("relative path").is_none());
-        h.get_by_label("mine").click();
-        h.run();
+        click(&mut h, "mine");
         h.get_by_label(&format!("Claude Code does not load this server. {why}"));
         h.state_mut().tab = DetailTab::Status;
         h.run();
@@ -12897,29 +12869,17 @@ mod tests {
         let (mut h, engine) = live_harness();
         let user = live_row("alpha", Scope::User, None);
         let p = plugin_row("plugin:docs:search", None);
-        engine
-            .events
-            .send(snapshot_of(vec![user.clone(), p.clone()]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![user.clone(), p.clone()]);
         h.state_mut().selected = BTreeSet::from([0, 1]);
         h.run();
-        for glyph in [icon::TOGGLE_LEFT, icon::TRASH, icon::EXPORT] {
-            assert!(
-                !h.get_by_label(glyph).accesskit_node().is_disabled(),
-                "{glyph}"
-            );
+        for t in [Tool::TurnOff, Tool::Delete, Tool::Export] {
+            assert!(!tool(&h, t).accesskit_node().is_disabled(), "{t:?}");
         }
         // Edit takes one server; this selection holds two.
-        assert!(
-            h.get_by_label(icon::PENCIL_SIMPLE)
-                .accesskit_node()
-                .is_disabled()
-        );
+        assert!(tool(&h, Tool::Edit).accesskit_node().is_disabled());
         drain(&engine);
         // Switching takes both.
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
+        press(&mut h, Tool::TurnOff);
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![
@@ -12953,8 +12913,7 @@ mod tests {
         // Export takes the rest too.
         h.state_mut().plan = None;
         h.state_mut().preparing = false;
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         assert_eq!(drain(&engine), vec![Command::Export(vec![user.id()])]);
 
         // Only plugin servers selected: the buttons are off, and their hint names the server.
@@ -12971,10 +12930,8 @@ mod tests {
     fn the_delete_key_deletes_the_selection_but_not_while_typing() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
+        click(&mut h, "alpha");
         h.key_press(egui::Key::Delete);
         h.run();
         assert_eq!(
@@ -12992,23 +12949,19 @@ mod tests {
     fn press_edit(h: &mut Harness<'static, ShellApp>, name: &str) {
         h.get_by_label(name).click();
         h.run();
-        h.get_by_label(icon::PENCIL_SIMPLE).click();
-        h.run();
+        press(h, Tool::Edit);
     }
 
     #[test]
     fn edit_opens_the_form_and_asks_for_the_definition() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
+        click(&mut h, "alpha");
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Status")
             .click();
         h.run();
-        h.get_by_label(icon::PENCIL_SIMPLE).click();
-        h.run();
+        press(&mut h, Tool::Edit);
         assert_eq!(h.state().tab, DetailTab::General);
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
         h.get_by_label_contains("Loading");
@@ -13052,10 +13005,8 @@ mod tests {
         for (how, way) in ways {
             let (mut h, engine) = live_harness();
             let (a, _) = two_rows();
-            engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-            h.run();
-            h.get_by_label("alpha").click();
-            h.run();
+            show_rows(&mut h, &engine, vec![a.clone()]);
+            click(&mut h, "alpha");
             h.get_by_role_and_label(egui::accesskit::Role::Button, "Status")
                 .click();
             h.run();
@@ -13068,8 +13019,7 @@ mod tests {
     #[test]
     fn json_is_reached_from_the_form_and_leads_back_to_it() {
         let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
-        h.get_by_label("Edit as JSON").click();
-        h.run();
+        click(&mut h, "Edit as JSON");
         h.get_by_value(&json_text(&h));
         h.get_by_label_contains("keep what they are now");
         assert!(
@@ -13078,13 +13028,11 @@ mod tests {
         );
         set_json_text(&mut h, |t| t.replace("\"node\"", "\"deno\""));
         h.run();
-        h.get_by_label("Back to the form").click();
-        h.run();
+        click(&mut h, "Back to the form");
         assert!(h.query_all_by_value("deno").next().is_some());
         assert!(h.query_by_value(&json_text(&h)).is_none());
         // JSON the form cannot read keeps you in the JSON, saying why.
-        h.get_by_label("Edit as JSON").click();
-        h.run();
+        click(&mut h, "Edit as JSON");
         set_json_text(&mut h, |_| "{ \"command\": ".into());
         h.run();
         h.get_by_label_contains("not valid");
@@ -13093,16 +13041,14 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
-        h.get_by_label("Revert").click();
-        h.run();
+        click(&mut h, "Revert");
         assert!(
             !h.get_by_label("Back to the form")
                 .accesskit_node()
                 .is_disabled()
         );
         // The Env tab follows: the definition is being edited as JSON.
-        h.get_by_label("Env").click();
-        h.run();
+        click(&mut h, "Env");
         h.get_by_value(&json_text(&h));
         assert!(h.query_by_label("hidden").is_none());
     }
@@ -13123,8 +13069,7 @@ mod tests {
         h.run();
         // Still the JSON being typed in, not the form popping up under the cursor.
         h.get_by_value(fixed);
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::Replace {
@@ -13146,20 +13091,17 @@ mod tests {
     fn an_edited_definition_is_sent_for_review_and_revert_undoes_it() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
         press_edit(&mut h, "alpha");
         drain(&engine);
         let original =
             "{\n  \"command\": \"node\",\n  \"env\": {\n    \"TOKEN\": \"<hidden>\"\n  }\n}";
         engine.events.send(entry_event(&a, original, true)).unwrap();
         h.run();
-        h.get_by_label("Edit as JSON").click();
-        h.run();
+        click(&mut h, "Edit as JSON");
         h.get_by_label_contains("keep what they are now");
         // Unchanged: nothing to review.
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert!(drain(&engine).is_empty());
         let edited = original.replace("node", "node22");
         if let Some(Editor {
@@ -13170,8 +13112,7 @@ mod tests {
             *text = edited.clone();
         }
         h.run();
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::Replace {
@@ -13179,8 +13120,7 @@ mod tests {
                 json: edited
             }])]
         );
-        h.get_by_label("Revert").click();
-        h.run();
+        click(&mut h, "Revert");
         match &h.state().editor {
             Some(Editor {
                 state: EditorState::Ready { text, .. },
@@ -13205,12 +13145,9 @@ mod tests {
     ) {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label("Edit definition").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
+        click(&mut h, "alpha");
+        click(&mut h, "Edit definition");
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
         engine.events.send(entry_event(&a, json, editable)).unwrap();
         h.run();
@@ -13265,11 +13202,7 @@ mod tests {
             scopes: Vec::new(),
         });
         let plain = live_row("plain", Scope::User, None);
-        engine
-            .events
-            .send(snapshot_of(vec![signed, dynamic, plain]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![signed, dynamic, plain]);
         let open = |h: &mut Harness<'static, ShellApp>, name: &str| {
             h.get_by_label(name).click();
             h.run();
@@ -13299,16 +13232,12 @@ mod tests {
             client_id: Some("klefki-1".into()),
             scopes: Vec::new(),
         });
-        engine
-            .events
-            .send(snapshot_of(vec![
-                sso.clone(),
-                live_row("plain", Scope::User, None),
-            ]))
-            .unwrap();
-        h.run();
-        h.get_by_label("sso").click();
-        h.run();
+        show_rows(
+            &mut h,
+            &engine,
+            vec![sso.clone(), live_row("plain", Scope::User, None)],
+        );
+        click(&mut h, "sso");
         h.get_by_role_and_label(Role::Button, "Auth").click();
         h.run();
         (h, engine, sso)
@@ -13332,8 +13261,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("Stored in your system's secret store");
         // A server that does not sign in with OAuth has no client secret to ask about.
-        h.get_by_label("plain").click();
-        h.run();
+        click(&mut h, "plain");
         assert!(drain(&engine).is_empty());
     }
 
@@ -13344,8 +13272,7 @@ mod tests {
         h.run();
         drain(&engine);
         h.get_by_label_contains("Not stored");
-        h.get_by_label("Set client secret…").click();
-        h.run();
+        click(&mut h, "Set client secret…");
         h.state_mut()
             .secret_input
             .as_mut()
@@ -13357,8 +13284,7 @@ mod tests {
             h.query_by_value("s3cret-value").is_none(),
             "not shown, not even to assistive technology"
         );
-        h.get_by_label("Save").click();
-        h.run();
+        click(&mut h, "Save");
         assert_eq!(
             drain(&engine),
             vec![Command::StoreSecret {
@@ -13376,12 +13302,10 @@ mod tests {
         engine.events.send(secret_event(&sso, Ok(true))).unwrap();
         h.run();
         drain(&engine);
-        h.get_by_label("Forget…").click();
-        h.run();
+        click(&mut h, "Forget…");
         assert!(drain(&engine).is_empty(), "not yet");
         h.get_by_label_contains("cannot be undone");
-        h.get_by_label("Forget it").click();
-        h.run();
+        click(&mut h, "Forget it");
         assert_eq!(drain(&engine), vec![Command::ForgetSecret(sso.id())]);
     }
 
@@ -13395,8 +13319,7 @@ mod tests {
             .unwrap();
         h.run();
         h.get_by_label_contains("no plaintext copy");
-        h.get_by_label("Try again").click();
-        h.run();
+        click(&mut h, "Try again");
         assert_eq!(drain(&engine), vec![Command::SecretStatus(sso.id())]);
     }
 
@@ -13419,8 +13342,7 @@ mod tests {
             "{\n  \"cwd\": \"/w\",\n  \"command\": \"node22\",\n  \"args\": [\n    \"a.js\",\n    \"--x\"\n  ],\n  \"env\": {\n    \"TOKEN\": \"<hidden>\"\n  }\n}",
             "the key the form does not show and the hidden value stay as they were"
         );
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::Replace {
@@ -13429,8 +13351,7 @@ mod tests {
             }])]
         );
         // The JSON shows the same draft.
-        h.get_by_label("Edit as JSON").click();
-        h.run();
+        click(&mut h, "Edit as JSON");
         h.get_by_value(&json_text(&h));
     }
 
@@ -13457,22 +13378,18 @@ mod tests {
         h.run();
         h.get_by_label_contains("not valid");
         // Revert brings the form back.
-        h.get_by_label("Revert").click();
-        h.run();
+        click(&mut h, "Revert");
         assert_eq!(form(&mut h).command, "node");
     }
 
     #[test]
     fn values_stay_hidden_until_changed_and_new_ones_can_be_added() {
         let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
-        h.get_by_label("Env").click();
-        h.run();
+        click(&mut h, "Env");
         h.get_by_label("hidden");
-        h.get_by_label("Change TOKEN").click();
-        h.run();
+        click(&mut h, "Change TOKEN");
         assert_eq!(form(&mut h).env, [("TOKEN".to_owned(), String::new())]);
-        h.get_by_label("Add variable").click();
-        h.run();
+        click(&mut h, "Add variable");
         assert_eq!(form(&mut h).env.len(), 2);
         form(&mut h).env[1] = ("MODE".into(), "dev".into());
         form(&mut h).env[0].1 = "n3w".into();
@@ -13489,20 +13406,17 @@ mod tests {
             h.query_all_by_value("MODE").next().is_some(),
             "names are shown"
         );
-        h.get_by_label("Remove MODE").click();
-        h.run();
+        click(&mut h, "Remove MODE");
         assert!(!json_text(&h).contains("MODE"));
     }
 
     #[test]
     fn a_typed_secret_is_met_with_a_reference_to_use_instead() {
         let (mut h, _engine, _a) = form_harness(FORM_ORIGINAL, true);
-        h.get_by_label("Env").click();
-        h.run();
+        click(&mut h, "Env");
         // The value that is kept is never offered a hint: the app does not have it.
         assert!(h.query_by_label_contains("Looks like a secret").is_none());
-        h.get_by_label("Add variable").click();
-        h.run();
+        click(&mut h, "Add variable");
         form(&mut h).env[1] = ("MODE".into(), "dev".into());
         h.run();
         assert!(h.query_by_label_contains("Looks like a secret").is_none());
@@ -13516,8 +13430,7 @@ mod tests {
             h.query_by_value("ghp_abcdefghijklmnopqrstuvwxyz0123456789")
                 .is_none()
         );
-        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
-        h.run();
+        click(&mut h, "Use ${GITHUB_TOKEN} instead");
         assert_eq!(form(&mut h).env[1].1, "${GITHUB_TOKEN}");
         assert!(
             json_text(&h).contains("\"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\""),
@@ -13534,18 +13447,14 @@ mod tests {
         let long = "{\n  \"command\": \"npx\",\n  \"args\": [\n    \"-y\",\n    \"@modelcontextprotocol/server-github-with-a-long-name\"\n  ],\n  \"env\": {\n    \"GITHUB_PERSONAL_ACCESS_TOKEN\": \"<hidden>\"\n  }\n}";
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
+        click(&mut h, "alpha");
         let before = detail_left_edge(&h, "General");
-        h.get_by_label("Edit definition").click();
-        h.run();
+        click(&mut h, "Edit definition");
         engine.events.send(entry_event(&a, long, true)).unwrap();
         h.run();
         assert_eq!(detail_left_edge(&h, "General"), before, "General");
-        h.get_by_label("Env").click();
-        h.run();
+        click(&mut h, "Env");
         assert_eq!(detail_left_edge(&h, "General"), before, "Env");
     }
 
@@ -13560,8 +13469,7 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert!(drain(&engine).is_empty());
     }
 
@@ -13570,16 +13478,14 @@ mod tests {
         let (mut h, engine, _a) = form_harness(FORM_ORIGINAL, true);
         form(&mut h).command = "node22".into();
         h.run();
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         // The first is on its way: the button waits for its answer.
         assert!(
             h.get_by_label("Review and save…")
                 .accesskit_node()
                 .is_disabled()
         );
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert_eq!(drain(&engine).len(), 1);
     }
 
@@ -13600,8 +13506,7 @@ mod tests {
         h.get_by_label_contains("you sign in again afterwards");
         form(&mut h).url = "https://h.example/v2/mcp".into();
         h.run();
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         match &drain(&engine)[..] {
             [Command::Prepare(changes)] => match &changes[..] {
                 [Change::Replace { id, json }] => {
@@ -13621,8 +13526,7 @@ mod tests {
     fn a_project_server_is_shown_read_only() {
         let (mut h, engine) = live_harness();
         let p = live_row("docs", Scope::Project, Some("C:/Repos/WebApp"));
-        engine.events.send(snapshot_of(vec![p.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![p.clone()]);
         press_edit(&mut h, "docs");
         engine
             .events
@@ -13638,8 +13542,7 @@ mod tests {
     fn a_definition_that_cannot_be_read_says_why() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
         press_edit(&mut h, "alpha");
         engine
             .events
@@ -13657,8 +13560,7 @@ mod tests {
     fn after_a_save_the_definition_is_read_again() {
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
         press_edit(&mut h, "alpha");
         engine.events.send(entry_event(&a, "{}", true)).unwrap();
         h.run();
@@ -13687,8 +13589,7 @@ mod tests {
             .send(Event::PlanReady(plan_view(plan, &["+ alpha"], &[], false)))
             .unwrap();
         h.run();
-        h.get_by_label("Apply").click();
-        h.run();
+        click(h, "Apply");
         assert_eq!(drain(engine), vec![Command::Apply(plan)]);
         engine
             .events
@@ -13735,8 +13636,7 @@ mod tests {
         // Once the message about the other change has faded: it sits over the save bar until then.
         h.state_mut().outcome.as_mut().unwrap().shown_at = Some(-1000.0);
         h.run();
-        h.get_by_label("Revert").click();
-        h.run();
+        click(&mut h, "Revert");
         assert_eq!(form(&mut h).command, "node");
         assert!(h.query_by_label("Unsaved").is_none());
     }
@@ -13757,8 +13657,7 @@ mod tests {
         let (mut h, engine, a) = form_harness(FORM_ORIGINAL, true);
         form(&mut h).command = "node22".into();
         h.run();
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         assert!(matches!(drain(&engine).as_slice(), [Command::Prepare(_)]));
         apply_another_change(&mut h, &engine, 5);
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
@@ -13770,18 +13669,15 @@ mod tests {
         form(&mut h).command = "node22".into();
         h.run();
         // Reviewed, then cancelled.
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         engine
             .events
             .send(Event::PlanReady(plan_view(5, &["+ node22"], &[], false)))
             .unwrap();
         h.run();
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         // Reviewed, and the engine could not prepare it.
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         engine
             .events
             .send(Event::PlanFailed("the file changed".into()))
@@ -13809,8 +13705,7 @@ mod tests {
             .send(Event::PlanReady(plan_view(4, &["+ alpha"], &[], false)))
             .unwrap();
         h.run();
-        h.get_by_label("Apply").click();
-        h.run();
+        click(h, "Apply");
         assert_eq!(drain(engine), vec![Command::Apply(4)]);
         engine.events.send(snapshot_of(after)).unwrap();
         engine
@@ -13892,8 +13787,7 @@ mod tests {
         assert!(!json_text(&h).contains("cwd"), "{}", json_text(&h));
         h.state_mut().outcome = None;
         h.run();
-        h.get_by_label("Review and save…").click();
-        h.run();
+        click(&mut h, "Review and save…");
         match &drain(&engine)[..] {
             [Command::Prepare(changes)] => match &changes[..] {
                 [Change::Replace { id, json }] => {
@@ -13908,8 +13802,7 @@ mod tests {
         h.state_mut().plan = None;
         h.state_mut().preparing = false;
         h.run();
-        h.get_by_label("Revert").click();
-        h.run();
+        click(&mut h, "Revert");
         assert_eq!(json_text(&h), without_cwd);
         assert!(h.query_by_label("Unsaved").is_none());
     }
@@ -13967,15 +13860,13 @@ mod tests {
     fn the_move_and_casing_dialogs_say_an_unsaved_edit_goes_along() {
         // From the review of #16: said before the change is confirmed, not only seen afterwards.
         let (mut h, _engine, _) = form_harness(FORM_ORIGINAL, true);
-        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
-        h.run();
+        press(&mut h, Tool::Move);
         assert!(h.query_by_label(GOES_ALONG).is_none(), "nothing edited");
         h.key_press(egui::Key::Escape);
         h.run();
         form(&mut h).command = "node22".into();
         h.run();
-        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
-        h.run();
+        press(&mut h, Tool::Move);
         h.get_by_label(GOES_ALONG);
 
         let (mut h, engine) = casing_harness(vec![]);
@@ -13988,14 +13879,11 @@ mod tests {
         h.run();
         form(&mut h).command = "node22".into();
         h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
+        click(&mut h, "Fix casing…");
         // Kept as it is spelled, the edited server is not renamed: nothing goes anywhere.
-        h.get_by_label("Keep gateway").click();
-        h.run();
+        click(&mut h, "Keep gateway");
         assert!(h.query_by_label(GOES_ALONG).is_none());
-        h.get_by_label("Keep Gateway").click();
-        h.run();
+        click(&mut h, "Keep Gateway");
         h.get_by_label(GOES_ALONG);
     }
 
@@ -14042,24 +13930,22 @@ mod tests {
         // buttons past its edge were cut off and could not be clicked.
         let (mut h, engine) = live_harness();
         let (a, _) = two_rows();
-        engine.events.send(snapshot_of(vec![a])).unwrap();
-        h.run();
-        h.get_by_label("alpha").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![a]);
+        click(&mut h, "alpha");
         let detail_left = h.get_by_label("General").rect().min.x;
         // (Add and Import were in this list; they are no longer shown until they work.)
-        for glyph in [
-            icon::PENCIL_SIMPLE,
-            icon::COPY,
-            icon::ARROW_FAT_LINES_RIGHT,
-            icon::TOGGLE_RIGHT,
-            icon::TOGGLE_LEFT,
-            icon::TRASH,
+        for t in [
+            Tool::Edit,
+            Tool::Duplicate,
+            Tool::Move,
+            Tool::TurnOn,
+            Tool::TurnOff,
+            Tool::Delete,
         ] {
-            let r = h.get_by_label(glyph).rect();
+            let r = tool(&h, t).rect();
             assert!(
                 r.max.x <= detail_left,
-                "{glyph:?} at {r:?}, detail panel from x={detail_left}"
+                "{t:?} at {r:?}, detail panel from x={detail_left}"
             );
         }
     }
@@ -14098,14 +13984,11 @@ mod tests {
     #[test]
     fn duplicate_suggests_a_name_and_the_same_place() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label("beta").click();
-        h.run();
-        h.get_by_label(icon::COPY).click();
-        h.run();
+        click(&mut h, "beta");
+        press(&mut h, Tool::Duplicate);
         h.get_by_label_contains("Duplicate beta");
         assert_eq!(h.state().duplicate.as_ref().unwrap().name, "beta_copy");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         // Hidden while the plan is made; kept until it comes.
         assert!(h.query_by_label_contains("Duplicate beta").is_none());
         assert_eq!(
@@ -14147,10 +14030,8 @@ mod tests {
             client_id: Some("acme-1".into()),
             scopes: Vec::new(),
         });
-        engine.events.send(snapshot_of(vec![sso.clone()])).unwrap();
-        h.run();
-        h.get_by_label("sso").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![sso.clone()]);
+        click(&mut h, "sso");
         drain(&engine);
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
@@ -14197,8 +14078,7 @@ mod tests {
         h.get_by_label_contains("signs in as the client above");
         copy_fields_of(&mut h).secret.edit().push_str("new-s3cret");
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::Duplicate {
@@ -14230,8 +14110,7 @@ mod tests {
         h.run();
         copy_fields_of(&mut h).secret.edit().push_str("new-s3cret");
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(duplicate_requested(&engine).len(), 1);
         assert!(h.query_by_label_contains("Duplicate sso").is_none());
         engine
@@ -14273,8 +14152,7 @@ mod tests {
         // Not said twice, beside the window as well.
         assert!(h.state().outcome.is_none());
         // Review again: the reason goes, and the same change is asked for.
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(h.state().duplicate.as_ref().unwrap().failed.is_none());
         assert!(matches!(
             duplicate_requested(&engine).as_slice(),
@@ -14333,8 +14211,7 @@ mod tests {
         h.run();
         assert_eq!(copy_fields_of(&mut h).base, "https://mcp.acme.com/v1");
         // Untouched, the copy changes nothing.
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::Duplicate {
@@ -14380,10 +14257,8 @@ mod tests {
         let mut web = live_row("web", Scope::User, None);
         web.transport = TransportKind::Http;
         web.target = "https://h.example/mcp".into();
-        engine.events.send(snapshot_of(vec![web.clone()])).unwrap();
-        h.run();
-        h.get_by_label("web").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![web.clone()]);
+        click(&mut h, "web");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         engine
@@ -14399,10 +14274,8 @@ mod tests {
         assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
         // A plain address: one field, the whole of it, and nothing about signing in.
         let (mut h, engine) = live_harness();
-        engine.events.send(snapshot_of(vec![web.clone()])).unwrap();
-        h.run();
-        h.get_by_label("web").click();
-        h.run();
+        show_rows(&mut h, &engine, vec![web.clone()]);
+        click(&mut h, "web");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         engine
@@ -14422,15 +14295,13 @@ mod tests {
     #[test]
     fn duplicate_goes_wherever_it_is_ticked_under_the_name_typed() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label("alpha").click();
-        h.run();
+        click(&mut h, "alpha");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         // User is ticked for a user server; add both projects, untick the user.
         h.get_by_label_contains("For the user").click();
         h.get_by_label("WebApp").click();
-        h.get_by_label("notes").click();
-        h.run();
+        click(&mut h, "notes");
         h.state_mut().duplicate.as_mut().unwrap().name = "alpha-2".into();
         h.run();
         h.key_press(egui::Key::Enter);
@@ -14452,10 +14323,8 @@ mod tests {
     #[test]
     fn duplicate_needs_a_usable_name_and_a_place() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label(icon::COPY).click();
-        h.run();
+        click(&mut h, "alpha");
+        press(&mut h, Tool::Duplicate);
         h.state_mut().duplicate.as_mut().unwrap().name = "has space".into();
         h.run();
         h.get_by_label_contains("not allowed");
@@ -14468,8 +14337,7 @@ mod tests {
         assert!(h.get_by_label("Review").accesskit_node().is_disabled());
         h.key_press(egui::Key::Enter);
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(duplicate_requested(&engine).is_empty());
         h.key_press(egui::Key::Escape);
         h.run();
@@ -14481,11 +14349,9 @@ mod tests {
     fn duplicate_waits_while_another_plan_is_on_its_way() {
         // One plan at a time: a Disable not yet answered keeps Duplicate from asking for a second.
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label("alpha").click();
-        h.run();
-        h.get_by_label(icon::TOGGLE_LEFT).click();
-        h.run();
-        assert!(h.get_by_label(icon::COPY).accesskit_node().is_disabled());
+        click(&mut h, "alpha");
+        press(&mut h, Tool::TurnOff);
+        assert!(tool(&h, Tool::Duplicate).accesskit_node().is_disabled());
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         assert!(h.state().duplicate.is_none());
@@ -14495,9 +14361,8 @@ mod tests {
     #[test]
     fn a_project_server_cannot_be_duplicated_yet() {
         let (mut h, _engine) = duplicate_harness();
-        h.get_by_label("gamma").click();
-        h.run();
-        assert!(h.get_by_label(icon::COPY).accesskit_node().is_disabled());
+        click(&mut h, "gamma");
+        assert!(tool(&h, Tool::Duplicate).accesskit_node().is_disabled());
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::D);
         h.run();
         assert!(h.state().duplicate.is_none());
@@ -14566,8 +14431,7 @@ mod tests {
             legacy("/home/x/api", &["a"], &[], false),
         ]);
         h.get_by_label_contains("bad: holds something other than server names");
-        h.get_by_label("Migrate…").click();
-        h.run();
+        click(&mut h, "Migrate…");
         let changes = duplicate_requested(&engine);
         assert_eq!(
             changes,
@@ -14668,27 +14532,22 @@ mod tests {
     #[test]
     fn only_a_server_with_a_casing_collision_offers_the_fix() {
         let (mut h, _engine) = casing_harness(vec![]);
-        h.get_by_label("other").click();
-        h.run();
+        click(&mut h, "other");
         assert!(h.query_by_label("Fix casing…").is_none());
-        h.get_by_label("gateway").click();
-        h.run();
+        click(&mut h, "gateway");
         h.get_by_label("Fix casing…");
     }
 
     #[test]
     fn the_fix_renames_the_others_to_the_spelling_chosen() {
         let (mut h, engine) = casing_harness(vec![]);
-        h.get_by_label("gateway").click();
-        h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
+        click(&mut h, "gateway");
+        click(&mut h, "Fix casing…");
         // Both spellings are offered; the selected server's own is the starting point.
         h.get_by_label("Keep gateway");
         h.get_by_label("Keep Gateway");
         assert_eq!(h.state().casing.as_ref().unwrap().keep, "gateway");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(h.state().casing.is_none());
         let user = h.state().snapshot.servers[0].id();
         assert_eq!(renames(&engine), vec![(user, "gateway".to_owned())]);
@@ -14697,14 +14556,10 @@ mod tests {
     #[test]
     fn choosing_the_other_spelling_renames_the_other_server() {
         let (mut h, engine) = casing_harness(vec![]);
-        h.get_by_label("gateway").click();
-        h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
-        h.get_by_label("Keep Gateway").click();
-        h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "gateway");
+        click(&mut h, "Fix casing…");
+        click(&mut h, "Keep Gateway");
+        click(&mut h, "Review");
         let local = h.state().snapshot.servers[1].id();
         assert_eq!(renames(&engine), vec![(local, "Gateway".to_owned())]);
     }
@@ -14715,18 +14570,15 @@ mod tests {
         project.casing_collision = true;
         project.approval = Some(Approval::Approved);
         let (mut h, engine) = casing_harness(vec![project]);
-        h.get_by_label("gateway").click();
-        h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
+        click(&mut h, "gateway");
+        click(&mut h, "Fix casing…");
         assert_eq!(h.state().casing.as_ref().unwrap().keep, "GATEWAY");
         assert!(
             h.get_by_label("Keep gateway")
                 .accesskit_node()
                 .is_disabled()
         );
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let ids: Vec<ServerId> = renames(&engine).into_iter().map(|(id, _)| id).collect();
         let rows = &h.state().snapshot.servers;
         assert_eq!(ids, vec![rows[0].id(), rows[1].id()]);
@@ -14739,10 +14591,8 @@ mod tests {
         one.casing_collision = true;
         two.casing_collision = true;
         let (mut h, engine) = casing_harness(vec![one, two]);
-        h.get_by_label("gateway").click();
-        h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
+        click(&mut h, "gateway");
+        click(&mut h, "Fix casing…");
         h.get_by_label_contains(".mcp.json");
         assert!(h.get_by_label("Review").accesskit_node().is_disabled());
         h.key_press(egui::Key::Escape);
@@ -14754,12 +14604,9 @@ mod tests {
     #[test]
     fn cancelling_the_fix_asks_for_nothing() {
         let (mut h, engine) = casing_harness(vec![]);
-        h.get_by_label("gateway").click();
-        h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "gateway");
+        click(&mut h, "Fix casing…");
+        click(&mut h, "Cancel");
         assert!(h.state().casing.is_none());
         assert!(duplicate_requested(&engine).is_empty());
     }
@@ -14802,8 +14649,7 @@ mod tests {
     #[test]
     fn a_click_beside_the_add_dialog_keeps_what_was_pasted() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label(icon::PLUS).click();
-        h.run();
+        press(&mut h, Tool::Add);
         let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
         paste(&mut h, text);
         click_beside(&mut h);
@@ -14811,8 +14657,7 @@ mod tests {
         h.get_by_label_contains("Adds files for the user.");
         h.key_press(egui::Key::Escape);
         h.run();
-        h.get_by_label("Discard").click();
-        h.run();
+        click(&mut h, "Discard");
         assert!(h.state().add.is_none());
         assert!(duplicate_requested(&engine).is_empty());
     }
@@ -14820,12 +14665,10 @@ mod tests {
     #[test]
     fn a_click_beside_the_review_of_an_add_keeps_the_review_and_the_add_dialog() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label(icon::PLUS).click();
-        h.run();
+        press(&mut h, Tool::Add);
         let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
         paste(&mut h, text);
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(waits_behind_review(&h));
         drain(&engine);
         let mut plan = plan_view(9, &["+   \"files\""], &[], false);
@@ -14844,18 +14687,15 @@ mod tests {
         click_beside(&mut h);
         assert!(drain(&engine).is_empty());
         h.get_by_label_contains("Review the change");
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert_eq!(drain(&engine), vec![Command::Discard(7)]);
     }
 
     #[test]
     fn a_click_beside_the_casing_dialog_keeps_it_open() {
         let (mut h, engine) = casing_harness(Vec::new());
-        h.get_by_label("gateway").click();
-        h.run();
-        h.get_by_label("Fix casing…").click();
-        h.run();
+        click(&mut h, "gateway");
+        click(&mut h, "Fix casing…");
         click_beside(&mut h);
         assert!(h.state().casing.is_some());
         h.key_press(egui::Key::Escape);
@@ -14885,13 +14725,11 @@ mod tests {
     fn a_click_beside_the_move_dialog_keeps_the_place_chosen() {
         let (mut h, engine) = duplicate_harness();
         open_move_of(&mut h, "beta");
-        h.get_by_label("For the user, in every project").click();
-        h.run();
+        click(&mut h, "For the user, in every project");
         click_beside(&mut h);
         assert!(h.state().moving.is_some());
         h.get_by_label("Moves beta to the user.");
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert!(h.state().moving.is_none());
         assert!(duplicate_requested(&engine).is_empty());
     }
@@ -14899,16 +14737,14 @@ mod tests {
     #[test]
     fn add_reads_a_pasted_command_and_adds_it_where_it_asks() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label(icon::PLUS).click();
-        h.run();
+        press(&mut h, Tool::Add);
         h.get_by_label_contains("Add servers");
         assert!(!ready(&mut h));
         let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
         paste(&mut h, text);
         h.get_by_label_contains("npx -y @x/fs /tmp");
         h.get_by_label_contains("Adds files for the user.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(waits_behind_review(&h));
         assert_eq!(
             duplicate_requested(&engine),
@@ -14936,16 +14772,14 @@ mod tests {
     #[test]
     fn a_local_command_goes_to_the_selected_servers_project() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label("beta").click();
-        h.run();
+        click(&mut h, "beta");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
         let text = "claude mcp add one node\nclaude mcp add two -- node two.js";
         paste(&mut h, text);
         h.get_by_label_contains("Adds one and two in WebApp.");
         // Ticking a place by hand is kept when the text changes.
-        h.get_by_label("notes").click();
-        h.run();
+        click(&mut h, "notes");
         paste(&mut h, &format!("{text}\n"));
         h.get_by_label_contains("Adds one and two in WebApp and notes.");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Enter);
@@ -14998,8 +14832,7 @@ mod tests {
         assert!(!ready(&mut h));
         h.state_mut().add.as_mut().unwrap().names[1] = "ok".into();
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let names: Vec<String> = duplicate_requested(&engine)
             .into_iter()
             .map(|c| match c {
@@ -15060,8 +14893,7 @@ mod tests {
         paste(&mut h, "claude mcp add x node");
         h.key_press(egui::Key::Escape);
         h.run();
-        h.get_by_label("Discard").click();
-        h.run();
+        click(&mut h, "Discard");
         assert!(h.state().add.is_none());
         assert!(duplicate_requested(&engine).is_empty());
     }
@@ -15133,14 +14965,12 @@ mod tests {
             assert!(h.query_by_label(DISCARD_QUESTION).is_none(), "{what}");
             h.key_press(egui::Key::Escape);
             h.run();
-            h.get_by_label("Keep editing").click();
-            h.run();
+            click(&mut h, "Keep editing");
             assert!(h.state().add.is_some(), "{what}");
             assert!(h.query_by_label(DISCARD_QUESTION).is_none(), "{what}");
             h.key_press(egui::Key::Escape);
             h.run();
-            h.get_by_label("Discard").click();
-            h.run();
+            click(&mut h, "Discard");
             assert!(h.state().add.is_none(), "{what}");
             assert!(duplicate_requested(&engine).is_empty(), "{what}");
         }
@@ -15207,8 +15037,7 @@ mod tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
         paste(&mut h, "claude mcp add x node");
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert!(h.state().add.is_none());
     }
 
@@ -15219,8 +15048,7 @@ mod tests {
         h.run();
         let text = "claude mcp add -s user files -- npx -y @x/fs /tmp";
         paste(&mut h, text);
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(waits_behind_review(&h));
         assert_eq!(duplicate_requested(&engine).len(), 1);
         let mut plan = plan_view(9, &["+   \"files\""], &[], false);
@@ -15240,8 +15068,7 @@ mod tests {
     fn fill_in(h: &mut Harness<'static, ShellApp>) {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
-        h.get_by_label("Fill in").click();
-        h.run();
+        click(h, "Fill in");
         assert_eq!(h.state().add.as_ref().unwrap().mode, AddMode::Fill);
     }
 
@@ -15297,8 +15124,7 @@ mod tests {
         add_form(&mut h).fields.env[0] = ("ROOT".into(), "/srv".into());
         h.run();
         h.get_by_label_contains("Adds files for the user.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(waits_behind_review(&h));
         let mut fields = ServerFields {
             command: r#"npx -y @x/fs "C:\My files""#.into(),
@@ -15320,8 +15146,7 @@ mod tests {
     fn an_oauth_server_is_added_with_its_client_secret_typed_hidden() {
         let (mut h, engine) = duplicate_harness();
         fill_in(&mut h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         assert!(h.query_by_label_contains("Client ID").is_none());
         h.get_by_label(OAUTH_TOGGLE).click();
         h.run();
@@ -15335,8 +15160,7 @@ mod tests {
         h.run();
         // The secret is never drawn.
         assert!(h.query_by_label_contains("Typed-S3cret").is_none());
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let fields = ServerFields {
             transport: TransportKind::Http,
             url: "https://sso.example.com/mcp".into(),
@@ -15366,8 +15190,7 @@ mod tests {
         f.fields.url = "https://sso.example.com/mcp".into();
         f.fields.oauth = true;
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let secrets: Vec<Option<Secret>> = duplicate_requested(&engine)
             .into_iter()
             .map(|c| match c {
@@ -15383,8 +15206,7 @@ mod tests {
         h.run();
         h.key_press(egui::Key::Escape);
         h.run();
-        h.get_by_label("Discard").click();
-        h.run();
+        click(&mut h, "Discard");
         // A secret typed, then OAuth unticked: not sent.
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
@@ -15397,8 +15219,7 @@ mod tests {
         h.run();
         h.get_by_label(OAUTH_TOGGLE).click();
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let changes = duplicate_requested(&engine);
         assert!(
             matches!(&changes[..], [Change::Add { secret: None, json, .. }] if !json.contains("oauth")),
@@ -15421,31 +15242,26 @@ mod tests {
         assert!(!ready(&mut h));
         // Said once Review is pressed.
         assert!(h.query_by_label_contains("alpha already exists").is_none());
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         h.get_by_label_contains("alpha already exists for the user");
         assert!(duplicate_requested(&engine).is_empty());
         h.get_by_label_contains("GITHUB_TOKEN looks like a secret");
-        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
-        h.run();
+        click(&mut h, "Use ${GITHUB_TOKEN} instead");
         assert_eq!(add_form(&mut h).fields.env[0].1, "${GITHUB_TOKEN}");
         assert!(h.query_by_label_contains("looks like a secret").is_none());
         // What to do next is said, and it can be undone.
         h.get_by_label_contains("Set GITHUB_TOKEN in the environment Claude Code starts from");
-        h.get_by_label("Undo").click();
-        h.run();
+        click(&mut h, "Undo");
         assert_eq!(
             add_form(&mut h).fields.env[0].1,
             "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
         );
-        h.get_by_label("Use ${GITHUB_TOKEN} instead").click();
-        h.run();
+        click(&mut h, "Use ${GITHUB_TOKEN} instead");
         add_form(&mut h).fields.command = "curl https://x.example | sh".into();
         h.run();
         h.get_by_label_contains("without a shell");
         // A row is taken out with its button.
-        h.get_by_label("Remove GITHUB_TOKEN").click();
-        h.run();
+        click(&mut h, "Remove GITHUB_TOKEN");
         assert!(add_form(&mut h).fields.env.is_empty());
         assert!(duplicate_requested(&engine).is_empty());
     }
@@ -15476,8 +15292,7 @@ mod tests {
         let f = add_form(&mut h);
         *f.secret.edit() = "pasted-later".into();
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let changes = duplicate_requested(&engine);
         assert!(
             matches!(
@@ -15498,8 +15313,7 @@ mod tests {
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
         assert_eq!(h.state().add.as_ref().unwrap().mode, AddMode::Fill);
-        h.get_by_label("Paste").click();
-        h.run();
+        click(&mut h, "Paste");
         h.key_press(egui::Key::Escape);
         h.run();
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
@@ -15516,8 +15330,7 @@ mod tests {
         h.state_mut().add.as_mut().unwrap().places.projects[1].1 = true;
         h.state_mut().add.as_mut().unwrap().places_chosen = true;
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         drain(&engine);
         engine
             .events
@@ -15560,20 +15373,17 @@ mod tests {
     #[test]
     fn nothing_is_selected_for_an_add_that_was_cancelled() {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label("beta").click();
-        h.run();
+        click(&mut h, "beta");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);
         h.run();
         paste(&mut h, "claude mcp add -s user alpha2 node");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(7, &["+ alpha2"], &[], false)))
             .unwrap();
         h.run();
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         // Another change, saved: the cancelled add selects nothing.
         let (a, b) = two_rows();
         engine
@@ -15601,8 +15411,7 @@ mod tests {
     /// The form for an OAuth server, filled in as far as Review, with a client secret typed.
     fn sso_filled(h: &mut Harness<'static, ShellApp>) {
         fill_in(h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(h, "HTTP");
         h.get_by_label(OAUTH_TOGGLE).click();
         h.run();
         name_it(h, "sso");
@@ -15625,8 +15434,7 @@ mod tests {
         let (mut h, engine) = duplicate_harness();
         sso_filled(&mut h);
         let before = form_state(&mut h);
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(waits_behind_review(&h));
         assert!(
             h.query_by_label("Fill in").is_none(),
@@ -15646,8 +15454,7 @@ mod tests {
         h.get_by_label_contains("secret store is not available");
         assert!(h.state().outcome.is_none());
         // Fixed and sent again: the message goes.
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(duplicate_requested(&engine).len(), 1);
         assert!(add_form(&mut h).failed.is_none());
         // Claude Code refusing the add, after review, also comes back to the form.
@@ -15673,8 +15480,7 @@ mod tests {
         let (mut h, engine) = duplicate_harness();
         sso_filled(&mut h);
         let before = form_state(&mut h);
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         drain(&engine);
         engine
             .events
@@ -15689,19 +15495,16 @@ mod tests {
         assert_eq!(form_state(&mut h), before);
         h.get_by_label("Fill in");
         // Cancel in the review drops the add as a whole.
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(8, &["+ sso"], &[], false)))
             .unwrap();
         h.run();
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert!(h.state().add.is_none());
         // Other reviews have no Back.
-        h.get_by_label("beta").click();
-        h.run();
+        click(&mut h, "beta");
         h.key_press(egui::Key::Delete);
         h.run();
         engine
@@ -15719,8 +15522,7 @@ mod tests {
     fn review_pressed_too_soon_says_what_is_missing_under_each_field_and_goes_there() {
         let (mut h, engine) = duplicate_harness();
         fill_in(&mut h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         let f = add_form(&mut h);
         f.fields.headers = vec![(String::new(), "1".into())];
         h.run();
@@ -15728,8 +15530,7 @@ mod tests {
             h.query_by_label_contains("Type the server's address")
                 .is_none()
         );
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         h.run();
         assert!(duplicate_requested(&engine).is_empty());
         // Each under its field, all at once.
@@ -15751,8 +15552,7 @@ mod tests {
     fn an_address_is_checked_when_it_is_left_and_https_is_added_for_the_user() {
         let (mut h, _engine) = duplicate_harness();
         fill_in(&mut h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         let address = field_id(Field::Part(Part::Address));
         h.ctx.memory_mut(|m| m.request_focus(address));
         h.run();
@@ -15801,8 +15601,7 @@ mod tests {
                 .collect()
         };
         fill_in(&mut h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         let f = add_form(&mut h);
         f.fields.url = "https://sso.example.com/mcp".into();
         f.fields.oauth = true;
@@ -15847,8 +15646,7 @@ mod tests {
         // Pressing Review checks again: the port may have been taken since.
         name_it(&mut h, "");
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         h.get_by_label_contains("Give it a name");
         assert_eq!(asked(&engine), [8767]);
         answer(&mut h, 8767, true);
@@ -15880,8 +15678,7 @@ mod tests {
                 .is_none()
         );
         h.get_by_label_contains("Adds corp for the user.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::Add {
@@ -15913,8 +15710,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("Metadata URL");
         // What the form cannot hold is not offered to it.
-        h.get_by_label("Paste").click();
-        h.run();
+        click(&mut h, "Paste");
         paste(
             &mut h,
             r#"claude mcp add-json -s user m --client-secret '{"type":"http","url":"https://m.example/mcp","headersHelper":"get-token"}'"#,
@@ -15955,8 +15751,7 @@ mod tests {
         let f = add_form(&mut h);
         *f.secret.edit() = "typed-here".into();
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let changes = duplicate_requested(&engine);
         assert!(
             matches!(&changes[..], [Change::Add { name, secret: Some(_), .. }] if name == "corp"),
@@ -15969,11 +15764,9 @@ mod tests {
         let (mut h, _engine) = duplicate_harness();
         sso_filled(&mut h);
         assert!(!add_form(&mut h).show_secret);
-        h.get_by_label("Show the client secret").click();
-        h.run();
+        click(&mut h, "Show the client secret");
         assert!(add_form(&mut h).show_secret);
-        h.get_by_label("Hide the client secret").click();
-        h.run();
+        click(&mut h, "Hide the client secret");
         // Typed for real, so egui keeps undo steps of it.
         h.ctx.memory_mut(|m| m.request_focus(secret_id()));
         h.run();
@@ -15987,8 +15780,7 @@ mod tests {
             })
         };
         assert!(remembered(&h));
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert!(h.state().add.is_none());
         assert!(!remembered(&h));
     }
@@ -15999,11 +15791,9 @@ mod tests {
         fill_in(&mut h);
         add_form(&mut h).fields.env = vec![("TEAM".into(), "engineering".into())];
         h.run();
-        h.get_by_label("Show TEAM").click();
-        h.run();
+        click(&mut h, "Show TEAM");
         assert!(add_form(&mut h).rows.shown.contains(&0));
-        h.get_by_label("Hide TEAM").click();
-        h.run();
+        click(&mut h, "Hide TEAM");
         assert!(add_form(&mut h).rows.shown.is_empty());
     }
 
@@ -16019,8 +15809,7 @@ mod tests {
         f.places_chosen = true;
         h.run();
         h.get_by_label_contains("Adds files in WebApp.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         drain(&engine);
         engine
             .events
@@ -16070,8 +15859,7 @@ mod tests {
     fn an_oauth_add_says_to_sign_in_once_it_is_added() {
         let (mut h, engine) = duplicate_harness();
         sso_filled(&mut h);
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(7, &["+ sso"], &[], false)))
@@ -16097,8 +15885,7 @@ mod tests {
         h.set_size(egui::vec2(960.0, 600.0));
         h.run();
         fill_in(&mut h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         h.get_by_label(OAUTH_TOGGLE).click();
         for _ in 0..4 {
             h.run();
@@ -16231,8 +16018,7 @@ mod tests {
     fn the_client_secret_toggle_says_in_words_what_it_does() {
         let (mut h, _engine) = duplicate_harness();
         fill_in(&mut h);
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         h.get_by_label(OAUTH_TOGGLE).click();
         h.run();
         h.run();
@@ -16241,8 +16027,7 @@ mod tests {
         let tall = h.get_by_label("Show the client secret").rect().height();
         let show = h.get_by_label("Show the client secret").rect().width();
         assert!(show > 3.0 * tall, "{show} wide, {tall} tall");
-        h.get_by_label("Show the client secret").click();
-        h.run();
+        click(&mut h, "Show the client secret");
         let hide = h.get_by_label("Hide the client secret").rect().width();
         assert!(hide > 3.0 * tall, "{hide} wide, {tall} tall");
     }
@@ -16253,14 +16038,12 @@ mod tests {
         fill_in(&mut h);
         h.run();
         let tabs = h.get_by_label("Paste").rect();
-        h.get_by_label("HTTP").click();
-        h.run();
+        click(&mut h, "HTTP");
         h.get_by_label(OAUTH_TOGGLE).click();
         h.run();
         h.run();
         assert_eq!(h.get_by_label("Paste").rect(), tabs);
-        h.get_by_label("Paste").click();
-        h.run();
+        click(&mut h, "Paste");
         h.run();
         assert_eq!(h.get_by_label("Paste").rect(), tabs);
     }
@@ -16316,13 +16099,11 @@ mod tests {
         h.state_mut().duplicate.as_mut().unwrap().places.filter = "HOME/me".into();
         h.run();
         assert!(h.query_by_label("project-00").is_none());
-        h.get_by_label("notes").click();
-        h.run();
+        click(&mut h, "notes");
         h.state_mut().duplicate.as_mut().unwrap().places.filter = "web".into();
         h.run();
         assert!(h.query_by_label("notes").is_none());
-        h.get_by_label("WebApp").click();
-        h.run();
+        click(&mut h, "WebApp");
         h.state_mut()
             .duplicate
             .as_mut()
@@ -16331,8 +16112,7 @@ mod tests {
             .filter
             .clear();
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::Duplicate {
@@ -16389,15 +16169,13 @@ mod tests {
         open_duplicate_of(&mut h, "alpha");
         h.get_by_label("Adds alpha_copy for the user.");
         h.get_by_label("WebApp").click();
-        h.get_by_label("notes").click();
-        h.run();
+        click(&mut h, "notes");
         h.get_by_label("Adds alpha_copy for the user and in WebApp and notes.");
         h.get_by_label_contains("For the user").click();
         h.run();
         h.get_by_label("Adds alpha_copy in WebApp and notes.");
         h.get_by_label("WebApp").click();
-        h.get_by_label("notes").click();
-        h.run();
+        click(&mut h, "notes");
         h.get_by_label("Tick at least one place.");
     }
 
@@ -16409,8 +16187,7 @@ mod tests {
         h.state_mut().duplicate.as_mut().unwrap().name = "beta".into();
         h.run();
         assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
-        h.get_by_label("WebApp").click();
-        h.run();
+        click(&mut h, "WebApp");
         h.get_by_label_contains("beta already exists in WebApp");
         assert!(h.get_by_label("Review").accesskit_node().is_disabled());
         // The user's own alpha.
@@ -16429,8 +16206,7 @@ mod tests {
     #[test]
     fn the_palette_offers_duplicate() {
         let (mut h, _engine) = duplicate_harness();
-        h.get_by_label("alpha").click();
-        h.run();
+        click(&mut h, "alpha");
         ctrl_k(&mut h);
         type_into_palette(&mut h, "dup");
         h.key_press(egui::Key::Enter);
@@ -16454,8 +16230,7 @@ mod tests {
     fn the_palette_runs_a_command_by_name() {
         let (mut h, engine) = live_harness();
         let (a, b) = two_rows();
-        engine.events.send(snapshot_of(vec![a, b])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a, b]);
         ctrl_k(&mut h);
         assert!(h.state().command.is_open());
         h.get_by_label_contains("Go to alpha");
@@ -16470,8 +16245,7 @@ mod tests {
     fn the_palette_goes_to_a_server_and_acts_on_the_selection() {
         let (mut h, engine) = live_harness();
         let (a, b) = two_rows();
-        engine.events.send(snapshot_of(vec![a, b.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a, b.clone()]);
         ctrl_k(&mut h);
         type_into_palette(&mut h, "go beta");
         h.key_press(egui::Key::Enter);
@@ -16502,21 +16276,15 @@ mod tests {
         // The palette keeps its entries while open; a snapshot arriving meanwhile must still show.
         let (mut h, engine) = live_harness();
         let (a, b) = two_rows();
-        engine.events.send(snapshot_of(vec![a.clone()])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a.clone()]);
         ctrl_k(&mut h);
         type_into_palette(&mut h, "go");
         h.get_by_label_contains("Go to alpha");
         assert!(h.query_by_label_contains("Go to beta").is_none());
-        engine.events.send(snapshot_of(vec![a, b])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a, b]);
         h.get_by_label_contains("Go to beta");
         // And one without the server takes it away again, query unchanged.
-        engine
-            .events
-            .send(snapshot_of(vec![live_row("gamma", Scope::User, None)]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![live_row("gamma", Scope::User, None)]);
         assert!(h.query_by_label_contains("Go to alpha").is_none());
         h.get_by_label_contains("Go to gamma");
         // Reopening starts from the current entries too.
@@ -16530,8 +16298,7 @@ mod tests {
     fn arrows_pick_the_entry_and_escape_closes_without_running_anything() {
         let (mut h, engine) = live_harness();
         let (a, b) = two_rows();
-        engine.events.send(snapshot_of(vec![a, b])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![a, b]);
         ctrl_k(&mut h);
         type_into_palette(&mut h, "go to");
         h.key_press(egui::Key::ArrowDown);
@@ -16557,8 +16324,7 @@ mod tests {
             live_row("three", Scope::Local, Some("C:/Repos/WebApp")),
         ];
         let engine = _engine;
-        engine.events.send(snapshot_of(rows)).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows);
         let name = |h: &Harness<'static, ShellApp>| {
             h.state()
                 .selected
@@ -16585,11 +16351,7 @@ mod tests {
     #[test]
     fn arrows_do_not_move_the_list_while_typing_in_the_filter() {
         let (mut h, engine) = live_harness();
-        engine
-            .events
-            .send(snapshot_of(vec![live_row("one", Scope::User, None)]))
-            .unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![live_row("one", Scope::User, None)]);
         h.get_by_role(egui::accesskit::Role::TextInput).click();
         h.run();
         h.key_press(egui::Key::ArrowDown);
@@ -16616,8 +16378,7 @@ mod tests {
         h.run();
         assert_eq!(drain(&engine), vec![Command::Apply(4)]);
         // Pressed again while saving: nothing more is sent.
-        h.get_by_label("Turn off").click();
-        h.run();
+        click(&mut h, "Turn off");
         assert!(drain(&engine).is_empty());
     }
 
@@ -16663,8 +16424,7 @@ mod tests {
         h.get_by_label_contains("Scope drift").click();
         h.run();
         h.get_by_label_contains("Coming soon");
-        h.get_by_label("Back to connections").click();
-        h.run();
+        click(&mut h, "Back to connections");
         assert_eq!(h.state().page, Page::Connections);
     }
 
@@ -16721,14 +16481,12 @@ mod tests {
             live_row("alpha", Scope::User, None),
             live_row("gamma", Scope::Local, Some("/work/app")),
         ];
-        engine.events.send(snapshot_of(rows.clone())).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows.clone());
         drain(&engine);
-        h.get_by_label(icon::EXPORT).hover();
+        tool(&h, Tool::Export).hover();
         h.run();
         h.get_by_label_contains("Export the servers in the list");
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         // In the list's order.
         assert_eq!(
             drain(&engine),
@@ -16791,16 +16549,13 @@ mod tests {
             live_row("alpha", Scope::User, None),
             live_row("beta", Scope::User, None),
         ];
-        engine.events.send(snapshot_of(rows.clone())).unwrap();
-        h.run();
-        h.get_by_label("beta").click();
-        h.run();
+        show_rows(&mut h, &engine, rows.clone());
+        click(&mut h, "beta");
         drain(&engine);
-        h.get_by_label(icon::EXPORT).hover();
+        tool(&h, Tool::Export).hover();
         h.run();
         h.get_by_label_contains("Export the selected servers");
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         assert_eq!(drain(&engine), vec![Command::Export(vec![rows[1].id()])]);
         h.get_by_label("Export beta");
         // Nothing to copy yet: Enter does nothing.
@@ -16835,20 +16590,17 @@ mod tests {
     fn the_palette_offers_export_and_an_earlier_answer_does_not_fill_a_later_export() {
         let (mut h, engine) = live_harness();
         let rows = vec![live_row("alpha", Scope::User, None)];
-        engine.events.send(snapshot_of(rows.clone())).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows.clone());
         assert!(
             h.state()
                 .commands()
                 .iter()
                 .any(|e| e.title == "Export the servers in the list"),
         );
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         h.key_press(egui::Key::Escape);
         h.run();
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         drain(&engine);
         let shown = |h: &Harness<'_, ShellApp>| {
             h.state()
@@ -16879,16 +16631,13 @@ mod tests {
             live_row("alpha", Scope::User, None),
             live_row("beta", Scope::User, None),
         ];
-        engine.events.send(snapshot_of(rows.clone())).unwrap();
-        h.run();
-        h.get_by_label("beta").click();
-        h.run();
+        show_rows(&mut h, &engine, rows.clone());
+        click(&mut h, "beta");
         h.state_mut().search = "alpha".into();
         h.run();
         assert_eq!(h.state().visible(), [0], "the search hides beta");
         drain(&engine);
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         assert_eq!(drain(&engine), vec![Command::Export(vec![rows[1].id()])]);
         h.get_by_label("Export beta");
         h.get_by_label("Includes 1 selected server the search hides.");
@@ -16902,12 +16651,10 @@ mod tests {
             live_row("alps", Scope::User, None),
             live_row("beta", Scope::User, None),
         ];
-        engine.events.send(snapshot_of(rows.clone())).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows.clone());
         h.state_mut().search = "alp".into();
         h.run();
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         h.get_by_label("Export 2 servers");
         h.get_by_label("alpha and alps");
         h.get_by_label("Only the servers that match \u{201c}alp\u{201d}.");
@@ -16930,10 +16677,8 @@ mod tests {
         block: &str,
     ) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         let (mut h, engine) = live_harness();
-        engine.events.send(snapshot_of(rows)).unwrap();
-        h.run();
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        show_rows(&mut h, &engine, rows);
+        press(&mut h, Tool::Export);
         engine.events.send(exported_block(block, &[], &[])).unwrap();
         h.run();
         drain(&engine);
@@ -16960,13 +16705,8 @@ mod tests {
                 crate::theme::apply(&cc.egui_ctx, ThemeChoice::Dark);
                 ShellApp::with_core(core, ThemeChoice::Dark)
             });
-        engine
-            .events
-            .send(snapshot_of(vec![live_row("github", Scope::User, None)]))
-            .unwrap();
-        h.run();
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        show_rows(&mut h, &engine, vec![live_row("github", Scope::User, None)]);
+        press(&mut h, Tool::Export);
         engine
             .events
             .send(exported_block("{\n  \"mcpServers\": {}\n}", &[], &[]))
@@ -17139,8 +16879,7 @@ mod tests {
         );
         let said = h.get_by_label("Not saved.");
         assert_eq!(said.accesskit_node().live(), egui::accesskit::Live::Polite);
-        h.get_by_label("Type a path instead").click();
-        h.run();
+        click(&mut h, "Type a path instead");
         let field = h.get_by_label("Save to");
         assert_eq!(
             field.accesskit_node().value().as_deref(),
@@ -17170,16 +16909,15 @@ mod tests {
     fn on_a_short_window_the_variables_fold_when_saving_needs_the_room() {
         let (mut h, engine) = live_harness();
         h.set_size(egui::vec2(800.0, 480.0));
-        engine
-            .events
-            .send(snapshot_of(vec![
+        show_rows(
+            &mut h,
+            &engine,
+            vec![
                 live_row("a", Scope::User, None),
                 live_row("b", Scope::User, None),
-            ]))
-            .unwrap();
-        h.run();
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+            ],
+        );
+        press(&mut h, Tool::Export);
         engine
             .events
             .send(exported_block("{}", &[("TOKEN", "a: env TOKEN")], &[]))
@@ -17432,8 +17170,7 @@ mod tests {
             .click();
         h.run();
         // Open again, with another block.
-        h.get_by_label(icon::EXPORT).click();
-        h.run();
+        press(&mut h, Tool::Export);
         engine
             .events
             .send(exported_block("second", &[], &[]))
@@ -17459,12 +17196,46 @@ mod tests {
     }
 
     #[test]
+    fn each_toolbar_button_says_on_hover_what_it_does_and_its_shortcut() {
+        // Written out here, not taken from `Tool::tip`: the hover text is what people read.
+        for (which, tip) in [
+            (Tool::Add, "Add (Ctrl+N)"),
+            (Tool::Import, "Import from a file (Ctrl+O)"),
+            (Tool::Edit, "Edit (Ctrl+E)"),
+            (Tool::Duplicate, "Duplicate (Ctrl+D)"),
+            (Tool::Move, "Move (Ctrl+Shift+M)"),
+            (Tool::SignIn, "Sign in"),
+            (Tool::TurnOn, "Turn on"),
+            (Tool::TurnOff, "Turn off"),
+            (Tool::Delete, "Delete (Del)"),
+            (Tool::Export, "Export the servers in the list"),
+        ] {
+            let (mut h, engine) = live_harness();
+            show_rows(&mut h, &engine, vec![live_row("alpha", Scope::User, None)]);
+            tool(&h, which).hover();
+            h.run();
+            // As it is, or with why it is off: "Edit (Ctrl+E): select one server".
+            let with_reason = format!("{tip}: ");
+            let shown = h.query_all_by_label(tip).count()
+                + h.query_all_by_label_contains(&with_reason).count();
+            assert_eq!(shown, 1, "{which:?}: \"{tip}\" on hover");
+            // Said by a screen reader as the button's description, without hovering.
+            let description = tool(&h, which).accesskit_node().description();
+            assert!(
+                description
+                    .as_deref()
+                    .is_some_and(|d| d == tip || d.starts_with(&with_reason)),
+                "{which:?}: {description:?}"
+            );
+        }
+    }
+
+    #[test]
     fn export_is_off_when_the_list_is_empty() {
         let (mut h, engine) = live_harness();
-        engine.events.send(snapshot_of(Vec::new())).unwrap();
-        h.run();
-        assert!(h.get_by_label(icon::EXPORT).accesskit_node().is_disabled());
-        h.get_by_label(icon::EXPORT).hover();
+        show_rows(&mut h, &engine, Vec::new());
+        assert!(tool(&h, Tool::Export).accesskit_node().is_disabled());
+        tool(&h, Tool::Export).hover();
         h.run();
         h.get_by_label_contains("no server to export");
     }
@@ -17473,20 +17244,110 @@ mod tests {
     fn the_toolbar_shows_only_what_works() {
         let (mut h, _engine) = live_harness();
         h.run();
-        // Duplicate (icon::COPY), Add (icon::PLUS) and Sign in (icon::SIGN_IN) were in this list until they were
-        // built; they are shown now.
-        h.get_by_label(icon::COPY);
-        h.get_by_label(icon::PLUS);
-        h.get_by_label(icon::SIGN_IN);
+        // Duplicate, Add and Sign in were in this list until they were built; they are shown now.
+        tool(&h, Tool::Duplicate);
+        tool(&h, Tool::Add);
+        tool(&h, Tool::SignIn);
         // And Export, since M3.
-        h.get_by_label(icon::EXPORT);
+        tool(&h, Tool::Export);
+        // The buttons once shown for what did not work yet. (Any button shown by its icon alone fails
+        // `every_control_is_named_in_words`.)
         for gone in [icon::SWAP, icon::DOWNLOAD_SIMPLE] {
+            assert!(!Tool::ALL.iter().any(|t| t.glyph() == gone), "{gone:?}");
             assert!(h.query_by_label(gone).is_none(), "{gone:?}");
         }
         assert!(
             h.query_by_label_contains("selected").is_none(),
             "no count without a selection"
         );
+    }
+
+    /// The controls on screen whose name has no word in it: an icon (a private-use character), a hint shown in the
+    /// box or a tooltip is no name to a screen reader.
+    fn unnamed_controls(h: &Harness<'static, ShellApp>) -> Vec<String> {
+        use egui::accesskit::Role;
+        h.query_all_by(|n| {
+            matches!(
+                n.role(),
+                Role::Button
+                    | Role::ComboBox
+                    | Role::TextInput
+                    | Role::CheckBox
+                    | Role::RadioButton
+            ) && !n
+                .label()
+                .is_some_and(|l| l.chars().any(char::is_alphabetic))
+        })
+        .map(|n| {
+            format!(
+                "{:?} {:?}",
+                n.accesskit_node().role(),
+                n.accesskit_node().label()
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn every_control_is_named_in_words() {
+        // WCAG 2.2 SC 4.1.2 Name, Role, Value: the toolbar, Refresh, the theme menu and the filter box were read out
+        // as private-use characters or not at all.
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(fixture_snapshot()))
+            .unwrap();
+        h.run();
+        click(&mut h, "issue-tracker");
+        assert_eq!(
+            unnamed_controls(&h),
+            Vec::<String>::new(),
+            "{:?}",
+            h.state().page
+        );
+        for (page, _, _) in Page::ALL {
+            h.state_mut().go(page);
+            h.run();
+            assert_eq!(unnamed_controls(&h), Vec::<String>::new(), "{page:?}");
+        }
+    }
+
+    #[test]
+    fn the_top_bar_and_the_toolbar_are_named_by_what_they_do() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        engine
+            .events
+            .send(klefki_core::api::Event::Snapshot(fixture_snapshot()))
+            .unwrap();
+        h.run();
+        h.get_by_role_and_label(Role::Button, "Refresh and re-check all");
+        h.get_by_role_and_label(Role::ComboBox, "Theme");
+        h.get_by_role_and_label(Role::Button, &format!("Commands ({})", shortcut("K")));
+        h.get_by_role_and_label(Role::TextInput, "Filter servers");
+        for tool in Tool::ALL {
+            h.get_by_role_and_label(Role::Button, tool.name());
+        }
+        // The theme menu says which theme is on, in words.
+        let current = ThemeOption::new(h.state().theme, h.state().tone);
+        assert_eq!(
+            h.get_by_role_and_label(Role::ComboBox, "Theme")
+                .accesskit_node()
+                .value()
+                .as_deref(),
+            Some(current.label())
+        );
+        // The filter box is named for what it filters on each page.
+        for (page, name) in [
+            (Page::ActivityLog, "Filter changes"),
+            (Page::Secrets, "Filter secrets"),
+            (Page::Desktop, "Filter servers"),
+            (Page::Profiles, "Filter profiles"),
+        ] {
+            h.state_mut().go(page);
+            h.run();
+            h.get_by_role_and_label(Role::TextInput, name);
+        }
     }
 
     #[test]
@@ -17502,11 +17363,9 @@ mod tests {
             let (mut h, engine) = live_harness();
             h.set_size(size);
             let (a, b) = two_rows();
-            engine.events.send(snapshot_of(vec![a, b])).unwrap();
-            h.run();
+            show_rows(&mut h, &engine, vec![a, b]);
             let before = h.get_by_label("Name").rect().top();
-            h.get_by_label("beta").click();
-            h.run();
+            click(&mut h, "beta");
             h.run();
             let after = h.get_by_label("Name").rect().top();
             // Rounded to the pixel; it moved 46 px.
@@ -17516,7 +17375,7 @@ mod tests {
             );
             if let Some(count) = h.query_by_label("1 selected") {
                 // On the row of the last button, which may have wrapped.
-                let last = h.get_by_label(icon::EXPORT).rect();
+                let last = tool(&h, Tool::Export).rect();
                 let y = count.rect().center().y;
                 assert!(
                     last.top() <= y && y <= last.bottom(),
@@ -17536,8 +17395,7 @@ mod tests {
         h.get_by_label_contains("Settings").click();
         h.run();
         assert_eq!(h.state().page, Page::Settings);
-        h.get_by_label("Warm gray").click();
-        h.run();
+        click(&mut h, "Warm gray");
         assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
         h.get_by_label_contains("Light").click();
         h.run();
@@ -17546,8 +17404,7 @@ mod tests {
         eframe::App::save(h.state_mut(), &mut storage);
         assert_eq!(theme::load_tone(Some(&storage)), Tone::Warm);
         assert_eq!(theme::load_choice(Some(&storage)), ThemeChoice::Light);
-        h.get_by_label("Cool (Catppuccin)").click();
-        h.run();
+        click(&mut h, "Cool (Catppuccin)");
         assert_eq!(theme::palette(&h.ctx).panel, theme::LIGHT.panel);
     }
 
@@ -17654,8 +17511,7 @@ mod tests {
         let (mut h, engine, row) = needs_auth_harness();
         // The way out of "Needs auth" is named where the problem is explained.
         h.get_by_label_contains("Claude Code opens the sign-in page in your browser");
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(row.id())]);
         h.get_by_label("Sign in to web");
         h.get_by_label("Starting Claude Code…");
@@ -17705,14 +17561,12 @@ mod tests {
             .send(status_event(&row, Status::NeedsAuth, None))
             .unwrap();
         h.run();
-        h.get_by_label("web").click();
-        h.run();
+        click(&mut h, "web");
         h.get_by_role_and_label(Role::Button, "General").click();
         h.run();
         drain_all(&engine);
         h.get_by_label("This server needs you to sign in.");
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(row.id())]);
         h.key_press(egui::Key::Escape);
         h.run();
@@ -17731,8 +17585,7 @@ mod tests {
     fn cancel_and_escape_stop_the_sign_in() {
         for escape in [false, true] {
             let (mut h, engine, row) = needs_auth_harness();
-            h.get_by_label("Sign in").click();
-            h.run();
+            click(&mut h, "Sign in");
             engine
                 .events
                 .send(sign_in_event(&row, waiting(true)))
@@ -17764,8 +17617,7 @@ mod tests {
     #[test]
     fn pasting_back_is_one_fold_away_and_hands_over_what_was_pasted() {
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine
             .events
             .send(sign_in_event(&row, waiting(true)))
@@ -17778,8 +17630,7 @@ mod tests {
         let address = "http://localhost:8080/callback?code=c&state=s";
         h.state_mut().sign_in.as_mut().unwrap().set_pasted(address);
         h.run();
-        h.get_by_label("Continue").click();
-        h.run();
+        click(&mut h, "Continue");
         assert_eq!(
             sign_in_commands(&engine),
             vec![Command::SignInPaste {
@@ -17824,8 +17675,7 @@ mod tests {
     #[test]
     fn a_failed_sign_in_says_why_and_can_be_tried_again() {
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine
             .events
             .send(sign_in_event(
@@ -17846,8 +17696,7 @@ mod tests {
             h.query_by_label("Cancel").is_none(),
             "nothing is running to cancel"
         );
-        h.get_by_label("Try again").click();
-        h.run();
+        click(&mut h, "Try again");
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(row.id())]);
         h.get_by_label("Starting Claude Code…");
         engine
@@ -17855,8 +17704,7 @@ mod tests {
             .send(sign_in_event(&row, failure("Again.", None, true)))
             .unwrap();
         h.run();
-        h.get_by_label("Close").click();
-        h.run();
+        click(&mut h, "Close");
         assert!(h.state().sign_in.is_none());
         assert!(
             sign_in_commands(&engine).is_empty(),
@@ -17867,8 +17715,7 @@ mod tests {
     #[test]
     fn when_the_browser_did_not_open_copying_the_link_is_the_way_on() {
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine
             .events
             .send(sign_in_event(&row, waiting(false)))
@@ -17916,10 +17763,15 @@ mod tests {
             .send(status_event(&sse, Status::NeedsAuth, None))
             .unwrap();
         h.run();
+        // Offered in the detail panel: the toolbar's button is always there, by a name of its own.
+        let offered = |h: &Harness<'static, ShellApp>| {
+            h.query_all_by_label_contains("Sign in")
+                .any(|n| n.accesskit_node().label().as_deref() != Some(Tool::SignIn.name()))
+        };
         // A server that works and has no OAuth set up (most likely a token in a header): not up front.
         open_status_tab(&mut h, "web");
-        assert!(h.query_by_label_contains("Sign in").is_none());
-        assert!(h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
+        assert!(!offered(&h));
+        assert!(tool(&h, Tool::SignIn).accesskit_node().is_disabled());
         // Its Auth tab still has it, without contradicting itself.
         h.get_by_role_and_label(Role::Button, "Auth").click();
         h.run();
@@ -17931,19 +17783,16 @@ mod tests {
             open_status_tab(&mut h, name);
             h.get_by_label("Sign in");
             assert!(h.query_by_label_contains("again").is_none(), "{name}");
-            assert!(!h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
+            assert!(!tool(&h, Tool::SignIn).accesskit_node().is_disabled());
         }
-        h.get_by_label("cmd").click();
-        h.run();
-        assert!(h.query_by_label_contains("Sign in").is_none());
-        assert!(h.get_by_label(icon::SIGN_IN).accesskit_node().is_disabled());
+        click(&mut h, "cmd");
+        assert!(!offered(&h));
+        assert!(tool(&h, Tool::SignIn).accesskit_node().is_disabled());
         h.get_by_role_and_label(Role::Button, "Auth").click();
         h.run();
         h.get_by_label_contains("does not sign in with OAuth");
-        h.get_by_label("sso").click();
-        h.run();
-        h.get_by_label(icon::SIGN_IN).click();
-        h.run();
+        click(&mut h, "sso");
+        press(&mut h, Tool::SignIn);
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(sso.id())]);
         // One at a time: while the dialog is open, nothing else starts one.
         assert!(h.state().sign_in.is_some());
@@ -17955,8 +17804,7 @@ mod tests {
     fn a_click_beside_the_dialog_does_not_stop_a_running_sign_in() {
         for checking in [false, true] {
             let (mut h, engine, row) = needs_auth_harness();
-            h.get_by_label("Sign in").click();
-            h.run();
+            click(&mut h, "Sign in");
             engine.events.send(sign_in_event(&row, starting())).unwrap();
             engine
                 .events
@@ -17977,8 +17825,7 @@ mod tests {
         }
         // Once it has ended there is nothing to lose: a click beside closes it.
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine
             .events
             .send(sign_in_event(&row, failure("Down.", None, true)))
@@ -17993,8 +17840,7 @@ mod tests {
     #[test]
     fn when_trying_again_cannot_help_close_is_the_way_on() {
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine
             .events
             .send(sign_in_event(
@@ -18020,8 +17866,7 @@ mod tests {
     #[test]
     fn the_wait_is_said_and_can_be_made_longer_before_it_ends() {
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine.events.send(sign_in_event(&row, starting())).unwrap();
         engine
             .events
@@ -18040,8 +17885,7 @@ mod tests {
             .set_ends_at(now + 20.0);
         h.run();
         h.get_by_label_contains("Klefki stops waiting in");
-        h.get_by_label("Keep waiting").click();
-        h.run();
+        click(&mut h, "Keep waiting");
         assert_eq!(
             sign_in_commands(&engine),
             vec![Command::KeepWaitingForSignIn(row.id())]
@@ -18053,8 +17897,7 @@ mod tests {
     #[test]
     fn a_sign_in_page_on_another_site_is_pointed_out() {
         let (mut h, engine, row) = needs_auth_harness();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         engine
             .events
             .send(sign_in_event(
@@ -18086,8 +17929,7 @@ mod tests {
     fn an_oauth_server_just_added_can_be_signed_in_to_from_the_card() {
         let (mut h, engine) = duplicate_harness();
         sso_filled(&mut h);
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(7, &["+ sso"], &[], false)))
@@ -18113,8 +17955,7 @@ mod tests {
         // It does not fade while it offers something to do: shown long ago, it is still there.
         h.state_mut().outcome.as_mut().unwrap().shown_at = Some(-1000.0);
         h.run();
-        h.get_by_label("Sign in").click();
-        h.run();
+        click(&mut h, "Sign in");
         assert_eq!(sign_in_commands(&engine), vec![Command::SignIn(sso.id())]);
         h.get_by_label("Sign in to sso");
         assert!(h.query_by_label_contains("Added sso").is_none());
@@ -18125,8 +17966,7 @@ mod tests {
     fn open_move_of(h: &mut Harness<'static, ShellApp>, name: &str) {
         h.get_by_label(name).click();
         h.run();
-        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
-        h.run();
+        press(h, Tool::Move);
         assert!(h.state().moving.is_some());
         h.get_by_label(&format!("Move {name}"));
     }
@@ -18143,12 +17983,10 @@ mod tests {
         here.click();
         h.run();
         assert!(h.get_by_label("Review").accesskit_node().is_disabled());
-        h.get_by_label("For the user, in every project").click();
-        h.run();
+        click(&mut h, "For the user, in every project");
         h.get_by_label("Moves beta to the user.");
         h.get_by_label_contains("keeps its settings");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(h.state().moving.is_none());
         assert_eq!(
             duplicate_requested(&engine),
@@ -18169,13 +18007,10 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
-        h.get_by_label("notes").click();
-        h.run();
-        h.get_by_label("WebApp").click();
-        h.run();
+        click(&mut h, "notes");
+        click(&mut h, "WebApp");
         // Clicking the chosen one again keeps it chosen.
-        h.get_by_label("WebApp").click();
-        h.run();
+        click(&mut h, "WebApp");
         let chosen: Vec<String> = h
             .get_all_by_role(Role::RadioButton)
             .filter(|n| n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True))
@@ -18211,38 +18046,29 @@ mod tests {
         h.run();
         h.state_mut().selected = BTreeSet::from([0]);
         h.run();
-        h.get_by_label(icon::ARROW_FAT_LINES_RIGHT).click();
-        h.run();
-        h.get_by_label("notes").click();
-        h.run();
+        press(&mut h, Tool::Move);
+        click(&mut h, "notes");
         h.get_by_label_contains("alpha already exists in notes");
         assert!(h.get_by_label("Review").accesskit_node().is_disabled());
         h.key_press(egui::Key::Enter);
         h.run();
         assert!(duplicate_requested(&engine).is_empty());
         // Somewhere free is fine.
-        h.get_by_label("WebApp").click();
-        h.run();
+        click(&mut h, "WebApp");
         assert!(!h.get_by_label("Review").accesskit_node().is_disabled());
     }
 
     #[test]
     fn move_is_in_the_palette_for_user_and_local_servers_only() {
         let (mut h, _engine) = duplicate_harness();
-        h.get_by_label("gamma").click();
-        h.run();
-        assert!(
-            h.get_by_label(icon::ARROW_FAT_LINES_RIGHT)
-                .accesskit_node()
-                .is_disabled()
-        );
+        click(&mut h, "gamma");
+        assert!(tool(&h, Tool::Move).accesskit_node().is_disabled());
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
         h.run();
         assert!(h.query_by_label_contains("Move gamma").is_none());
         h.key_press(egui::Key::Escape);
         h.run();
-        h.get_by_label("beta").click();
-        h.run();
+        click(&mut h, "beta");
         h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
         h.run();
         h.get_by_label_contains("Move beta").click();
@@ -18255,10 +18081,8 @@ mod tests {
     fn a_moved_server_is_selected_where_it_went_and_the_message_says_moved() {
         let (mut h, engine) = duplicate_harness();
         open_move_of(&mut h, "beta");
-        h.get_by_label("notes").click();
-        h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "notes");
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(
@@ -18295,8 +18119,7 @@ mod tests {
         assert!(h.state().outcome.as_ref().is_some_and(|o| o.warn));
         // Undo moves it back where it was.
         drain(&engine);
-        h.get_by_label("Undo").click();
-        h.run();
+        click(&mut h, "Undo");
         assert_eq!(
             duplicate_requested(&engine),
             [Change::Move {
@@ -18309,8 +18132,7 @@ mod tests {
     #[test]
     fn a_change_made_with_claude_code_says_each_step_while_it_runs() {
         let (mut h, engine) = with_plan(&["+ alpha"], &[], false);
-        h.get_by_label("Apply").click();
-        h.run();
+        click(&mut h, "Apply");
         h.get_by_label("Saving…");
         // A step of another plan is not this one's.
         for (plan, step) in [
@@ -18354,10 +18176,8 @@ mod tests {
         h.run();
         open_move_of(&mut h, "sso");
         h.get_by_label_contains("so you will need to sign in to it again afterwards");
-        h.get_by_label("WebApp").click();
-        h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "WebApp");
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(
@@ -18429,8 +18249,7 @@ mod tests {
         let (mut h, engine) = kept_harness();
         h.get_by_label("A server is out of the configuration");
         h.get_by_label("sso in WebApp (signs in with OAuth)");
-        h.get_by_label("Put back").click();
-        h.run();
+        click(&mut h, "Put back");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::PutBack {
@@ -18475,8 +18294,7 @@ mod tests {
                 .is_none()
         );
         // Forgetting it says what was let go of.
-        h.get_by_label("Forget\u{2026}").click();
-        h.run();
+        click(&mut h, "Forget\u{2026}");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::ForgetKept {
@@ -18504,8 +18322,7 @@ mod tests {
     #[test]
     fn a_kept_server_can_be_forgotten_after_a_review() {
         let (mut h, engine) = kept_harness();
-        h.get_by_label("Forget\u{2026}").click();
-        h.run();
+        click(&mut h, "Forget\u{2026}");
         assert_eq!(
             duplicate_requested(&engine),
             vec![Change::ForgetKept {
@@ -18527,8 +18344,7 @@ mod tests {
     fn a_copy_is_selected_and_the_message_says_copied() {
         let (mut h, engine) = duplicate_harness();
         open_duplicate_of(&mut h, "beta");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         engine
             .events
             .send(Event::PlanReady(plan_view(7, &["+ beta_copy"], &[], false)))
@@ -18565,9 +18381,9 @@ mod tests {
         // characters JetBrains Mono draws itself (its Powerline symbols).
         const MONO_SYMBOLS: [std::ops::RangeInclusive<char>; 2] =
             ['\u{E0A0}'..='\u{E0A2}', '\u{E0B0}'..='\u{E0B3}'];
-        let glyphs = ACTIONS
+        let glyphs = Tool::ALL
             .iter()
-            .map(|(g, _)| *g)
+            .map(|t| t.glyph())
             .chain(Page::ALL.iter().map(|(_, g, _)| *g));
         for glyph in glyphs {
             for c in glyph.chars() {
@@ -18600,8 +18416,7 @@ mod tests {
     /// The Import dialog, open on `text` as read from `mcp-servers.json`.
     fn import_open(text: &str) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label(icon::TRAY_ARROW_DOWN).click();
-        h.run();
+        press(&mut h, Tool::Import);
         assert_eq!(
             drain(&engine),
             vec![Command::ChooseImportFile { shown: None }]
@@ -18629,8 +18444,7 @@ mod tests {
         // alpha is there already: kept unless asked otherwise, and said so.
         h.get_by_label_contains("alpha already exists for the user.");
         h.get_by_label_contains("Adds docs and notion for the user.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(waits_behind_review(&h));
         assert_eq!(
             duplicate_requested(&engine),
@@ -18654,11 +18468,9 @@ mod tests {
     #[test]
     fn a_server_that_exists_is_kept_replaced_or_imported_under_another_name() {
         let (mut h, engine) = import_open(IMPORTED);
-        h.get_by_label("Replace it").click();
-        h.run();
+        click(&mut h, "Replace it");
         h.get_by_label_contains("Replaces alpha for the user.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let alpha = live_row("alpha", Scope::User, None).id();
         let changes = duplicate_requested(&engine);
         assert!(
@@ -18702,11 +18514,9 @@ mod tests {
 
         // Nearby: under a free name it is added like the others.
         let (mut h, engine) = import_open(IMPORTED);
-        h.get_by_label("import it as alpha_2").click();
-        h.run();
+        click(&mut h, "import it as alpha_2");
         h.get_by_label_contains("Adds alpha_2, docs and notion for the user.");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let changes = duplicate_requested(&engine);
         assert!(
             changes.iter().any(|c| matches!(
@@ -18718,10 +18528,8 @@ mod tests {
 
         // Kept where it is, it still goes where it is not: a project ticked as well.
         let (mut h, engine) = import_open(IMPORTED);
-        h.get_by_label("notes").click();
-        h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "notes");
+        click(&mut h, "Review");
         let changes = duplicate_requested(&engine);
         assert!(
             changes.iter().any(|c| matches!(
@@ -18736,8 +18544,7 @@ mod tests {
         // Nearby: when everything is kept, it says nothing would change, and Review asks for nothing.
         let (mut h, engine) = import_open(r#"{"mcpServers": {"alpha": {"command": "node"}}}"#);
         h.get_by_label_contains("nothing would change");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(duplicate_requested(&engine).is_empty());
     }
 
@@ -18750,8 +18557,7 @@ mod tests {
         h.run();
         // Never shown as typed unless asked.
         assert!(h.query_by_label_contains("s3cret").is_none());
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         let changes = duplicate_requested(&engine);
         assert_eq!(
             changes.iter().find_map(|c| match c {
@@ -18769,27 +18575,22 @@ mod tests {
         let (mut h, engine) = import_open(
             "claude mcp add --transport http --client-id abc --client-secret -s user sso https://sso.example.com/mcp",
         );
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(duplicate_requested(&engine).is_empty());
         h.get_by_label_contains("Type the client secret it asks for");
         *h.state_mut().add.as_mut().unwrap().secrets[0].edit() = "x".into();
         h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert_eq!(duplicate_requested(&engine).len(), 1);
     }
 
     #[test]
     fn a_server_unticked_is_left_out_and_nothing_ticked_imports_nothing() {
         let (mut h, engine) = import_open(IMPORTED);
-        h.get_by_label("Import docs").click();
-        h.run();
+        click(&mut h, "Import docs");
         h.get_by_label_contains("Adds notion for the user.");
-        h.get_by_label("Import notion").click();
-        h.run();
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Import notion");
+        click(&mut h, "Review");
         assert!(duplicate_requested(&engine).is_empty());
         // Nearby: one tick puts them all back.
         h.get_by_label_contains("All 3").click();
@@ -18811,21 +18612,15 @@ mod tests {
             vec![Command::ChooseImportFile { shown: None }]
         );
         // Nearby: while the dialog is open, another is not asked for.
-        h.get_by_label(icon::TRAY_ARROW_DOWN).click();
-        h.run();
+        press(&mut h, Tool::Import);
         assert!(drain(&engine).is_empty());
-        assert!(
-            h.get_by_label(icon::TRAY_ARROW_DOWN)
-                .accesskit_node()
-                .is_disabled()
-        );
+        assert!(tool(&h, Tool::Import).accesskit_node().is_disabled());
     }
 
     #[test]
     fn a_file_that_cannot_be_read_says_why_and_another_can_be_chosen() {
         let (mut h, engine) = import_open(IMPORTED);
-        h.get_by_label("Choose another file…").click();
-        h.run();
+        click(&mut h, "Choose another file…");
         assert_eq!(
             drain(&engine),
             vec![Command::ChooseImportFile { shown: None }]
@@ -18850,8 +18645,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("From notes.txt");
         h.get_by_label_contains("Nothing here adds a server");
-        h.get_by_label("Review").click();
-        h.run();
+        click(&mut h, "Review");
         assert!(duplicate_requested(&engine).is_empty());
     }
 
@@ -18874,8 +18668,7 @@ mod tests {
         let typed = whole("/home/me/servers.json");
         h.state_mut().add.as_mut().unwrap().path = format!("\"{typed}\"");
         h.run();
-        h.get_by_label("Read").click();
-        h.run();
+        click(&mut h, "Read");
         assert_eq!(drain(&engine), vec![Command::ReadImportFile(typed.into())]);
         // Nearby: a path that is not whole would be read from wherever Klefki was started, so it is refused.
         engine
@@ -18885,8 +18678,7 @@ mod tests {
         h.run();
         h.state_mut().add.as_mut().unwrap().path = "servers.json".into();
         h.run();
-        h.get_by_label("Read").click();
-        h.run();
+        click(&mut h, "Read");
         assert!(drain(&engine).is_empty());
         h.get_by_label_contains("Give the whole path, starting from the drive or /.");
 
@@ -18936,8 +18728,7 @@ mod tests {
         // Found in review: a desktop portal without a file chooser fails slowly, which looks like a cancel; without
         // a word, Import would seem to do nothing at all.
         let (mut h, engine) = duplicate_harness();
-        h.get_by_label(icon::TRAY_ARROW_DOWN).click();
-        h.run();
+        press(&mut h, Tool::Import);
         drain(&engine);
         engine
             .events
@@ -18946,15 +18737,13 @@ mod tests {
         h.run();
         assert!(h.state().add.is_none());
         h.get_by_label_contains("No file chosen.");
-        h.get_by_label("Type a path instead").click();
-        h.run();
+        click(&mut h, "Type a path instead");
         let form = h.state().add.as_ref().expect("the Import dialog");
         assert_eq!(form.mode, AddMode::Import);
         h.get_by_label_contains("Type the path of the file to import");
         assert!(h.query_by_label_contains("No file chosen.").is_none());
         // The system's dialog can still be tried again from there.
-        h.get_by_label("Choose a file…").click();
-        h.run();
+        click(&mut h, "Choose a file…");
         assert_eq!(
             drain(&engine),
             vec![Command::ChooseImportFile { shown: None }]
@@ -18962,8 +18751,7 @@ mod tests {
 
         // Nearby: closing the dialog asked for from the Import dialog leaves that dialog as it was, with no notice.
         let (mut h, engine) = import_open(IMPORTED);
-        h.get_by_label("Choose another file…").click();
-        h.run();
+        click(&mut h, "Choose another file…");
         drain(&engine);
         engine
             .events
@@ -19043,8 +18831,7 @@ mod tests {
         h.run();
         h.get_by_label("999.0.0 is available");
         h.get_by_label("Klefki was installed from the .deb package.");
-        h.get_by_label("What's new").click();
-        h.run();
+        click(&mut h, "What's new");
         let sent = drain_all(&engine);
         assert!(sent.contains(&Command::OpenReleasePage(version)));
         assert!(
@@ -19090,8 +18877,7 @@ mod tests {
         h.run();
         h.get_by_label("999.0.0 is ready: it installs when Klefki closes");
         // Restarting installs it; the stand-in engine has nothing downloaded, so this says why it could not.
-        h.get_by_label("Restart now").click();
-        h.run();
+        click(&mut h, "Restart now");
         h.get_by_label("No update has been downloaded.");
         h.get_by_label_contains("Update: 999.0.0");
     }
@@ -19293,8 +19079,7 @@ mod tests {
         let (mut h, _engine) = update_harness();
         h.state_mut().go(Page::Settings);
         h.run();
-        h.get_by_label("Update Klefki automatically").click();
-        h.run();
+        click(&mut h, "Update Klefki automatically");
         assert!(!h.state().updates.auto);
         let mut storage = crate::theme::tests::MemoryStorage::default();
         eframe::App::save(h.state_mut(), &mut storage);
@@ -19481,8 +19266,7 @@ mod tests {
             .map(|i| live_row(&format!("s{i}"), Scope::User, None))
             .collect();
         let members = rows.iter().map(|r| r.connection.clone()).collect();
-        engine.events.send(snapshot_of(rows)).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, rows);
         open_profiles(
             &mut h,
             &engine,
@@ -19504,8 +19288,7 @@ mod tests {
         open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
         h.get_by_label_contains("New profile").click();
         h.run();
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         // Ticking a server does not give the profile a name: the message stays.
         h.get_by_role_and_label(Role::CheckBox, "beta").click();
         h.run();
@@ -19526,8 +19309,7 @@ mod tests {
             h.query_by_label_contains("Give the profile a name.")
                 .is_none()
         );
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         h.get_by_label_contains("Tick at least one server.");
         h.get_by_label("Name").focus();
         h.get_by_label("Name").type_text("2");
@@ -19546,15 +19328,13 @@ mod tests {
         // The name is typed straight away.
         assert!(h.get_by_label("Name").accesskit_node().is_focused());
         // Save says what is missing, next to the name, rather than being greyed out.
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         h.get_by_label_contains("Give the profile a name.");
         assert!(sent(&engine).is_empty());
         h.get_by_label("Name").focus();
         h.get_by_label("Name").type_text("Writing");
         h.run();
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         h.get_by_label_contains("Tick at least one server.");
         // Grouped as on the Connections page.
         h.get_by_label("User");
@@ -19568,8 +19348,7 @@ mod tests {
         );
         h.get_by_role_and_label(Role::CheckBox, "lint").click();
         h.run();
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         assert_eq!(
             sent(&engine),
             [Command::SaveProfile {
@@ -19591,8 +19370,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("There is a profile named Writing already.");
         // Kept, it closes the form.
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         engine
             .events
             .send(klefki_core::api::Event::Profiles(work_profile()))
@@ -19658,8 +19436,7 @@ mod tests {
         h.get_by_label("Name").type_text("Office");
         h.get_by_role_and_label(Role::CheckBox, "beta").click();
         h.run();
-        h.get_by_label("Save profile").click();
-        h.run();
+        click(&mut h, "Save profile");
         // A server no longer configured is kept: it may come back, and leaving it out is the user's call.
         assert_eq!(
             sent(&engine),
@@ -19681,8 +19458,7 @@ mod tests {
         let (mut h, engine) = profiles_harness();
         open_profiles(&mut h, &engine, work_profile());
         // Nowhere chosen yet: pressing it says so, rather than nothing happening.
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Use profile…");
         h.get_by_label_contains("Choose a project to use it in first.");
         assert!(sent(&engine).is_empty());
         h.get_by_role_and_label(Role::ComboBox, "Use in").click();
@@ -19712,8 +19488,7 @@ mod tests {
                 .toggled(),
             Some(egui::accesskit::Toggled::True)
         );
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Use profile…");
         assert_eq!(
             sent(&engine),
             [Command::Prepare(vec![Change::UseProfile {
@@ -19727,10 +19502,8 @@ mod tests {
         h.state_mut().preparing = false;
         h.get_by_role_and_label(Role::ComboBox, "Use in").click();
         h.run();
-        h.get_by_label("Every project").click();
-        h.run();
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Every project");
+        click(&mut h, "Use profile…");
         assert!(matches!(
             &sent(&engine)[..],
             [Command::Prepare(c)] if matches!(&c[..], [Change::UseProfile { project: None, only: true, .. }])
@@ -19740,8 +19513,7 @@ mod tests {
         h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
             .click();
         h.run();
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Use profile…");
         assert!(matches!(
             &sent(&engine)[..],
             [Command::Prepare(c)] if matches!(&c[..], [Change::UseProfile { project: None, only: false, .. }])
@@ -19763,8 +19535,7 @@ mod tests {
         h.get_by_role_and_label(Role::CheckBox, "Only these servers there")
             .click();
         h.run();
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Use profile…");
         assert!(matches!(&sent(&engine)[..], [Command::Prepare(_)]));
         let mut plan = plan_view(
             7,
@@ -19788,8 +19559,7 @@ mod tests {
             .click();
         h.run();
         assert!(h.query_by_label_contains("Nothing to change").is_none());
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Use profile…");
         assert!(matches!(&sent(&engine)[..], [Command::Prepare(_)]));
         engine
             .events
@@ -19811,8 +19581,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("app/work").click();
         h.run();
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(h, "Use profile…");
         while engine.commands.try_recv().is_ok() {}
         let mut plan = plan_view(7, &[], &[], true);
         plan.already = vec![already.to_owned()];
@@ -19901,8 +19670,7 @@ mod tests {
         h.run();
         h.get_by_label_contains("app/work").click();
         h.run();
-        h.get_by_label("Use profile…").click();
-        h.run();
+        click(&mut h, "Use profile…");
         h.state_mut().go(Page::Connections);
         h.run();
         let mut plan = plan_view(7, &[], &[], true);
@@ -19940,13 +19708,11 @@ mod tests {
         h.run();
         assert!(sent(&engine).is_empty());
         h.get_by_label_contains("Its servers stay as they are");
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         assert!(sent(&engine).is_empty());
         h.get_by_label_contains("Delete").click();
         h.run();
-        h.get_by_label("Delete profile").click();
-        h.run();
+        click(&mut h, "Delete profile");
         assert_eq!(sent(&engine), [Command::DeleteProfile("Work".to_owned())]);
     }
 
@@ -19988,8 +19754,7 @@ mod tests {
             h.query_by_label_contains("Only these servers are on in")
                 .is_none()
         );
-        h.get_by_label("Stop using in notes…").click();
-        h.run();
+        click(&mut h, "Stop using in notes…");
         assert_eq!(
             sent(&engine),
             [Command::Prepare(vec![Change::StopProfile {
@@ -20002,8 +19767,7 @@ mod tests {
         h.get_by_label_contains("Delete").click();
         h.run();
         h.get_by_label_contains("It is in use in notes.");
-        h.get_by_label("Stop using and delete…").click();
-        h.run();
+        click(&mut h, "Stop using and delete…");
         assert_eq!(
             sent(&engine),
             [Command::Prepare(vec![Change::StopProfile {
@@ -20015,8 +19779,7 @@ mod tests {
         h.state_mut().preparing = false;
         h.get_by_label_contains("Delete").click();
         h.run();
-        h.get_by_label("Delete only").click();
-        h.run();
+        click(&mut h, "Delete only");
         assert_eq!(sent(&engine), [Command::DeleteProfile("Work".to_owned())]);
         // Switched since (beta back on): no longer in use, and Delete asks as before.
         engine
@@ -20055,10 +19818,8 @@ mod tests {
             .unwrap();
         h.run();
         open_profiles(&mut h, &engine, work_profile());
-        h.get_by_label("Stop using in…").click();
-        h.run();
-        h.get_by_label("notes").click();
-        h.run();
+        click(&mut h, "Stop using in…");
+        click(&mut h, "notes");
         assert_eq!(
             sent(&engine),
             [Command::Prepare(vec![Change::StopProfile {
@@ -20068,10 +19829,8 @@ mod tests {
             }])]
         );
         h.state_mut().preparing = false;
-        h.get_by_label("Stop using in…").click();
-        h.run();
-        h.get_by_label("All 2 projects").click();
-        h.run();
+        click(&mut h, "Stop using in…");
+        click(&mut h, "All 2 projects");
         assert!(matches!(
             &sent(&engine)[..],
             [Command::Prepare(c)] if matches!(&c[..], [Change::StopProfile { project: None, delete: false, .. }])
@@ -20180,8 +19939,7 @@ mod tests {
             .run(&ctx, command::Action::UseProfile("Work".into()));
         h.run();
         h.get_by_label_contains("Finish or cancel the profile you are editing first");
-        h.get_by_label("Cancel").click();
-        h.run();
+        click(&mut h, "Cancel");
         h.run();
         let focused = h.query_all_by(|n| n.is_focused()).count();
         assert_eq!(focused, 0, "focus moved with nobody asking");
@@ -20205,8 +19963,7 @@ mod tests {
         let (mut h, engine) = live_harness();
         let mut blocked = live_row("notion", Scope::User, None);
         blocked.not_loaded = Some("Your organisation's policy denies it.".to_owned());
-        engine.events.send(snapshot_of(vec![blocked])).unwrap();
-        h.run();
+        show_rows(&mut h, &engine, vec![blocked]);
         open_profiles(&mut h, &engine, klefki_core::api::Profiles::default());
         h.get_by_label_contains("New profile").click();
         h.run();

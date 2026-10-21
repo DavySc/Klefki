@@ -10,7 +10,7 @@ use klefki_core::api::{Activity, ActivityEntry, Backup};
 const COPIED_SECONDS: f64 = 2.0;
 
 #[derive(Default)]
-pub struct ActivityPage {
+pub(crate) struct ActivityPage {
     /// `None` until the engine answers.
     pub log: Option<Activity>,
     /// What the top bar's filter box holds on this page: it filters the changes, not the hidden list of servers.
@@ -21,7 +21,7 @@ pub struct ActivityPage {
 
 impl ActivityPage {
     /// Draws the page. Returns the backup the user asked to restore, for the shell to have reviewed.
-    pub fn show(&mut self, ui: &mut Ui) -> Option<String> {
+    pub(crate) fn show(&mut self, ui: &mut Ui) -> Option<String> {
         let pal = theme::palette(ui.ctx());
         ui.add_space(8.0);
         ui.label(RichText::new("Activity log").heading());

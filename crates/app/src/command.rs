@@ -5,7 +5,7 @@ use egui::{Key, RichText, Sense};
 
 /// What choosing an entry does. The shell carries it out.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Action {
+pub(crate) enum Action {
     /// Select this row of the snapshot.
     Select(usize),
     TurnOn,
@@ -44,7 +44,7 @@ pub enum Action {
     UseProfile(String),
 }
 
-pub struct Entry {
+pub(crate) struct Entry {
     pub icon: &'static str,
     pub title: String,
     /// Shown muted after the title; also searched.
@@ -54,7 +54,7 @@ pub struct Entry {
 }
 
 #[derive(Default)]
-pub struct CommandPalette {
+pub(crate) struct CommandPalette {
     open: bool,
     query: String,
     /// Index into the filtered list.
@@ -73,7 +73,7 @@ pub struct CommandPalette {
 const SHOWN: usize = 9;
 
 impl CommandPalette {
-    pub fn open(&mut self) {
+    pub(crate) fn open(&mut self) {
         self.open = true;
         self.query.clear();
         self.cursor = 0;
@@ -82,27 +82,27 @@ impl CommandPalette {
     }
 
     /// The entries no longer match what they were built from (a new snapshot): build them again when next shown.
-    pub fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.entries = None;
         self.matched = None;
     }
 
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.open = false;
     }
 
-    pub fn is_open(&self) -> bool {
+    pub(crate) fn is_open(&self) -> bool {
         self.open
     }
 
     #[cfg(test)]
-    pub fn query_mut(&mut self) -> &mut String {
+    pub(crate) fn query_mut(&mut self) -> &mut String {
         &mut self.query
     }
 
     /// Draws the palette over everything and returns the action chosen this frame, if any. `entries` is called
     /// only when the palette has none built yet.
-    pub fn show(
+    pub(crate) fn show(
         &mut self,
         ctx: &egui::Context,
         entries: impl FnOnce() -> Vec<Entry>,
@@ -254,7 +254,7 @@ impl CommandPalette {
 }
 
 /// The entries matching `query`, best first; all of them, in their own order, for an empty query.
-pub fn filter(query: &str, entries: &[Entry]) -> Vec<usize> {
+pub(crate) fn filter(query: &str, entries: &[Entry]) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
         return (0..entries.len()).collect();
@@ -275,7 +275,7 @@ pub fn filter(query: &str, entries: &[Entry]) -> Vec<usize> {
 
 /// How well `query` matches `text`: its letters in order, case ignored. Letters that start a word and letters
 /// next to each other count more, so "off gh" finds "Turn off github" before "Go to github". `None`: no match.
-pub fn score(query: &str, text: &str) -> Option<i32> {
+pub(crate) fn score(query: &str, text: &str) -> Option<i32> {
     // One pass over `text`, lower-cased as it is read: no copy of it is made. `at` counts lower-cased characters.
     let mut text = text.chars().flat_map(char::to_lowercase);
     let mut at = 0;
@@ -306,14 +306,14 @@ pub fn score(query: &str, text: &str) -> Option<i32> {
             total += 5;
         }
         // Gaps cost a little, so tighter matches win.
-        total -= (found - start).min(10) as i32;
+        total -= i32::try_from((found - start).min(10)).unwrap_or(10);
         previous = Some(found);
     }
     Some(total)
 }
 
 /// How a shortcut is written on this platform: `⌘K` on macOS, `Ctrl+K` elsewhere.
-pub fn shortcut(key: &str) -> String {
+pub(crate) fn shortcut(key: &str) -> String {
     if cfg!(target_os = "macos") {
         format!("⌘{key}")
     } else {
@@ -384,7 +384,7 @@ mod tests {
             if previous.is_some_and(|p| p + 1 == found) {
                 total += 5;
             }
-            total -= (found - at).min(10) as i32;
+            total -= i32::try_from((found - at).min(10)).unwrap_or(10);
             previous = Some(found);
             at = found + 1;
         }

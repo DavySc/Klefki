@@ -17,7 +17,7 @@ const MAX_PACKAGE: u64 = 256 * 1024 * 1024;
 
 /// How this copy of Klefki was installed, and so how it updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstallKind {
+pub(crate) enum InstallKind {
     /// Windows, by the per-user setup: the new setup runs over it.
     WindowsSetup,
     /// macOS, the app bundle at this path: replaced by the new one.

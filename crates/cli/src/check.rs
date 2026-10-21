@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-pub struct Answers {
+pub(crate) struct Answers {
     pub snapshot: Arc<Snapshot>,
     pub cli_version: Option<String>,
     /// Final answers, by server. A server asked about but missing here did not answer in time.
@@ -22,7 +22,7 @@ const PER_CHECK: Duration = Duration::from_secs(35);
 /// Starts the engine, waits for its snapshot, asks for every server `pick` chooses, and collects the answers.
 /// `progress` is told how many of how many have answered, and the first one still waited on. `Err` when the
 /// Claude CLI cannot be used.
-pub fn run(
+pub(crate) fn run(
     claude: Option<PathBuf>,
     pick: impl FnOnce(&Snapshot) -> Vec<ServerId>,
     mut progress: impl FnMut(usize, usize, Option<&str>),
@@ -53,7 +53,10 @@ pub fn run(
     let mut waiting: HashSet<ConnectionId> =
         wanted.iter().map(|id| id.connection.clone()).collect();
     let mut checked = HashMap::new();
-    let rounds = (total as u32).div_ceil(CHECKS_AT_ONCE) + 1;
+    let rounds = u32::try_from(total)
+        .unwrap_or(u32::MAX)
+        .div_ceil(CHECKS_AT_ONCE)
+        + 1;
     let deadline = Instant::now() + PER_CHECK * rounds;
     let waited_on = |waiting: &HashSet<ConnectionId>| {
         wanted
