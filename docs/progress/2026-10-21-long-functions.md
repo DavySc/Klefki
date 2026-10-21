@@ -54,10 +54,29 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    Mutants on the changed lines: main 45 (5 missed); the branch before the tests 49 (the same 5 missed): an `-e`
    with nothing before `=`, an `-H` with no name, `--callback-port 0` (two), and `-e` on a remote server. A test now
    refuses each; with them 43 caught, 6 unviable, 0 missed. Merged in #87.
+6. `paste::lex_with` (215 lines, splitting pasted text into commands and words) becomes a `Lexer` with named steps:
+   `code_ended` (the end of Markdown inline code or a table cell), `pasted_line` and `not_claude` (what a pasted
+   line that is not a claude command becomes), `read` (one character), `single_quoted`, `double_quoted`, `plain`,
+   `needs_shell` and `finish`. The same steps in the same order. The paste speed tests take the same time as on main
+   (five runs each, 1.52 s and 1.50 s on average). Mutants on the changed lines: main 88 (8 missed), branch 103 (the
+   same 8, and one more that main's run counted as caught but is missed there too when tried by hand:
+   `from + start` to `from - start`). Tests now catch seven: the arguments of inline code, two commands with more
+   text between them than in the first, a line of text starting with an escape that does not show, `#` and a long
+   dash inside a word, and parentheses. Review showed the last two, `end + 1` to `end - 1` or `end * 1` where the
+   next command on the line is searched for, are not equivalent (a panic inside a two-byte character; the closing
+   backtick read as opening code) and gave a test for both, so all 9 are caught. Merged in #88.
+
+7. `ops::use_profile` (293 lines, using a profile) in named steps: `profile_places` (the project, or every one),
+   `ProfileWalk::of` and `server` (what each server is in each place: its switch, whether it is on now, held back,
+   elsewhere or not approved), `held`, `remember` (what stopping the profile puts back), `really_off`,
+   `left_as_they_are`, `not_approved` and `already_on`; `use_profile` (89 lines) writes the review in the same
+   order with the same words. Mutants on the changed lines: main 34 (3 missed), branch 64 (the same 3): whether a
+   switch that goes off hides a duplicate (two) and grouping the places of a member held back. Tests now catch each:
+   `a_duplicate_stays_out_while_what_it_repeats_stays_on`, `two_members_held_back_are_each_named`.
 
 ## Next
-6. The rest, file by file: `paste::lex_with`, `ops::use_profile`,
-   `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
+8. The rest, file by file: `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay
+   moves.
 
 ## Follow-ups for the owner (not in this slice)
 - From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…
