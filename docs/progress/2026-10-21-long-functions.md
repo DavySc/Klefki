@@ -40,12 +40,12 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    changed, returning those left out), `switches` (one project's on/off switches), `leave_added` (servers added
    since, left as they are) and `closing_notes`; `compare` reads both sides and walks the projects (about 50
    lines). Same steps in the same order with the same words. Mutants on `restore.rs` on main: 91, 13 missed;
-   eight in `compare` (a project gone since named even with no servers, the undefined-switch filter, two match
-   arms for one and for several servers added since, and the three parts of "what a restore leaves" being said
-   only when it writes). Tests now check each: `one_server_added_since_is_left_as_it_is`,
+   seven in `compare` (a project gone since named even with no servers, the undefined-switch filter, the match arms
+   for one undefined switch and for one server added since, and the three parts of "what a restore leaves" being
+   said only when it writes). Tests now check each: `one_server_added_since_is_left_as_it_is`,
    `a_project_gone_since_is_named_only_when_it_had_servers`,
    `what_a_restore_leaves_is_said_whenever_it_writes_anything`, a no-notes assertion when nothing differs, and the
-   undefined-switch line in `switches_go_back_except_for_servers_added_since`. The other five are outside
+   undefined-switch line in `switches_go_back_except_for_servers_added_since`. The other six are outside
    `compare` (`Servers::read`, `places_of`, `mentions`, `server`) and not touched here.
 
 ## Next

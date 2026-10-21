@@ -703,7 +703,11 @@ mod tests {
 
     #[test]
     fn what_a_restore_leaves_is_said_whenever_it_writes_anything() {
-        let left = "Only servers and where they are switched off are restored.";
+        let said = [
+            "Only servers and where they are switched off are restored.",
+            "Klefki keeps a copy of the configuration as it is now before it restores",
+            "A running Claude Code session may need a restart",
+        ];
         let mut changed = sso();
         changed["url"] = json!("https://sso.example.com/v2/mcp");
         for (what, backup, now) in [
@@ -724,11 +728,13 @@ mod tests {
             ),
         ] {
             let out = restore(&backup, &now);
-            assert!(
-                out.notes.iter().any(|n| n.starts_with(left)),
-                "{what}: {:?}",
-                out.notes
-            );
+            for note in said {
+                assert!(
+                    out.notes.iter().any(|n| n.starts_with(note)),
+                    "{what}: {note}: {:?}",
+                    out.notes
+                );
+            }
         }
     }
 
