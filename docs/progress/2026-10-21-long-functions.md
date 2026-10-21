@@ -51,8 +51,9 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
 5. `paste::add` (267 lines, reading `claude mcp add`) in named steps: `read_add` reads the options and words into
    `AddWords` (with its `Settings`: transport, env, headers, OAuth), `server_of` turns them into the server for its
    transport, and `add` (38 lines) checks what may be added. The same checks in the same order with the same words.
-   Mutants on the changed lines: main 45 (5 missed), branch 49 (the same 5): an `-e` with nothing before `=`, an
-   `-H` with no name, `--callback-port 0` (two), and `-e` on a remote server. A test now refuses each.
+   Mutants on the changed lines: main 45 (5 missed); the branch before the tests 49 (the same 5 missed): an `-e`
+   with nothing before `=`, an `-H` with no name, `--callback-port 0` (two), and `-e` on a remote server. A test now
+   refuses each; with them 43 caught, 6 unviable, 0 missed. Merged in #87.
 
 ## Next
 6. The rest, file by file: `paste::lex_with`, `ops::use_profile`,
