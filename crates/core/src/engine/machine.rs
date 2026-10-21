@@ -17,7 +17,11 @@
 //! step and the outcome the engine reported. proptest shrinks a failing sequence and keeps it in
 //! `proptest-regressions/engine/machine.txt`, which runs first every time.
 use super::*;
+use crate::api::Scope;
+use crate::cli::runner::RunOutput;
+use crate::config::entry;
 use crate::model::Target;
+use crate::sanitize::sanitize;
 use proptest::prelude::*;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
