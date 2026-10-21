@@ -76,7 +76,7 @@ pub(super) fn start(shared: &Arc<Shared>, state: &mut State, id: ServerId) {
         Ok(found) => found,
         Err(why) => return fail(format!("Klefki cannot sign in to it: {why}."), false),
     };
-    let Some(program) = super::checks::claude_program(shared) else {
+    let Some(program) = super::claude_program(shared) else {
         return fail(
             "The Claude Code command line was not found, and signing in goes through it."
                 .to_owned(),

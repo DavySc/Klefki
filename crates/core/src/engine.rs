@@ -31,6 +31,7 @@ mod command_loop;
 mod diagnose;
 #[cfg(test)]
 mod machine;
+mod reload;
 mod sign_in;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -842,6 +843,15 @@ fn backup_dir(shared: &Shared) -> Result<PathBuf, String> {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The Claude Code CLI the last refresh found, if it found one.
+fn claude_program(shared: &Shared) -> Option<PathBuf> {
+    shared
+        .claude
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// The engine thread's view: the current snapshot, how the files spell its servers, and the watcher that tells when

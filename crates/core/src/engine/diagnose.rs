@@ -1,5 +1,6 @@
 //! Diagnose: one server run with Claude Code's debug output, and what it says explained.
-use super::checks::{Job, check_env, claude_program, interpret};
+use super::checks::{Job, check_env, interpret};
+use super::claude_program;
 use super::{Diagnosis, MAX_CHECK_OUTPUT, Shared, hint};
 use crate::api::Status;
 use crate::cli::runner::{self, RunSpec};

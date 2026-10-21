@@ -1,7 +1,10 @@
 //! Live status checks: the queue, the workers that take jobs from it, and how `claude mcp get` and
 //! `claude mcp list` answers are read.
 use super::diagnose::run_diagnose;
-use super::{Diagnosis, Event, MAX_CHECK_OUTPUT, MAX_DETAIL_CHARS, ProgramStamp, Shared, lock};
+use super::{
+    Diagnosis, Event, MAX_CHECK_OUTPUT, MAX_DETAIL_CHARS, ProgramStamp, Shared, claude_program,
+    lock,
+};
 use crate::api::{Scope, ServerId, ServerRow, Status};
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
@@ -455,14 +458,6 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
     let token = out.stdout.split_whitespace().next()?;
     (out.exit_code == Some(0) && token.starts_with(|c: char| c.is_ascii_digit()))
         .then(|| clip(token, 32))
-}
-
-pub(super) fn claude_program(shared: &Shared) -> Option<PathBuf> {
-    shared
-        .claude
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
 }
 
 /// What `check_listed` made of the job it was given.
