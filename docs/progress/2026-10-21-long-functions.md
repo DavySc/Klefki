@@ -22,6 +22,13 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    `take_snapshot` in `shell.rs`. Fields now private: the forms' `port_pending` and `port_checked`, Duplicate's
    `source`, Export's `save` and `status`, the editor's `moved`, all of `SecretView`'s. The rest stay `pub(super)`
    because the tests in `shell/tests/` read them (a test module there is not inside the dialog's module).
+   Mutants on the changed lines (68): 46 caught, 13 unviable, 9 missed, each also missed on main (the same code in
+   `apply_event`). Seven now have tests (seen failing against the mutant): `port_answered`'s `==` in Add and
+   Duplicate; `applied`'s `signs_in && changed` and the "to each" guard (three mutants); `take_snapshot`'s
+   `live_gen += 1` (a check cut off by a snapshot left the old explanation). Two are equivalent: `kept.is_empty()`
+   guard (both arms give "Saved." for an empty `kept`), and `editor.moved` guard to `true` (an editor that did not
+   move only gets its own definition again, which rebases to the same text). Review: a comment repeating
+   `editor_after_change`'s doc dropped.
 
 ## Next
 3. Core's long functions, file by file: `inventory::build`, `ops::use_profile`, `paste::add`, `paste::lex_with`,

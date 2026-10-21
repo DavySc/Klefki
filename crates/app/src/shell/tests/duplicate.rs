@@ -270,6 +270,42 @@ fn duplicate_warns_about_a_callback_port_another_program_holds_once_left() {
 }
 
 #[test]
+fn duplicate_asks_about_a_port_again_only_once_its_answer_is_in() {
+    let (mut h, engine, _) = duplicate_sso();
+    let port = egui::Id::new("copy_callback_port");
+    let leave = |h: &mut Harness<'static, ShellApp>| {
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+    };
+    let answer = |h: &mut Harness<'static, ShellApp>, port: u16| {
+        engine
+            .events
+            .send(Event::CallbackPort {
+                port,
+                warning: None,
+            })
+            .unwrap();
+        h.run();
+    };
+    copy_fields_of(&mut h).callback_port = "8765".into();
+    leave(&mut h);
+    assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8765)]);
+    copy_fields_of(&mut h).callback_port = "8766".into();
+    leave(&mut h);
+    assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8766)]);
+    // A late answer for the earlier port leaves the one asked about waiting: not asked twice.
+    answer(&mut h, 8765);
+    leave(&mut h);
+    assert!(drain(&engine).is_empty());
+    // Once its own answer is in, leaving the field asks again: the port may have been taken since.
+    answer(&mut h, 8766);
+    leave(&mut h);
+    assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8766)]);
+}
+
+#[test]
 fn duplicate_of_a_server_whose_definition_cannot_be_read_copies_it_as_it_is() {
     let (mut h, engine) = live_harness();
     let mut web = live_row("web", Scope::User, None);
