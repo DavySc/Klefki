@@ -2040,7 +2040,7 @@ mod tests {
             ),
             (
                 "claude mcp add -t http --callback-port 0 x https://a.example",
-                "from 1 to 65535",
+                "--callback-port takes a port",
             ),
             (
                 "claude mcp add -t http -e K=v x https://a.example",

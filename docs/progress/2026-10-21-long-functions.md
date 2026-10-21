@@ -46,10 +46,16 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    `a_project_gone_since_is_named_only_when_it_had_servers`,
    `what_a_restore_leaves_is_said_whenever_it_writes_anything`, a no-notes assertion when nothing differs, and the
    undefined-switch line in `switches_go_back_except_for_servers_added_since`. The other six are outside
-   `compare` (`Servers::read`, `places_of`, `mentions`, `server`) and not touched here.
+   `compare` (`Servers::read`, `places_of`, `mentions`, `server`) and not touched here. Review: the test checks all
+   three closing notes. Merged in #86 (17e7771).
+5. `paste::add` (267 lines, reading `claude mcp add`) in named steps: `read_add` reads the options and words into
+   `AddWords` (with its `Settings`: transport, env, headers, OAuth), `server_of` turns them into the server for its
+   transport, and `add` (38 lines) checks what may be added. The same checks in the same order with the same words.
+   Mutants on the changed lines: main 45 (5 missed), branch 49 (the same 5): an `-e` with nothing before `=`, an
+   `-H` with no name, `--callback-port 0` (two), and `-e` on a remote server. A test now refuses each.
 
 ## Next
-5. The rest, file by file: `paste::add` (written, waits for part 4), `paste::lex_with`, `ops::use_profile`,
+6. The rest, file by file: `paste::lex_with`, `ops::use_profile`,
    `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
 
 ## Follow-ups for the owner (not in this slice)
