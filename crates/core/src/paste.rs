@@ -2589,6 +2589,17 @@ mod tests {
     }
 
     #[test]
+    fn the_next_command_on_a_line_is_looked_for_after_the_closing_backtick() {
+        // Not inside the character before it (two bytes here), which would not be a character at all.
+        let s = one("Run `claude mcp add a -- node \u{e9}` now");
+        assert_eq!(json_of(&s)["args"], json!(["\u{e9}"]));
+        // Nor at the backtick itself, which would open code of its own.
+        let pasted = Pasted::parse("`claude mcp add a -- x`claude mcp add b -- y`").unwrap();
+        let names: Vec<&str> = pasted.servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a"], "{pasted:?}");
+    }
+
+    #[test]
     fn what_ends_a_word_only_at_its_start_stays_inside_one() {
         // A `#` starts a comment and a long dash is typography only where a word starts; inside a word both are
         // characters of it.

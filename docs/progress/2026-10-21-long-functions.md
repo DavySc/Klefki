@@ -62,8 +62,9 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    same 8, and one more that main's run counted as caught but is missed there too when tried by hand:
    `from + start` to `from - start`). Tests now catch seven: the arguments of inline code, two commands with more
    text between them than in the first, a line of text starting with an escape that does not show, `#` and a long
-   dash inside a word, and parentheses. Two are equivalent: `end + 1` to `end - 1` or `end * 1` where the next command
-   on the line is searched for, since its start is counted from wherever the search begins.
+   dash inside a word, and parentheses. Review showed the last two, `end + 1` to `end - 1` or `end * 1` where the
+   next command on the line is searched for, are not equivalent (a panic inside a two-byte character; the closing
+   backtick read as opening code) and gave a test for both, so all 9 are caught. Merged in #88.
 
 ## Next
 7. The rest, file by file: `ops::use_profile`,
