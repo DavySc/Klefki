@@ -3850,4 +3850,75 @@ mod profile_review_regressions {
         let out = use_profile(&inv, vec![dup.connection.clone()], false);
         assert!(warned(&out), "{:?}", out.warnings);
     }
+
+    /// Nearby: with "only", another server going off does not let the duplicate load while what it repeats stays on.
+    #[test]
+    fn a_duplicate_stays_out_while_what_it_repeats_stays_on() {
+        let dir = tempfile::tempdir().unwrap();
+        two_plugins(dir.path());
+        let inv = inv(
+            dir.path(),
+            json!({"mcpServers": {"x": {"command": "x"}}, "projects": {"/q": {}}}),
+        );
+        let plugin = |dup: bool| {
+            inv.snapshot
+                .servers
+                .iter()
+                .find(|r| {
+                    r.plugin
+                        .as_ref()
+                        .is_some_and(|p| p.same_as.is_some() == dup)
+                })
+                .unwrap_or_else(|| panic!("fixture: {:?}", inv.snapshot.servers))
+                .connection
+                .clone()
+        };
+        let out = use_profile(&inv, vec![plugin(false), plugin(true)], true);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("same command or address")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("also turns off x")),
+            "fixture: x goes off: {:?}",
+            out.warnings
+        );
+    }
+
+    /// Each member held back is named with its own reason.
+    #[test]
+    fn two_members_held_back_are_each_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"deniedMcpServers":[{"serverName":"a"},{"serverName":"b"}]}"#,
+        )
+        .unwrap();
+        let inv = inv(
+            dir.path(),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {"/q": {}}
+            }),
+        );
+        let members = inv
+            .snapshot
+            .servers
+            .iter()
+            .map(|r| r.connection.clone())
+            .collect();
+        let out = use_profile(&inv, members, false);
+        for name in ["a", "b"] {
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{name} will still not load in q: "))),
+                "{name}: {:?}",
+                out.warnings
+            );
+        }
+    }
 }
