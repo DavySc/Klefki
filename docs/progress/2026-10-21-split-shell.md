@@ -36,9 +36,16 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
    `duplicate_requested` stay in `shell::tests`: other sections use them. `field_row`, `field_note` and
    `field_warning` stay in `shell.rs` until Add moves. `shell.rs` 17,690 to 16,839 lines. CI's `cargo doc` failed
    on a moved comment linking `Event`, which the new file does not import: the link now names its full path. Review:
-   the types now come before `copy_fields`.
+   the types now come before `copy_fields`. Merged in #76 (3b3cc1c).
+4. Add and Import, one dialog: `shell/add.rs` (`AddMode`, `Field`, `RowsState`, `Replaced`, `AddForm`, `Filled`,
+   `Check`, `Conflict`, `ImportPlan`, `Existing`, then the field ids, `forget_typed`, the shared `field_row`,
+   `field_note`, `field_warning`, `value_rows`, and `open_add`, `add_dialog`, `can_import`, `ask_import`,
+   `take_dropped_file`, `open_import`, `open_import_form`, `close_add`), and the add and import sections' tests.
+   Helpers other sections use (`pasted_json`, `ready`, `waits_behind_review`, `sso_filled`,
+   `open_duplicate_of`, `fill_in`, `name_it`, `add_form`) stay in `shell::tests`. Duplicate now takes the field
+   widgets from `super::add`. `shell.rs` 16,839 to 12,968 lines.
 
-Next, one pull request each: Add and Import, the review and outcome, the detail panel and editor, the server list,
+Next, one pull request each: the review and outcome, the detail panel and editor, the server list,
 the top bar, toolbar and Settings.
 
 ## Checks
