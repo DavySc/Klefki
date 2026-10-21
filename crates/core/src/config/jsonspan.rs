@@ -233,6 +233,31 @@ mod tests {
     }
 
     #[test]
+    fn a_list_or_object_never_closed_is_an_error_not_a_panic() {
+        // Found by cargo-mutants: no test fed the scan a value that runs to the end of the text, as in a truncated
+        // `.claude.json`, so reading one byte past the end went unnoticed.
+        for text in [
+            "{\"a\":[1,2",
+            "{\"a\":[",
+            "{\"a\":{\"b\":1",
+            "{\"a\":{\"b\":\"}\"",
+            "{\"a\":[[[]]",
+        ] {
+            assert_eq!(
+                object_at(text, 0),
+                Err("unterminated object or list".to_owned()),
+                "{text:?}"
+            );
+        }
+        // The same inside an object that is read member by member.
+        let text = "{\"a\":{\"b\":[1";
+        assert_eq!(
+            object_with(text, 0, &mut |_, _| true),
+            Err("unterminated object or list".to_owned())
+        );
+    }
+
+    #[test]
     fn nested_objects_are_read_only_where_asked() {
         let text = r#"{"skip": {"a": {"b": 1}}, "into": {"x": {"y": [1]}, "z": 2}}"#;
         let mut asked = Vec::new();
