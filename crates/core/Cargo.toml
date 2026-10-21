@@ -71,3 +71,6 @@ wayland = ["rfd/wayland", "dep:wayland-backend"]
 expect-test = "1"
 filetime = "0.2"
 proptest = "1"
+
+[lints]
+workspace = true

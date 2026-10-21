@@ -1,4 +1,13 @@
 //! All IO lives here. The UI crate may only use [`api`].
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "tests build sizes and seeded values with `as`; the casts in product code are checked"
+    )
+)]
 mod activity;
 mod adjust;
 pub mod api;

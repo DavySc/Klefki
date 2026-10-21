@@ -51,7 +51,7 @@ pub trait Owner: HasWindowHandle + HasDisplayHandle {}
 impl<T: HasWindowHandle + HasDisplayHandle + ?Sized> Owner for T {}
 
 /// The user's answer to a save dialog that is open: the file picked, or `None`.
-pub type Answer = Pin<Box<dyn Future<Output = Option<PathBuf>> + Send>>;
+pub(crate) type Answer = Pin<Box<dyn Future<Output = Option<PathBuf>> + Send>>;
 
 /// Shows the system's save dialog, starting with `name` as the file name, over `owner` when there is one. It returns
 /// once the dialog is open; the answer comes later.
