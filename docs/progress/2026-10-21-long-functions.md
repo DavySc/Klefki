@@ -33,6 +33,8 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    `Options::read` the options and names after it, `Options::into_cmd` checks they fit the command, `use_cmd`
    builds `use`. The same checks in the same order with the same messages; `-h` still answers at once (`read`
    returns with `help` set, and `parse` answers Help before any later check).
+   Mutants on `args.rs`: main 76 (3 missed), branch 79 (3 missed, the same three); a test now kills each (an
+   option given as the command, `--output=` on `list`, an empty `--project=`).
 
 ## Next
 4. The rest, file by file: `restore::compare`, `paste::add`, `paste::lex_with`, `ops::use_profile`,
