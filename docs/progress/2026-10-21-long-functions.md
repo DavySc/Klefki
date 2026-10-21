@@ -12,7 +12,7 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    `shell/tests/top_bar.rs`; `outcome_toast`'s stacked doc comment dropped; `managed_read_only`'s doc says the
    organisation, not a plugin. `shell.rs` 6,914 to 6,324 lines. Checked by script: removed and added lines are
    the same apart from `pub(super)`, imports, module lines, the two doc comments and one signature `cargo fmt`
-   joined.
+   joined. Merged in #82 (ca451ed).
 2. Each dialog's handling of the engine's events moves into its module, and `apply_event` (540 lines) becomes a
    dispatch of 191: Export's three answers (`exported`, `export_file_chosen`, `export_saved`) to `export.rs`;
    Duplicate's definition (`copy_read`) to `duplicate.rs`; the editor's (`definition_read`, `editor_after_change`,
@@ -26,6 +26,10 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
 ## Next
 3. Core's long functions, file by file: `inventory::build`, `ops::use_profile`, `paste::add`, `paste::lex_with`,
    `restore::compare`, `cli args::parse`, `swap::run` last; the engine ideas from A2's review where they stay moves.
+
+## Follow-ups for the owner (not in this slice)
+- From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…
+  over its own label (WCAG 2.2 SC 1.4.10 Reflow). Wrapping the label above the buttons would fix it; a look change.
 
 ## Checks
 See each pull request description.
