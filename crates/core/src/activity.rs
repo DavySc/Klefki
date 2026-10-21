@@ -375,7 +375,12 @@ fn shown(s: &str) -> String {
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Whole seconds in `ms` milliseconds since 1970, as the signed number the calendar arithmetic uses.
+fn secs_of(ms: u64) -> i64 {
+    i64::try_from(ms / 1000).unwrap_or(i64::MAX)
 }
 
 const MONTHS: [&str; 12] = [
@@ -386,7 +391,7 @@ const MONTHS: [&str; 12] = [
 /// a moment (seconds since 1970), so a change from before a daylight-saving switch shows the hour it had then.
 fn when(at_ms: u64, now_ms: u64, offset: impl Fn(i64) -> i64) -> String {
     let local = |ms: u64| {
-        let secs = (ms / 1000) as i64;
+        let secs = secs_of(ms);
         secs + offset(secs)
     };
     let (at, now) = (local(at_ms), local(now_ms));
@@ -412,7 +417,7 @@ pub(crate) fn moment(at_ms: u64) -> String {
 }
 
 fn on_day_at(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
-    let secs = (at_ms / 1000) as i64;
+    let secs = secs_of(at_ms);
     let local = secs + offset(secs);
     let (day, time) = (local.div_euclid(86_400), local.rem_euclid(86_400));
     let (y, m, d) = civil(day);
@@ -426,7 +431,7 @@ fn on_day_at(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
 
 /// `at` to the second, in local time, with the offset it had then.
 fn exact(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
-    let secs = (at_ms / 1000) as i64;
+    let secs = secs_of(at_ms);
     let off = offset(secs);
     let local = secs + off;
     let (day, time) = (local.div_euclid(86_400), local.rem_euclid(86_400));
@@ -451,8 +456,8 @@ fn civil(days: i64) -> (i64, u32, u32) {
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let d = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1);
+    let m = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
     (yoe + era * 400 + i64::from(m <= 2), m, d)
 }
 

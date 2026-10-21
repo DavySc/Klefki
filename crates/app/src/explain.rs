@@ -247,6 +247,11 @@ impl Explanation {
                 .size()
                 .x
                 .max(1.0);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a float width, never negative here, as a whole column count"
+            )]
             let columns = (ui.available_width() / char_width) as usize;
             let marker = self.marker.as_ref().map(|m| Self::marker_lines(m, columns));
             // The command or URL is shown whole on one line, so the markers stay under their part; a long

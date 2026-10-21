@@ -120,11 +120,11 @@ fn unbase64url(text: &str) -> Option<Vec<u8>> {
     for chunk in text.as_bytes().chunks(4) {
         let mut n = 0u32;
         for (i, &c) in chunk.iter().enumerate() {
-            let v = BASE64URL.iter().position(|&a| a == c)? as u32;
+            let v = u32::try_from(BASE64URL.iter().position(|&a| a == c)?).ok()?;
             n |= v << (18 - 6 * i);
         }
         for i in 0..chunk.len() - 1 {
-            out.push((n >> (16 - 8 * i)) as u8);
+            out.push(u8::try_from((n >> (16 - 8 * i)) & 0xFF).unwrap_or_default());
         }
     }
     Some(out)

@@ -2,6 +2,20 @@
 //!
 //! Behaviour comes entirely from the scenario file named by `FAKE_CLAUDE_SCENARIO`. It never reads the
 //! real Claude configuration (`HOME`, `CLAUDE_CONFIG_DIR`) and never touches the network.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        reason = "tests build sizes and seeded values with `as`; the casts in product code are checked"
+    )
+)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line program: its output is the product"
+)]
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Write};
@@ -49,11 +63,10 @@ fn matches(rule: &[String], argv: &[String]) -> bool {
             .all(|(want, got)| want == "*" || want == got)
 }
 
-fn now_ms() -> u128 {
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 fn log(event: &str, argv: &[String]) {
@@ -69,7 +82,7 @@ fn log(event: &str, argv: &[String]) {
         // The value itself is never written, only its hash, so tests can compare without leaking it.
         "secret_sha256": secret.map(|s| format!("{:x}", Sha256::digest(s.as_bytes()))),
         "no_color_set": std::env::var_os("NO_COLOR").is_some(),
-        "ms": now_ms() as u64,
+        "ms": now_ms(),
     });
     // One `write` call for the whole line: parallel runs append to the same file and must not tear each other's lines.
     let mut buf = line.to_string();

@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Page {
+pub(crate) enum Page {
     Connections,
     Profiles,
     Desktop,
@@ -38,7 +38,7 @@ impl Page {
         (Page::ActivityLog, icon::LIST_BULLETS, "Activity log"),
     ];
 
-    pub fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         Self::ALL
             .iter()
             .find(|(p, ..)| *p == self)
@@ -83,7 +83,7 @@ impl Page {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DetailTab {
+pub(crate) enum DetailTab {
     General,
     Auth,
     HeadersEnv,
@@ -231,9 +231,9 @@ enum OutcomeChoice {
 }
 
 /// The size Klefki opens at.
-pub const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
+pub(crate) const OPENING_SIZE: egui::Vec2 = egui::vec2(1200.0, 720.0);
 /// The smallest it can be made; also the room the opening size gives at 150 % zoom.
-pub const SMALLEST_SIZE: egui::Vec2 = egui::vec2(800.0, 480.0);
+pub(crate) const SMALLEST_SIZE: egui::Vec2 = egui::vec2(800.0, 480.0);
 
 enum GridRow {
     Group(Group),
@@ -250,7 +250,7 @@ struct Group {
     count: usize,
 }
 
-pub struct ShellApp {
+pub(crate) struct ShellApp {
     snapshot: Arc<Snapshot>,
     /// The engine. `None` for demo data and tests that feed the UI directly.
     core: Option<Core>,
@@ -385,7 +385,7 @@ pub struct ShellApp {
 }
 
 impl ShellApp {
-    pub fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
+    pub(crate) fn new(snapshot: Arc<Snapshot>, theme: ThemeChoice) -> Self {
         Self {
             core: None,
             live: vec![None; snapshot.servers.len()],
@@ -458,7 +458,7 @@ impl ShellApp {
     }
 
     /// The app driven by the engine: the snapshot and every status arrive as events.
-    pub fn with_core(core: Core, theme: ThemeChoice) -> Self {
+    pub(crate) fn with_core(core: Core, theme: ThemeChoice) -> Self {
         let mut app = Self::new(Arc::new(Snapshot::default()), theme);
         app.updated_by_hand = core.updated_by_hand().map(str::to_owned);
         app.checks_for_updates = core.checks_for_updates();
@@ -1112,7 +1112,7 @@ impl ShellApp {
     }
 
     /// Indices into the snapshot matching the search, ordered by scope, project and name.
-    pub fn visible(&self) -> Vec<usize> {
+    pub(crate) fn visible(&self) -> Vec<usize> {
         let q = self.search.trim().to_lowercase();
         let idx: Vec<usize> = (0..self.snapshot.servers.len())
             .filter(|&i| matches_search(&self.snapshot.servers[i], &q))
@@ -4083,7 +4083,7 @@ impl ShellApp {
         let next = match at {
             None if step > 0 => 0,
             None => order.len() - 1,
-            Some(p) => (p as i32 + step).clamp(0, order.len() as i32 - 1) as usize,
+            Some(p) => p.saturating_add_signed(step as isize).min(order.len() - 1),
         };
         self.selected.clear();
         self.selected.insert(order[next]);
@@ -6019,6 +6019,10 @@ fn search_id() -> egui::Id {
 
 /// Room kept free at the right of the detail panel's content: its scroll bar floats over the content and, at its
 /// widest when the pointer is on it, takes the clicks there.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a few pixels; `as` saturates for a float"
+)]
 fn scroll_gutter(style: &egui::Style) -> i8 {
     let bar = &style.spacing.scroll;
     (bar.bar_width + bar.bar_outer_margin).ceil() as i8
@@ -9033,7 +9037,12 @@ fn hovered_for(ui: &Ui, id: egui::Id, rect: egui::Rect, delay: f64) -> bool {
     let since = ctx.data_mut(|d| *d.get_temp_mut_or(key, now));
     let left = delay - (now - since);
     if left > 0.0 {
-        ctx.request_repaint_after_secs(left as f32);
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "a repaint delay in seconds needs no more than f32"
+        )]
+        let left = left as f32;
+        ctx.request_repaint_after_secs(left);
         return false;
     }
     true

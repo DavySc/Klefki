@@ -40,13 +40,13 @@ pub(crate) struct PluginServer {
 
 impl PluginServer {
     /// The name Claude Code gives the server.
-    pub fn full_name(&self) -> String {
+    pub(crate) fn full_name(&self) -> String {
         full_name(&self.plugin, &self.server)
     }
 
     /// The definition as Claude Code runs it: `${CLAUDE_PLUGIN_ROOT}` replaced by the plugin's folder in every text.
     /// Any other `${…}` comes from Claude Code's own environment, which Klefki does not know, and stays as written.
-    pub fn expanded(&self) -> Value {
+    pub(crate) fn expanded(&self) -> Value {
         let root = self.root.to_string_lossy();
         let mut entry = self.entry.clone();
         expand(&mut entry, &root);

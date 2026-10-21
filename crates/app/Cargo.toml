@@ -54,3 +54,6 @@ depends = ["libgl1 | libegl1", "libxkbcommon0"]
 # The release workflow builds with MACOSX_DEPLOYMENT_TARGET set to the same version.
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
+
+[lints]
+workspace = true

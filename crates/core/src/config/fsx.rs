@@ -83,7 +83,8 @@ pub(crate) fn read_limited_bytes(path: &Path, max_bytes: u64) -> io::Result<Opti
     };
     // Sized from the metadata (plus one byte, to notice a file that grew meanwhile), so a large file is read
     // into one allocation rather than a series of growing ones.
-    let mut buf = Vec::with_capacity(meta.len() as usize + 1);
+    let mut buf =
+        Vec::with_capacity(usize::try_from(meta.len()).map_or(0, |n| n.saturating_add(1)));
     file.take(max_bytes + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > max_bytes {
         return Err(io::Error::other(

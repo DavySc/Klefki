@@ -16,7 +16,7 @@ const FILTER_FROM: usize = 10;
 const READ_ONLY: &str = "Not until the profiles file can be read in full (see above).";
 
 #[derive(Default)]
-pub struct ProfilesPage {
+pub(crate) struct ProfilesPage {
     /// `None` until the engine answers.
     profiles: Option<Profiles>,
     /// What the top bar's filter box holds on this page: it filters the profiles, and the servers of the one edited.
@@ -60,7 +60,7 @@ struct Unchanged {
 
 /// A profile being made or edited.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Draft {
+pub(crate) struct Draft {
     /// The profile's name before the edit; `None` for a new profile.
     replaces: Option<String>,
     name: String,
@@ -98,7 +98,7 @@ impl Default for Choice {
 
 /// What the page's buttons asked the shell to do.
 #[derive(Debug, PartialEq)]
-pub enum Asked {
+pub(crate) enum Asked {
     Save {
         name: String,
         members: Vec<ConnectionId>,
@@ -121,7 +121,7 @@ enum Card {
 
 impl ProfilesPage {
     /// The page, with a profile being made or edited when the page was last left.
-    pub fn with_draft(draft: Option<Draft>) -> Self {
+    pub(crate) fn with_draft(draft: Option<Draft>) -> Self {
         Self {
             editing: draft.map(|d| Draft { focus: true, ..d }),
             ..Self::default()
@@ -129,13 +129,13 @@ impl ProfilesPage {
     }
 
     /// The profile being made or edited, to keep while the page is not shown.
-    pub fn draft(&mut self) -> Option<Draft> {
+    pub(crate) fn draft(&mut self) -> Option<Draft> {
         self.editing.take()
     }
 
     /// The profiles as the engine has them. After a save, the profile being made or edited is done; the first
     /// answer on opening the page leaves a draft carried over from before.
-    pub fn set(&mut self, profiles: Profiles) {
+    pub(crate) fn set(&mut self, profiles: Profiles) {
         self.profiles = Some(profiles);
         self.alone = None;
         self.in_use = None;
@@ -149,7 +149,7 @@ impl ProfilesPage {
     /// Using `profile` would change nothing: said on its card, rather than in a review with nothing to save.
     /// `already` says what is already so; `warnings`, what still keeps a server from loading there; `others_on`, that
     /// other servers there are on, which "Only these servers there" would turn off.
-    pub fn unchanged(
+    pub(crate) fn unchanged(
         &mut self,
         profile: &str,
         already: Vec<String>,
@@ -169,7 +169,7 @@ impl ProfilesPage {
 
     /// A new snapshot is shown: where each profile is on alone is worked out again, and what a Use found already so is
     /// let go.
-    pub fn snapshot_changed(&mut self) {
+    pub(crate) fn snapshot_changed(&mut self) {
         self.alone = None;
         self.in_use = None;
         // What a Use found already so was true of the files then: another change may have made it false since.
@@ -180,7 +180,7 @@ impl ProfilesPage {
 
     /// Starts a new profile once the profiles are read, unless one is being made or edited: that is not thrown away.
     /// Not while the file cannot be read in full, as the page's own New profile.
-    pub fn start_new(&mut self) {
+    pub(crate) fn start_new(&mut self) {
         if self.editing.is_none() {
             self.new_asked = true;
         }
@@ -188,7 +188,7 @@ impl ProfilesPage {
 
     /// Brings the profile `name` into view, with where to use it taking the keyboard. A filter that would hide it is
     /// cleared. Not while a profile is being made or edited, which fills the page: that is said instead.
-    pub fn reveal(&mut self, name: String) {
+    pub(crate) fn reveal(&mut self, name: String) {
         if self.editing.is_some() {
             self.refused = Some(format!(
                 "Finish or cancel the profile you are editing first, then use {name}."
@@ -199,13 +199,13 @@ impl ProfilesPage {
         self.reveal = Some(name);
     }
 
-    pub fn refused(&mut self, why: String) {
+    pub(crate) fn refused(&mut self, why: String) {
         self.saving = false;
         self.refused = Some(why);
     }
 
     /// Draws the page. `live` is false for sample data, which has no folder to keep profiles in.
-    pub fn show(&mut self, ui: &mut Ui, snapshot: &Snapshot, live: bool) -> Option<Asked> {
+    pub(crate) fn show(&mut self, ui: &mut Ui, snapshot: &Snapshot, live: bool) -> Option<Asked> {
         let pal = theme::palette(ui.ctx());
         let mut asked = None;
         egui::ScrollArea::vertical()
