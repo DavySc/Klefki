@@ -1,7 +1,7 @@
 //! Export: what it takes, copying, and saving to a file.
 
 use super::*;
-use klefki_core::api::Exported;
+use klefki_core::api::{Exported, FileChoice, SaveError};
 
 /// An answer to Export. A variable's name ending in `=value` is a plain setting with that default.
 fn exported_block(text: &str, variables: &[(&str, &str)], notes: &[&str]) -> Event {

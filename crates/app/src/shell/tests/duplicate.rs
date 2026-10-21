@@ -1,6 +1,8 @@
 //! Duplicate: the name and places it suggests, the fields it copies, and what it asks the engine for.
 
 use super::*;
+use crate::shell::duplicate::CopyRead;
+use klefki_core::api::CopyFields;
 
 #[test]
 fn duplicate_suggests_a_name_and_the_same_place() {
@@ -265,6 +267,42 @@ fn duplicate_warns_about_a_callback_port_another_program_holds_once_left() {
     copy_fields_of(&mut h).callback_port = "8767".into();
     h.run();
     assert!(h.query_by_label_contains("Port 8766 is in use").is_none());
+}
+
+#[test]
+fn duplicate_asks_about_a_port_again_only_once_its_answer_is_in() {
+    let (mut h, engine, _) = duplicate_sso();
+    let port = egui::Id::new("copy_callback_port");
+    let leave = |h: &mut Harness<'static, ShellApp>| {
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        h.key_press(egui::Key::Tab);
+        h.run();
+    };
+    let answer = |h: &mut Harness<'static, ShellApp>, port: u16| {
+        engine
+            .events
+            .send(Event::CallbackPort {
+                port,
+                warning: None,
+            })
+            .unwrap();
+        h.run();
+    };
+    copy_fields_of(&mut h).callback_port = "8765".into();
+    leave(&mut h);
+    assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8765)]);
+    copy_fields_of(&mut h).callback_port = "8766".into();
+    leave(&mut h);
+    assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8766)]);
+    // A late answer for the earlier port leaves the one asked about waiting: not asked twice.
+    answer(&mut h, 8765);
+    leave(&mut h);
+    assert!(drain(&engine).is_empty());
+    // Once its own answer is in, leaving the field asks again: the port may have been taken since.
+    answer(&mut h, 8766);
+    leave(&mut h);
+    assert_eq!(drain(&engine), vec![Command::CheckCallbackPort(8766)]);
 }
 
 #[test]

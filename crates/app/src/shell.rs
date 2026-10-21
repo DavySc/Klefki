@@ -7,9 +7,9 @@ use crate::theme::{self, ThemeChoice, Tone};
 use egui::{Frame, Margin, RichText, Sense, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, CopyFields, Core, Definition, Diagnosis, Event,
-    FileChoice, Hint, ImportFile, PlanView, SaveError, Scope, Secret, ServerId, ServerName,
-    ServerRow, Snapshot, Status, Target, TransportKind, UpdateDownload, same_project,
+    Approval, Change, Command, ConnectionId, Core, Diagnosis, Event, Hint, ImportFile, PlanView,
+    Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
+    UpdateDownload, same_project,
     words::{self, capitalized},
 };
 use std::collections::{BTreeSet, HashMap};
@@ -34,9 +34,9 @@ mod top_bar;
 use add::{AddForm, AddMode, forget_typed};
 use casing::CasingForm;
 use detail::{bring_focus_into_view, scroll_gutter};
-use duplicate::{CopyRead, DuplicateForm};
-use editor::{Editor, EditorState, SecretView};
-use export::{ExportView, Saving};
+use duplicate::DuplicateForm;
+use editor::{Editor, SecretView};
+use export::ExportView;
 use list::{GridRow, group_of};
 use move_dialog::MoveForm;
 use notices::LegacyNotice;
@@ -517,70 +517,7 @@ impl ShellApp {
                     page.log = Some(log);
                 }
             }
-            Event::Snapshot(snapshot) => {
-                // Rows are kept by position; carry selection, live results and diagnoses over by identity: the
-                // connection, as the file spells the server, since two servers can show the same name.
-                let new_index: HashMap<&ConnectionId, usize> = snapshot
-                    .servers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| (&r.connection, i))
-                    .collect();
-                let moved = |old: usize| {
-                    new_index
-                        .get(&self.snapshot.servers[old].connection)
-                        .copied()
-                };
-                let selected = self.selected.iter().filter_map(|&i| moved(i)).collect();
-                let mut live = vec![None; snapshot.servers.len()];
-                for (old, result) in self.live.iter_mut().enumerate() {
-                    // Dropped; the engine says again, right after each snapshot, which checks still run.
-                    if let (Some(new), Some(r)) = (moved(old), result.take())
-                        && r.status != Status::Checking
-                    {
-                        live[new] = Some(r);
-                    }
-                }
-                self.live_gen += 1;
-                self.diagnoses
-                    .retain(|id, _| new_index.contains_key(&id.connection));
-                self.selected = selected;
-                self.live = live;
-                // Positions now mean other servers: tell the engine again.
-                self.on_screen.clear();
-                if let Some(e) = &mut self.editor
-                    && !new_index.contains_key(&e.id.connection)
-                {
-                    // Gone from where it was: moved or renamed by the change being applied, it is followed there.
-                    let landed = self
-                        .relocating
-                        .iter()
-                        .filter(|_| self.applying)
-                        .find(|(id, ..)| *id == e.id)
-                        .and_then(|(_, name, to)| {
-                            snapshot.servers.iter().position(|r| lands_at(r, name, to))
-                        });
-                    match landed {
-                        Some(i) => {
-                            e.id = snapshot.servers[i].id();
-                            e.moved = true;
-                            self.selected = BTreeSet::from([i]);
-                            self.reveal = Some(i);
-                        }
-                        None => self.editor = None,
-                    }
-                }
-                self.grid_cache = None;
-                self.command.invalidate();
-                if let Some(page) = &mut self.profiles {
-                    page.snapshot_changed();
-                }
-                self.profile_names.clone_from(&snapshot.profiles);
-                if snapshot.cli_version.is_some() {
-                    self.cli_version = snapshot.cli_version.clone();
-                }
-                self.snapshot = snapshot;
-            }
+            Event::Snapshot(snapshot) => self.take_snapshot(snapshot),
             Event::Diagnosis { id, diagnosis } => {
                 if self.snapshot.servers.iter().any(|r| r.is(&id)) {
                     // It is drawn under the status and its explanation, often below the window: brought into view
@@ -593,232 +530,29 @@ impl ShellApp {
                     self.diagnoses.insert(id, diagnosis);
                 }
             }
-            Event::PlanReady(plan) => {
-                self.preparing = false;
-                if self.duplicate.as_ref().is_some_and(|f| f.reviewing) {
-                    self.duplicate = None;
-                }
-                let saves_draft = std::mem::take(&mut self.draft_asked);
-                let profile = self.profile_asked.take();
-                // Said on the profile's card while the page is shown; once it is left, the review says it.
-                let card = profile
-                    .filter(|_| plan.nothing_to_do && self.plan.is_none())
-                    .and_then(|name| Some((name, self.profiles.as_mut()?)));
-                if let Some((name, page)) = card {
-                    page.unchanged(&name, plan.already, plan.warnings, plan.others_on);
-                    self.send(Command::Discard(plan.id));
-                } else if self.plan.is_some() {
-                    // Only one dialog at a time; the one open (perhaps being saved) keeps it.
-                    self.send(Command::Discard(plan.id));
-                } else {
-                    self.draft_plan = saves_draft.then_some(plan.id);
-                    self.plan = Some(Arc::new(plan));
-                }
-            }
-            Event::PlanFailed(why) => {
-                self.preparing = false;
-                self.draft_asked = false;
-                self.profile_asked = None;
-                self.adding.clear();
-                let duplicate = self.duplicate.as_mut().filter(|f| f.reviewing);
-                match (self.add.as_mut().filter(|f| f.reviewing), duplicate) {
-                    // Said in the Add dialog, which comes back as it was, so nothing typed is lost.
-                    (Some(form), _) => {
-                        form.reviewing = false;
-                        form.failed = Some(why);
-                    }
-                    // The same for Duplicate.
-                    (None, Some(form)) => {
-                        form.reviewing = false;
-                        form.failed = Some(why);
-                    }
-                    (None, None) => {
-                        self.outcome = Some(Outcome {
-                            text: why,
-                            ok: false,
-                            shown_at: None,
-                            warn: false,
-                            undo: None,
-                            sign_in: None,
-                            logged: false,
-                            type_path: false,
-                        })
-                    }
-                }
-            }
+            Event::PlanReady(plan) => self.plan_ready(plan),
+            Event::PlanFailed(why) => self.plan_failed(why),
             Event::Applied {
                 plan,
                 changed,
                 backup,
                 notes,
-            } => {
-                if changed {
-                    // Read again what was saved, for the server still being edited; drop it for any other.
-                    let saved_draft = self.draft_plan.take() == Some(plan);
-                    let open = self
-                        .editor
-                        .take()
-                        .filter(|e| self.single_selected().is_some_and(|s| s.is(&e.id)));
-                    if let Some(mut e) = open {
-                        if !saved_draft && e.state.edited() {
-                            // Edits not saved yet stay: what was applied was another change. Moved or renamed,
-                            // what the new place holds is read, to compare them with and revert to.
-                            if e.moved {
-                                self.send(Command::Inspect(e.id.clone()));
-                            }
-                            self.editor = Some(e);
-                        } else {
-                            self.editor = Some(Editor {
-                                id: e.id.clone(),
-                                state: EditorState::Loading,
-                                reveal: false,
-                                moved: false,
-                            });
-                            self.send(Command::Inspect(e.id));
-                        }
-                    }
-                }
-                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
-                    self.plan = None;
-                    self.applying = false;
-                    self.applying_step = None;
-                }
-                let added = self.added_in_words();
-                if self.add.as_ref().is_some_and(|f| f.reviewing) {
-                    self.close_add();
-                }
-                let signs_in = std::mem::take(&mut self.adding_signs_in) && added.is_some();
-                // The list already holds what was saved: the engine sends it first.
-                self.select_added();
-                // One server added in one place: offer to sign in to it right here.
-                let sign_in = self
-                    .single_selected()
-                    .filter(|_| signs_in && changed)
-                    .filter(|row| sign_in::can_sign_in(row))
-                    .map(ServerRow::id);
-                let next = match (&sign_in, signs_in) {
-                    (Some(_), _) => " Sign in now, or later from its Status tab.",
-                    (None, true) if self.selected.len() > 1 => {
-                        " Sign in to each from its Status tab."
-                    }
-                    (None, true) => " Sign in to it from its Status tab.",
-                    (None, false) => "",
-                };
-                // How it went, when there is more to say (settings Claude Code left out, say), then the backup.
-                let warn = changed && !notes.is_empty();
-                let mut kept: String = notes.iter().map(|n| format!(" {n}")).collect();
-                if let Some(b) = backup {
-                    kept.push_str(&format!(" The previous file is kept in {b}"));
-                }
-                self.outcome = Some(Outcome {
-                    // What was saved is read again next time it is shown.
-                    text: match (changed, added) {
-                        (false, _) => "Nothing needed to change.".to_owned(),
-                        (true, None) if let Some(gone) = self.forgetting.take() => {
-                            format!("Klefki no longer keeps the definition of {gone}.{kept}")
-                        }
-                        (true, Some(added)) => format!("{added}{next}{kept}"),
-                        (true, None) if kept.is_empty() => "Saved.".to_owned(),
-                        (true, None) => format!("Saved.{kept}"),
-                    },
-                    ok: true,
-                    shown_at: None,
-                    warn,
-                    undo: self.undo_move(changed),
-                    sign_in,
-                    logged: changed,
-                    type_path: false,
-                });
-            }
+            } => self.applied(plan, changed, backup, notes),
             Event::Applying { plan, step } => {
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.applying_step = Some(step);
                 }
             }
-            Event::ApplyFailed { plan, error } => {
-                self.moved_from = None;
-                if self.plan.as_ref().is_some_and(|p| p.id == plan) {
-                    self.plan = None;
-                    self.applying = false;
-                    self.applying_step = None;
-                }
-                // Claude Code may have added some before one failed.
-                self.select_added();
-                if let Some(form) = self.add.as_mut().filter(|f| f.reviewing) {
-                    // Said in the Add dialog, which comes back as it was, to try again or cancel.
-                    form.reviewing = false;
-                    form.failed = Some(error);
-                    return;
-                }
-                self.outcome = Some(Outcome {
-                    text: error,
-                    ok: false,
-                    shown_at: None,
-                    warn: false,
-                    undo: None,
-                    sign_in: None,
-                    logged: false,
-                    type_path: false,
-                });
-            }
+            Event::ApplyFailed { plan, error } => self.apply_failed(plan, error),
             Event::Reapplied { .. } => {
-                self.outcome = Some(Outcome {
-                    text: "Claude Code overwrote the change right after it was saved, so it was written again. Close running Claude Code sessions if this keeps happening."
+                self.outcome = Some(Outcome::problem(
+                    "Claude Code overwrote the change right after it was saved, so it was written again. Close running Claude Code sessions if this keeps happening."
                         .to_owned(),
-                    ok: false,
-                    shown_at: None,
-                    warn: false,
-                    undo: None,
-                    sign_in: None,
-                    logged: false,
-                    type_path: false,
-                });
+                ));
             }
             Event::Entry { id, json, editable } => {
-                if let Some(form) = &mut self.duplicate
-                    && form.source == id
-                    && form.copy == CopyRead::Reading
-                {
-                    form.copy = match &json {
-                        Ok(text) => CopyFields::from_definition(text)
-                            .map_or(CopyRead::NoAddress, |f| CopyRead::Ready(Box::new(f))),
-                        Err(why) => CopyRead::Failed(why.clone()),
-                    };
-                }
-                // Brought into view for the server shown on a tab with the form; one looked at later opens as it is.
-                let shown = matches!(self.tab, DetailTab::General | DetailTab::HeadersEnv)
-                    && self.single_selected().is_some_and(|s| s.is(&id));
-                if let Some(editor) = &mut self.editor
-                    && editor.id == id
-                {
-                    match (&mut editor.state, json) {
-                        (EditorState::Loading, json) => {
-                            editor.state = match json {
-                                Ok(text) => EditorState::ready(text, editable),
-                                Err(why) => EditorState::Failed(why),
-                            };
-                            editor.reveal &= shown;
-                        }
-                        // Read again after a move under a draft: the draft is carried onto what is there now.
-                        (
-                            EditorState::Ready {
-                                original,
-                                text,
-                                editable: can_edit,
-                                ..
-                            },
-                            Ok(now),
-                        ) if editor.moved => {
-                            if let Some(rebased) = Definition::rebase(original, &now, text) {
-                                *text = rebased;
-                            }
-                            *original = now;
-                            *can_edit = editable;
-                        }
-                        _ => {}
-                    }
-                    editor.moved = false;
-                }
+                self.copy_read(&id, &json);
+                self.definition_read(id, json, editable);
             }
             Event::ImportFile(file) => {
                 self.import_waiting = false;
@@ -832,107 +566,24 @@ impl ShellApp {
                     self.note("No file chosen.".to_owned(), true);
                 }
             }
-            Event::Exported(exported) => {
-                self.exports_pending = self.exports_pending.saturating_sub(1);
-                if let Some(view) = &mut self.exporting
-                    && self.exports_pending == 0
-                {
-                    view.result = Some(exported);
-                }
-            }
-            Event::ExportFileChosen(choice) => {
-                self.export_choices_pending = self.export_choices_pending.saturating_sub(1);
-                if let Some(view) = &mut self.exporting
-                    && self.export_choices_pending == 0
-                    && view.save == Saving::Choosing
-                {
-                    view.save = Saving::Idle;
-                    match choice {
-                        FileChoice::Chosen(path) => {
-                            if let Some(result) = &view.result {
-                                // The system's dialog asked before replacing a file there.
-                                let text = result.text.clone();
-                                view.save = Saving::Writing {
-                                    path: path.clone(),
-                                    typed: None,
-                                };
-                                self.send(Command::SaveExport {
-                                    path,
-                                    text,
-                                    replace: true,
-                                });
-                            }
-                        }
-                        // A dialog that failed slowly looks like a cancel: the way to type a path stays in reach.
-                        FileChoice::Cancelled { suggested } => {
-                            view.save = Saving::Offered {
-                                path: suggested.to_string_lossy().into_owned(),
-                            };
-                        }
-                        FileChoice::NoDialog { suggested } => {
-                            view.save = Saving::Typing {
-                                path: suggested.to_string_lossy().into_owned(),
-                                focus: true,
-                                no_dialog: true,
-                            };
-                        }
-                    }
-                }
-            }
+            Event::Exported(exported) => self.exported(exported),
+            Event::ExportFileChosen(choice) => self.export_file_chosen(choice),
             Event::ExportSaved {
                 path,
                 shown,
                 result,
-            } => {
-                if let Some(view) = &mut self.exporting
-                    && let Saving::Writing { path: asked, typed } = &view.save
-                    && *asked == path
-                {
-                    let typed = typed.clone();
-                    view.save = Saving::Idle;
-                    match result {
-                        Ok(()) => view.status = Some(Ok(format!("Saved to {shown}"))),
-                        Err(SaveError::Exists) => {
-                            view.status = None;
-                            view.save = Saving::Exists {
-                                path,
-                                typed: typed.unwrap_or_default(),
-                            };
-                        }
-                        Err(why) => {
-                            view.status = Some(Err(format!("Not saved: {why}")));
-                            // A typed path stays, to be put right.
-                            if let Some(path) = typed {
-                                view.save = Saving::Typing {
-                                    path,
-                                    focus: false,
-                                    no_dialog: false,
-                                };
-                            }
-                        }
-                    }
-                }
-            }
+            } => self.export_saved(path, shown, result),
             Event::CallbackPort { port, warning } => {
                 if let Some(form) = &mut self.add {
-                    if form.port_pending == Some(port) {
-                        form.port_pending = None;
-                    }
-                    form.port_checked = Some((port, warning.clone()));
+                    form.port_answered(port, warning.clone());
                 }
                 if let Some(form) = &mut self.duplicate {
-                    if form.port_pending == Some(port) {
-                        form.port_pending = None;
-                    }
-                    form.port_checked = Some((port, warning));
+                    form.port_answered(port, warning);
                 }
             }
             Event::SecretStatus { id, stored } => {
-                if let Some(view) = &mut self.secret
-                    && view.id == id
-                {
-                    view.known = Some(stored);
-                    view.busy = None;
+                if let Some(view) = &mut self.secret {
+                    view.answered(&id, stored);
                 }
             }
             Event::SignIn { id, step } => {
@@ -975,6 +626,51 @@ impl ShellApp {
                 }
             }
         }
+    }
+
+    /// A new snapshot of the configuration: what was selected, checked and diagnosed follows its server.
+    fn take_snapshot(&mut self, snapshot: Arc<Snapshot>) {
+        // Rows are kept by position; carry selection, live results and diagnoses over by identity: the
+        // connection, as the file spells the server, since two servers can show the same name.
+        let new_index: HashMap<&ConnectionId, usize> = snapshot
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (&r.connection, i))
+            .collect();
+        let moved = |old: usize| {
+            new_index
+                .get(&self.snapshot.servers[old].connection)
+                .copied()
+        };
+        let selected = self.selected.iter().filter_map(|&i| moved(i)).collect();
+        let mut live = vec![None; snapshot.servers.len()];
+        for (old, result) in self.live.iter_mut().enumerate() {
+            // Dropped; the engine says again, right after each snapshot, which checks still run.
+            if let (Some(new), Some(r)) = (moved(old), result.take())
+                && r.status != Status::Checking
+            {
+                live[new] = Some(r);
+            }
+        }
+        self.live_gen += 1;
+        self.diagnoses
+            .retain(|id, _| new_index.contains_key(&id.connection));
+        self.selected = selected;
+        self.live = live;
+        // Positions now mean other servers: tell the engine again.
+        self.on_screen.clear();
+        self.follow_editor(&snapshot, &new_index);
+        self.grid_cache = None;
+        self.command.invalidate();
+        if let Some(page) = &mut self.profiles {
+            page.snapshot_changed();
+        }
+        self.profile_names.clone_from(&snapshot.profiles);
+        if snapshot.cli_version.is_some() {
+            self.cli_version = snapshot.cli_version.clone();
+        }
+        self.snapshot = snapshot;
     }
 
     /// What to show for row `i`: the engine's latest answer, else what Claude's own cache said.
@@ -2239,6 +1935,7 @@ struct Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::editor::EditorState;
     use crate::shell::list::{BLOCKED_BY_POLICY, TURNED_OFF};
     use crate::shell::list::{NOT_LOADED, PLUGIN_STATUS, in_projects_text};
     use crate::shell::places::Places;
@@ -2576,6 +2273,33 @@ mod tests {
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
         h.get_by_label_contains("Can't reach the server's host");
+    }
+
+    #[test]
+    fn the_explanation_follows_a_check_a_new_snapshot_cut_off() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("acme-prod", Scope::User, None);
+        row.status = Status::Failed;
+        row.status_cached = true;
+        show_rows(&mut h, &engine, vec![row.clone()]);
+        click(&mut h, "acme-prod");
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Claude Code could not connect to this server");
+        // Being checked: nothing to explain yet.
+        engine
+            .events
+            .send(status_event(&row, Status::Checking, None))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label_contains("Claude Code could not connect")
+                .is_none()
+        );
+        // A new snapshot drops the check; what Claude's cache says is explained again.
+        show_rows(&mut h, &engine, vec![row]);
+        h.get_by_label_contains("Claude Code could not connect to this server");
     }
 
     #[test]

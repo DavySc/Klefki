@@ -4,7 +4,8 @@ use super::list::keep_the_end;
 use super::{ShellApp, closed_on_purpose, matches_search, names_in_a_line};
 use crate::theme;
 use egui::{RichText, Ui};
-use klefki_core::api::{Command, Exported};
+use klefki_core::api::{Command, Exported, FileChoice, SaveError};
+use std::path::PathBuf;
 
 /// What the Export dialog holds: what is exported, and the block once the engine sent it.
 pub(super) struct ExportView {
@@ -19,9 +20,9 @@ pub(super) struct ExportView {
     pub(super) copied: Option<(Copied, f64)>,
     /// The file name the save dialog starts with.
     file_name: String,
-    pub(super) save: Saving,
+    save: Saving,
     /// What the last save did, said as a sentence: `Ok` when it saved.
-    pub(super) status: Option<Result<String, String>>,
+    status: Option<Result<String, String>>,
     /// The dialog's size in the last frame.
     size: egui::Vec2,
     /// How tall the save status was in the last frame (it wraps a long path).
@@ -520,6 +521,94 @@ impl ShellApp {
         }
         if close || closed_on_purpose(&modal) {
             self.exporting = None;
+        }
+    }
+
+    /// The exported block arrived; shown once the last one asked for is in.
+    pub(super) fn exported(&mut self, exported: Exported) {
+        self.exports_pending = self.exports_pending.saturating_sub(1);
+        if let Some(view) = &mut self.exporting
+            && self.exports_pending == 0
+        {
+            view.result = Some(exported);
+        }
+    }
+
+    /// The system's save dialog closed: save to the file chosen, or offer to type a path.
+    pub(super) fn export_file_chosen(&mut self, choice: FileChoice) {
+        self.export_choices_pending = self.export_choices_pending.saturating_sub(1);
+        if let Some(view) = &mut self.exporting
+            && self.export_choices_pending == 0
+            && view.save == Saving::Choosing
+        {
+            view.save = Saving::Idle;
+            match choice {
+                FileChoice::Chosen(path) => {
+                    if let Some(result) = &view.result {
+                        // The system's dialog asked before replacing a file there.
+                        let text = result.text.clone();
+                        view.save = Saving::Writing {
+                            path: path.clone(),
+                            typed: None,
+                        };
+                        self.send(Command::SaveExport {
+                            path,
+                            text,
+                            replace: true,
+                        });
+                    }
+                }
+                // A dialog that failed slowly looks like a cancel: the way to type a path stays in reach.
+                FileChoice::Cancelled { suggested } => {
+                    view.save = Saving::Offered {
+                        path: suggested.to_string_lossy().into_owned(),
+                    };
+                }
+                FileChoice::NoDialog { suggested } => {
+                    view.save = Saving::Typing {
+                        path: suggested.to_string_lossy().into_owned(),
+                        focus: true,
+                        no_dialog: true,
+                    };
+                }
+            }
+        }
+    }
+
+    /// The export was written to `path`, or why not.
+    pub(super) fn export_saved(
+        &mut self,
+        path: PathBuf,
+        shown: String,
+        result: Result<(), SaveError>,
+    ) {
+        if let Some(view) = &mut self.exporting
+            && let Saving::Writing { path: asked, typed } = &view.save
+            && *asked == path
+        {
+            let typed = typed.clone();
+            view.save = Saving::Idle;
+            match result {
+                Ok(()) => view.status = Some(Ok(format!("Saved to {shown}"))),
+                Err(SaveError::Exists) => {
+                    view.status = None;
+                    view.save = Saving::Exists {
+                        path,
+                        typed: typed.unwrap_or_default(),
+                    };
+                }
+                Err(why) => {
+                    view.status = Some(Err(format!("Not saved: {why}")));
+                    // A typed path stays, to be put right.
+                    if let Some(path) = typed {
+                        view.save = Saving::Typing {
+                            path,
+                            focus: false,
+                            no_dialog: false,
+                        };
+                    }
+                }
+            }
         }
     }
 }

@@ -101,10 +101,10 @@ pub(super) struct AddForm {
     /// pressed, not while it is typed in.
     port_wanted: Option<u16>,
     /// The callback port sent to be checked, until its answer comes: it is asked once.
-    pub(super) port_pending: Option<u16>,
+    port_pending: Option<u16>,
     /// The callback port last checked, and why a sign-in could not come back to it
     /// ([`Event::CallbackPort`](klefki_core::api::Event::CallbackPort)).
-    pub(super) port_checked: Option<(u16, Option<String>)>,
+    port_checked: Option<(u16, Option<String>)>,
     /// Import: the file read, as it can be shown.
     file: Option<String>,
     /// Import: why the last file chosen could not be read.
@@ -248,6 +248,20 @@ impl<'a> Existing<'a> {
 }
 
 impl AddForm {
+    /// Back from a review that failed, as it was, so nothing typed is lost; the dialog says why.
+    pub(super) fn review_failed(&mut self, why: String) {
+        self.reviewing = false;
+        self.failed = Some(why);
+    }
+
+    /// What the engine found about the OAuth callback `port`: whether a sign-in could come back to it now.
+    pub(super) fn port_answered(&mut self, port: u16, warning: Option<String>) {
+        if self.port_pending == Some(port) {
+            self.port_pending = None;
+        }
+        self.port_checked = Some((port, warning));
+    }
+
     fn new(mode: AddMode, places: Places) -> Self {
         Self {
             mode,

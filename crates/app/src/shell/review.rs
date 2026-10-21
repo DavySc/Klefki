@@ -1,11 +1,13 @@
 //! The review dialog: what a change will do, in words first, then each file's diff, before it is applied.
 
+use super::outcome::Outcome;
 use super::{ShellApp, closed_on_purpose, settle};
 use crate::theme;
 use egui::{Frame, Margin, RichText, Ui};
 use egui_phosphor::regular as icon;
-use klefki_core::api::Command;
+use klefki_core::api::{Command, PlanView};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Where each line of a plan's diffs starts, laid out once per plan, file and width.
 #[derive(Default)]
@@ -311,6 +313,46 @@ impl ShellApp {
             } else if from_add {
                 self.close_add();
             }
+        }
+    }
+
+    /// The plan asked for is ready: shown for review, said on the profile's card, or discarded while another is open.
+    pub(super) fn plan_ready(&mut self, plan: PlanView) {
+        self.preparing = false;
+        if self.duplicate.as_ref().is_some_and(|f| f.reviewing) {
+            self.duplicate = None;
+        }
+        let saves_draft = std::mem::take(&mut self.draft_asked);
+        let profile = self.profile_asked.take();
+        // Said on the profile's card while the page is shown; once it is left, the review says it.
+        let card = profile
+            .filter(|_| plan.nothing_to_do && self.plan.is_none())
+            .and_then(|name| Some((name, self.profiles.as_mut()?)));
+        if let Some((name, page)) = card {
+            page.unchanged(&name, plan.already, plan.warnings, plan.others_on);
+            self.send(Command::Discard(plan.id));
+        } else if self.plan.is_some() {
+            // Only one dialog at a time; the one open (perhaps being saved) keeps it.
+            self.send(Command::Discard(plan.id));
+        } else {
+            self.draft_plan = saves_draft.then_some(plan.id);
+            self.plan = Some(Arc::new(plan));
+        }
+    }
+
+    /// No plan could be made: said in the dialog that asked for it, which comes back as it was, or as the outcome.
+    pub(super) fn plan_failed(&mut self, why: String) {
+        self.preparing = false;
+        self.draft_asked = false;
+        self.profile_asked = None;
+        self.adding.clear();
+        let duplicate = self.duplicate.as_mut().filter(|f| f.reviewing);
+        match (self.add.as_mut().filter(|f| f.reviewing), duplicate) {
+            // Said in the Add dialog, which comes back as it was, so nothing typed is lost.
+            (Some(form), _) => form.review_failed(why),
+            // The same for Duplicate.
+            (None, Some(form)) => form.review_failed(why),
+            (None, None) => self.outcome = Some(Outcome::problem(why)),
         }
     }
 }

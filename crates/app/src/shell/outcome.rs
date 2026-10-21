@@ -1,10 +1,11 @@
 //! The outcome message: what a change did, or what went wrong, beside the list or over it, with its next steps.
 
 use super::{Page, ShellApp};
+use crate::sign_in;
 use crate::theme::{self, Palette};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Ui};
 use egui_phosphor::regular as icon;
-use klefki_core::api::{Change, ServerId};
+use klefki_core::api::{Change, ServerId, ServerRow};
 
 /// What happened to the last change, for the banner.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +24,22 @@ pub(super) struct Outcome {
     pub(super) logged: bool,
     /// No file came of asking for one to import: the card offers to type its path instead.
     pub(super) type_path: bool,
+}
+
+impl Outcome {
+    /// Something that went wrong: it stays until dismissed, with nothing more to offer.
+    pub(super) fn problem(text: String) -> Self {
+        Self {
+            text,
+            ok: false,
+            shown_at: None,
+            warn: false,
+            undo: None,
+            sign_in: None,
+            logged: false,
+            type_path: false,
+        }
+    }
 }
 
 /// What was chosen on the outcome message.
@@ -246,5 +263,87 @@ impl ShellApp {
             },
         );
         chosen
+    }
+
+    /// A plan was written: the outcome says what changed, offers to sign in to a server just added or to undo a
+    /// move, and names the backup.
+    pub(super) fn applied(
+        &mut self,
+        plan: u64,
+        changed: bool,
+        backup: Option<String>,
+        notes: Vec<String>,
+    ) {
+        if changed {
+            self.editor_after_change(plan);
+        }
+        if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+            self.plan = None;
+            self.applying = false;
+            self.applying_step = None;
+        }
+        let added = self.added_in_words();
+        if self.add.as_ref().is_some_and(|f| f.reviewing) {
+            self.close_add();
+        }
+        let signs_in = std::mem::take(&mut self.adding_signs_in) && added.is_some();
+        // The list already holds what was saved: the engine sends it first.
+        self.select_added();
+        // One server added in one place: offer to sign in to it right here.
+        let sign_in = self
+            .single_selected()
+            .filter(|_| signs_in && changed)
+            .filter(|row| sign_in::can_sign_in(row))
+            .map(ServerRow::id);
+        let next = match (&sign_in, signs_in) {
+            (Some(_), _) => " Sign in now, or later from its Status tab.",
+            (None, true) if self.selected.len() > 1 => " Sign in to each from its Status tab.",
+            (None, true) => " Sign in to it from its Status tab.",
+            (None, false) => "",
+        };
+        // How it went, when there is more to say (settings Claude Code left out, say), then the backup.
+        let warn = changed && !notes.is_empty();
+        let mut kept: String = notes.iter().map(|n| format!(" {n}")).collect();
+        if let Some(b) = backup {
+            kept.push_str(&format!(" The previous file is kept in {b}"));
+        }
+        self.outcome = Some(Outcome {
+            // What was saved is read again next time it is shown.
+            text: match (changed, added) {
+                (false, _) => "Nothing needed to change.".to_owned(),
+                (true, None) if let Some(gone) = self.forgetting.take() => {
+                    format!("Klefki no longer keeps the definition of {gone}.{kept}")
+                }
+                (true, Some(added)) => format!("{added}{next}{kept}"),
+                (true, None) if kept.is_empty() => "Saved.".to_owned(),
+                (true, None) => format!("Saved.{kept}"),
+            },
+            ok: true,
+            shown_at: None,
+            warn,
+            undo: self.undo_move(changed),
+            sign_in,
+            logged: changed,
+            type_path: false,
+        });
+    }
+
+    /// A plan could not be written: said in the Add dialog when it asked, which comes back as it was, or as the
+    /// outcome.
+    pub(super) fn apply_failed(&mut self, plan: u64, error: String) {
+        self.moved_from = None;
+        if self.plan.as_ref().is_some_and(|p| p.id == plan) {
+            self.plan = None;
+            self.applying = false;
+            self.applying_step = None;
+        }
+        // Claude Code may have added some before one failed.
+        self.select_added();
+        if let Some(form) = self.add.as_mut().filter(|f| f.reviewing) {
+            // Said in the Add dialog, which comes back as it was, to try again or cancel.
+            form.review_failed(error);
+            return;
+        }
+        self.outcome = Some(Outcome::problem(error));
     }
 }
