@@ -1,6 +1,8 @@
 //! Duplicate: the name and places it suggests, the fields it copies, and what it asks the engine for.
 
 use super::*;
+use crate::shell::duplicate::CopyRead;
+use klefki_core::api::CopyFields;
 
 #[test]
 fn duplicate_suggests_a_name_and_the_same_place() {

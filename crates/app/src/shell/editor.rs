@@ -1,12 +1,15 @@
 //! Editing a server in the detail panel: its definition as a form or as JSON, its values, its client secret, and
 //! the save bar.
 
-use super::{DetailTab, ShellApp, icon_button, transport_name};
+use super::{DetailTab, ShellApp, icon_button, lands_at, transport_name};
 use crate::theme;
 use egui::{Align, Color32, Layout, RichText, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::words::capitalized;
-use klefki_core::api::{Change, Command, Definition, Secret, ServerId, ServerRow, TransportKind};
+use klefki_core::api::{
+    Change, Command, ConnectionId, Definition, Secret, ServerId, ServerRow, Snapshot, TransportKind,
+};
+use std::collections::{BTreeSet, HashMap};
 
 /// The definition being edited, for one server: in the form, or as JSON.
 pub(super) struct Editor {
@@ -17,7 +20,7 @@ pub(super) struct Editor {
     pub(super) reveal: bool,
     /// Its server was moved or renamed under a draft: the definition is read again from the new place, and the draft
     /// carried onto it ([`Definition::rebase`]).
-    pub(super) moved: bool,
+    moved: bool,
 }
 
 pub(super) enum EditorState {
@@ -101,13 +104,23 @@ impl EditorState {
 
 /// What the Auth tab knows about one server's client secret.
 pub(super) struct SecretView {
-    pub(super) id: ServerId,
+    id: ServerId,
     /// The store's last answer: stored or not, or why it could not say.
-    pub(super) known: Option<Result<bool, String>>,
+    known: Option<Result<bool, String>>,
     /// Waiting for the store: what to say meanwhile.
-    pub(super) busy: Option<&'static str>,
+    busy: Option<&'static str>,
     /// Forget… was pressed; asking before doing it.
     confirm_forget: bool,
+}
+
+impl SecretView {
+    /// The store's answer about `id`'s client secret, if it is the server shown.
+    pub(super) fn answered(&mut self, id: &ServerId, stored: Result<bool, String>) {
+        if self.id == *id {
+            self.known = Some(stored);
+            self.busy = None;
+        }
+    }
 }
 
 impl ShellApp {
@@ -610,6 +623,109 @@ impl ShellApp {
         {
             self.prepare(vec![Change::Replace { id: s.id(), json }]);
             self.draft_asked = true;
+        }
+    }
+
+    /// A change was saved: the server still being edited is read again, or keeps edits that were not part of it;
+    /// the editor of any other server is dropped.
+    pub(super) fn editor_after_change(&mut self, plan: u64) {
+        // Read again what was saved, for the server still being edited; drop it for any other.
+        let saved_draft = self.draft_plan.take() == Some(plan);
+        let open = self
+            .editor
+            .take()
+            .filter(|e| self.single_selected().is_some_and(|s| s.is(&e.id)));
+        if let Some(mut e) = open {
+            if !saved_draft && e.state.edited() {
+                // Edits not saved yet stay: what was applied was another change. Moved or renamed,
+                // what the new place holds is read, to compare them with and revert to.
+                if e.moved {
+                    self.send(Command::Inspect(e.id.clone()));
+                }
+                self.editor = Some(e);
+            } else {
+                self.editor = Some(Editor {
+                    id: e.id.clone(),
+                    state: EditorState::Loading,
+                    reveal: false,
+                    moved: false,
+                });
+                self.send(Command::Inspect(e.id));
+            }
+        }
+    }
+
+    /// A server's definition arrived: the editor waiting for it shows it, or carries its draft onto it.
+    pub(super) fn definition_read(
+        &mut self,
+        id: ServerId,
+        json: Result<String, String>,
+        editable: bool,
+    ) {
+        // Brought into view for the server shown on a tab with the form; one looked at later opens as it is.
+        let shown = matches!(self.tab, DetailTab::General | DetailTab::HeadersEnv)
+            && self.single_selected().is_some_and(|s| s.is(&id));
+        if let Some(editor) = &mut self.editor
+            && editor.id == id
+        {
+            match (&mut editor.state, json) {
+                (EditorState::Loading, json) => {
+                    editor.state = match json {
+                        Ok(text) => EditorState::ready(text, editable),
+                        Err(why) => EditorState::Failed(why),
+                    };
+                    editor.reveal &= shown;
+                }
+                // Read again after a move under a draft: the draft is carried onto what is there now.
+                (
+                    EditorState::Ready {
+                        original,
+                        text,
+                        editable: can_edit,
+                        ..
+                    },
+                    Ok(now),
+                ) if editor.moved => {
+                    if let Some(rebased) = Definition::rebase(original, &now, text) {
+                        *text = rebased;
+                    }
+                    *original = now;
+                    *can_edit = editable;
+                }
+                _ => {}
+            }
+            editor.moved = false;
+        }
+    }
+
+    /// The server being edited is gone from the new snapshot: moved or renamed by the change being applied, the
+    /// editor follows it; otherwise it closes.
+    pub(super) fn follow_editor(
+        &mut self,
+        snapshot: &Snapshot,
+        new_index: &HashMap<&ConnectionId, usize>,
+    ) {
+        if let Some(e) = &mut self.editor
+            && !new_index.contains_key(&e.id.connection)
+        {
+            // Gone from where it was: moved or renamed by the change being applied, it is followed there.
+            let landed = self
+                .relocating
+                .iter()
+                .filter(|_| self.applying)
+                .find(|(id, ..)| *id == e.id)
+                .and_then(|(_, name, to)| {
+                    snapshot.servers.iter().position(|r| lands_at(r, name, to))
+                });
+            match landed {
+                Some(i) => {
+                    e.id = snapshot.servers[i].id();
+                    e.moved = true;
+                    self.selected = BTreeSet::from([i]);
+                    self.reveal = Some(i);
+                }
+                None => self.editor = None,
+            }
         }
     }
 }

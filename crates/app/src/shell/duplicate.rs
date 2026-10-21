@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 
 /// What the Duplicate dialog holds: the copy's name, where it goes, and what it changes.
 pub(super) struct DuplicateForm {
-    pub(super) source: ServerId,
+    source: ServerId,
     /// What is being copied, under the title: `http · https://…`.
     about: String,
     pub(super) name: String,
@@ -30,10 +30,10 @@ pub(super) struct DuplicateForm {
     /// The callback port to check, sent to the engine after this frame: when the field is left.
     port_wanted: Option<u16>,
     /// The callback port sent to be checked, until its answer comes: it is asked once.
-    pub(super) port_pending: Option<u16>,
+    port_pending: Option<u16>,
     /// The callback port last checked, and why a sign-in could not come back to it
     /// ([`Event::CallbackPort`](klefki_core::api::Event::CallbackPort)).
-    pub(super) port_checked: Option<(u16, Option<String>)>,
+    port_checked: Option<(u16, Option<String>)>,
     /// Review was pressed and the plan is being prepared: the dialog is hidden, and comes back as it was if that fails.
     pub(super) reviewing: bool,
     /// Why the last Review failed, said in the dialog.
@@ -70,6 +70,20 @@ impl CopyRead {
 }
 
 impl DuplicateForm {
+    /// Back from a review that failed, as it was, so nothing typed is lost; the dialog says why.
+    pub(super) fn review_failed(&mut self, why: String) {
+        self.reviewing = false;
+        self.failed = Some(why);
+    }
+
+    /// What the engine found about the OAuth callback `port`: whether a sign-in could come back to it now.
+    pub(super) fn port_answered(&mut self, port: u16, warning: Option<String>) {
+        if self.port_pending == Some(port) {
+            self.port_pending = None;
+        }
+        self.port_checked = Some((port, warning));
+    }
+
     /// Why a sign-in could not come back to the callback port, as last checked: only while it is still the one typed.
     fn port_warning(&self) -> Option<&str> {
         let CopyRead::Ready(fields) = &self.copy else {
@@ -437,6 +451,20 @@ impl ShellApp {
             self.adding_signs_in = signs_in;
         } else if cancel || closed_on_purpose(&modal) {
             self.duplicate = None;
+        }
+    }
+
+    /// The definition Duplicate asked for arrived: what can be copied from it, or why nothing can.
+    pub(super) fn copy_read(&mut self, id: &ServerId, json: &Result<String, String>) {
+        if let Some(form) = &mut self.duplicate
+            && form.source == *id
+            && form.copy == CopyRead::Reading
+        {
+            form.copy = match json {
+                Ok(text) => CopyFields::from_definition(text)
+                    .map_or(CopyRead::NoAddress, |f| CopyRead::Ready(Box::new(f))),
+                Err(why) => CopyRead::Failed(why.clone()),
+            };
         }
     }
 }

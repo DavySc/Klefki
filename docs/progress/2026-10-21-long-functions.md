@@ -13,10 +13,17 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    organisation, not a plugin. `shell.rs` 6,914 to 6,324 lines. Checked by script: removed and added lines are
    the same apart from `pub(super)`, imports, module lines, the two doc comments and one signature `cargo fmt`
    joined.
+2. Each dialog's handling of the engine's events moves into its module, and `apply_event` (540 lines) becomes a
+   dispatch of 191: Export's three answers (`exported`, `export_file_chosen`, `export_saved`) to `export.rs`;
+   Duplicate's definition (`copy_read`) to `duplicate.rs`; the editor's (`definition_read`, `editor_after_change`,
+   `follow_editor`, `SecretView::answered`) to `editor.rs`; `plan_ready` and `plan_failed` to `review.rs`;
+   `applied`, `apply_failed` and `Outcome::problem` (the five-field "went wrong" outcome written out three times) to
+   `outcome.rs`; `AddForm` and `DuplicateForm` get `review_failed` and `port_answered`; the snapshot's arm is
+   `take_snapshot` in `shell.rs`. Fields now private: the forms' `port_pending` and `port_checked`, Duplicate's
+   `source`, Export's `save` and `status`, the editor's `moved`, all of `SecretView`'s. The rest stay `pub(super)`
+   because the tests in `shell/tests/` read them (a test module there is not inside the dialog's module).
 
 ## Next
-2. Each dialog's `apply_event` arm into its module, so its fields can be private again; `apply_event` becomes a
-   dispatch to named steps.
 3. Core's long functions, file by file: `inventory::build`, `ops::use_profile`, `paste::add`, `paste::lex_with`,
    `restore::compare`, `cli args::parse`, `swap::run` last; the engine ideas from A2's review where they stay moves.
 
