@@ -404,20 +404,79 @@ fn is_claude(word: &str) -> bool {
     base.eq_ignore_ascii_case("claude") || base.eq_ignore_ascii_case("claude.exe")
 }
 
+/// What `claude mcp add`'s words said, before they are put together into a server.
+struct AddWords<'a> {
+    scope: Option<Scope>,
+    settings: Settings<'a>,
+    /// The name, the program or address, and the program's arguments.
+    positional: Vec<&'a str>,
+    asks_secret: bool,
+    /// A word that may be the secret was left out: nothing but the address is used of the rest.
+    hidden: bool,
+    /// The first thing wrong, said as a sentence.
+    problem: Option<String>,
+}
+
+/// The options that make up the server's definition.
+#[derive(Default)]
+struct Settings<'a> {
+    transport: Option<&'a str>,
+    env: Vec<(String, String)>,
+    headers: Vec<(String, String)>,
+    oauth: Option<Map<String, Value>>,
+}
+
 /// `claude mcp add [options] <name> <commandOrUrl> [args...]`, read the way Claude Code reads it, except that an
 /// address without `--transport` is taken as http (which is what it means), an option Claude Code does not have is
 /// the program's own once the program is named, and `-e` and `-H` take only the words that look like their values.
 fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
+    let AddWords {
+        scope,
+        settings,
+        mut positional,
+        asks_secret,
+        hidden,
+        problem,
+    } = read_add(words, notes);
+    let mut left_out = false;
+    if hidden {
+        // The name may be the word left out, or the secret itself: only the address is kept.
+        let Some(url) = positional.iter().copied().find(|w| w.contains("://")) else {
+            return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+        };
+        left_out = true;
+        positional = vec!["", url];
+    }
+    if asks_secret && positional.len() != 2 {
+        // Nothing of it is shown: a secret may have been typed after --client-secret, among the words.
+        return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
+    }
+    let name = positional.first().copied().unwrap_or_default();
+    let mut server = match (positional.get(1), problem) {
+        (_, Some(problem)) => PastedServer::refused(name, problem),
+        _ if positional.is_empty() => {
+            PastedServer::refused("", "The command does not name the server.".to_owned())
+        }
+        (None, None) => PastedServer::refused(
+            name,
+            "The command does not say what to run, or which address to connect to.".to_owned(),
+        ),
+        (Some(&target), None) => server_of(name, target, &positional[2..], settings, notes),
+    };
+    server.scope = scope;
+    server.asks_secret = asks_secret && server.problem.is_none();
+    server.word_left_out = left_out && server.asks_secret;
+    server
+}
+
+/// What the words of `claude mcp add` said, read one by one as Claude Code reads them.
+fn read_add<'a>(words: &[&'a str], notes: &mut Vec<String>) -> AddWords<'a> {
     let mut scope = Some(Scope::Local);
-    let mut transport: Option<&str> = None;
-    let mut env: Vec<(String, String)> = Vec::new();
-    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut settings = Settings::default();
     let mut positional: Vec<&str> = Vec::new();
-    let mut oauth: Option<Map<String, Value>> = None;
     let mut asks_secret = false;
     // A word that may be the secret was left out: nothing but the address is used of the rest.
     let mut hidden = false;
-    let mut left_out = false;
     let mut problem: Option<String> = None;
     let mut i = 0;
     let mut rest_are_args = false;
@@ -481,7 +540,7 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                     ));
                 }
             },
-            "-t" | "--transport" => transport = Some(value(&mut i).unwrap_or_default()),
+            "-t" | "--transport" => settings.transport = Some(value(&mut i).unwrap_or_default()),
             "-e" | "--env" => {
                 let mut first = value(&mut i);
                 // Variadic, as in Claude Code: more KEY=value words may follow.
@@ -491,7 +550,9 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                     Some(*next)
                 }) {
                     match v.split_once('=') {
-                        Some((k, val)) if !k.is_empty() => env.push((k.to_owned(), val.to_owned())),
+                        Some((k, val)) if !k.is_empty() => {
+                            settings.env.push((k.to_owned(), val.to_owned()));
+                        }
                         _ => {
                             problem.get_or_insert(format!(
                                 "-e takes KEY=value, not {:?}.",
@@ -510,7 +571,9 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 }) {
                     match v.split_once(':') {
                         Some((k, val)) if !k.trim().is_empty() => {
-                            headers.push((k.trim().to_owned(), val.trim().to_owned()));
+                            settings
+                                .headers
+                                .push((k.trim().to_owned(), val.trim().to_owned()));
                         }
                         _ => {
                             problem.get_or_insert(format!(
@@ -523,7 +586,8 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
             }
             "--client-id" => {
                 let id = value(&mut i).unwrap_or_default();
-                oauth
+                settings
+                    .oauth
                     .get_or_insert_default()
                     .insert("clientId".into(), id.into());
             }
@@ -531,7 +595,8 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                 let port = value(&mut i).unwrap_or_default();
                 match port.parse::<u16>() {
                     Ok(p) if p > 0 => {
-                        oauth
+                        settings
+                            .oauth
                             .get_or_insert_default()
                             .insert("callbackPort".into(), p.into());
                     }
@@ -551,129 +616,122 @@ fn add(words: &[&str], notes: &mut Vec<String>) -> PastedServer {
                     hidden = true;
                     i += 1;
                 }
-                oauth.get_or_insert_default();
+                settings.oauth.get_or_insert_default();
                 asks_secret = true;
             }
             _ => {
-                // Without what follows `=`, which may be a value.
-                let option = option.split_once('=').map_or(option, |(o, _)| o);
-                // Claude Code would take `-H=value` as the value `=value`.
-                let example = match option {
-                    "-s" => Some("-s user"),
-                    "-t" => Some("-t http"),
-                    "-e" => Some("-e KEY=value"),
-                    "-H" => Some("-H \"Name: value\""),
-                    _ => None,
-                };
-                problem.get_or_insert(match example {
-                    Some(example) => {
-                        format!("{option} takes its value after a space, as in {example}.")
-                    }
-                    None => format!(
-                        "Claude Code's mcp add has no option {}.",
-                        shown_text(option)
-                    ),
-                });
+                problem.get_or_insert(unknown_option(option));
             }
         }
     }
-    if hidden {
-        // The name may be the word left out, or the secret itself: only the address is kept.
-        let Some(url) = positional.iter().copied().find(|w| w.contains("://")) else {
-            return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
-        };
-        left_out = true;
-        positional = vec!["", url];
+    AddWords {
+        scope,
+        settings,
+        positional,
+        asks_secret,
+        hidden,
+        problem,
     }
-    if asks_secret && positional.len() != 2 {
-        // Nothing of it is shown: a secret may have been typed after --client-secret, among the words.
-        return PastedServer::refused("", SECRET_AFTER_OPTION.to_owned());
-    }
-    let name = positional.first().copied().unwrap_or_default();
-    let mut server = match (positional.get(1), problem) {
-        (_, Some(problem)) => PastedServer::refused(name, problem),
-        _ if positional.is_empty() => {
-            PastedServer::refused("", "The command does not name the server.".to_owned())
+}
+
+/// The server `target` (a program or an address) makes, with `args` after it and the options in `settings`.
+fn server_of(
+    name: &str,
+    target: &str,
+    args: &[&str],
+    settings: Settings<'_>,
+    notes: &mut Vec<String>,
+) -> PastedServer {
+    let remote = target.starts_with("https://") || target.starts_with("http://");
+    let kind = match settings.transport {
+        Some(t) => t,
+        None if remote => {
+            notes.push(format!(
+                "{} is read as an http server: an address needs --transport http when you give it to Claude Code.",
+                if name.is_empty() { "It".to_owned() } else { sanitize(name) }
+            ));
+            "http"
         }
-        (None, None) => PastedServer::refused(
-            name,
-            "The command does not say what to run, or which address to connect to.".to_owned(),
-        ),
-        (Some(&target), None) => {
-            let args = &positional[2..];
-            let remote = target.starts_with("https://") || target.starts_with("http://");
-            let kind = match transport {
-                Some(t) => t,
-                None if remote => {
-                    notes.push(format!(
-                        "{} is read as an http server: an address needs --transport http when you give it to Claude Code.",
-                        if name.is_empty() { "It".to_owned() } else { sanitize(name) }
-                    ));
-                    "http"
-                }
-                None => "stdio",
-            };
-            match kind {
-                "stdio" if oauth.is_some() => PastedServer::refused(
-                    name,
-                    "Only a server with an address signs in with OAuth (--client-id, --client-secret, --callback-port).".to_owned(),
-                ),
-                "stdio" => {
-                    let mut entry = Map::new();
-                    entry.insert("type".into(), "stdio".into());
-                    entry.insert("command".into(), target.into());
-                    entry.insert(
-                        "args".into(),
-                        args.iter().map(|a| Value::from(*a)).collect(),
-                    );
-                    entry.insert("env".into(), pairs(&env));
-                    if !headers.is_empty() {
-                        PastedServer::refused(
-                            name,
-                            "-H sets headers for a remote server; this one runs a program."
-                                .to_owned(),
-                        )
-                    } else {
-                        PastedServer::with_entry(name, Value::Object(entry), notes)
-                    }
-                }
-                "http" | "sse" if !args.is_empty() => PastedServer::refused(
-                    name,
-                    format!(
-                        "A remote server takes only an address, but {} follows it.",
-                        sanitize(&args.join(" "))
-                    ),
-                ),
-                "http" | "sse" if !env.is_empty() => PastedServer::refused(
-                    name,
-                    "-e sets the environment of a program; this server is an address.".to_owned(),
-                ),
-                "http" | "sse" => {
-                    let mut entry = Map::new();
-                    entry.insert("type".into(), kind.into());
-                    entry.insert("url".into(), target.into());
-                    if !headers.is_empty() {
-                        entry.insert("headers".into(), pairs(&headers));
-                    }
-                    if let Some(oauth) = oauth {
-                        entry.insert("oauth".into(), Value::Object(oauth));
-                    }
-                    PastedServer::with_entry(name, Value::Object(entry), notes)
-                }
-                other => PastedServer::refused(
-                    name,
-                    format!(
-                        "The transport must be stdio, http or sse, not {:?}.",
-                        sanitize(other)
-                    ),
-                ),
-            }
-        }
+        None => "stdio",
     };
-    server.scope = scope;
-    server.asks_secret = asks_secret && server.problem.is_none();
-    server.word_left_out = left_out && server.asks_secret;
-    server
+    match kind {
+        "stdio" if settings.oauth.is_some() => PastedServer::refused(
+            name,
+            "Only a server with an address signs in with OAuth (--client-id, --client-secret, --callback-port).".to_owned(),
+        ),
+        "stdio" => {
+            let mut entry = Map::new();
+            entry.insert("type".into(), "stdio".into());
+            entry.insert("command".into(), target.into());
+            entry.insert(
+                "args".into(),
+                args.iter().map(|a| Value::from(*a)).collect(),
+            );
+            entry.insert("env".into(), pairs(&settings.env));
+            if !settings.headers.is_empty() {
+                PastedServer::refused(
+                    name,
+                    "-H sets headers for a remote server; this one runs a program."
+                        .to_owned(),
+                )
+            } else {
+                PastedServer::with_entry(name, Value::Object(entry), notes)
+            }
+        }
+        "http" | "sse" if !args.is_empty() => PastedServer::refused(
+            name,
+            format!(
+                "A remote server takes only an address, but {} follows it.",
+                sanitize(&args.join(" "))
+            ),
+        ),
+        "http" | "sse" if !settings.env.is_empty() => PastedServer::refused(
+            name,
+            "-e sets the environment of a program; this server is an address.".to_owned(),
+        ),
+        "http" | "sse" => {
+            let mut entry = Map::new();
+            entry.insert("type".into(), kind.into());
+            entry.insert("url".into(), target.into());
+            if !settings.headers.is_empty() {
+                entry.insert("headers".into(), pairs(&settings.headers));
+            }
+            if let Some(oauth) = settings.oauth {
+                entry.insert("oauth".into(), Value::Object(oauth));
+            }
+            PastedServer::with_entry(name, Value::Object(entry), notes)
+        }
+        other => PastedServer::refused(
+            name,
+            format!(
+                "The transport must be stdio, http or sse, not {:?}.",
+                sanitize(other)
+            ),
+        ),
+    }
+}
+
+/// What is wrong with `option`, which `claude mcp add` does not have, or takes its value after a space.
+fn unknown_option(option: &str) -> String {
+    // Without what follows `=`, which may be a value.
+    let option = option.split_once('=').map_or(option, |(o, _)| o);
+    // Claude Code would take `-H=value` as the value `=value`.
+    let example = match option {
+        "-s" => Some("-s user"),
+        "-t" => Some("-t http"),
+        "-e" => Some("-e KEY=value"),
+        "-H" => Some("-H \"Name: value\""),
+        _ => None,
+    };
+    match example {
+        Some(example) => {
+            format!("{option} takes its value after a space, as in {example}.")
+        }
+        None => format!(
+            "Claude Code's mcp add has no option {}.",
+            shown_text(option)
+        ),
+    }
 }
 
 /// `claude mcp add-json [-s scope] <name> <json>`.
@@ -1975,6 +2033,19 @@ mod tests {
             ("claude mcp add -t http x ftp://a.example", "url"),
             ("claude mcp add -e NOEQUALS x node", "NOEQUALS"),
             ("claude mcp add -H nocolon x node", "nocolon"),
+            ("claude mcp add -e =v x node", "-e takes KEY=value"),
+            (
+                r#"claude mcp add -t http -H " : v" x https://a.example"#,
+                "-H takes",
+            ),
+            (
+                "claude mcp add -t http --callback-port 0 x https://a.example",
+                "--callback-port takes a port",
+            ),
+            (
+                "claude mcp add -t http -e K=v x https://a.example",
+                "sets the environment",
+            ),
         ] {
             let s = one(text);
             let problem = s.problem.unwrap_or_default();
