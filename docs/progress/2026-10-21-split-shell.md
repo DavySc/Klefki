@@ -43,10 +43,15 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
    `take_dropped_file`, `open_import`, `open_import_form`, `close_add`), and the add and import sections' tests.
    Helpers other sections use (`pasted_json`, `ready`, `waits_behind_review`, `sso_filled`,
    `open_duplicate_of`, `fill_in`, `name_it`, `add_form`) stay in `shell::tests`. Duplicate now takes the field
-   widgets from `super::add`. `shell.rs` 16,839 to 12,968 lines.
+   widgets from `super::add`. `shell.rs` 16,839 to 12,968 lines. Merged in #77 (c6043c9).
+5. Review dialog and outcome message: `shell/review.rs` (`DiffTops`, `plan_dialog`) and `shell/outcome.rs`
+   (`Outcome`, `OutcomeChoice`, `SUCCESS_SECONDS`, the toast sizes, `outcome_look`, `outcome_frame` and the
+   `outcome_*` methods), with one test each. From the review of #77: the seven Duplicate tests that sat in the add
+   tests move to `shell/tests/duplicate.rs`; their helper `duplicate_harness_with_many_projects` goes back to
+   `shell::tests` beside `duplicate_harness`, as Add's small-window tests use it too. `shell.rs` 12,968 to
+   12,390 lines.
 
-Next, one pull request each: the review and outcome, the detail panel and editor, the server list,
-the top bar, toolbar and Settings.
+Next, one pull request each: the detail panel and editor, the server list, the top bar, toolbar and Settings.
 
 ## Checks
 See each pull request description.
