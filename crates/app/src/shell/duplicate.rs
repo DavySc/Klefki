@@ -11,6 +11,76 @@ use klefki_core::api::{
 };
 use std::collections::BTreeSet;
 
+/// What the Duplicate dialog holds: the copy's name, where it goes, and what it changes.
+pub(super) struct DuplicateForm {
+    pub(super) source: ServerId,
+    /// What is being copied, under the title: `http · https://…`.
+    about: String,
+    pub(super) name: String,
+    pub(super) places: Places,
+    /// Give the name field the keyboard on the first frame.
+    focus: bool,
+    /// The copy's address and sign-in settings.
+    pub(super) copy: CopyRead,
+    /// The new client's secret is shown while it is checked.
+    show_secret: bool,
+    /// The fields the keyboard has left: what is wrong with them is said from then on.
+    left: BTreeSet<Part>,
+    /// The callback port to check, sent to the engine after this frame: when the field is left.
+    port_wanted: Option<u16>,
+    /// The callback port sent to be checked, until its answer comes: it is asked once.
+    pub(super) port_pending: Option<u16>,
+    /// The callback port last checked, and why a sign-in could not come back to it
+    /// ([`Event::CallbackPort`](klefki_core::api::Event::CallbackPort)).
+    pub(super) port_checked: Option<(u16, Option<String>)>,
+    /// Review was pressed and the plan is being prepared: the dialog is hidden, and comes back as it was if that fails.
+    pub(super) reviewing: bool,
+    /// Why the last Review failed, said in the dialog.
+    pub(super) failed: Option<String>,
+}
+
+/// The Duplicate dialog's address and sign-in fields, from the original's definition.
+#[derive(Debug, PartialEq)]
+pub(super) enum CopyRead {
+    /// Asked for ([`Command::Inspect`]); it comes in a moment.
+    Reading,
+    Ready(Box<CopyFields>),
+    /// A program: nothing to change but its name and place.
+    NoAddress,
+    /// The definition could not be read; the copy is made as it is.
+    Failed(String),
+}
+
+impl CopyRead {
+    /// What the copy takes from the original, said under the places.
+    fn keeps(&self) -> &'static str {
+        match self {
+            CopyRead::Ready(f) if f.client_changed() => {
+                "The copy keeps the original's environment and header values, and signs in as \
+                 the client above."
+            }
+            CopyRead::Ready(f) if f.oauth => {
+                "The copy keeps the original's environment and header values, and its client \
+                 secret."
+            }
+            _ => "The copy keeps the original's environment and header values.",
+        }
+    }
+}
+
+impl DuplicateForm {
+    /// Why a sign-in could not come back to the callback port, as last checked: only while it is still the one typed.
+    fn port_warning(&self) -> Option<&str> {
+        let CopyRead::Ready(fields) = &self.copy else {
+            return None;
+        };
+        let (port, warning) = self.port_checked.as_ref()?;
+        (fields.oauth && fields.typed_port() == Some(*port))
+            .then_some(warning.as_deref())
+            .flatten()
+    }
+}
+
 /// Width of the labels of the Duplicate dialog's address and sign-in fields.
 const COPY_LABEL_WIDTH: f32 = 124.0;
 
@@ -167,75 +237,6 @@ fn copy_fields(ui: &mut Ui, pal: &Palette, form: &mut DuplicateForm) {
         && let Some(warning) = form.port_warning()
     {
         field_warning(ui, pal, COPY_LABEL_WIDTH, warning);
-    }
-}
-
-/// What the Duplicate dialog holds: the copy's name, where it goes, and what it changes.
-pub(super) struct DuplicateForm {
-    pub(super) source: ServerId,
-    /// What is being copied, under the title: `http · https://…`.
-    about: String,
-    pub(super) name: String,
-    pub(super) places: Places,
-    /// Give the name field the keyboard on the first frame.
-    focus: bool,
-    /// The copy's address and sign-in settings.
-    pub(super) copy: CopyRead,
-    /// The new client's secret is shown while it is checked.
-    show_secret: bool,
-    /// The fields the keyboard has left: what is wrong with them is said from then on.
-    left: BTreeSet<Part>,
-    /// The callback port to check, sent to the engine after this frame: when the field is left.
-    port_wanted: Option<u16>,
-    /// The callback port sent to be checked, until its answer comes: it is asked once.
-    pub(super) port_pending: Option<u16>,
-    /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`](klefki_core::api::Event::CallbackPort)).
-    pub(super) port_checked: Option<(u16, Option<String>)>,
-    /// Review was pressed and the plan is being prepared: the dialog is hidden, and comes back as it was if that fails.
-    pub(super) reviewing: bool,
-    /// Why the last Review failed, said in the dialog.
-    pub(super) failed: Option<String>,
-}
-
-/// The Duplicate dialog's address and sign-in fields, from the original's definition.
-#[derive(Debug, PartialEq)]
-pub(super) enum CopyRead {
-    /// Asked for ([`Command::Inspect`]); it comes in a moment.
-    Reading,
-    Ready(Box<CopyFields>),
-    /// A program: nothing to change but its name and place.
-    NoAddress,
-    /// The definition could not be read; the copy is made as it is.
-    Failed(String),
-}
-
-impl CopyRead {
-    /// What the copy takes from the original, said under the places.
-    fn keeps(&self) -> &'static str {
-        match self {
-            CopyRead::Ready(f) if f.client_changed() => {
-                "The copy keeps the original's environment and header values, and signs in as \
-                 the client above."
-            }
-            CopyRead::Ready(f) if f.oauth => {
-                "The copy keeps the original's environment and header values, and its client \
-                 secret."
-            }
-            _ => "The copy keeps the original's environment and header values.",
-        }
-    }
-}
-
-impl DuplicateForm {
-    /// Why a sign-in could not come back to the callback port, as last checked: only while it is still the one typed.
-    fn port_warning(&self) -> Option<&str> {
-        let CopyRead::Ready(fields) = &self.copy else {
-            return None;
-        };
-        let (port, warning) = self.port_checked.as_ref()?;
-        (fields.oauth && fields.typed_port() == Some(*port))
-            .then_some(warning.as_deref())
-            .flatten()
     }
 }
 
