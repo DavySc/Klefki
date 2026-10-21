@@ -1986,11 +1986,20 @@ impl ShellApp {
                     Tool::Export => (can_export, "no server to export"),
                     Tool::Edit => (can_edit, "select one server"),
                 };
+                let hover = if enabled {
+                    tip.to_owned()
+                } else {
+                    format!("{tip}: {needs}")
+                };
                 let response = ui
                     .add_enabled(enabled, button)
                     .on_hover_text(tip)
-                    .on_disabled_hover_text(format!("{tip}: {needs}"));
+                    .on_disabled_hover_text(&hover);
                 name_for_screen_readers(&response, tool.name());
+                // The hover text, why it is off included, without hovering: its shortcut, or what to select.
+                response
+                    .ctx
+                    .accesskit_node_builder(response.id, |node| node.set_description(hover));
                 if response.clicked() {
                     match tool {
                         Tool::TurnOn => self.prepare_toggle(true),
@@ -8138,8 +8147,8 @@ impl Tool {
             Tool::Duplicate => "Duplicate server",
             Tool::Move => "Move server",
             Tool::SignIn => "Sign in to server",
-            Tool::TurnOn => "Turn servers on",
-            Tool::TurnOff => "Turn servers off",
+            Tool::TurnOn => "Turn on servers",
+            Tool::TurnOff => "Turn off servers",
             Tool::Delete => "Delete servers",
             Tool::Export => "Export servers",
         }
@@ -17175,6 +17184,41 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
+    }
+
+    #[test]
+    fn each_toolbar_button_says_on_hover_what_it_does_and_its_shortcut() {
+        // Written out here, not taken from `Tool::tip`: the hover text is what people read.
+        for (which, tip) in [
+            (Tool::Add, "Add (Ctrl+N)"),
+            (Tool::Import, "Import from a file (Ctrl+O)"),
+            (Tool::Edit, "Edit (Ctrl+E)"),
+            (Tool::Duplicate, "Duplicate (Ctrl+D)"),
+            (Tool::Move, "Move (Ctrl+Shift+M)"),
+            (Tool::SignIn, "Sign in"),
+            (Tool::TurnOn, "Turn on"),
+            (Tool::TurnOff, "Turn off"),
+            (Tool::Delete, "Delete (Del)"),
+            (Tool::Export, "Export the servers in the list"),
+        ] {
+            let (mut h, engine) = live_harness();
+            show_rows(&mut h, &engine, vec![live_row("alpha", Scope::User, None)]);
+            tool(&h, which).hover();
+            h.run();
+            // As it is, or with why it is off: "Edit (Ctrl+E): select one server".
+            let with_reason = format!("{tip}: ");
+            let shown = h.query_all_by_label(tip).count()
+                + h.query_all_by_label_contains(&with_reason).count();
+            assert_eq!(shown, 1, "{which:?}: \"{tip}\" on hover");
+            // Said by a screen reader as the button's description, without hovering.
+            let description = tool(&h, which).accesskit_node().description();
+            assert!(
+                description
+                    .as_deref()
+                    .is_some_and(|d| d == tip || d.starts_with(&with_reason)),
+                "{which:?}: {description:?}"
+            );
+        }
     }
 
     #[test]
