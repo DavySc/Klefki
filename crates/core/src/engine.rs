@@ -1733,7 +1733,7 @@ fn stays_off(changes: &[Change], text: &str) -> Vec<String> {
             })
         })
         .map(|(name, project)| {
-            let (name, folder) = (sanitize(name), sanitize(&ops::folder_name(project)));
+            let (name, folder) = (sanitize(name), sanitize(crate::words::folder_name(project)));
             format!("{name} is switched off in {folder}, so it stays off there. Switch it on there to use it.")
         })
         .collect()
@@ -1943,7 +1943,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 if !without.is_empty() {
                     resolved.notes.push(format!(
                         "Klefki has no copy of the client secret of {}, so Claude Code keeps none. If a server needs one, enter it on its Auth tab once it is back.",
-                        ops::and_list(&without)
+                        crate::words::and_list(&without)
                     ));
                 }
             }
@@ -2074,7 +2074,7 @@ fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                             } else {
                                 "profiles"
                             },
-                            ops::and_list(&held),
+                            crate::words::and_list(&held),
                             if held.len() == 1 { "keeps" } else { "keep" }
                         ));
                     }
@@ -2489,7 +2489,7 @@ fn add_with_claude(
         let name = sanitize(&add.name);
         let place = match &add.project {
             None => "for the user".to_owned(),
-            Some(p) => format!("in {}", sanitize(&ops::folder_name(p))),
+            Some(p) => format!("in {}", sanitize(crate::words::folder_name(p))),
         };
         // Checked again here: a change in another Klefki may have kept a definition there since the review.
         let spot = swap::Spot {

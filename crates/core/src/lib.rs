@@ -35,3 +35,4 @@ mod secrets;
 mod swap;
 mod update;
 mod watch;
+mod words;

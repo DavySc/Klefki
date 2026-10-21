@@ -25,6 +25,14 @@ pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecret
 pub use crate::secrets::{Secret, SecretError};
 pub use crate::update::{UpdateCheck, Version};
 
+/// How lists, counts, folders and sentences are put in words, as the engine says them.
+pub mod words {
+    pub use crate::words::{
+        and_list, and_list_upto, and_more, capitalized, comma_list_upto, count, folder_name,
+        parent_folder, sentence,
+    };
+}
+
 /// Whether two project keys name the same folder, as the engine compares them: `c:\Repos\x\` is `C:/Repos/x`.
 pub fn same_project(a: &str, b: &str) -> bool {
     project_key(a) == project_key(b)

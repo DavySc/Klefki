@@ -2,9 +2,11 @@
 //! Klefki's own folder; using one is an ordinary change, reviewed before anything is saved.
 //! Asked of the engine each time the page is opened, and let go when it is left, like the Activity log. A profile
 //! being made or edited is kept by the shell when the page is left ([`ProfilesPage::draft`]).
+use crate::shell::folder_name;
 use crate::theme;
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
+use klefki_core::api::words::{self, parent_folder};
 use klefki_core::api::{Change, ConnectionId, Profile, Profiles, Scope, ServerRow, Snapshot};
 use std::collections::HashMap;
 
@@ -735,7 +737,7 @@ fn places(
             0.0,
             egui::TextFormat::simple(font.clone(), pal.text),
         );
-        let parent = parent_of(project);
+        let parent = parent_folder(project);
         if !parent.is_empty() {
             job.append(
                 parent,
@@ -977,15 +979,11 @@ fn summary(profile: &Profile, snapshot: &Snapshot) -> String {
             }
         })
         .collect();
-    let servers = if rows.len() == 1 { "server" } else { "servers" };
-    match rows.len() - named.len() {
-        0 => format!("{} {servers}: {}", rows.len(), named.join(", ")),
-        more => format!(
-            "{} {servers}: {} and {more} more",
-            rows.len(),
-            named.join(", ")
-        ),
-    }
+    format!(
+        "{}: {}",
+        words::count(rows.len(), "server"),
+        words::and_more(&named, rows.len())
+    )
 }
 
 /// The names of the servers of `profile` that are no longer configured.
@@ -1023,14 +1021,6 @@ fn matches(profile: &Profile, snapshot: &Snapshot, query: &str) -> bool {
         })
 }
 
-fn folder_name(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    match trimmed.rfind(['/', '\\']) {
-        Some(cut) if cut + 1 < trimmed.len() => &trimmed[cut + 1..],
-        _ => trimmed,
-    }
-}
-
 /// A project by its folder's name, with the folder that holds it when another project's folder has that name too.
 fn shown_project(path: &str, snapshot: &Snapshot) -> String {
     let name = folder_name(path);
@@ -1041,7 +1031,7 @@ fn shown_project(path: &str, snapshot: &Snapshot) -> String {
         .count()
         > 1;
     if shared {
-        format!("{name} ({})", folder_name(parent_of(path)))
+        format!("{name} ({})", folder_name(parent_folder(path)))
     } else {
         name.to_owned()
     }
@@ -1050,20 +1040,7 @@ fn shown_project(path: &str, snapshot: &Snapshot) -> String {
 /// A few projects by name, and how many more: "q, r and 2 more".
 fn named_few(names: &[String]) -> String {
     const FEW: usize = 3;
-    match names {
-        [one] => one.clone(),
-        [first @ .., last] if names.len() <= FEW => format!("{} and {last}", first.join(", ")),
-        _ => format!("{} and {} more", names[..FEW].join(", "), names.len() - FEW),
-    }
-}
-
-/// The folder a project's folder is in; empty for a project at the top.
-fn parent_of(path: &str) -> &str {
-    let trimmed = path.trim_end_matches(['/', '\\']);
-    match trimmed.rfind(['/', '\\']) {
-        Some(cut) if cut + 1 < trimmed.len() => &trimmed[..cut],
-        _ => "",
-    }
+    words::and_list_upto(names, FEW, FEW)
 }
 
 /// Next to the button that asked: nothing to save, what is already so (unless `covered`, said under its servers

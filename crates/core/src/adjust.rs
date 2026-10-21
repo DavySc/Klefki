@@ -292,7 +292,7 @@ impl CopyFields {
             .collect();
         if let Some(why) = base_problem(self.base.trim(), self.base_is_whole_address()) {
             problems.retain(|(part, _)| !matches!(part, Part::Address | Part::MetadataUrl));
-            problems.insert(0, (Part::Address, crate::form::sentence(why)));
+            problems.insert(0, (Part::Address, crate::words::sentence(why)));
         }
         if self.base.trim().is_empty() {
             // Nor is the metadata address that follows from it: one thing to fix, said once.
