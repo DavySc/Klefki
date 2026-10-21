@@ -84,10 +84,14 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    one and held back in the other, and a connector held back by a setting that is not policy. Five tests now catch
    all 7 (each seen failing against its mutant). Start-up (`scripts/perf-baseline.py --runs 9`, release builds):
    first snapshot with 950 rows 105.2 ms on main, 106.0 ms here; with 70 rows 111.8 and 109.8 ms; `klefki-cli list`
-   12.1 and 12.4 ms; memory the same (about 130 MB resident, 44 MB private dirty).
+   12.1 and 12.4 ms; memory the same (about 130 MB resident, 44 MB private dirty). Merged in #90 (136909c).
+9. `swap::run` (222 lines, an edit, move or copy of a server through Claude Code) in named steps: `checked` (the
+   entry as it is and as it will be, or why not), `secret_for` (the client secret to hand over), `remove_old`,
+   `undo_remove` (putting the old entry back when adding the new one failed) and `move_secret`; `run` (64 lines) does
+   them in the same order with the same words. Mutants on the changed lines: main 18 (17 caught, 1 unviable), branch
+   12 (11 caught, 1 unviable); none missed. `same_settings`' inverted stdio condition is left as it is (owner).
 
 ## Next
-9. `swap::run` in named steps.
 10. The engine ideas from A2's review, as moves.
 
 ## Follow-ups for the owner (not in this slice)
