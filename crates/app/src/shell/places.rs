@@ -203,6 +203,54 @@ impl Places {
     }
 }
 
+/// Which ticked places already have a server of a given name, for many names at once.
+pub(super) struct Taken<'a> {
+    user: bool,
+    /// The ticked projects, in order.
+    ticked: Vec<&'a str>,
+    /// By name: whether the user has one, and the ticked projects (in `ticked`) that have one of their own.
+    names: HashMap<&'a str, (bool, Vec<usize>)>,
+}
+
+impl<'a> Taken<'a> {
+    pub(super) fn new(places: &'a Places, servers: impl Iterator<Item = &'a ServerRow>) -> Self {
+        let ticked: Vec<&str> = places.ticked().collect();
+        let mut at: HashMap<_, Vec<usize>> = HashMap::new();
+        for (i, project) in ticked.iter().enumerate() {
+            at.entry(klefki_core::api::project_key(project))
+                .or_default()
+                .push(i);
+        }
+        let mut names: HashMap<&str, (bool, Vec<usize>)> = HashMap::new();
+        for s in servers {
+            match (s.scope, s.project.as_deref()) {
+                (Scope::User, None) => names.entry(s.name.as_str()).or_default().0 = true,
+                (Scope::Local, Some(project)) => {
+                    if let Some(found) = at.get(&klefki_core::api::project_key(project)) {
+                        names.entry(s.name.as_str()).or_default().1.extend(found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            user: places.user,
+            ticked,
+            names,
+        }
+    }
+
+    /// The ticked places that already have a server called `name`, in words.
+    pub(super) fn of(&self, name: &str) -> Option<String> {
+        let (user, found) = self.names.get(name)?;
+        let mut found = found.clone();
+        found.sort_unstable();
+        found.dedup();
+        let folders: Vec<&str> = found.iter().map(|&i| folder_name(self.ticked[i])).collect();
+        places_in_words(self.user && *user, &folders)
+    }
+}
+
 /// `for the user`, `in a and b`, `for the user and in 5 projects`; None for nowhere.
 pub(super) fn places_in_words(user: bool, folders: &[&str]) -> Option<String> {
     let projects =
@@ -383,52 +431,4 @@ pub(super) fn place_mark(
         );
     }
     response
-}
-
-/// Which ticked places already have a server of a given name, for many names at once.
-pub(super) struct Taken<'a> {
-    user: bool,
-    /// The ticked projects, in order.
-    ticked: Vec<&'a str>,
-    /// By name: whether the user has one, and the ticked projects (in `ticked`) that have one of their own.
-    names: HashMap<&'a str, (bool, Vec<usize>)>,
-}
-
-impl<'a> Taken<'a> {
-    pub(super) fn new(places: &'a Places, servers: impl Iterator<Item = &'a ServerRow>) -> Self {
-        let ticked: Vec<&str> = places.ticked().collect();
-        let mut at: HashMap<_, Vec<usize>> = HashMap::new();
-        for (i, project) in ticked.iter().enumerate() {
-            at.entry(klefki_core::api::project_key(project))
-                .or_default()
-                .push(i);
-        }
-        let mut names: HashMap<&str, (bool, Vec<usize>)> = HashMap::new();
-        for s in servers {
-            match (s.scope, s.project.as_deref()) {
-                (Scope::User, None) => names.entry(s.name.as_str()).or_default().0 = true,
-                (Scope::Local, Some(project)) => {
-                    if let Some(found) = at.get(&klefki_core::api::project_key(project)) {
-                        names.entry(s.name.as_str()).or_default().1.extend(found);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Self {
-            user: places.user,
-            ticked,
-            names,
-        }
-    }
-
-    /// The ticked places that already have a server called `name`, in words.
-    pub(super) fn of(&self, name: &str) -> Option<String> {
-        let (user, found) = self.names.get(name)?;
-        let mut found = found.clone();
-        found.sort_unstable();
-        found.dedup();
-        let folders: Vec<&str> = found.iter().map(|&i| folder_name(self.ticked[i])).collect();
-        places_in_words(self.user && *user, &folders)
-    }
 }
