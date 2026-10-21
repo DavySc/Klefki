@@ -49,9 +49,13 @@ may change. `ShellApp` keeps the routing (`apply_event`, `show`, the commands).
    `outcome_*` methods), with one test each. From the review of #77: the seven Duplicate tests that sat in the add
    tests move to `shell/tests/duplicate.rs`; their helper `duplicate_harness_with_many_projects` goes back to
    `shell::tests` beside `duplicate_harness`, as Add's small-window tests use it too. `shell.rs` 12,968 to
-   12,390 lines.
+   12,390 lines. Merged in #78 (bf84059). Review note for A4: `outcome_toast` has two doc comments stacked, as on main.
+6. Detail panel and editor: `shell/detail.rs` (the panel, its tabs, `diagnosis_report`, `diagnosis_panel`,
+   `scroll_gutter`, `bring_focus_into_view`) and `shell/editor.rs` (`Editor`, `EditorState`, `SecretView`, the
+   form, the JSON editor, values, client secret and save bar), with their tests (28 and 30). The client-secret test
+   heading, left with no tests under it in `shell::tests`, is dropped. `shell.rs` 12,390 to 9,422 lines.
 
-Next, one pull request each: the detail panel and editor, the server list, the top bar, toolbar and Settings.
+Next, one pull request each: the server list, the top bar, toolbar and Settings.
 
 ## Checks
 See each pull request description.
