@@ -301,6 +301,59 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
     };
     let verb = swap.verb();
     let shown = swap.from.words();
+    let (old, new) = checked(ctx, swap)?;
+    let secret = secret_for(ctx, swap, &old, &new)?;
+    ctx.kept(
+        ctx.docstore()
+            .keep_copy()
+            .map_err(|e| format!("{shown} was not {verb}: {e}"))?,
+    );
+    let recovery = if swap.remove {
+        Some(
+            Recovery::save(ctx, &swap.from, &old, Some((&swap.to, &new)))
+                .map_err(|e| format!("{shown} was not {verb}: Klefki could not keep its definition safe first ({}). Nothing was changed.", sanitize(&e.to_string())))?,
+        )
+    } else {
+        None
+    };
+    if swap.remove {
+        remove_old(ctx, swap, &old, recovery.as_ref())?;
+    }
+    let mut done = Done::default();
+    let handed = secret.as_ref().filter(|_| signs_in(&new));
+    match add(ctx, &swap.to, &new, handed) {
+        Ok(left_out) => {
+            if !left_out.is_empty() {
+                done.notes.push(format!(
+                    "Claude Code left out settings it does not use: {}. The copy Klefki kept of the configuration still has them.",
+                    left_out.join(", ")
+                ));
+            }
+        }
+        Err(why) if !swap.remove => {
+            return Err(format!("{shown} was not {verb}: {why}"));
+        }
+        Err(why) => {
+            let back = secret.as_ref().filter(|_| signs_in(&old));
+            return Err(undo_remove(ctx, swap, &old, back, recovery.as_ref(), &why));
+        }
+    }
+    // Klefki's copy goes with the server, before the recovery file goes: a crash in between leaves the file, which
+    // the next listing sees is done (see [`Recovery::list`]). A copy Klefki holds for the new place must be the one
+    // Claude Code was given, or none: one left there from before would claim a secret Claude Code does not have.
+    if let Some(store) = ctx.store.filter(|_| signs_in(&new)) {
+        move_secret(store, swap, handed, &mut done);
+    }
+    if let Some(r) = &recovery {
+        r.discard();
+    }
+    Ok(done)
+}
+
+/// The server `swap` starts from and the one it makes, once both are known to be usable where they go.
+fn checked(ctx: &Ctx, swap: &Swap) -> Result<(Value, Value), String> {
+    let verb = swap.verb();
+    let shown = swap.from.words();
     let old = read_entry(ctx.claude_json, &swap.from)?.ok_or_else(|| {
         format!("{shown} is no longer in the configuration. Refresh and try again.")
     })?;
@@ -346,40 +399,42 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             "{shown} was not {verb}: {why}\nNothing was changed."
         ));
     }
-    // Klefki's copy of the client secret: handed back to Claude Code with the add, since its remove forgets its own.
-    // A copy that signs in as another client takes that client's secret instead.
-    let secret = if let Some(given) = swap.new_client_secret() {
-        given.cloned()
-    } else if signs_in(&old) || signs_in(&new) {
+    Ok((old, new))
+}
+
+/// Klefki's copy of the client secret: handed back to Claude Code with the add, since its remove forgets its own.
+/// A copy that signs in as another client takes that client's secret instead.
+fn secret_for(ctx: &Ctx, swap: &Swap, old: &Value, new: &Value) -> Result<Option<Secret>, String> {
+    let verb = swap.verb();
+    let shown = swap.from.words();
+    if let Some(given) = swap.new_client_secret() {
+        Ok(given.cloned())
+    } else if signs_in(old) || signs_in(new) {
         let store = ctx.store.ok_or_else(|| {
             format!("{shown} was not {verb}: Klefki can't use your system's secret store.")
         })?;
         store
             .get(&swap.from.connection())
-            .map_err(|e| format!("{shown} was not {verb}: {e}"))?
+            .map_err(|e| format!("{shown} was not {verb}: {e}"))
     } else {
-        None
-    };
-    ctx.kept(
-        ctx.docstore()
-            .keep_copy()
-            .map_err(|e| format!("{shown} was not {verb}: {e}"))?,
-    );
-    let recovery = if swap.remove {
-        Some(
-            Recovery::save(ctx, &swap.from, &old, Some((&swap.to, &new)))
-                .map_err(|e| format!("{shown} was not {verb}: Klefki could not keep its definition safe first ({}). Nothing was changed.", sanitize(&e.to_string())))?,
-        )
-    } else {
-        None
-    };
-    if swap.remove
-        && let Err(why) = remove(ctx, &swap.from, &old)
-    {
+        Ok(None)
+    }
+}
+
+/// Removes the server `swap` starts from. Fails only when it is still there, or where it stands is unknown.
+fn remove_old(
+    ctx: &Ctx,
+    swap: &Swap,
+    old: &Value,
+    recovery: Option<&Recovery>,
+) -> Result<(), String> {
+    let verb = swap.verb();
+    let shown = swap.from.words();
+    if let Err(why) = remove(ctx, &swap.from, old) {
         match read_entry(ctx.claude_json, &swap.from) {
             // Still there: nothing to undo.
             Ok(Some(_)) => {
-                if let Some(r) = &recovery {
+                if let Some(r) = recovery {
                     r.discard();
                 }
                 return Err(format!(
@@ -395,117 +450,109 @@ pub(crate) fn run(ctx: &Ctx, swap: &Swap) -> Result<Done, String> {
             }
         }
     }
-    let mut done = Done::default();
-    let handed = secret.as_ref().filter(|_| signs_in(&new));
-    match add(ctx, &swap.to, &new, handed) {
-        Ok(left_out) => {
-            if !left_out.is_empty() {
-                done.notes.push(format!(
-                    "Claude Code left out settings it does not use: {}. The copy Klefki kept of the configuration still has them.",
-                    left_out.join(", ")
-                ));
+    Ok(())
+}
+
+/// After the new server could not be added (`why`), puts the old one back; what happened, and where everything is.
+fn undo_remove(
+    ctx: &Ctx,
+    swap: &Swap,
+    old: &Value,
+    back: Option<&Secret>,
+    recovery: Option<&Recovery>,
+    why: &str,
+) -> String {
+    let verb = swap.verb();
+    let shown = swap.from.words();
+    match add(ctx, &swap.from, old, back) {
+        Ok(left_out) if left_out.is_empty() => {
+            if let Some(r) = recovery {
+                r.discard();
             }
-        }
-        Err(why) if !swap.remove => {
-            return Err(format!("{shown} was not {verb}: {why}"));
-        }
-        Err(why) => {
-            let back = secret.as_ref().filter(|_| signs_in(&old));
-            return match add(ctx, &swap.from, &old, back) {
-                Ok(left_out) if left_out.is_empty() => {
-                    if let Some(r) = &recovery {
-                        r.discard();
-                    }
-                    Err(format!(
-                        "{shown} was not {verb}: {why}\nIt was put back as it was{}.",
-                        if signs_in(&old) {
-                            "; sign in to it again"
-                        } else {
-                            ""
-                        }
-                    ))
+            format!(
+                "{shown} was not {verb}: {why}\nIt was put back as it was{}.",
+                if signs_in(old) {
+                    "; sign in to it again"
+                } else {
+                    ""
                 }
-                // Back, but without settings Claude Code dropped: the recovery file keeps the whole definition.
-                Ok(left_out) => Err(format!(
-                    "{shown} was not {verb}: {why}\nIt was put back, but Claude Code left out {}; Klefki keeps the whole definition, listed on the Connections page until you forget it.",
-                    left_out.join(", ")
-                )),
-                Err(again) => {
-                    // Claude Code's remove took the client secret of a server sharing this sign-in too; putting this
-                    // one back hands it over again.
-                    let also = if back.is_some() {
-                        let others = read_root(ctx.claude_json)
-                            .map(|root| sharing(&root, &swap.from, &old))
-                            .unwrap_or_default();
-                        if others.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                "\n{} {} shares its sign-in, so it has no client secret in Claude Code until then.",
-                                sanitize(&swap.from.name),
-                                others.join(" and ")
-                            )
-                        }
-                    } else {
-                        String::new()
-                    };
-                    Err(format!(
-                        "{shown} was not {verb}: {why}\nPutting it back failed too: {again}\nKlefki kept its definition{}, so you can put it back from the Connections page once Claude Code works again.{also}",
-                        if back.is_some() {
-                            " and its client secret"
-                        } else {
-                            ""
-                        }
-                    ))
+            )
+        }
+        // Back, but without settings Claude Code dropped: the recovery file keeps the whole definition.
+        Ok(left_out) => format!(
+            "{shown} was not {verb}: {why}\nIt was put back, but Claude Code left out {}; Klefki keeps the whole definition, listed on the Connections page until you forget it.",
+            left_out.join(", ")
+        ),
+        Err(again) => {
+            // Claude Code's remove took the client secret of a server sharing this sign-in too; putting this
+            // one back hands it over again.
+            let also = if back.is_some() {
+                let others = read_root(ctx.claude_json)
+                    .map(|root| sharing(&root, &swap.from, old))
+                    .unwrap_or_default();
+                if others.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n{} {} shares its sign-in, so it has no client secret in Claude Code until then.",
+                        sanitize(&swap.from.name),
+                        others.join(" and ")
+                    )
                 }
+            } else {
+                String::new()
             };
+            format!(
+                "{shown} was not {verb}: {why}\nPutting it back failed too: {again}\nKlefki kept its definition{}, so you can put it back from the Connections page once Claude Code works again.{also}",
+                if back.is_some() {
+                    " and its client secret"
+                } else {
+                    ""
+                }
+            )
         }
     }
-    // Klefki's copy goes with the server, before the recovery file goes: a crash in between leaves the file, which
-    // the next listing sees is done (see [`Recovery::list`]). A copy Klefki holds for the new place must be the one
-    // Claude Code was given, or none: one left there from before would claim a secret Claude Code does not have.
-    if let Some(store) = ctx.store.filter(|_| signs_in(&new)) {
-        let (from, to) = (swap.from.connection(), swap.to.connection());
-        if from != to {
-            let note = |e: crate::secrets::SecretError| {
-                format!(
-                    "Claude Code has what it needs, but Klefki could not update its own copy of the client secret: {e} Type it in on the Auth tab of {} to keep one.",
-                    swap.to.words()
-                )
-            };
-            match handed {
-                Some(secret) => match store.set(&to, secret) {
-                    Err(e) => {
-                        // Better none than a stale one, here or where it was: a server added there later would
-                        // claim it. Claude Code has the secret.
-                        let _ = store.delete(&to);
-                        if swap.remove {
-                            let _ = store.delete(&from);
-                        }
-                        done.notes.push(note(e));
-                    }
-                    Ok(()) if swap.remove => {
-                        if let Err(e) = store.delete(&from) {
-                            done.notes.push(format!(
-                                "Klefki could not delete its copy of the client secret for {}: {e}",
-                                swap.from.words()
-                            ));
-                        }
-                    }
-                    Ok(()) => {}
-                },
-                None => {
-                    if let Err(e) = store.delete(&to) {
-                        done.notes.push(note(e));
-                    }
+}
+
+/// Moves Klefki's copy of the client secret to where the server now is: the one `handed` to Claude Code, or none.
+fn move_secret(store: &dyn SecretStore, swap: &Swap, handed: Option<&Secret>, done: &mut Done) {
+    let (from, to) = (swap.from.connection(), swap.to.connection());
+    if from == to {
+        return;
+    }
+    let note = |e: crate::secrets::SecretError| {
+        format!(
+            "Claude Code has what it needs, but Klefki could not update its own copy of the client secret: {e} Type it in on the Auth tab of {} to keep one.",
+            swap.to.words()
+        )
+    };
+    match handed {
+        Some(secret) => match store.set(&to, secret) {
+            Err(e) => {
+                // Better none than a stale one, here or where it was: a server added there later would
+                // claim it. Claude Code has the secret.
+                let _ = store.delete(&to);
+                if swap.remove {
+                    let _ = store.delete(&from);
                 }
+                done.notes.push(note(e));
+            }
+            Ok(()) if swap.remove => {
+                if let Err(e) = store.delete(&from) {
+                    done.notes.push(format!(
+                        "Klefki could not delete its copy of the client secret for {}: {e}",
+                        swap.from.words()
+                    ));
+                }
+            }
+            Ok(()) => {}
+        },
+        None => {
+            if let Err(e) = store.delete(&to) {
+                done.notes.push(note(e));
             }
         }
     }
-    if let Some(r) = &recovery {
-        r.discard();
-    }
-    Ok(done)
 }
 
 /// What a swap means for the user, said in the plan before anything runs.
