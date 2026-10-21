@@ -22,10 +22,35 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    `take_snapshot` in `shell.rs`. Fields now private: the forms' `port_pending` and `port_checked`, Duplicate's
    `source`, Export's `save` and `status`, the editor's `moved`, all of `SecretView`'s. The rest stay `pub(super)`
    because the tests in `shell/tests/` read them (a test module there is not inside the dialog's module).
+   Mutants on the changed lines (68): 46 caught, 13 unviable, 9 missed, each also missed on main (the same code in
+   `apply_event`). Seven now have tests (seen failing against the mutant): `port_answered`'s `==` in Add and
+   Duplicate; `applied`'s `signs_in && changed` and the "to each" guard (three mutants); `take_snapshot`'s
+   `live_gen += 1` (a check cut off by a snapshot left the old explanation). Two are equivalent: `kept.is_empty()`
+   guard (both arms give "Saved." for an empty `kept`), and `editor.moved` guard to `true` (an editor that did not
+   move only gets its own definition again, which rebases to the same text unless the file changed in between). Review: a comment repeating
+   `editor_after_change`'s doc dropped. Merged in #83 (8fdfb6c).
+3. `klefki-cli`'s `args::parse` (167 lines) in named steps: `parse` reads the command (33 lines),
+   `Options::read` the options and names after it (`None` when the help is asked for, so `-h` still answers at
+   once), `Options::into_cmd` checks they fit the command, `use_cmd` builds `use`. The same checks in the same
+   order with the same messages. Mutants on `args.rs`: main 76 (3 missed), branch the same three: an option given
+   as the command, `--force` on a command other than export, an empty `--project=`. A test now refuses each
+   (`list --force` added in review: the first version tested `list --output=x.json`, another line). Merged in
+   #85 (0ccb057).
+4. `restore::compare` (about 190 lines) in named steps: `put_back` (servers the backup had that are gone or
+   changed, returning those left out), `switches` (one project's on/off switches), `leave_added` (servers added
+   since, left as they are) and `closing_notes`; `compare` reads both sides and walks the projects (about 50
+   lines). Same steps in the same order with the same words. Mutants on `restore.rs` on main: 91, 13 missed;
+   seven in `compare` (a project gone since named even with no servers, the undefined-switch filter, the match arms
+   for one undefined switch and for one server added since, and the three parts of "what a restore leaves" being
+   said only when it writes). Tests now check each: `one_server_added_since_is_left_as_it_is`,
+   `a_project_gone_since_is_named_only_when_it_had_servers`,
+   `what_a_restore_leaves_is_said_whenever_it_writes_anything`, a no-notes assertion when nothing differs, and the
+   undefined-switch line in `switches_go_back_except_for_servers_added_since`. The other six are outside
+   `compare` (`Servers::read`, `places_of`, `mentions`, `server`) and not touched here.
 
 ## Next
-3. Core's long functions, file by file: `inventory::build`, `ops::use_profile`, `paste::add`, `paste::lex_with`,
-   `restore::compare`, `cli args::parse`, `swap::run` last; the engine ideas from A2's review where they stay moves.
+5. The rest, file by file: `paste::add` (written, waits for part 4), `paste::lex_with`, `ops::use_profile`,
+   `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
 
 ## Follow-ups for the owner (not in this slice)
 - From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…

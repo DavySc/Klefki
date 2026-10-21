@@ -1001,6 +1001,59 @@ fn a_callback_port_another_program_holds_is_warned_about_once_left_and_does_not_
 }
 
 #[test]
+fn add_asks_about_a_port_again_only_once_its_answer_is_in() {
+    let (mut h, engine) = duplicate_harness();
+    let answer = |h: &mut Harness<'static, ShellApp>, port: u16| {
+        engine
+            .events
+            .send(klefki_core::api::Event::CallbackPort {
+                port,
+                warning: None,
+            })
+            .unwrap();
+        h.run();
+    };
+    let asked = |engine: &klefki_core::api::Detached| -> Vec<u16> {
+        drain(engine)
+            .into_iter()
+            .filter_map(|c| match c {
+                Command::CheckCallbackPort(port) => Some(port),
+                _ => None,
+            })
+            .collect()
+    };
+    fill_in(&mut h);
+    click(&mut h, "HTTP");
+    let f = add_form(&mut h);
+    f.fields.url = "https://sso.example.com/mcp".into();
+    f.fields.oauth = true;
+    h.run();
+    let port = field_id(Field::Part(Part::CallbackPort));
+    let leave = |h: &mut Harness<'static, ShellApp>, typed: Option<&str>| {
+        h.ctx.memory_mut(|m| m.request_focus(port));
+        h.run();
+        if let Some(typed) = typed {
+            add_form(h).fields.callback_port = typed.into();
+            h.run();
+        }
+        h.key_press(egui::Key::Tab);
+        h.run();
+    };
+    leave(&mut h, Some("8765"));
+    assert_eq!(asked(&engine), [8765]);
+    leave(&mut h, Some("8766"));
+    assert_eq!(asked(&engine), [8766]);
+    // A late answer for the earlier port leaves the one asked about waiting: not asked twice.
+    answer(&mut h, 8765);
+    leave(&mut h, None);
+    assert_eq!(asked(&engine), Vec::<u16>::new());
+    // Once its own answer is in, leaving the field asks again: the port may have been taken since.
+    answer(&mut h, 8766);
+    leave(&mut h, None);
+    assert_eq!(asked(&engine), [8766]);
+}
+
+#[test]
 fn a_pasted_oauth_server_without_a_client_secret_is_added_as_pasted() {
     let (mut h, engine) = duplicate_harness();
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::N);

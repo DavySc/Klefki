@@ -158,11 +158,11 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usa
             ));
         }
     };
-    let options = Options::read(&kind, &command, args)?;
-    if options.help {
-        return Ok(Cmd::Help);
+    match Options::read(kind, &command, args)? {
+        // `-h` or `--help`: the help is the answer, whatever else is on the line after it.
+        None => Ok(Cmd::Help),
+        Some(options) => options.into_cmd(kind),
     }
-    options.into_cmd(kind)
 }
 
 /// What follows the command on the line, before it is checked against the command.
@@ -177,20 +177,19 @@ struct Options {
     every: bool,
     only: bool,
     yes: bool,
-    /// `-h` or `--help`: the help is the answer, whatever else is on the line after it.
-    help: bool,
 }
 
 impl Options {
-    /// Reads the options and names after `command`; an option the command does not take is refused here.
+    /// Reads the options and names after `command`; an option the command does not take is refused here. `None`
+    /// when the help is asked for.
     fn read(
-        kind: &Kind,
+        kind: Kind,
         command: &str,
         mut args: impl Iterator<Item = OsString>,
-    ) -> Result<Self, Usage> {
-        let status = *kind == Kind::Status;
-        let export = *kind == Kind::Export;
-        let using = *kind == Kind::Use;
+    ) -> Result<Option<Self>, Usage> {
+        let status = kind == Kind::Status;
+        let export = kind == Kind::Export;
+        let using = kind == Kind::Use;
         let mut o = Self::default();
         let mut only_names = false;
         while let Some(arg) = args.next() {
@@ -220,7 +219,7 @@ impl Options {
             match arg.as_str() {
                 _ if only_names => o.names.push(arg),
                 "--" => only_names = true,
-                "--json" if *kind == Kind::Export => {
+                "--json" if kind == Kind::Export => {
                     return Err(bad("export always prints JSON; leave out --json".to_owned()));
                 }
                 "--json" if using => {
@@ -238,10 +237,7 @@ impl Options {
                         "{arg} is only for use: {command} changes no project"
                     )));
                 }
-                "-h" | "--help" => {
-                    o.help = true;
-                    return Ok(o);
-                }
+                "-h" | "--help" => return Ok(None),
                 "--claude" if status => o.claude = Some(claude_path(args.next())?),
                 "--claude" => {
                     return Err(bad(format!(
@@ -266,7 +262,7 @@ impl Options {
                 _ => o.names.push(arg),
             }
         }
-        Ok(o)
+        Ok(Some(o))
     }
 
     /// The command, once what was read fits together.
@@ -281,7 +277,6 @@ impl Options {
             every,
             only,
             yes,
-            help: _,
         } = self;
         Ok(match kind {
             Kind::Status => Cmd::Status {
@@ -310,6 +305,7 @@ impl Options {
         })
     }
 }
+
 /// `use`: one profile, and one place to use it in.
 fn use_cmd(
     names: Vec<String>,
@@ -349,7 +345,7 @@ fn use_cmd(
     })
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     List,
     Status,
@@ -580,5 +576,25 @@ mod tests {
         ] {
             assert!(p(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_option_where_it_does_not_belong_is_named_in_the_refusal() {
+        let refused = |args: &[&str], why: &str| {
+            assert_eq!(p(args), Err(Usage::Bad(why.to_owned())), "{args:?}");
+        };
+        refused(&["-x"], "unknown option -x");
+        refused(
+            &["list", "--output=x.json"],
+            "unknown option --output=x.json",
+        );
+        refused(
+            &["list", "--force"],
+            "--force is only for export: list writes nothing",
+        );
+        refused(
+            &["use", "Writing", "--project="],
+            "--project needs the path of a project folder",
+        );
     }
 }

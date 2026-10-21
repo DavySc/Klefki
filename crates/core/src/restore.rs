@@ -698,6 +698,69 @@ mod tests {
         let out = restore(&both, &both);
         assert!(out.claude.is_empty() && out.cli.is_empty() && out.swaps.is_empty());
         assert_eq!(out.summary.len(), 1);
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    #[test]
+    fn what_a_restore_leaves_is_said_whenever_it_writes_anything() {
+        let said = [
+            "Only servers and where they are switched off are restored.",
+            "Klefki keeps a copy of the configuration as it is now before it restores",
+            "A running Claude Code session may need a restart",
+        ];
+        let mut changed = sso();
+        changed["url"] = json!("https://sso.example.com/v2/mcp");
+        for (what, backup, now) in [
+            (
+                "written by Klefki",
+                json!({"mcpServers": {"gw": stdio("gw")}}),
+                json!({}),
+            ),
+            (
+                "added through Claude Code",
+                json!({"mcpServers": {"gone": sso()}}),
+                json!({}),
+            ),
+            (
+                "changed through Claude Code",
+                json!({"mcpServers": {"sso": sso()}}),
+                json!({"mcpServers": {"sso": changed}}),
+            ),
+        ] {
+            let out = restore(&backup, &now);
+            for note in said {
+                assert!(
+                    out.notes.iter().any(|n| n.starts_with(note)),
+                    "{what}: {note}: {:?}",
+                    out.notes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn one_server_added_since_is_left_as_it_is() {
+        let out = restore(
+            &json!({}),
+            &json!({"mcpServers": {"newer": stdio("newer")}}),
+        );
+        assert_eq!(
+            out.summary[1..],
+            ["Leave newer for the user as it is: it was added after this backup".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_project_gone_since_is_named_only_when_it_had_servers() {
+        let backup = json!({"projects": {
+            "/gone/empty": {"disabledMcpServers": ["gw"]},
+            "/gone/full": {"mcpServers": {"old": stdio("old")}}
+        }});
+        let out = restore(&backup, &json!({}));
+        assert_eq!(
+            out.notes,
+            ["Not restored: old in full. Claude Code no longer lists that project.".to_owned()]
+        );
     }
 
     #[test]
@@ -740,6 +803,15 @@ mod tests {
             out.summary
         );
         assert!(out.summary.contains(&"Turn on tool in b".to_owned()));
+        // The project's own server is named once, alone; newer, added since, is not among those left as they are.
+        assert!(
+            out.summary.contains(
+                &"Leave the switch of repo-server in a as it is: the backup does not define that server"
+                    .to_owned()
+            ),
+            "{:?}",
+            out.summary
+        );
         assert!(
             !out.claude
                 .iter()

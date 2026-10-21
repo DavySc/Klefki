@@ -2276,6 +2276,33 @@ mod tests {
     }
 
     #[test]
+    fn the_explanation_follows_a_check_a_new_snapshot_cut_off() {
+        use egui::accesskit::Role;
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("acme-prod", Scope::User, None);
+        row.status = Status::Failed;
+        row.status_cached = true;
+        show_rows(&mut h, &engine, vec![row.clone()]);
+        click(&mut h, "acme-prod");
+        h.get_by_role_and_label(Role::Button, "Status").click();
+        h.run();
+        h.get_by_label_contains("Claude Code could not connect to this server");
+        // Being checked: nothing to explain yet.
+        engine
+            .events
+            .send(status_event(&row, Status::Checking, None))
+            .unwrap();
+        h.run();
+        assert!(
+            h.query_by_label_contains("Claude Code could not connect")
+                .is_none()
+        );
+        // A new snapshot drops the check; what Claude's cache says is explained again.
+        show_rows(&mut h, &engine, vec![row]);
+        h.get_by_label_contains("Claude Code could not connect to this server");
+    }
+
+    #[test]
     fn hovering_a_failed_status_explains_it() {
         let (mut h, engine) = live_harness();
         let row = live_row("acme-prod", Scope::User, None);
