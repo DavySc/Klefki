@@ -629,7 +629,6 @@ impl ShellApp {
     /// A change was saved: the server still being edited is read again, or keeps edits that were not part of it;
     /// the editor of any other server is dropped.
     pub(super) fn editor_after_change(&mut self, plan: u64) {
-        // Read again what was saved, for the server still being edited; drop it for any other.
         let saved_draft = self.draft_plan.take() == Some(plan);
         let open = self
             .editor
