@@ -189,7 +189,7 @@ pub(super) struct DuplicateForm {
     port_wanted: Option<u16>,
     /// The callback port sent to be checked, until its answer comes: it is asked once.
     pub(super) port_pending: Option<u16>,
-    /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`]).
+    /// The callback port last checked, and why a sign-in could not come back to it ([`Event::CallbackPort`](klefki_core::api::Event::CallbackPort)).
     pub(super) port_checked: Option<(u16, Option<String>)>,
     /// Review was pressed and the plan is being prepared: the dialog is hidden, and comes back as it was if that fails.
     pub(super) reviewing: bool,
