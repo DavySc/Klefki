@@ -3,7 +3,10 @@ summary:
   Move loc to the user
 notes:
   As a user server, loc is on in every project, except where it is switched off.
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open to pick it up.
 diff .claude.json:
     mcpServers
   + loc

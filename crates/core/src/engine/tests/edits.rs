@@ -645,13 +645,20 @@ fn a_plan_says_in_words_what_it_does_and_what_the_button_does() {
     assert_eq!(off.action, "Turn off");
     assert!(!off.destructive);
     assert!(
-        off.notes.iter().any(|n| n.contains("restart")),
+        off.sessions
+            .as_deref()
+            .is_some_and(|s| s.contains("restart")),
         "{:?}",
-        off.notes
+        off.sessions
     );
     assert!(
         !off.warnings.iter().any(|w| w.contains("restart")),
-        "the restart hint is a note"
+        "the restart hint is not a warning"
+    );
+    assert!(
+        !off.notes.iter().any(|n| n.contains("restart")),
+        "said once, on its own: {:?}",
+        off.notes
     );
     let delete = plan_for(
         &core,
@@ -677,6 +684,86 @@ fn a_plan_says_in_words_what_it_does_and_what_the_button_does() {
         mixed.summary,
         ["Turn off loc in a", "Delete gw (user server)"]
     );
+}
+
+// ---- what a Claude Code session already open gets (it keeps its servers until it restarts)
+
+#[test]
+fn a_switch_in_one_project_says_open_sessions_there_keep_their_servers_until_restarted() {
+    let env = quiet_env(&two_projects("end"));
+    let core = env.start();
+    for enabled in [false, true] {
+        let plan = plan_for(
+            &core,
+            vec![Change::SetEnabled {
+                id: local_id("loc", "/work/a"),
+                enabled,
+            }],
+        );
+        if enabled {
+            // Already on: nothing is written, so nothing reaches any session.
+            assert!(plan.nothing_to_do);
+            assert_eq!(plan.sessions, None);
+            assert_eq!(plan.restart, None);
+            continue;
+        }
+        assert_eq!(
+            plan.sessions.as_deref(),
+            Some(
+                "Claude Code sessions already open in a keep their servers until you restart them (or switch \
+                 them there with /mcp). New sessions get the change."
+            )
+        );
+        assert_eq!(
+            plan.restart.as_deref(),
+            Some("Restart Claude Code sessions already open in a to pick it up.")
+        );
+    }
+}
+
+#[test]
+fn a_user_server_switched_in_every_project_names_each_project() {
+    let env = quiet_env(&two_projects("end"));
+    let core = env.start();
+    let plan = plan_for(
+        &core,
+        vec![Change::SetEnabled {
+            id: user_id("gw"),
+            enabled: false,
+        }],
+    );
+    let said = plan.sessions.expect("a switch is written");
+    assert!(said.contains("already open in a and b keep"), "{said}");
+    assert!(said.contains("/mcp"), "{said}");
+}
+
+#[test]
+fn a_change_outside_projects_says_every_open_session_keeps_its_servers() {
+    let env = quiet_env(&two_projects("end"));
+    let core = env.start();
+    // A user server is loaded in every folder: no project to name, and /mcp cannot bring back a deleted one.
+    let plan = plan_for(&core, vec![Change::Delete { id: user_id("gw") }]);
+    assert_eq!(
+        plan.sessions.as_deref(),
+        Some(
+            "Claude Code sessions already open keep their servers until you restart them. New sessions get the \
+             change."
+        )
+    );
+    assert_eq!(
+        plan.restart.as_deref(),
+        Some("Restart Claude Code sessions already open to pick it up.")
+    );
+    // A local server deleted: its project is named, but switching it there with /mcp is no answer.
+    let plan = plan_for(
+        &core,
+        vec![Change::Delete {
+            id: local_id("loc", "/work/a"),
+        }],
+    );
+    let said = plan.sessions.expect("a delete is written");
+    assert!(said.contains("already open in a keep"), "{said}");
+    assert!(!said.contains("/mcp"), "{said}");
 }
 
 #[test]

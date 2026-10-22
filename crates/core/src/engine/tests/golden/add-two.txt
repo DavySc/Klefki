@@ -4,7 +4,10 @@ summary:
   Add docs in a
 notes:
   Klefki checks a new server once it is added: it starts its command, or connects to its address.
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open to pick it up.
 review files would run:
   Command: npx
   Argument 1: -y

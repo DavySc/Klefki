@@ -188,13 +188,13 @@ fn shown(plan: &PlanView) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    if !plan.warnings.is_empty() || !plan.notes.is_empty() {
+    if !plan.warnings.is_empty() || !plan.notes.is_empty() || plan.sessions.is_some() {
         out.push('\n');
     }
     for warning in &plan.warnings {
         out.push_str(&format!("warning: {warning}\n"));
     }
-    for note in &plan.notes {
+    for note in plan.notes.iter().chain(&plan.sessions) {
         out.push_str(&format!("note: {note}\n"));
     }
     for file in &plan.files {

@@ -248,6 +248,17 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, status: Status, project_count: usize) {
             pal.warn,
             None,
         ));
+    } else if off_everywhere_known(s, project_count) {
+        // Quiet, like the plugin's own off switch: turned off on purpose, not a problem.
+        badges.push(Badge {
+            text: "on in new".to_owned(),
+            fill: pal.border,
+            color: pal.text,
+            hover: Some(format!(
+                "Switched off in {} Claude Code knows. A project it opens for the first time still loads it.",
+                all_known(project_count)
+            )),
+        });
     }
     // A project's own settings can switch the plugin off there: quiet, as it is often deliberate.
     if let Some(off) = s.plugin.as_ref().map(|p| p.off_in.len()).filter(|n| *n > 0) {
@@ -860,5 +871,24 @@ impl ShellApp {
                 self.selected.insert(i);
             }
         }
+    }
+}
+
+/// A server Claude Code loads in every project, switched off in each one it knows: one it opens later still loads it.
+/// Not one that loads nowhere anyway (replaced, held back, or its plugin off everywhere).
+pub(super) fn off_everywhere_known(s: &ServerRow, project_count: usize) -> bool {
+    s.scope.is_everywhere()
+        && !s.enabled
+        && project_count > 0
+        && s.not_loaded.is_none()
+        && !plugin_off_everywhere(s, project_count)
+}
+
+/// Every project Claude Code knows, in words: "all 3 projects", "the 1 project".
+pub(super) fn all_known(project_count: usize) -> String {
+    if project_count == 1 {
+        "the 1 project".to_owned()
+    } else {
+        format!("all {project_count} projects")
     }
 }

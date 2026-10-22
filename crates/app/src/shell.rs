@@ -2875,6 +2875,8 @@ mod tests {
             action: String::new(),
             destructive: false,
             notes: Vec::new(),
+            sessions: None,
+            restart: None,
         }
     }
 
@@ -3107,14 +3109,14 @@ mod tests {
         let (_h, engine) = {
             let (h, engine) = with_plan(
                 &["  projects[\"C:/x\"].disabledMcpServers", "+ alpha"],
-                &["A running Claude Code session may need a restart before it notices this."],
+                &["alpha is a user server, and Claude Code switches it per project."],
                 false,
             );
             h.get_by_label_contains("Review the change");
             h.get_by_label_contains("disabledMcpServers");
             h.get_by_label("+ alpha");
             h.get_by_label("Changes in .claude.json · 2 lines");
-            h.get_by_label_contains("may need a restart");
+            h.get_by_label_contains("switches it per project");
             (h, engine)
         };
         assert!(drain(&engine).is_empty());

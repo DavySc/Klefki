@@ -103,6 +103,79 @@ fn a_user_server_off_everywhere_reads_disabled_without_the_partial_badge() {
 }
 
 #[test]
+fn a_server_off_in_every_known_project_says_new_projects_still_load_it() {
+    // Off where Claude Code has been, on where it goes next: "Disabled" alone reads as off for good.
+    for scope in [Scope::User, Scope::Plugin, Scope::ClaudeAi] {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", scope, None);
+        row.disabled_in = 17;
+        row.enabled = false;
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label("on in new");
+        click(&mut h, "gateway");
+        h.get_by_label("no, in all 17 projects; on in projects Claude Code opens later");
+    }
+    // A local server is only ever in its own project: nothing new loads it.
+    let (mut h, engine) = live_harness();
+    let mut row = live_row("loc", Scope::Local, Some("C:/Repos/WebApp"));
+    row.enabled = false;
+    engine
+        .events
+        .send(snapshot_with_projects(17, vec![row]))
+        .unwrap();
+    h.run();
+    h.get_by_label_contains("Disabled");
+    assert!(h.query_by_label("on in new").is_none());
+}
+
+/// A plugin's description for a row, its plugin off in `off_in`.
+fn plugin_off_in(off_in: &[&str]) -> klefki_core::api::PluginInfo {
+    klefki_core::api::PluginInfo {
+        plugin: "tools".into(),
+        marketplace: "market".into(),
+        same_as: None,
+        written_target: None,
+        off_in: off_in.iter().map(|p| (*p).to_owned()).collect(),
+    }
+}
+
+#[test]
+fn a_server_that_loads_nowhere_gets_no_new_projects_badge() {
+    // Replaced by the organisation's server of the same name: no project loads it, new ones neither.
+    let (mut h, engine) = live_harness();
+    let mut row = live_row("gateway", Scope::User, None);
+    row.disabled_in = 3;
+    row.enabled = false;
+    row.not_loaded = Some("Your organisation's server of the same name replaces it.".into());
+    engine
+        .events
+        .send(snapshot_with_projects(3, vec![row]))
+        .unwrap();
+    h.run();
+    assert!(h.query_by_label("on in new").is_none());
+    click(&mut h, "gateway");
+    assert!(h.query_by_label_contains("opens later").is_none());
+    // Variant: a plugin's server whose plugin is off in every project.
+    let (mut h, engine) = live_harness();
+    let mut row = live_row("gateway", Scope::Plugin, None);
+    row.disabled_in = 2;
+    row.enabled = false;
+    row.plugin = Some(plugin_off_in(&["/p1", "/p2"]));
+    engine
+        .events
+        .send(snapshot_with_projects(2, vec![row]))
+        .unwrap();
+    h.run();
+    assert!(h.query_by_label("on in new").is_none());
+    click(&mut h, "gateway");
+    assert!(h.query_by_label_contains("opens later").is_none());
+}
+
+#[test]
 fn a_user_server_hidden_in_some_projects_says_how_many_and_where() {
     let (mut h, engine) = live_harness();
     let mut row = live_row("gateway", Scope::User, None);

@@ -3,8 +3,10 @@ summary:
   Turn off gw in 2 projects
 warnings:
   gw is a user server, and Claude Code switches it per project. This changes the 2 projects it knows today; a project it first opens later is not covered.
-notes:
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open in a and b keep their servers until you restart them (or switch them there with /mcp). New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open in a and b to pick it up.
 diff .claude.json:
     projects["/work/a"].disabledMcpServers
   + gw

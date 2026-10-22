@@ -4,7 +4,10 @@ summary:
 notes:
   Claude Code adds it with its own command (claude mcp add-json), and keeps the client secret in its own secure storage; Klefki keeps a copy in the system's secret store. Sign in to it from Claude Code (/mcp) once it is added.
   Klefki checks a new server once it is added: it starts its command, or connects to its address.
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open to pick it up.
 review sso2 would connect:
   Connects to: https://sso.example.com/mcp
   Sends headers: X-Team

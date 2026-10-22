@@ -104,6 +104,15 @@ impl ShellApp {
                             .wrap(),
                         );
                     }
+                    // What a session already open gets: easy to assume it follows along, and it does not. In full
+                    // text, not with the quieter notes under the diff.
+                    if let Some(sessions) = &plan.sessions {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("{} {sessions}", icon::INFO)))
+                                .wrap(),
+                        );
+                    }
                     for review in &plan.reviews {
                         ui.add_space(4.0);
                         Frame::new()

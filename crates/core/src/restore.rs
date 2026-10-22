@@ -402,10 +402,8 @@ fn closing_notes(left_out: &[String], out: &mut Resolved) {
             "Klefki keeps a copy of the configuration as it is now before it restores, so the activity log can undo this restore too."
                 .to_owned(),
         );
-        out.notes.push(
-            "A running Claude Code session may need a restart before it notices this.".to_owned(),
-        );
     }
+    (out.sessions, out.restart) = crate::ops::open_sessions(out).unzip();
     for said in [&mut out.warnings, &mut out.notes] {
         let mut seen = std::collections::HashSet::new();
         said.retain(|s| seen.insert(s.clone()));
@@ -706,7 +704,6 @@ mod tests {
         let said = [
             "Only servers and where they are switched off are restored.",
             "Klefki keeps a copy of the configuration as it is now before it restores",
-            "A running Claude Code session may need a restart",
         ];
         let mut changed = sso();
         changed["url"] = json!("https://sso.example.com/v2/mcp");
@@ -735,6 +732,13 @@ mod tests {
                     out.notes
                 );
             }
+            assert!(
+                out.sessions
+                    .as_deref()
+                    .is_some_and(|s| s.contains("until you restart them")),
+                "{what}: {:?}",
+                out.sessions
+            );
         }
     }
 

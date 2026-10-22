@@ -3,7 +3,10 @@ summary:
   Duplicate gw as gw-copy for the user and in b
 notes:
   The copy keeps the original's environment and header values; it does not share a sign-in.
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open to pick it up.
 diff .claude.json:
     mcpServers
   + gw-copy
