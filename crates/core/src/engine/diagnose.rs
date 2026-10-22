@@ -24,6 +24,7 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> (Diagnosis, Option<Tim
         server_said: Vec::new(),
         client_log: Vec::new(),
         note: Some(note),
+        folder: job.folder.clone(),
     };
     let Some(program) = claude_program(shared) else {
         return (nothing("the claude CLI is not available".to_owned()), None);
@@ -109,6 +110,7 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> (Diagnosis, Option<Tim
         server_said: report.server_said,
         client_log: report.client_log,
         note,
+        folder: job.folder.clone(),
     };
     (diagnosis, timing)
 }

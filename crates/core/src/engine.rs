@@ -66,6 +66,12 @@ pub enum Command {
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
+    /// [`Command::Diagnose`] for a user server, run from the folder of `project` (one of [`Snapshot::projects`]) as a
+    /// session started there would run it: relative paths, a `.env` file and the like are looked for there. Klefki's
+    /// own checks run user servers from the home folder. Refused, with a note saying why, where Claude Code would not
+    /// start it: off there, another server of its name loaded in its place, held back by policy. Only on request;
+    /// the server's status stays the home folder's.
+    DiagnoseIn { id: ServerId, project: String },
     /// Work out what the changes would do to the configuration, and show it. Writes nothing.
     Prepare(Vec<Change>),
     /// Write a plan shown by [`Event::PlanReady`]. A plan can be applied once.
@@ -396,6 +402,8 @@ pub struct Diagnosis {
     pub client_log: Vec<String>,
     /// Set when diagnosing itself ran into trouble (could not start, timed out, no debug output).
     pub note: Option<String>,
+    /// The project it was run in, as shown, after [`Command::DiagnoseIn`]; `None` where Klefki checks the server.
+    pub folder: Option<String>,
 }
 
 #[derive(Debug, Clone)]

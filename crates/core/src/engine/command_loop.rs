@@ -1,7 +1,7 @@
 //! The engine thread: it takes the UI's commands one at a time and reads the configuration again when it
 //! changes, queueing the checks that calls for.
 use super::changes::{Plans, apply, prepare};
-use super::checks::{Folders, Job, JobKind, Queue, build_job, worker};
+use super::checks::{Folders, Job, JobKind, Queue, build_job, where_to_run, worker};
 use super::client_secrets::{SecretOp, SecretsAsk, secret, secrets};
 use super::reload::{profiles_changed, refresh, reload_after_change};
 use super::{
@@ -86,6 +86,7 @@ pub(super) fn engine_main(
             Command::Check(id) => enqueue_now(&shared, &state, &id, JobKind::Check, false),
             Command::CheckLonger(id) => enqueue_now(&shared, &state, &id, JobKind::Check, true),
             Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose, false),
+            Command::DiagnoseIn { id, project } => diagnose_in(&shared, &state, &id, &project),
             Command::Inspect(id) => inspect(&shared, &state, id),
             Command::LastStarts(id) => last_starts(&shared, &state, id),
             Command::InspectorCommand(id) => inspector_command(&shared, &state, id),
@@ -536,4 +537,92 @@ fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind, lon
         lock(&shared.queue).push_now(Job { longer, ..job });
         shared.wake_workers.notify_one();
     }
+}
+
+/// [`Command::DiagnoseIn`]: the user server's diagnose, from the folder of `project` as `.claude.json` spells it, or a
+/// diagnosis saying why not. Nothing runs where Claude Code would not start the server either.
+fn diagnose_in(shared: &Shared, state: &State, id: &ServerId, project: &str) {
+    let shown = inventory::shown_project(project);
+    let refuse = |why: String| {
+        shared.emitter.emit(Event::Diagnosis {
+            id: id.clone(),
+            diagnosis: super::Diagnosis {
+                status: crate::api::Status::Unknown,
+                detail: None,
+                hints: Vec::new(),
+                server_said: Vec::new(),
+                client_log: Vec::new(),
+                note: Some(format!("not diagnosed: {why}")),
+                folder: Some(shown.clone()),
+            },
+        });
+    };
+    let Some((row, file)) = inventory::locate(&state.snapshot, &state.keys, id) else {
+        return refuse("the server is no longer in the configuration".to_owned());
+    };
+    if row.scope != Scope::User {
+        return refuse(
+            "only a user server is started in each project's folder; this one runs in its own"
+                .to_owned(),
+        );
+    }
+    if row.transport != crate::api::TransportKind::Stdio {
+        return refuse(
+            "Claude Code reaches this server by its address, whatever folder a session starts in"
+                .to_owned(),
+        );
+    }
+    if !state.snapshot.projects.iter().any(|p| p == project) {
+        return refuse("Claude Code does not know that project".to_owned());
+    }
+    if row.disabled_projects.contains(&shown) {
+        return refuse(
+            "it is off in that project, so Claude Code does not start it there".to_owned(),
+        );
+    }
+    if row.shadowed_in.contains(&shown) {
+        return refuse(format!(
+            "Claude Code loads another server called {} there instead",
+            row.name
+        ));
+    }
+    if row
+        .blocked
+        .as_ref()
+        .is_some_and(|b| b.projects.contains(&shown))
+    {
+        return refuse("a rule on which servers load holds it back in that project".to_owned());
+    }
+    let name = match where_to_run(shared, &mut Folders::default(), row, Some(file)) {
+        Ok((name, _home)) => name,
+        Err(why) => return refuse(why),
+    };
+    // From the folder as the file spells it, as Claude Code finds that project's entry by it.
+    let folder = shared.config.paths.as_ref().map_or_else(
+        || project.to_owned(),
+        |paths| crate::swap::spelled_in(&paths.claude_json, project),
+    );
+    // Asked before the folder is looked at: Windows would contact the server of a network folder.
+    if !inventory::is_safe_project_path(&folder) {
+        return refuse(
+            "Klefki does not run anything in a network folder (\\\\server\\share) or an unusual path".to_owned(),
+        );
+    }
+    if !Folders::default().usable(&folder) {
+        return refuse("the project folder was not found".to_owned());
+    }
+    lock(&shared.queue).push_now(Job {
+        id: row.id(),
+        name,
+        cwd: folder.into(),
+        kind: JobKind::Diagnose,
+        // The row's status stays the home folder's: no "Checking…" on it.
+        announce: false,
+        background: false,
+        now: false,
+        alone: false,
+        longer: false,
+        folder: Some(shown),
+    });
+    shared.wake_workers.notify_one();
 }

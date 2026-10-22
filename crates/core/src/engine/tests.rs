@@ -742,6 +742,7 @@ mod checks;
 mod client_secrets;
 mod debug_report;
 mod diagnose;
+mod diagnose_in;
 mod edits;
 mod export;
 mod golden;

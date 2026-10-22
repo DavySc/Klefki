@@ -7,6 +7,7 @@ use std::time::Duration;
 
 fn start(folder: &str, when: &str, outcome: StartOutcome) -> LastStart {
     LastStart {
+        project: None,
         folder: folder.to_owned(),
         when: when.to_owned(),
         exact: "22 Oct 2026, 07:32:16 (UTC+00:00)".to_owned(),

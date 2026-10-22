@@ -77,6 +77,11 @@ fn the_last_starts_come_from_claude_codes_logs_with_the_servers_values_hidden() 
     assert_eq!(user.starts.len(), 1, "{user:?}");
     let start = &user.starts[0];
     assert_eq!(start.folder, "/work/b");
+    assert_eq!(
+        start.project.as_deref(),
+        Some("/work/b"),
+        "to match it with a project"
+    );
     assert!(
         matches!(&start.outcome, StartOutcome::Failed { code: Some(c), .. } if c == "CONNECTION_CLOSED")
     );

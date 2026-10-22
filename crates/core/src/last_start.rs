@@ -366,6 +366,8 @@ fn start_in(
             || "an unknown folder".to_owned(),
             |c| shown_path(Path::new(c), ask.home),
         ),
+        project: cwd
+            .map(|c| crate::sanitize::shown(&crate::config::inventory::normalise_project(c))),
         when,
         exact,
         outcome,

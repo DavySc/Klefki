@@ -1516,6 +1516,7 @@ fn only_the_waiting_background_checks_of_edited_servers_are_dropped() {
         now: false,
         alone: false,
         longer: false,
+        folder: None,
     };
     let mut queue = Queue {
         jobs: [
@@ -1541,4 +1542,36 @@ fn only_the_waiting_background_checks_of_edited_servers_are_dropped() {
             ("other", true, true),
         ]
     );
+}
+
+/// A diagnose in a project answers only the user who asked, so the server's own check waiting in the queue still
+/// runs; a diagnose where Klefki checks it replaces that check, as before.
+#[test]
+fn a_diagnose_in_a_project_keeps_the_servers_waiting_check() {
+    let job = |kind, folder: Option<&str>| Job {
+        id: user_id("s"),
+        name: crate::model::ServerName::parse("s").unwrap(),
+        cwd: PathBuf::new(),
+        kind,
+        announce: false,
+        background: true,
+        now: false,
+        alone: false,
+        longer: false,
+        folder: folder.map(str::to_owned),
+    };
+    let mut queue = Queue {
+        jobs: [job(JobKind::Check, None)].into(),
+        ..Queue::default()
+    };
+    queue.push_now(job(JobKind::Diagnose, Some("/work/app")));
+    let kinds = |q: &Queue| -> Vec<_> {
+        q.jobs
+            .iter()
+            .map(|j| (j.kind == JobKind::Check, j.folder.is_some()))
+            .collect()
+    };
+    assert_eq!(kinds(&queue), [(false, true), (true, false)]);
+    queue.push_now(job(JobKind::Diagnose, None));
+    assert_eq!(kinds(&queue), [(false, true), (false, false)]);
 }
