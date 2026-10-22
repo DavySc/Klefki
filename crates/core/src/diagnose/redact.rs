@@ -31,10 +31,20 @@ const RULES: &[(&str, &str)] = &[
         r#"(?i)([?&](?:code|state|code_verifier)=)[^&\s"']+"#,
         "${1}***",
     ),
-    // user:password@ in a URL.
+    // A key, token or password in an address's query: `?key=…&token=…`.
     (
-        r#"(?i)\b((?:https?|wss?)://)[^/\s:@"']+:[^/\s@"']+@"#,
+        r#"(?i)([?&][a-z0-9_.-]*(?:key|token|secret|passw(?:or)?d|pwd|sig|signature|auth|credential)[a-z0-9_.-]*=)[^&\s"']+"#,
+        "${1}***",
+    ),
+    // user:password@ in an address, whatever the scheme (`postgres://`, `amqp://`, `redis://`).
+    (
+        r#"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@"']*:[^/\s@"']+@"#,
         "${1}***@",
+    ),
+    // "API key 9f8e…", "access token abc…", "secret abc…": a credential named in words and then given.
+    (
+        r#"(?i)\b((?:api|access|auth|private|secret)[ _-]?(?:key|token)|secret|password|passphrase)(\s+(?:is\s+|=\s*|:\s*)?)[A-Za-z0-9._~+/=-]{8,}"#,
+        "${1}${2}***",
     ),
     // Token shapes that are secrets wherever they appear.
     (
@@ -84,6 +94,31 @@ fn hide_environment_values(text: &str) -> String {
         .into_owned()
 }
 
+/// The values a server's own definition holds that must not show in text read elsewhere (its environment and header
+/// values as written and filled in, the arguments and address parts an export replaces) hidden, then
+/// [`redact`]'s rules. A value's last word counts on its own too: a header such as `Bearer <token>` or
+/// `Basic <credentials>`, whose token a server may print without its scheme. The longest go first, so a whole value
+/// is hidden in one piece. A value of fewer than [`MIN_SECRET`] characters is left: it would hide ordinary words.
+pub(crate) fn scrubbed(text: &str, secrets: &[String]) -> String {
+    let mut hidden: Vec<&str> = secrets
+        .iter()
+        .flat_map(|s| [s.as_str(), s.split_whitespace().last().unwrap_or("")])
+        .filter(|s| s.chars().count() >= MIN_SECRET)
+        .collect();
+    hidden.sort_by_key(|s| (std::cmp::Reverse(s.len()), *s));
+    hidden.dedup();
+    let mut text = text.to_owned();
+    for secret in hidden {
+        if text.contains(secret) {
+            text = text.replace(secret, "***");
+        }
+    }
+    redact(&crate::sanitize::sanitize(&text))
+}
+
+/// The shortest value [`scrubbed`] hides.
+pub(crate) const MIN_SECRET: usize = 6;
+
 pub(crate) fn redact(text: &str) -> String {
     let mut out = hide_environment_values(text);
     for (re, with) in COMPILED.iter() {
@@ -102,6 +137,61 @@ mod tests {
             !out.contains(secret),
             "{secret:?} survived in {out:?} (from {input:?})"
         );
+    }
+
+    #[test]
+    fn an_address_that_signs_in_loses_its_password_whatever_the_scheme() {
+        gone(
+            "error connecting to postgres://admin:hunter2pw@db:5432/x",
+            "hunter2pw",
+        );
+        gone("redis://:pw0rd1234@cache:6379", "pw0rd1234");
+        gone("amqps://guest:guestpass@mq/vhost", "guestpass");
+        // Nearby: the host stays, so the text still says where it failed.
+        assert!(redact("postgres://admin:hunter2pw@db:5432/x").contains("@db:5432/x"));
+    }
+
+    #[test]
+    fn a_secret_in_an_addresses_query_is_hidden_for_https_too() {
+        gone(
+            "Failed to connect to https://mcp.example.com/mcp?key=abc123secret",
+            "abc123secret",
+        );
+        gone("GET /sse?api_key=zzz999yyy&x=1", "zzz999yyy");
+        gone(
+            "https://x.example/cb?access_token=tok12345678&y=2",
+            "tok12345678",
+        );
+        // Nearby: a plain parameter is kept.
+        assert!(redact("https://x.example/a?page=2&sort=name").contains("page=2&sort=name"));
+    }
+
+    #[test]
+    fn a_credential_named_in_words_and_then_given_is_hidden() {
+        gone("Using API key 9f8e7d6c5b4a3 for requests", "9f8e7d6c5b4a3");
+        gone("access token abcd1234efgh used", "abcd1234efgh");
+        gone("the password is hunter2hunter2", "hunter2hunter2");
+        // Nearby: the word alone, or a short one after it, is ordinary text.
+        assert_eq!(
+            redact("Using API key for requests"),
+            "Using API key for requests"
+        );
+        assert_eq!(redact("secret sauce"), "secret sauce");
+    }
+
+    #[test]
+    fn the_servers_own_values_are_hidden_as_well() {
+        let secrets = vec![
+            "my-plain-secret-value".to_owned(),
+            "Bearer tok-abcdef".to_owned(),
+        ];
+        let out = scrubbed(
+            "auth with my-plain-secret-value failed; sent tok-abcdef",
+            &secrets,
+        );
+        assert_eq!(out, "auth with *** failed; sent ***");
+        // Short values are left: they would hide ordinary words.
+        assert_eq!(scrubbed("a b true", &["true".to_owned()]), "a b true");
     }
 
     #[test]

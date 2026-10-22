@@ -89,7 +89,9 @@ pub(super) fn engine_main(
             Command::Inspect(id) => inspect(&shared, &state, id),
             Command::LastStarts(id) => last_starts(&shared, &state, id),
             Command::InspectorCommand(id) => inspector_command(&shared, &state, id),
-            Command::RedactedDefinition(id) => redacted_definition(&shared, &state, id),
+            Command::RedactedDefinition { id, also } => {
+                redacted_definition(&shared, &state, id, &also);
+            }
             Command::Export(ids) => {
                 let sources = crate::export::sources(
                     shared.config.paths.as_ref(),
@@ -390,7 +392,7 @@ fn last_starts(shared: &Shared, state: &State, id: ServerId) {
                     &file.name,
                     row.scope == Scope::Project,
                 )
-                .map(|entry| entry::values_filled_in(&entry, &*shared.config.vars))
+                .map(|entry| entry::hidden_values(&entry, &*shared.config.vars))
                 .unwrap_or_default(),
                 _ => Vec::new(),
             };
@@ -460,8 +462,9 @@ fn inspector_command(shared: &Shared, state: &State, id: ServerId) {
     shared.emitter.emit(Event::InspectorCommand { id, line });
 }
 
-/// The definition as an export writes it, for a debug report. Reads the files; nothing is written or started.
-fn redacted_definition(shared: &Shared, state: &State, id: ServerId) {
+/// The definition as an export writes it, for a debug report, and the texts the report also holds (`also`) with
+/// what the definition keeps secret hidden in them. Reads the files; nothing is written or started.
+fn redacted_definition(shared: &Shared, state: &State, id: ServerId, also: &[String]) {
     let sources = crate::export::sources(
         shared.config.paths.as_ref(),
         &state.snapshot,
@@ -469,6 +472,7 @@ fn redacted_definition(shared: &Shared, state: &State, id: ServerId) {
         std::slice::from_ref(&id),
     );
     let exported = crate::export::export(sources);
+    let hidden = super::diagnose::hidden_values_of(shared, &id);
     let result = if exported.servers == 1 {
         Ok(exported)
     } else {
@@ -481,9 +485,13 @@ fn redacted_definition(shared: &Shared, state: &State, id: ServerId) {
             },
         ))
     };
+    let also = also
+        .iter()
+        .map(|text| crate::diagnose::redact::scrubbed(text, &hidden))
+        .collect();
     shared
         .emitter
-        .emit(Event::RedactedDefinition { id, result });
+        .emit(Event::RedactedDefinition { id, result, also });
 }
 
 fn inspect(shared: &Shared, state: &State, id: ServerId) {

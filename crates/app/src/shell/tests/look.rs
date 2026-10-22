@@ -741,9 +741,17 @@ fn the_debug_report_section_after_copying() {
     h.state_mut().copy_debug_report(id.clone());
     engine
         .events
+        .send(Event::LastStarts {
+            id: id.clone(),
+            starts: klefki_core::api::LastStarts::default(),
+        })
+        .unwrap();
+    engine
+        .events
         .send(Event::RedactedDefinition {
             id,
             result: Err("your organisation sets it, for everyone on this machine".to_owned()),
+            also: Vec::new(),
         })
         .unwrap();
     h.run();

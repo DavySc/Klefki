@@ -549,10 +549,11 @@ impl ShellApp {
                 if let Some(seen) = self.last_starts.get_mut(&id) {
                     seen.starts = Some(starts);
                 }
+                self.debug_report_starts_arrived(&id);
             }
             Event::InspectorCommand { id, line } => self.inspector_arrived(&id, line),
-            Event::RedactedDefinition { id, result } => {
-                self.redacted_definition_arrived(&id, &result);
+            Event::RedactedDefinition { id, result, also } => {
+                self.redacted_definition_arrived(&id, result, also);
             }
             Event::PlanReady(plan) => self.plan_ready(plan),
             Event::PlanFailed(why) => self.plan_failed(why),

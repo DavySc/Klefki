@@ -35,6 +35,27 @@ Claude Code's own starts went. Plus two leftovers of the last-starts slice (P1).
 ## Next
 Pull request, cross-review, merge; then P4 (check from a project folder).
 
+## Review fixes (cross-review of #97)
+- B1: one scrub for everything the report holds. `diagnose/redact.rs::scrubbed` (the last starts' own scrub, moved)
+  hides the server's values, then the pattern rules; `config/entry.rs::hidden_values` is the list: environment and
+  header values as written and filled in, the arguments and address parts an export replaces (taken from
+  `rewritten_args` / `rewritten_url`). Used for the last starts, for Diagnose (its status detail, the server's stderr
+  and the debug text, before hints and the report are made) and, through `Command::RedactedDefinition { also }`, for the
+  status line in the report. The pattern rules now also cover `user:password@` for any scheme (also an empty user),
+  a secret parameter in any address's query (`?key=`, `access_token=`), and "API key <value>" in words. Reproducers:
+  one test per leak in `redact.rs`, `diagnose_hides_the_servers_own_values_and_the_parts_an_export_replaces`
+  (failed before), and the `also` test; each with a nearby variant that must stay readable.
+- B2: the report is made only when the definition and a fresh read of the last starts have both arrived (the starts
+  are asked for first); a test from the palette on the General tab, with the definition answering first.
+- S1: "diagnosis: not run (Diagnose on the Status tab runs it)" and "last starts by Claude Code: not read".
+- S2: "Show what was copied", collapsed, under the button after a copy: the same text, selectable.
+- S3: a default or a referenced variable's value is hidden only when it is not plainly a setting (`localhost`,
+  `fast`, a folder such as `${HOME}`): tests for both sides. A host name with a dot counts as not plain and is hidden.
+- S4: the section's text says "where Klefki can read it".
+- Nit not taken: `~` for the home folder in the report's paths (the starts' folders already have it).
+- Known gap: a hint's `points_at` excerpt of the status text is not scrubbed (it holds only the part of the
+  server's own address the hint is about).
+
 ## Checks
 - `cargo fmt --check`: exit 0. `cargo clippy --workspace --all-targets -- -D warnings`: exit 0.
 - `cargo test --workspace`: exit 0 (app 499, core 1081, cli 26 + 43). New: 3 entry, 1 last-starts and 2 definition
@@ -43,3 +64,5 @@ Pull request, cross-review, merge; then P4 (check from a project folder).
   sources ok.
 - Seen failing first: the filled-in value test (the value showed in the log text before the change).
 - Not run: macOS and Windows; cargo-mutants (not installed in the cloud session; the quality workflow runs it).
+- After the review fixes: fmt, clippy `-D warnings` and `cargo test --workspace` exit 0 (app 503, core 1089, cli 26 + 43);
+  `cargo deny` as above (only the yanked tokio).

@@ -1,5 +1,6 @@
 //! One server's definition as the user sees and edits it: checked before it is written, with environment and header
 //! values hidden on the way out and put back on the way in, and a line diff for the plan.
+use crate::config::secretlike::{plain_setting, rewritten_args, rewritten_url};
 use crate::sanitize::sanitize;
 use serde_json::{Map, Value};
 
@@ -36,7 +37,9 @@ pub(crate) fn values(entry: &Value) -> Vec<String> {
 /// What [`values`] gives, and what each `${NAME}` reference stands for where Klefki can see it. Claude Code fills the
 /// references in from its own environment, so the server may print the filled-in value (`Bearer abc123` for
 /// `Bearer ${TOKEN}`) and not the text the file holds. `vars` is Klefki's own environment, the best it knows of
-/// Claude Code's. A reference with a `:-default` stands for its default when nothing is set.
+/// Claude Code's. A reference with a `:-default` stands for its default when nothing is set. A value or default that
+/// is plainly a setting (`localhost`, a folder, `debug`) is left: hiding it would blank every path and address in a
+/// log, which is what a person reading one needs.
 pub(crate) fn values_filled_in(
     entry: &Value,
     vars: &dyn Fn(&str) -> Option<std::ffi::OsString>,
@@ -52,24 +55,48 @@ pub(crate) fn values_filled_in(
             }
         }
     }
-    let mut named = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     strings(entry, &mut |text| {
         for (name, default) in references(text) {
+            if let Some(default) = default.filter(|d| !plain_setting(&name, d)) {
+                out.push(default);
+            }
             if !named.contains(&name) {
                 named.push(name);
             }
-            if let Some(default) = default {
-                out.push(default);
-            }
         }
     });
-    out.extend(
-        named
-            .iter()
-            .filter_map(|name| vars(name)?.into_string().ok()),
-    );
+    out.extend(named.iter().filter_map(|name| {
+        let value = vars(name)?.into_string().ok()?;
+        (!plain_setting(name, &value)).then_some(value)
+    }));
     out.retain(|value| !value.is_empty());
-    out.dedup();
+    out
+}
+
+/// Everything in `entry` that must not show in text read elsewhere (a server's log, Claude Code's message, a
+/// diagnosis): [`values_filled_in`], and each argument and address part an export replaces by a `${VAR}`.
+pub(crate) fn hidden_values(
+    entry: &Value,
+    vars: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<String> {
+    let mut out = values_filled_in(entry, vars);
+    let args: Vec<&str> = entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut take = |_: &str, secret: &str| {
+        out.push(secret.to_owned());
+        String::new()
+    };
+    // Both ways: an address that signs in keeps its host in one, and the whole argument goes in the other.
+    rewritten_args(args.iter().copied(), false, &mut take);
+    rewritten_args(args.iter().copied(), true, &mut take);
+    if let Some(url) = entry.get("url").and_then(Value::as_str) {
+        rewritten_url(url, &mut take);
+    }
+    out.retain(|value| !value.is_empty());
     out
 }
 
@@ -435,11 +462,59 @@ mod tests {
             "tok-123456",
             "pg://u:pw@h/db",
             "fallback-key",
-            "fast",
         ] {
             assert!(
                 hidden.iter().any(|v| v == wanted),
                 "{wanted:?} not in {hidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_setting_behind_a_reference_is_left_readable() {
+        let entry = json!({
+            "command": "node",
+            "args": ["${HOME}/mcp/server.js", "--host", "${HOST:-localhost}", "--mode=${MODE:-fast}"],
+            "env": {"A": "x"},
+        });
+        let hidden = values_filled_in(
+            &entry,
+            &vars(&[("HOME", "/home/someone"), ("HOST", "db.internal")]),
+        );
+        for plain in ["localhost", "fast", "/home/someone"] {
+            assert!(
+                !hidden.iter().any(|v| v == plain),
+                "{plain:?} in {hidden:?}"
+            );
+        }
+        // Nearby: the same references with values that are secrets are hidden.
+        let hidden = values_filled_in(
+            &json!({"args": ["--x", "${DB_PASSWORD:-hunter2pw}", "${API_TOKEN}"]}),
+            &vars(&[("API_TOKEN", "tok-0123456789")]),
+        );
+        assert!(hidden.iter().any(|v| v == "hunter2pw"), "{hidden:?}");
+        assert!(hidden.iter().any(|v| v == "tok-0123456789"), "{hidden:?}");
+    }
+
+    #[test]
+    fn what_an_export_replaces_in_arguments_and_the_address_is_hidden_too() {
+        let entry = json!({
+            "command": "npx",
+            "args": ["-y", "pkg", "--api-key", "plain-key-value-1", "--db=postgres://u:pw1234567@db/x", "--verbose"],
+            "url": "https://mcp.example.com/mcp?key=abc123secret&page=2",
+        });
+        let hidden = hidden_values(&entry, &vars(&[]));
+        for secret in ["plain-key-value-1", "pw1234567", "abc123secret"] {
+            assert!(
+                hidden.iter().any(|v| v.contains(secret)),
+                "{secret:?} not in {hidden:?}"
+            );
+        }
+        // Nearby: what is not a secret stays readable.
+        for plain in ["pkg", "--verbose", "page=2"] {
+            assert!(
+                !hidden.iter().any(|v| v == plain),
+                "{plain:?} in {hidden:?}"
             );
         }
     }

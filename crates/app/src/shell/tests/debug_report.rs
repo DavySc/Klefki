@@ -44,20 +44,53 @@ fn shown() -> (
     (h, engine, row)
 }
 
+/// The engine's answers to a click: the last starts, then the definition (and the status line, hidden).
 fn answer(
     h: &mut Harness<'static, ShellApp>,
     engine: &klefki_core::api::Detached,
     row: &ServerRow,
     result: Result<Exported, String>,
 ) {
+    answer_starts(h, engine, row, LastStarts::default());
+    answer_definition(h, engine, row, result, Vec::new());
+}
+
+fn answer_starts(
+    h: &mut Harness<'static, ShellApp>,
+    engine: &klefki_core::api::Detached,
+    row: &ServerRow,
+    starts: LastStarts,
+) {
+    engine
+        .events
+        .send(Event::LastStarts {
+            id: row.id(),
+            starts,
+        })
+        .unwrap();
+    h.step();
+}
+
+fn answer_definition(
+    h: &mut Harness<'static, ShellApp>,
+    engine: &klefki_core::api::Detached,
+    row: &ServerRow,
+    result: Result<Exported, String>,
+    also: Vec<String>,
+) {
     engine
         .events
         .send(Event::RedactedDefinition {
             id: row.id(),
             result,
+            also,
         })
         .unwrap();
     h.step();
+}
+
+fn asked(engine: &klefki_core::api::Detached) -> Vec<Command> {
+    drain(engine)
 }
 
 #[test]
@@ -67,7 +100,7 @@ fn nothing_is_asked_until_the_button_is_pressed() {
     assert!(
         drain(&engine)
             .iter()
-            .all(|c| !matches!(c, Command::RedactedDefinition(_)))
+            .all(|c| !matches!(c, Command::RedactedDefinition { .. }))
     );
     h.get_by_label(COPY);
 }
@@ -90,17 +123,34 @@ fn pressing_it_asks_once_and_copies_the_report_when_the_definition_comes() {
     h.run();
     h.get_by_label(COPY).click();
     h.step();
-    // The status that came meanwhile has the last starts read again; the definition is asked for once.
-    let asked: Vec<Command> = drain(&engine)
-        .into_iter()
-        .filter(|c| !matches!(c, Command::LastStarts(_)))
-        .collect();
-    assert_eq!(asked, vec![Command::RedactedDefinition(row.id())]);
+    // A fresh read of the last starts and the definition, with the status line to hide what is secret in.
+    let wanted = asked(&engine);
+    assert!(
+        wanted.contains(&Command::LastStarts(row.id())),
+        "{wanted:?}"
+    );
+    assert_eq!(
+        wanted
+            .iter()
+            .filter(|c| matches!(c, Command::RedactedDefinition { .. }))
+            .collect::<Vec<_>>(),
+        [&Command::RedactedDefinition {
+            id: row.id(),
+            also: vec!["Connection closed".to_owned()],
+        }]
+    );
     assert!(
         copied(&h).is_empty(),
         "nothing is copied before there is a definition"
     );
-    answer(&mut h, &engine, &row, Ok(definition()));
+    answer_starts(&mut h, &engine, &row, LastStarts::default());
+    answer_definition(
+        &mut h,
+        &engine,
+        &row,
+        Ok(definition()),
+        vec!["Connection closed".to_owned()],
+    );
     let [text] = &copied(&h)[..] else {
         panic!("copied once: {:?}", copied(&h));
     };
@@ -138,38 +188,37 @@ fn the_report_holds_the_diagnosis_and_the_last_starts_when_there_are_some() {
             ),
         })
         .unwrap();
-    engine
-        .events
-        .send(Event::LastStarts {
-            id: row.id(),
-            starts: LastStarts {
-                starts: vec![LastStart {
-                    folder: "~/proj".to_owned(),
-                    when: "Today 07:32".to_owned(),
-                    exact: String::new(),
-                    outcome: StartOutcome::Failed {
-                        code: Some("CONNECTION_CLOSED".to_owned()),
-                        said: "Connection closed".to_owned(),
-                        after: None,
-                    },
-                    server_said: vec!["Error: Cannot find module 'foo'".to_owned()],
-                    hints: vec![Hint {
-                        title: "A file the server needs is missing".to_owned(),
-                        code: None,
-                        help: Vec::new(),
-                        points_at: None,
-                    }],
-                    partly: false,
-                    file: "~/.cache/x.jsonl".to_owned(),
-                }],
-                ..LastStarts::default()
-            },
-        })
-        .unwrap();
     h.run();
     h.get_by_label(COPY).click();
     h.step();
-    answer(&mut h, &engine, &row, Ok(definition()));
+    answer_starts(
+        &mut h,
+        &engine,
+        &row,
+        LastStarts {
+            starts: vec![LastStart {
+                folder: "~/proj".to_owned(),
+                when: "Today 07:32".to_owned(),
+                exact: String::new(),
+                outcome: StartOutcome::Failed {
+                    code: Some("CONNECTION_CLOSED".to_owned()),
+                    said: "Connection closed".to_owned(),
+                    after: None,
+                },
+                server_said: vec!["Error: Cannot find module 'foo'".to_owned()],
+                hints: vec![Hint {
+                    title: "A file the server needs is missing".to_owned(),
+                    code: None,
+                    help: Vec::new(),
+                    points_at: None,
+                }],
+                partly: false,
+                file: "~/.cache/x.jsonl".to_owned(),
+            }],
+            ..LastStarts::default()
+        },
+    );
+    answer_definition(&mut h, &engine, &row, Ok(definition()), Vec::new());
     let text = copied(&h).concat();
     for needle in [
         "diagnosis:",
@@ -236,7 +285,17 @@ fn the_palette_copies_it_for_the_selected_server() {
     h.run();
     h.get_by_label_contains("Copy debug report for s").click();
     h.run();
-    assert_eq!(drain(&engine), vec![Command::RedactedDefinition(row.id())]);
+    let wanted = asked(&engine);
+    assert!(
+        wanted.contains(&Command::LastStarts(row.id())),
+        "{wanted:?}"
+    );
+    assert!(
+        wanted
+            .iter()
+            .any(|c| matches!(c, Command::RedactedDefinition { .. })),
+        "{wanted:?}"
+    );
     answer(&mut h, &engine, &row, Ok(definition()));
     assert!(copied(&h).concat().contains("Klefki debug report"));
 }
@@ -289,4 +348,108 @@ fn copying_the_diagnosis_says_copied_and_its_hover_does_not_promise_all_secrets_
         assert!(steps < 100, "still Copied");
     }
     h.get_by_label("Copy report");
+}
+
+#[test]
+fn from_the_palette_on_another_tab_it_waits_for_the_last_starts() {
+    use egui::accesskit::Role;
+    let (mut h, engine, row) = shown();
+    h.get_by_role_and_label(Role::Button, "General").click();
+    h.run();
+    drain(&engine);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    h.run();
+    h.get_by_label_contains("Copy debug report for s").click();
+    h.run();
+    let wanted = asked(&engine);
+    // The starts are asked for before the definition, since the tab that would ask is not shown yet.
+    let starts_at = wanted
+        .iter()
+        .position(|c| matches!(c, Command::LastStarts(_)));
+    let definition_at = wanted
+        .iter()
+        .position(|c| matches!(c, Command::RedactedDefinition { .. }));
+    assert!(
+        starts_at < definition_at && starts_at.is_some(),
+        "{wanted:?}"
+    );
+    // The definition first, as the engine may answer it first: nothing is copied until the starts are in.
+    answer_definition(&mut h, &engine, &row, Ok(definition()), Vec::new());
+    h.step();
+    assert!(copied(&h).is_empty(), "{:?}", copied(&h));
+    answer_starts(
+        &mut h,
+        &engine,
+        &row,
+        LastStarts {
+            problem: Some("Klefki could not tell where Claude Code keeps its logs.".to_owned()),
+            ..LastStarts::default()
+        },
+    );
+    let text = copied(&h).concat();
+    assert!(
+        text.contains("last starts by Claude Code:")
+            && text.contains("Klefki could not tell where Claude Code keeps its logs."),
+        "{text}"
+    );
+}
+
+#[test]
+fn what_is_missing_is_said_and_not_left_out() {
+    let (mut h, engine, row) = shown();
+    h.get_by_label(COPY).click();
+    h.step();
+    answer(&mut h, &engine, &row, Ok(definition()));
+    let text = copied(&h).concat();
+    assert!(
+        text.contains("diagnosis: not run (Diagnose on the Status tab runs it)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("last starts by Claude Code:\n  none in Claude Code's logs"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_status_line_in_the_report_is_the_one_the_engine_hid_secrets_in() {
+    let (mut h, engine, row) = shown();
+    engine
+        .events
+        .send(status_event(
+            &row,
+            Status::Failed,
+            Some("bad key plain-secret-value"),
+        ))
+        .unwrap();
+    h.run();
+    h.get_by_label(COPY).click();
+    h.step();
+    answer_starts(&mut h, &engine, &row, LastStarts::default());
+    answer_definition(
+        &mut h,
+        &engine,
+        &row,
+        Ok(definition()),
+        vec!["bad key ***".to_owned()],
+    );
+    let text = copied(&h).concat();
+    assert!(text.contains("status: Failed: bad key ***"), "{text}");
+    assert!(!text.contains("plain-secret-value"), "{text}");
+}
+
+#[test]
+fn what_was_copied_can_be_read_in_the_section() {
+    let (mut h, engine, row) = shown();
+    assert!(h.query_by_label("Show what was copied").is_none());
+    h.get_by_label(COPY).click();
+    h.step();
+    answer(&mut h, &engine, &row, Ok(definition()));
+    h.run();
+    h.get_by_label("Show what was copied").click();
+    h.run();
+    h.get_by_label_contains("Klefki debug report");
+    // Gone with the configuration it was made from.
+    show_rows(&mut h, &engine, vec![row]);
+    assert!(h.query_by_label("Show what was copied").is_none());
 }

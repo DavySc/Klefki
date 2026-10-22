@@ -13,7 +13,7 @@ use egui::{RichText, Ui};
 use klefki_core::api::{Command, Diagnosis, Exported, LastStarts, ServerId, ServerRow, Status};
 
 pub(super) const HEADING: &str = "Debug report";
-pub(super) const ABOUT: &str = "Everything on this tab and the server's definition as one text, for a bug report or someone who is helping you.";
+pub(super) const ABOUT: &str = "Everything on this tab and, where Klefki can read it, the server's definition, as one text for a bug report or someone who is helping you.";
 pub(super) const COPY: &str = "Copy debug report";
 const COPY_HOVER: &str = "Copy this server's status, definition and logs as plain text. Environment and header values \
      and anything that looks like a secret are replaced or hidden, but check it before you share it.";
@@ -21,10 +21,16 @@ const COPY_HOVER: &str = "Copy this server's status, definition and logs as plai
 /// A debug report asked for: waiting for the definition, then copied.
 pub(super) struct DebugSeen {
     id: ServerId,
-    /// Still to be copied when the definition arrives.
+    /// Still to be copied when what it needs has arrived.
     copy: bool,
+    /// The definition, and the status line hidden as it says, once it arrived.
+    definition: Option<(Result<Exported, String>, Vec<String>)>,
+    /// A fresh read of Claude Code's last starts is still to arrive: the report is not made before it.
+    starts_waiting: bool,
     /// The text to copy the next time the section is drawn.
     ready: Option<String>,
+    /// What was copied last, to read in the section.
+    copied_text: Option<String>,
     /// When it was copied, in egui time.
     copied: Option<f64>,
 }
@@ -106,56 +112,98 @@ pub(super) fn report(f: &Facts<'_>) -> String {
             let _ = writeln!(out, "\ndefinition: not shown, {why}");
         }
     }
-    if let Some(d) = f.diagnosis {
-        out.push_str("\ndiagnosis:\n");
-        diagnosis_details(&mut out, row, d);
+    match f.diagnosis {
+        Some(d) => {
+            out.push_str("\ndiagnosis:\n");
+            diagnosis_details(&mut out, row, d);
+        }
+        None => out.push_str("\ndiagnosis: not run (Diagnose on the Status tab runs it)\n"),
     }
-    if let Some(last) = f.starts {
-        out.push_str("\nlast starts by Claude Code:\n");
-        if let Some(problem) = &last.problem {
-            let _ = writeln!(out, "  {problem}");
+    match f.starts {
+        None => out.push_str("\nlast starts by Claude Code: not read\n"),
+        Some(last) => {
+            out.push_str("\nlast starts by Claude Code:\n");
+            if let Some(problem) = &last.problem {
+                let _ = writeln!(out, "  {problem}");
+            }
+            if last.starts.is_empty() && last.problem.is_none() {
+                out.push_str("  none in Claude Code's logs\n");
+            }
+            starts_text(&mut out, row, last);
         }
-        if last.starts.is_empty() && last.problem.is_none() {
-            out.push_str("  none in Claude Code's logs\n");
-        }
-        starts_text(&mut out, row, last);
     }
     out
 }
 
 impl ShellApp {
-    /// Asks for the definition; the report is copied when it arrives.
+    /// Asks for what the report needs: a fresh read of the last starts and the definition. It is copied when both
+    /// have arrived, whichever tab the user asked from.
     pub(super) fn copy_debug_report(&mut self, id: ServerId) {
-        match &mut self.debug_report {
-            Some(seen) if seen.id == id => {
-                seen.copy = true;
-                seen.ready = None;
-            }
-            _ => {
-                self.debug_report = Some(DebugSeen {
-                    id: id.clone(),
-                    copy: true,
-                    ready: None,
-                    copied: None,
-                });
-            }
-        }
-        self.send(Command::RedactedDefinition(id));
+        self.debug_report = Some(DebugSeen {
+            copied_text: self
+                .debug_report
+                .take()
+                .filter(|seen| seen.id == id)
+                .and_then(|seen| seen.copied_text),
+            id: id.clone(),
+            copy: true,
+            definition: None,
+            starts_waiting: true,
+            ready: None,
+            copied: None,
+        });
+        // The status line is Claude Code's own message: the engine hides what the definition keeps secret in it.
+        let detail = self
+            .snapshot
+            .servers
+            .iter()
+            .position(|s| s.is(&id))
+            .and_then(|i| self.effective(i).1.map(str::to_owned));
+        // The report keeps what it is shown from the section's own reads.
+        self.last_starts.entry(id.clone()).or_default();
+        self.send(Command::LastStarts(id.clone()));
+        self.send(Command::RedactedDefinition {
+            id,
+            also: detail.into_iter().collect(),
+        });
     }
 
     pub(super) fn redacted_definition_arrived(
         &mut self,
         id: &ServerId,
-        definition: &Result<Exported, String>,
+        definition: Result<Exported, String>,
+        also: Vec<String>,
     ) {
+        if let Some(seen) = self.debug_report.as_mut().filter(|seen| seen.id == *id) {
+            seen.definition = Some((definition, also));
+        }
+        self.debug_report_if_complete(id);
+    }
+
+    /// The last starts the report waits for have arrived.
+    pub(super) fn debug_report_starts_arrived(&mut self, id: &ServerId) {
+        if let Some(seen) = self.debug_report.as_mut().filter(|seen| seen.id == *id) {
+            seen.starts_waiting = false;
+        }
+        self.debug_report_if_complete(id);
+    }
+
+    fn debug_report_if_complete(&mut self, id: &ServerId) {
         // Not copied after the user went elsewhere: the clipboard is not theirs to have changed then.
         let here =
             self.tab == DetailTab::Status && self.single_selected().is_some_and(|s| s.is(id));
-        if !self
+        let Some(seen) = self
             .debug_report
-            .as_ref()
-            .is_some_and(|seen| seen.id == *id && seen.copy && here)
-        {
+            .as_mut()
+            .filter(|seen| seen.id == *id && seen.copy && !seen.starts_waiting)
+        else {
+            return;
+        };
+        let Some((definition, also)) = seen.definition.take() else {
+            return;
+        };
+        seen.copy = false;
+        if !here {
             return;
         }
         let snapshot = std::sync::Arc::clone(&self.snapshot);
@@ -163,6 +211,8 @@ impl ShellApp {
             return;
         };
         let (status, detail) = self.effective(i);
+        // What the engine answered for the status line, which has what the definition keeps secret hidden.
+        let detail = detail.and(also.first().map(String::as_str));
         let explanation = Explanation::for_status_timed(
             &snapshot.servers[i],
             status,
@@ -184,15 +234,15 @@ impl ShellApp {
                 .last_starts
                 .get(id)
                 .and_then(|seen| seen.starts.as_ref()),
-            definition,
+            definition: &definition,
         });
         if let Some(seen) = self.debug_report.as_mut() {
-            seen.copy = false;
             seen.ready = Some(text);
         }
     }
 
-    /// The last section of the Status tab: what the report holds, the button, and "Copied" after it.
+    /// The last section of the Status tab: what the report holds, the button, "Copied" after it, and the text that
+    /// was copied, to read.
     pub(super) fn debug_report_section(&mut self, ui: &mut Ui, s: &ServerRow) {
         if self.core.is_none() {
             return;
@@ -211,7 +261,8 @@ impl ShellApp {
         if let Some(seen) = self.debug_report.as_mut().filter(|seen| seen.id == s.id())
             && let Some(text) = seen.ready.take()
         {
-            ui.ctx().copy_text(text);
+            ui.ctx().copy_text(text.clone());
+            seen.copied_text = Some(text);
             seen.copied = Some(now);
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
@@ -228,6 +279,26 @@ impl ShellApp {
         announce(ui.ctx(), button.id);
         if button.clicked() {
             self.copy_debug_report(s.id());
+        }
+        // What was copied can be read here, before it is pasted anywhere: "check it" needs something to check.
+        if let Some(text) = self
+            .debug_report
+            .as_ref()
+            .filter(|seen| seen.id == s.id())
+            .and_then(|seen| seen.copied_text.as_deref())
+        {
+            egui::CollapsingHeader::new("Show what was copied")
+                .id_salt(("debug report text", s.id()))
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::ScrollArea::both().max_height(260.0).show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(text).monospace().small())
+                                .extend()
+                                .selectable(true),
+                        );
+                    });
+                });
         }
     }
 }

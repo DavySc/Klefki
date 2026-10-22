@@ -2,9 +2,12 @@
 use super::checks::{Job, check_env, interpret, run_timeout, time_limit, timing};
 use super::claude_program;
 use super::{Diagnosis, MAX_CHECK_OUTPUT, Shared, hint};
+use crate::api::Scope;
 use crate::api::{Status, Timing};
 use crate::cli::runner::{self, RunSpec};
 use crate::config::fsx;
+use crate::config::inventory;
+use crate::diagnose::redact::scrubbed;
 use crate::diagnose::report;
 use crate::sanitize::sanitize;
 
@@ -65,14 +68,16 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> (Diagnosis, Option<Tim
         max_output: MAX_CHECK_OUTPUT,
         end_leftovers: true,
     });
+    let hidden = hidden_values_of(shared, &job.id);
     let stderr = result
         .as_ref()
         .ok()
-        .map(|o| o.stderr.clone())
+        .map(|o| scrubbed(&o.stderr, &hidden))
         .unwrap_or_default();
     let took = started.elapsed();
     let timed_out = matches!(&result, Ok(o) if o.timed_out);
     let (status, detail) = interpret(result, timeout);
+    let detail = detail.map(|d| scrubbed(&d, &hidden));
     let timing = timing(false, status, detail.as_deref(), timed_out, took, limit);
 
     let (debug_text, read_note) = match fsx::read_limited(&file, MAX_DEBUG_FILE) {
@@ -89,6 +94,7 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> (Diagnosis, Option<Tim
             )),
         ),
     };
+    let debug_text = scrubbed(&debug_text, &hidden);
     let note = if timed_out { detail.clone() } else { read_note };
     let said = format!("{}\n{}", detail.as_deref().unwrap_or(""), stderr);
     let report = report::build(&debug_text, job.name.as_str(), &said);
@@ -105,4 +111,19 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> (Diagnosis, Option<Tim
         note,
     };
     (diagnosis, timing)
+}
+
+/// What the server's definition holds that must not show in text about it: its environment and header values, as
+/// written and filled in, and the arguments and address parts an export replaces. Nothing when it cannot be read.
+pub(super) fn hidden_values_of(shared: &Shared, id: &crate::api::ServerId) -> Vec<String> {
+    let (Some(paths), Some((scope, project, name))) = (
+        &shared.config.paths,
+        crate::model::ConnectionId::parse(id.connection.as_str()),
+    ) else {
+        return Vec::new();
+    };
+    // The project and name as the file spells them, which the connection holds.
+    inventory::server_entry(paths, project.as_deref(), &name, scope == Scope::Project)
+        .map(|entry| crate::config::entry::hidden_values(&entry, &*shared.config.vars))
+        .unwrap_or_default()
 }

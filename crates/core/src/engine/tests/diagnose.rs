@@ -432,3 +432,63 @@ fn diagnose_also_updates_the_servers_status() {
     let events = collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
     assert_eq!(final_status(&events, "bad-stdio"), Some(Status::Failed));
 }
+
+/// What the server's own definition holds is hidden in a diagnosis too, as in the last starts: the leaks a reviewer
+/// found with `redact` alone (a plain environment value, an argument an export replaces, an address's password).
+#[test]
+fn diagnose_hides_the_servers_own_values_and_the_parts_an_export_replaces() {
+    let hostile = b"2026-10-17T20:00:00.000Z [ERROR] \"MCP server \\\"bad-stdio\\\" Server stderr: auth with my-plain-secret-value failed\"\n\
+2026-10-17T20:00:01.000Z [ERROR] \"MCP server \\\"bad-stdio\\\" Server stderr: Using --key plain-arg-secret-77 now\"\n\
+2026-10-17T20:00:02.000Z [ERROR] \"MCP server \\\"bad-stdio\\\" Server stderr: connect to postgres://u:dbpw-1234567@db/x and https://h.example/mcp?key=urlsecret999\"\n\
+2026-10-17T20:00:03.000Z [ERROR] \"MCP server \\\"bad-stdio\\\" Server stderr: filled in value fill-from-env-42 and Bearer tok-from-env-abc\"\n";
+    let rule = format!(
+        r#",{{{},"debug_file_from":"dbg.log","stdout_file":"failed.txt"}}"#,
+        diagnose_args()
+    );
+    let env = diagnose_env(
+        &rule,
+        &[("dbg.log", hostile), ("failed.txt", FAILED)],
+        serde_json::json!({"bad-stdio": {
+            "command": "x",
+            "args": ["--key", "plain-arg-secret-77", "--db=postgres://u:dbpw-1234567@db/x"],
+            "env": {"PLAIN": "my-plain-secret-value", "FILLED": "${FILLED_FROM}", "AUTH": "Bearer ${TOK_FROM}"},
+        }}),
+    );
+    let core = start_with(
+        EngineConfig {
+            vars: std::sync::Arc::new(|name: &str| match name {
+                "FILLED_FROM" => Some("fill-from-env-42".into()),
+                "TOK_FROM" => Some("tok-from-env-abc".into()),
+                _ => None,
+            }),
+            ..env.config()
+        },
+        || {},
+    );
+    let events = collect(&core, |e| final_status(e, "bad-stdio").is_some());
+    let id = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Snapshot(s) => s.servers.first().map(|r| r.id()),
+            _ => None,
+        })
+        .unwrap();
+    core.send(Command::Diagnose(id));
+    let events = collect(&core, |e| diagnosis_of(e, "bad-stdio").is_some());
+    let d = diagnosis_of(&events, "bad-stdio").unwrap();
+    let dump = format!("{d:?}");
+    for secret in [
+        "my-plain-secret-value",
+        "plain-arg-secret-77",
+        "dbpw-1234567",
+        "urlsecret999",
+        "fill-from-env-42",
+        "tok-from-env-abc",
+    ] {
+        assert!(!dump.contains(secret), "{secret} shown in {dump}");
+    }
+    assert!(
+        !d.server_said.is_empty() || !d.client_log.is_empty(),
+        "{dump}"
+    );
+}

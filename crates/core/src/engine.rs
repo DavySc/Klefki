@@ -57,7 +57,12 @@ pub enum Command {
     InspectorCommand(ServerId),
     /// The server's definition with every value that may be secret replaced, for a debug report (see
     /// [`Event::RedactedDefinition`]). Reads the definition; starts nothing and writes nothing.
-    RedactedDefinition(ServerId),
+    RedactedDefinition {
+        id: ServerId,
+        /// Texts the report holds that came from the server or Claude Code (the status line): answered with what
+        /// the definition keeps secret hidden in them, in the same order.
+        also: Vec<String>,
+    },
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
@@ -433,6 +438,8 @@ pub enum Event {
     RedactedDefinition {
         id: ServerId,
         result: Result<crate::export::Exported, String>,
+        /// The `also` of the command, with the values the definition holds hidden.
+        also: Vec<String>,
     },
     PlanReady(PlanView),
     /// The changes could not be turned into a plan (nothing was written).
