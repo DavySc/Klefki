@@ -138,6 +138,32 @@ pub(super) fn bring_focus_into_view(ui: &Ui) {
 }
 
 impl ShellApp {
+    /// What Claude Code's logs say about the server's last starts, asked for the first time it is shown.
+    fn last_starts_section(&mut self, ui: &mut Ui, s: &ServerRow) {
+        let id = s.id();
+        if self.core.is_some() {
+            let seen = self.last_starts.entry(id.clone()).or_default();
+            // Not drawn in the frame before: the tab or the server was just chosen, so read again (a session may
+            // have started it meanwhile). It takes milliseconds.
+            let frame = ui.ctx().cumulative_frame_nr();
+            if seen.drawn.is_none_or(|drawn| drawn + 1 < frame) {
+                seen.asked = false;
+            }
+            seen.drawn = Some(frame);
+            if !seen.asked {
+                seen.asked = true;
+                self.send(Command::LastStarts(id.clone()));
+            }
+        }
+        if let Some(last) = self
+            .last_starts
+            .get(&id)
+            .and_then(|seen| seen.starts.as_ref())
+        {
+            super::last_starts::panel(ui, s, last);
+        }
+    }
+
     pub(super) fn detail(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
         let gutter = Margin {
@@ -586,6 +612,7 @@ impl ShellApp {
                 }
                 if let Some(why) = not_checked(s) {
                     ui.add(egui::Label::new(RichText::new(why).color(pal.text_muted)).wrap());
+                    self.last_starts_section(ui, s);
                     return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
@@ -676,6 +703,7 @@ impl ShellApp {
                     ui.add_space(10.0);
                     explanation.show(ui, ui.id().with("status"));
                 }
+                self.last_starts_section(ui, s);
                 if let Some(d) = self.diagnoses.get(&s.id()) {
                     let shown = ui.scope(|ui| diagnosis_panel(ui, s, d)).response;
                     if self.reveal_diagnosis.take_if(|id| s.is(id)).is_some() {

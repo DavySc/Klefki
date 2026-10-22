@@ -87,6 +87,7 @@ pub(super) fn engine_main(
             Command::CheckLonger(id) => enqueue_now(&shared, &state, &id, JobKind::Check, true),
             Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose, false),
             Command::Inspect(id) => inspect(&shared, &state, id),
+            Command::LastStarts(id) => last_starts(&shared, &state, id),
             Command::Export(ids) => {
                 let sources = crate::export::sources(
                     shared.config.paths.as_ref(),
@@ -351,6 +352,86 @@ fn download_update(shared: &Shared) -> Option<UpdateDownload> {
         }
         Err(why) => UpdateDownload::Failed(why),
     })
+}
+
+/// What Claude Code's logs say about the server's last starts. Reads only names and, of at most a few files, both
+/// ends (decision 013).
+fn last_starts(shared: &Shared, state: &State, id: ServerId) {
+    let found = inventory::locate(&state.snapshot, &state.keys, &id);
+    let row = state.snapshot.servers.iter().find(|r| r.is(&id));
+    let starts = match (row, &shared.config.claude_logs) {
+        (None, _) => crate::api::LastStarts {
+            problem: Some("The server is no longer in the configuration.".to_owned()),
+            ..Default::default()
+        },
+        (Some(_), None) => crate::api::LastStarts {
+            problem: Some("Klefki could not tell where Claude Code keeps its logs.".to_owned()),
+            ..Default::default()
+        },
+        (Some(row), Some(root)) => {
+            // The name and project as the files spell them, not as shown.
+            let (name, project) = match (
+                found,
+                crate::model::ConnectionId::parse(row.connection.as_str()),
+            ) {
+                (Some((_, file)), _) => (file.name.clone(), file.project.clone()),
+                (None, Some((_, project, name))) => (name, project),
+                (None, None) => (row.name.clone(), row.project.clone()),
+            };
+            let within = matches!(row.scope, Scope::Local | Scope::Project)
+                .then_some(project.as_deref())
+                .flatten();
+            let secrets = match (&shared.config.paths, found) {
+                (Some(paths), Some((_, file))) => inventory::server_entry(
+                    paths,
+                    file.project.as_deref(),
+                    &file.name,
+                    row.scope == Scope::Project,
+                )
+                .map(|entry| entry::values(&entry))
+                .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let mut starts = crate::last_start::read(&crate::last_start::Ask {
+                root,
+                name: &name,
+                within,
+                elsewhere: &row.shadowed_in,
+                home: shared.config.home.as_deref(),
+                secrets: &secrets,
+                now_ms: crate::activity::now_ms(),
+                offset: &crate::activity::local_offset_secs,
+            });
+            let logged_as = crate::last_start::folder_name(&name);
+            let mut others: Vec<String> = Vec::new();
+            for other in &state.snapshot.servers {
+                let other_name = state
+                    .keys
+                    .get(&other.connection)
+                    .map(|k| k.name.clone())
+                    .or_else(|| {
+                        crate::model::ConnectionId::parse(other.connection.as_str()).map(|p| p.2)
+                    })
+                    .unwrap_or_else(|| other.name.clone());
+                if other_name != name
+                    && crate::last_start::folder_name(&other_name) == logged_as
+                    && !others.contains(&other.name)
+                {
+                    others.push(other.name.clone());
+                }
+            }
+            starts.shares_log_with = others;
+            // A user server hidden in every known project still starts in other folders.
+            if (row.shadowed && !row.scope.is_everywhere()) || row.not_loaded.is_some() {
+                starts.problem = Some(
+                    "Claude Code loads another server of this name in its place, so its logs are about that one."
+                        .to_owned(),
+                );
+            }
+            starts
+        }
+    };
+    shared.emitter.emit(Event::LastStarts { id, starts });
 }
 
 fn inspect(shared: &Shared, state: &State, id: ServerId) {

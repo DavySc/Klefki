@@ -1,0 +1,3 @@
+{"debug":"Starting connection with timeout of 5000ms","timestamp":"2026-10-22T07:32:17.751Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Connection failed after 16ms, 15ms of it awake (ENOENT): Executable not found in $PATH: \"does-not-exist-xyz\"","timestamp":"2026-10-22T07:32:17.757Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"error":"Connection failed (ENOENT): Executable not found in $PATH: \"does-not-exist-xyz\"","timestamp":"2026-10-22T07:32:17.757Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}

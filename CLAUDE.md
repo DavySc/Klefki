@@ -31,6 +31,7 @@ If a command can't run, report the work as **unverified**.
 - Claude is spawned with no shell, no `.cmd` or `.bat`, and names matching `^[A-Za-z0-9_-]{1,64}$`. URLs opened are https only. TLS verification is always on.
 - Network: only Klefki's own updates in `klefki-core` (decision 009): https to GitHub, and nothing trusted unless signed by the release key built in from `minisign.pub`. A downloaded package is installed or started only if its SHA-256 matches the signed `SHA256SUMS`. That key signs only in the `release` environment, behind the owner's required approval, for `v*` tags only the owner can create (`docs/RELEASING.md`).
 - `.mcp.json`, server metadata and CLI output are untrusted: size-limit, validate and sanitize them (ANSI, control and bidi characters).
+- Claude Code's MCP logs (`claude-cli-nodejs/<folder>/mcp-logs-<server>/`) are read only by `last_start.rs` (decision 013): names listed, at most a few files, only both ends of each, never written or deleted. They are untrusted, and what is shown or copied is sanitised with the server's own values and secret-looking text hidden.
 
 ## Progress
 Each slice has its own file, `docs/progress/<YYYY-MM-DD>-<slug>.md`, written only by the session doing it. Keep it factual: the goal, done work with commits, checks run and their results, open failures, and the next action. `docs/progress.md` is the log up to 2026-10-18; add nothing to it, but strike an open item there when you fix it. Re-run checks rather than trusting either.

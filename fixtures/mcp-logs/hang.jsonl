@@ -1,0 +1,5 @@
+{"debug":"Starting connection with timeout of 3000ms","timestamp":"2026-10-22T07:35:11.161Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Connection timeout triggered after 3021ms, 3022ms of it awake (limit: 3000ms)","timestamp":"2026-10-22T07:35:14.164Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"error":"Server stderr: hanging\n","timestamp":"2026-10-22T07:35:14.164Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Connection failed after 3027ms, 3027ms of it awake (CONNECT_TIMEOUT): MCP server \"hang\" connection timed out after 3000ms","timestamp":"2026-10-22T07:35:14.169Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"error":"Connection failed (CONNECT_TIMEOUT): MCP server \"hang\" connection timed out after 3000ms","timestamp":"2026-10-22T07:35:14.169Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}

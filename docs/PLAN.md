@@ -165,7 +165,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
 ## Nice to have (after M4)
 Ideas from an outside brainstorm, compared with this plan and checked on a real machine in `docs/decisions/003-brainstorm-comparison.md`. None of them blocks M0 to M4, and they are in rough order of value.
 1. **Claude Desktop detection, read-only.** List the servers in `claude_desktop_config.json`. Check both locations: `%APPDATA%\Claude\` and the MSIX-virtualised `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\` (the MSIX one is the real one on the owner's machine). No editing and no health check of Desktop servers (there is no CLI to delegate to); show them with their log tail instead.
-2. **Bounded log tail for MCP servers.** Show the newest log for a server (Claude Code: `%LOCALAPPDATA%\claude-cli-nodejs\Cache\<project>\mcp-logs-<server>\`), reading from the end of the file in chunks. Acceptance criteria, written before the code:
+2. **Bounded log tail for MCP servers.** Built as the Status tab's last starts by Claude Code (decision 013): what each start said, not the raw log. The memory criterion is met by reading only both ends of a file, at most 64 KB each; a test reads a 1 GB file that way. Show the newest log for a server (Claude Code: `%LOCALAPPDATA%\claude-cli-nodejs\Cache\<project>\mcp-logs-<server>\`), reading from the end of the file in chunks. Acceptance criteria, written before the code:
    - memory stays flat whatever the file size, proven by a test that runs the tail in a child process on a generated 1 GB file and checks peak working set grows by only a few MB, with the first lines visible quickly;
    - a single huge line without a newline, a file that grows or rotates while read, and a file held open by its writer are all handled;
    - text is sanitised like all untrusted output, and tokens, `Authorization` values and environment values are redacted by default (the logs can contain full JSON-RPC traffic), with an explicit "copy sanitised" action.
@@ -190,7 +190,7 @@ Everything not yet built, ranked by impact and by how much it sets Klefki apart 
 | 5 | Approvals per server | S–M | Medium-high | Yes: others leave Claude Code permission rules to hand-edited settings | Below |
 | 6 | Network probe for HTTP servers | M | Medium: explains bare `ECONNREFUSED` and TLS-proxy failures | Yes: no manager diagnoses why a remote server fails. Builds `net/` together with 3 | Nice to have 5 |
 | 7 | VS Code servers | M read-only, L to write | Medium-high: the other client the owner uses | No: add-mcp, mcpm, MCPMate and Docker cover it | Below |
-| 8 | Bounded log tail | M | Medium | Partly: MCP Router has logs; redaction and flat memory are Klefki's own | Nice to have 2 |
+| 8 | Bounded log tail, reframed as the last starts by Claude Code (done, decision 013) | M | Medium | Partly: MCP Router has logs; redaction and flat memory are Klefki's own | Nice to have 2, decision 013 |
 | 9 | Scope drift watcher and Refresh scopes | M | Low-medium: OAuth gateway users only | Yes, but niche | Milestones, M3 |
 | 10 | Copy MCP Inspector command | S | Low | No | Nice to have 7 |
 | 11 | Import: `${VAR}` value entry and leftovers | S–M | Low-medium | No | Progress file of Import |

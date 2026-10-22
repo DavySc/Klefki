@@ -7,8 +7,8 @@ use crate::theme::{self, ThemeChoice, Tone};
 use egui::{Frame, Margin, RichText, Sense, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, Core, Diagnosis, Event, Hint, ImportFile, PlanView,
-    Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, Timing,
+    Approval, Change, Command, ConnectionId, Core, Diagnosis, Event, Hint, ImportFile, LastStarts,
+    PlanView, Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, Timing,
     TransportKind, UpdateDownload, same_project,
     words::{self, capitalized},
 };
@@ -21,6 +21,7 @@ mod detail;
 mod duplicate;
 mod editor;
 mod export;
+mod last_starts;
 mod list;
 mod move_dialog;
 mod notices;
@@ -156,6 +157,8 @@ pub(crate) struct ShellApp {
     on_screen_now: Vec<usize>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
+    /// What Claude Code's logs say about each server's last starts, asked for when its Status tab is shown.
+    last_starts: HashMap<ServerId, LastStartsSeen>,
     /// A diagnosis that came in for the server shown on its Status tab, to bring into view once drawn.
     reveal_diagnosis: Option<ServerId>,
     /// The server checked with more time, and when that was asked for (egui's clock, in seconds): the Status tab
@@ -284,6 +287,7 @@ impl ShellApp {
             explained: None,
             legacy_cache: None,
             diagnoses: HashMap::new(),
+            last_starts: HashMap::new(),
             reveal_diagnosis: None,
             longer_since: None,
             save_bar_wanted: false,
@@ -534,6 +538,11 @@ impl ShellApp {
                     self.diagnoses.insert(id, diagnosis);
                 }
             }
+            Event::LastStarts { id, starts } => {
+                if let Some(seen) = self.last_starts.get_mut(&id) {
+                    seen.starts = Some(starts);
+                }
+            }
             Event::PlanReady(plan) => self.plan_ready(plan),
             Event::PlanFailed(why) => self.plan_failed(why),
             Event::Applied {
@@ -630,6 +639,11 @@ impl ShellApp {
                 {
                     self.longer_since = None;
                 }
+                if status != Status::Checking
+                    && let Some(seen) = self.last_starts.get_mut(&id)
+                {
+                    seen.asked = false;
+                }
                 if let Some(i) = self.snapshot.servers.iter().position(|r| r.is(&id)) {
                     self.live[i] = Some(Live {
                         status,
@@ -671,6 +685,12 @@ impl ShellApp {
         self.live_gen += 1;
         self.diagnoses
             .retain(|id, _| new_index.contains_key(&id.connection));
+        // Read again when next shown: the server's definition, and so what is hidden in its log, may have changed.
+        self.last_starts
+            .retain(|id, _| new_index.contains_key(&id.connection));
+        for seen in self.last_starts.values_mut() {
+            seen.asked = false;
+        }
         self.selected = selected;
         self.live = live;
         // Positions now mean other servers: tell the engine again.
@@ -1954,6 +1974,17 @@ struct Live {
     timing: Option<Timing>,
 }
 
+/// A server's last starts as last read, and whether they have been asked for since they could have changed (a check
+/// ended: it is a start too; the files changed; the section was shown again). Kept while read again, so the section
+/// does not blink.
+#[derive(Default)]
+struct LastStartsSeen {
+    starts: Option<LastStarts>,
+    asked: bool,
+    /// The frame the section was last drawn in.
+    drawn: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2659,6 +2690,8 @@ mod tests {
         click(&mut h, "docs");
         h.get_by_role_and_label(Role::Button, "Status").click();
         h.run();
+        // Its last starts are read from Claude Code's logs, which runs nothing.
+        assert_eq!(drain(&engine), vec![Command::LastStarts(row.id())]);
         h.get_by_label_contains("CONNECTION_CLOSED: Connection closed");
         // A project server's check runs the repository's own command, and the UI says so.
         h.get_by_label_contains("runs this server's command");
@@ -3562,7 +3595,8 @@ mod tests {
         h.get_by_label_contains("Klefki does not check a plugin's servers");
         assert!(h.query_by_label("Check now").is_none());
         assert!(h.query_by_label("Diagnose").is_none());
-        assert_eq!(drain(&engine), Vec::<Command>::new());
+        // Only its last starts are read, from Claude Code's logs: nothing runs.
+        assert_eq!(drain(&engine), vec![Command::LastStarts(p.id())]);
         // Switched like a user server, through a review.
         press(&mut h, Tool::TurnOff);
         assert_eq!(
@@ -3956,6 +3990,7 @@ mod tests {
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Status")
             .click();
         h.run();
+        assert_eq!(drain(&engine), vec![Command::LastStarts(a.id())]);
         press(&mut h, Tool::Edit);
         assert_eq!(h.state().tab, DetailTab::General);
         assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
@@ -4005,6 +4040,7 @@ mod tests {
             h.get_by_role_and_label(egui::accesskit::Role::Button, "Status")
                 .click();
             h.run();
+            assert_eq!(drain(&engine), vec![Command::LastStarts(a.id())], "{how}");
             way(&mut h);
             assert_eq!(h.state().tab, DetailTab::General, "{how}");
             assert_eq!(drain(&engine), vec![Command::Inspect(a.id())], "{how}");
@@ -6063,6 +6099,7 @@ mod tests {
     mod duplicate;
     mod editor;
     mod export;
+    mod last_starts;
     mod list;
     mod move_dialog;
     mod notices;

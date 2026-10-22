@@ -1,0 +1,8 @@
+{"debug":"Starting connection with timeout of 5000ms","timestamp":"2026-10-22T07:32:17.172Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"error":"Server stderr: ok server up\n","timestamp":"2026-10-22T07:32:17.224Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Successfully connected (transport: stdio) in 62ms","timestamp":"2026-10-22T07:32:17.225Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Connection established with capabilities: {\"hasTools\":true,\"hasPrompts\":false,\"hasResources\":false,\"hasResourceSubscribe\":false,\"serverVersion\":{\"name\":\"ok\",\"version\":\"1\"},\"protocolEra\":\"legacy\",\"negotiatedProtocolVersion\":\"2025-11-25\"}","timestamp":"2026-10-22T07:32:17.225Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Sending SIGINT to MCP server process","timestamp":"2026-10-22T07:32:17.245Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"STDIO connection closed after 0s (cleanly)","timestamp":"2026-10-22T07:32:17.250Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Cleared connection cache for reconnection","timestamp":"2026-10-22T07:32:17.251Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"MCP server process exited cleanly","timestamp":"2026-10-22T07:32:17.296Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
