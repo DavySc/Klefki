@@ -16,6 +16,7 @@ pub use crate::export_file::{
 };
 pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
+pub use crate::inspector::InspectorCommand;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
 pub use crate::ops::{profile_alone_in, profile_in_use};
 pub use crate::paste::{Pasted, PastedServer};

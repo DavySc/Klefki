@@ -744,6 +744,7 @@ mod diagnose;
 mod edits;
 mod export;
 mod golden;
+mod inspector;
 mod last_starts;
 mod oauth;
 mod profiles;

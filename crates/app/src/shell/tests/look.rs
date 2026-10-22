@@ -694,3 +694,33 @@ fn last_starts_from_claude_codes_logs() {
         .unwrap();
     shot(&mut h, "last-starts");
 }
+
+/// The Status tab after "Copy Inspector command": the line that was copied, and what to know before running it.
+#[test]
+fn the_inspector_command_under_the_actions() {
+    use klefki_core::api::InspectorCommand;
+    let (mut h, engine) = app_at(PAGE);
+    select(&mut h, "azure-devops", Scope::User);
+    h.state_mut().tab = DetailTab::Status;
+    h.run();
+    let id = {
+        let i = row(&h, "azure-devops", Scope::User);
+        h.state().snapshot.servers[i].id()
+    };
+    h.state_mut().copy_inspector_command(id.clone());
+    engine
+        .events
+        .send(Event::InspectorCommand {
+            id,
+            line: Ok(InspectorCommand {
+                text: "npx @modelcontextprotocol/inspector -- npx -y @azure-devops/mcp contoso".to_owned(),
+                notes: vec![
+                    "Its environment (AZURE_DEVOPS_PAT) is not in the line, so no secret is typed into a shell: enter it in the Inspector, under Environment Variables.".to_owned(),
+                    "Needs Node 22.19 or newer. Running the line downloads the Inspector and opens it in your browser; Klefki does not run it.".to_owned(),
+                ],
+            }),
+        })
+        .unwrap();
+    h.run();
+    shot(&mut h, "inspector-command");
+}

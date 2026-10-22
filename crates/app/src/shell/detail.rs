@@ -613,6 +613,7 @@ impl ShellApp {
                 if let Some(why) = not_checked(s) {
                     ui.add(egui::Label::new(RichText::new(why).color(pal.text_muted)).wrap());
                     self.last_starts_section(ui, s);
+                    self.inspector_section(ui, s);
                     return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
@@ -704,6 +705,7 @@ impl ShellApp {
                     explanation.show(ui, ui.id().with("status"));
                 }
                 self.last_starts_section(ui, s);
+                self.inspector_section(ui, s);
                 if let Some(d) = self.diagnoses.get(&s.id()) {
                     let shown = ui.scope(|ui| diagnosis_panel(ui, s, d)).response;
                     if self.reveal_diagnosis.take_if(|id| s.is(id)).is_some() {

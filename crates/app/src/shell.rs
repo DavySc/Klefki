@@ -21,6 +21,7 @@ mod detail;
 mod duplicate;
 mod editor;
 mod export;
+mod inspector;
 mod last_starts;
 mod list;
 mod move_dialog;
@@ -159,6 +160,8 @@ pub(crate) struct ShellApp {
     diagnoses: HashMap<ServerId, Diagnosis>,
     /// What Claude Code's logs say about each server's last starts, asked for when its Status tab is shown.
     last_starts: HashMap<ServerId, LastStartsSeen>,
+    /// The line that opens a server in the MCP Inspector, for the one server it was asked for.
+    inspector: Option<inspector::InspectorSeen>,
     /// A diagnosis that came in for the server shown on its Status tab, to bring into view once drawn.
     reveal_diagnosis: Option<ServerId>,
     /// The server checked with more time, and when that was asked for (egui's clock, in seconds): the Status tab
@@ -288,6 +291,7 @@ impl ShellApp {
             legacy_cache: None,
             diagnoses: HashMap::new(),
             last_starts: HashMap::new(),
+            inspector: None,
             reveal_diagnosis: None,
             longer_since: None,
             save_bar_wanted: false,
@@ -543,6 +547,7 @@ impl ShellApp {
                     seen.starts = Some(starts);
                 }
             }
+            Event::InspectorCommand { id, line } => self.inspector_arrived(&id, line),
             Event::PlanReady(plan) => self.plan_ready(plan),
             Event::PlanFailed(why) => self.plan_failed(why),
             Event::Applied {
@@ -691,6 +696,8 @@ impl ShellApp {
         for seen in self.last_starts.values_mut() {
             seen.asked = false;
         }
+        // The definition may have changed.
+        self.inspector = None;
         self.selected = selected;
         self.live = live;
         // Positions now mean other servers: tell the engine again.
@@ -1205,6 +1212,15 @@ impl ShellApp {
                     None,
                     command::Action::Diagnose,
                 );
+                if self.core.is_some() && inspector::offers(s) {
+                    add(
+                        icon::TERMINAL_WINDOW,
+                        format!("Copy Inspector command for {}", s.name),
+                        "Opens it in the MCP Inspector; no secrets in the line".into(),
+                        None,
+                        command::Action::CopyInspector,
+                    );
+                }
                 if s.scope == Scope::Project && s.approval.is_some_and(|a| a != Approval::Approved)
                 {
                     add(
@@ -1387,6 +1403,13 @@ impl ShellApp {
                             self.send(Command::Prepare(vec![Change::Approve { id }]));
                         }
                     }
+                }
+            }
+            A::CopyInspector => {
+                if let Some(s) = self.single_selected().filter(|s| inspector::offers(s)) {
+                    let id = s.id();
+                    self.tab = DetailTab::Status;
+                    self.copy_inspector_command(id);
                 }
             }
             A::Refresh => self.refresh(),
@@ -6099,6 +6122,7 @@ mod tests {
     mod duplicate;
     mod editor;
     mod export;
+    mod inspector;
     mod last_starts;
     mod list;
     mod move_dialog;

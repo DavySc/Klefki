@@ -52,6 +52,9 @@ pub enum Command {
     /// The last times Claude Code started this server, read from its own logs (see [`Event::LastStarts`], decision
     /// 013). Starts nothing and writes nothing.
     LastStarts(ServerId),
+    /// The line that opens this server in the MCP Inspector, to copy (see [`Event::InspectorCommand`], decision
+    /// 014). Reads the definition; starts nothing and writes nothing.
+    InspectorCommand(ServerId),
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
@@ -416,6 +419,11 @@ pub enum Event {
     LastStarts {
         id: ServerId,
         starts: crate::api::LastStarts,
+    },
+    /// The line [`Command::InspectorCommand`] asked for, or why there is none (sanitised).
+    InspectorCommand {
+        id: ServerId,
+        line: Result<crate::inspector::InspectorCommand, String>,
     },
     PlanReady(PlanView),
     /// The changes could not be turned into a plan (nothing was written).
