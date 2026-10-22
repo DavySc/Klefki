@@ -1014,7 +1014,6 @@ impl ShellApp {
         });
         if menu_below && let Some(p) = &self.lens {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Profile").color(pal.text_muted));
                 asked = profile_menu(ui, &self.snapshot, p, &self.lens_profiles).or(asked.take());
             });
         }
@@ -1029,8 +1028,8 @@ impl ShellApp {
     }
 }
 
-/// What the profile menu takes beside the Where list, about: a profile's name, its icon and the gap.
-const PROFILE_MENU_WIDTH: f32 = 120.0;
+/// What the profile menu takes beside the Where list, about: its label, a profile's name, the caret and the gaps.
+const PROFILE_MENU_WIDTH: f32 = 180.0;
 
 /// The profile in use in `project` (`in_use`, in the profiles' order), as a menu that switches to another profile
 /// there, uses one, or stops one: each a change reviewed before it is saved (it can turn many servers off), with
@@ -1051,7 +1050,16 @@ fn profile_menu(
         [first, rest @ ..] => format!("{first} +{}", rest.len()),
     };
     let mut asked = None;
-    ui.menu_button(format!("{} {current}", icon::STACK), |ui| {
+    // Named as what it is in both layouts, with a caret like the Where list's: it opens a list to choose from.
+    let label = ui.label(RichText::new("Profile").color(theme::palette(ui.ctx()).text_muted));
+    let menu = ui.menu_button(format!("{current} {}", icon::CARET_DOWN), |ui| {
+        // The profiles in use first, ticked: what is chosen now, not something to do.
+        for name in in_use {
+            ui.label(format!("{} {name}", icon::CHECK));
+        }
+        if !in_use.is_empty() {
+            ui.separator();
+        }
         for profile in snapshot.profiles.iter().filter(|p| !in_use.contains(&p.name)) {
             let (text, tip) = if in_use.is_empty() {
                 (
@@ -1100,9 +1108,16 @@ fn profile_menu(
                 }
             }
         }
-    })
-    .response
-    .on_hover_text(match in_use {
+    });
+    let response = menu.response.labelled_by(label.id);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("Profile in {shown}: {current}"),
+        )
+    });
+    response.on_hover_text(match in_use {
         [] => format!("No profile is in use in {shown}. Use one here."),
         _ => format!(
             "In use in {shown}: {}. Switch to another profile here, or stop it.",

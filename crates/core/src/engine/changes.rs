@@ -818,6 +818,9 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
             notes.push(sanitize(&why));
         }
     }
+    // A switch whose writes all cancel out still hands the record over from the profiles stopped to the one used:
+    // it changed what Klefki remembers, and its Undo hands it back.
+    let changed = changed || (!profiles_stopped.is_empty() && !profiles_used.is_empty());
     // Klefki's own records of profile uses, once Claude Code's files are saved; read again with the snapshot below.
     if changed && let Ok(dir) = backup_dir(shared) {
         if !follow.is_empty() {

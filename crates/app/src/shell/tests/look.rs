@@ -890,7 +890,7 @@ fn switching_profiles() {
             app_showing(Arc::clone(&snapshot), size, ThemeChoice::Dark, Tone::Cool);
         h.state_mut().look_in(Some("/home/notes".to_owned()));
         h.run();
-        h.get_by_label_contains("Work").click();
+        h.get_by_label("Profile in notes: Work").click();
         shot(&mut h, name);
         all.extend_harness(&mut h);
     }

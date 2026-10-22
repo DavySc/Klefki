@@ -103,8 +103,10 @@ fn the_list_seen_from_a_project_names_its_profile_and_switches_it() {
     h.state_mut().look_in(Some(NOTES.to_owned()));
     h.run();
     sent(&engine);
-    h.get_by_label_contains("Work").click();
+    // Named as a profile, for a screen reader too, and the one in use ticked in the menu.
+    h.get_by_label("Profile in notes: Work").click();
     h.run();
+    h.get_by_label(&format!("{} Work", egui_phosphor::regular::CHECK));
     click(&mut h, "Switch to Notes");
     assert_eq!(
         sent(&engine),
@@ -112,7 +114,7 @@ fn the_list_seen_from_a_project_names_its_profile_and_switches_it() {
     );
     assert!(h.state().preparing, "reviewed, not saved at once");
     h.state_mut().preparing = false;
-    h.get_by_label_contains("Work").click();
+    h.get_by_label("Profile in notes: Work").click();
     h.run();
     click(&mut h, "Stop using Work");
     assert_eq!(
@@ -128,7 +130,7 @@ fn the_list_seen_from_a_project_names_its_profile_and_switches_it() {
     h.state_mut().look_in(Some("/work/app".to_owned()));
     h.run();
     sent(&engine);
-    h.get_by_label_contains("No profile").click();
+    h.get_by_label("Profile in app: No profile").click();
     h.run();
     assert!(h.query_by_label("Stop using Work").is_none());
     click(&mut h, "Use Notes");

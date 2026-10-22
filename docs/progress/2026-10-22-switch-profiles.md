@@ -52,3 +52,17 @@ project (S3); `klefki-cli switch` and `stop`; and fix `klefki-cli use` in a git 
 - The palette has no "Switch to" entry yet (the card and the lens menu do it).
 - The lens menu always switches with "Only these servers there"; the card has the choice.
 - Next in the plan: S5, start a session with a profile (`claude --settings` allowedMcpServers, `klefki-cli run`).
+
+## Review round 1 (cross-review on #105)
+- B1: a switch whose writes all cancel out (to a profile that ends where the old one left the files) forgot the old
+  profile and never recorded the new one: no Undo, and stopping the new one said "no record", so the old switches
+  could never be put back. `changed` now counts a switch's stops and use, so the record is handed over and the Undo
+  hands it back. Regression test `a_switch_that_writes_nothing_still_hands_the_record_over` (seen failing before the
+  fix) and the variant `a_switch_without_only_to_a_profile_already_on_puts_the_old_one_back`.
+- Polish (profile menu beside Where): labelled "Profile" in both layouts, a caret like the Where list's, the profile
+  in use ticked at the top of the menu, and a screen-reader name "Profile in notes: Work". Pictures
+  `connections-profile-menu(-800x480)` changed with it.
+- Left for later (reviewer's): with Every project chosen, a card's Use still stacks over profiles in use in some
+  projects without saying so.
+- Checks: fmt, clippy (workspace and `-p klefki`) exit 0; `cargo test --workspace` exit 0 (1121 core, 550 app,
+  29 + 51 CLI); `cargo deny check` ok.

@@ -245,3 +245,85 @@ fn a_switch_without_only_and_its_edges() {
     );
     assert!(why.contains("does not know the project"), "{why}");
 }
+
+/// Found in cross-review of PR #105 (B1): a switch whose writes all cancel out (the new profile ends where the old one
+/// left the files) still forgets the old profile and records the new one, so stopping the new one puts back what the
+/// old one switched, and the switch can be undone.
+#[test]
+fn a_switch_that_writes_nothing_still_hands_the_record_over() {
+    let env = quiet_env(&designs_config());
+    let core = env.start();
+    let plan = plan_for(
+        &core,
+        vec![use_profile("Writing", &["gw"], Some("/work/designs"), true)],
+    );
+    applied(&core, &plan);
+    let plan = plan_for(
+        &core,
+        vec![switch_profile(
+            &["Writing"],
+            "Copy",
+            &["gw"],
+            "/work/designs",
+            true,
+        )],
+    );
+    assert!(!plan.nothing_to_do);
+    let events = applied(&core, &plan);
+    assert_eq!(off_sorted(&env, "/work/designs"), ["db", "memory"]);
+    let snapshot = snapshot_after(&events);
+    assert_eq!(
+        crate::ops::profiles_in_use_in(&snapshot, "/work/designs"),
+        ["Copy"]
+    );
+    // Undone: Writing in use again.
+    let undo = undo_in(&events).expect("a switch that writes nothing can still be undone");
+    let plan = plan_for(&core, vec![Change::Undo(undo)]);
+    let events = applied(&core, &plan);
+    assert_eq!(
+        crate::ops::profiles_in_use_in(&snapshot_after(&events), "/work/designs"),
+        ["Writing"]
+    );
+    // Switched again and stopped: back to before both.
+    let plan = plan_for(
+        &core,
+        vec![switch_profile(
+            &["Writing"],
+            "Copy",
+            &["gw"],
+            "/work/designs",
+            true,
+        )],
+    );
+    applied(&core, &plan);
+    let plan = plan_for(&core, vec![stop_profile("Copy", None, false)]);
+    applied(&core, &plan);
+    assert!(off_sorted(&env, "/work/designs").is_empty());
+}
+
+/// Nearby: without "only", to a profile whose server is already on there and which the old one never switched. The
+/// old profile's switches go back; nothing is left recorded for the new one, as using it would record nothing.
+#[test]
+fn a_switch_without_only_to_a_profile_already_on_puts_the_old_one_back() {
+    let env = quiet_env(&designs_config());
+    let core = env.start();
+    let plan = plan_for(
+        &core,
+        vec![use_profile("Writing", &["gw"], Some("/work/designs"), true)],
+    );
+    applied(&core, &plan);
+    let plan = plan_for(
+        &core,
+        vec![switch_profile(
+            &["Writing"],
+            "Gw",
+            &["gw"],
+            "/work/designs",
+            false,
+        )],
+    );
+    let events = applied(&core, &plan);
+    assert!(off_sorted(&env, "/work/designs").is_empty());
+    assert!(crate::ops::profiles_in_use_in(&snapshot_after(&events), "/work/designs").is_empty());
+    assert!(undo_in(&events).is_some());
+}
