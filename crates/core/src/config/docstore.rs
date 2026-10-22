@@ -110,7 +110,7 @@ pub(crate) enum Op {
 
 impl Op {
     /// The project this op changes inside, if any.
-    fn project(&self) -> Option<&str> {
+    pub(crate) fn project(&self) -> Option<&str> {
         match self {
             Op::SetDisabled { project, .. }
             | Op::RenameDisabled { project, .. }

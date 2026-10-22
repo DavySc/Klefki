@@ -22,6 +22,7 @@ fn render(plan: &PlanView) -> String {
     section("summary", &plan.summary);
     section("warnings", &plan.warnings);
     section("notes", &plan.notes);
+    section("sessions", plan.sessions.as_slice());
     section("already", &plan.already);
     for review in &plan.reviews {
         section(&format!("review {}", review.title), &review.lines);

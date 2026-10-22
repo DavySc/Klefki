@@ -277,8 +277,10 @@ impl ShellApp {
         if changed {
             self.editor_after_change(plan);
         }
-        if self.plan.as_ref().is_some_and(|p| p.id == plan) {
-            self.plan = None;
+        // What a session already open gets, said again now that it is so: the review may have been read quickly.
+        let mut sessions = None;
+        if let Some(p) = self.plan.take_if(|p| p.id == plan) {
+            sessions = p.sessions.clone().filter(|_| changed);
             self.applying = false;
             self.applying_step = None;
         }
@@ -303,7 +305,11 @@ impl ShellApp {
         };
         // How it went, when there is more to say (settings Claude Code left out, say), then the backup.
         let warn = changed && !notes.is_empty();
-        let mut kept: String = notes.iter().map(|n| format!(" {n}")).collect();
+        let mut kept: String = sessions
+            .iter()
+            .chain(&notes)
+            .map(|n| format!(" {n}"))
+            .collect();
         if let Some(b) = backup {
             kept.push_str(&format!(" The previous file is kept in {b}"));
         }

@@ -486,6 +486,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 guards,
                 warnings,
                 notes,
+                sessions,
                 summary,
                 action,
                 destructive,
@@ -531,6 +532,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 action,
                 destructive,
                 notes: if nothing_to_do { Vec::new() } else { notes },
+                sessions: sessions.filter(|_| !nothing_to_do),
                 files: cli
                     .iter()
                     .map(|c| &c.preview)

@@ -103,6 +103,36 @@ fn a_user_server_off_everywhere_reads_disabled_without_the_partial_badge() {
 }
 
 #[test]
+fn a_server_off_in_every_known_project_says_new_projects_still_load_it() {
+    // Off where Claude Code has been, on where it goes next: "Disabled" alone reads as off for good.
+    for scope in [Scope::User, Scope::Plugin, Scope::ClaudeAi] {
+        let (mut h, engine) = live_harness();
+        let mut row = live_row("gateway", scope, None);
+        row.disabled_in = 17;
+        row.enabled = false;
+        engine
+            .events
+            .send(snapshot_with_projects(17, vec![row]))
+            .unwrap();
+        h.run();
+        h.get_by_label("new: on");
+        click(&mut h, "gateway");
+        h.get_by_label("no, in all 17 projects; on in projects Claude Code opens later");
+    }
+    // A local server is only ever in its own project: nothing new loads it.
+    let (mut h, engine) = live_harness();
+    let mut row = live_row("loc", Scope::Local, Some("C:/Repos/WebApp"));
+    row.enabled = false;
+    engine
+        .events
+        .send(snapshot_with_projects(17, vec![row]))
+        .unwrap();
+    h.run();
+    h.get_by_label_contains("Disabled");
+    assert!(h.query_by_label("new: on").is_none());
+}
+
+#[test]
 fn a_user_server_hidden_in_some_projects_says_how_many_and_where() {
     let (mut h, engine) = live_harness();
     let mut row = live_row("gateway", Scope::User, None);

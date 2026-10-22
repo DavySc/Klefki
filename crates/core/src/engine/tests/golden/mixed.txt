@@ -4,8 +4,8 @@ summary:
   Delete gw (user server)
 warnings:
   Deleting removes the definition only. A sign-in Claude Code keeps for this server is not removed.
-notes:
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open keep the servers they started with until you restart them. New sessions get this.
 diff .claude.json:
     mcpServers
   - gw

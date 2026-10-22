@@ -4,7 +4,7 @@ exit: Some(0)
 User
   alpha   on   stdio  npx -y alpha-mcp --api-key … --token=… …
   beta    on   http   http://127.0.0.1:9/mcp
-  delta   off  sse    https://delta.example.com/sse
+  delta   off  sse    https://delta.example.com/sse  (off in the 1 project, on in new ones)
   remote  on   stdio  npx mcp-remote https://r.example.com/mcp --header Authorization: Bearer …
 
 Local in <project>

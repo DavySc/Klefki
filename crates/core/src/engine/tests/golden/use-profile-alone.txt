@@ -5,7 +5,8 @@ warnings:
   This also turns off db and memory, which are not in Writing.
 notes:
   Klefki remembers what this switches: stop using Writing, or delete it, to put it back.
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open in designs keep the servers they started with until you restart them, or switch the same servers there with /mcp. New sessions get this.
 diff .claude.json:
     projects["/work/designs"].disabledMcpServers
   + memory

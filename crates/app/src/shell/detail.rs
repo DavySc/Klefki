@@ -2,10 +2,10 @@
 
 use super::editor::EditorState;
 use super::list::{
-    ABOUT_CONNECTORS, CONNECTOR_READ_ONLY, NOT_LOADED, PLUGIN_STATUS, in_projects_text,
-    managed_read_only, not_checked, plugin_off_everywhere, plugin_on_text, plugin_read_only,
-    preflight_shown, projects_paths, relative_job, replaced_by_organisation, shadowed_paths,
-    shadowed_text,
+    ABOUT_CONNECTORS, CONNECTOR_READ_ONLY, NOT_LOADED, PLUGIN_STATUS, all_known, in_projects_text,
+    managed_read_only, not_checked, off_everywhere_known, plugin_off_everywhere, plugin_on_text,
+    plugin_read_only, preflight_shown, projects_paths, relative_job, replaced_by_organisation,
+    shadowed_paths, shadowed_text,
 };
 use super::{DetailTab, ShellApp, flat_items};
 use crate::command::shortcut;
@@ -458,6 +458,11 @@ impl ShellApp {
                             }
                         } else if plugin_off_everywhere(s, self.snapshot.project_count) {
                             "yes, but its plugin is off in every project".to_owned()
+                        } else if off_everywhere_known(s, self.snapshot.project_count) {
+                            format!(
+                                "no, in {}; on in projects Claude Code opens later",
+                                all_known(self.snapshot.project_count)
+                            )
                         } else if s.enabled {
                             "yes".to_owned()
                         } else {

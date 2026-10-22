@@ -321,6 +321,14 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         }
         notes.push(note);
     }
+    // Off in every project Claude Code knows is not off for good: a project it opens later loads it.
+    if everywhere && !row.enabled && project_count > 0 {
+        notes.push(if project_count == 1 {
+            "off in the 1 project, on in new ones".to_owned()
+        } else {
+            format!("off in all {project_count} projects, on in new ones")
+        });
+    }
     // Not loaded at all: what else it would leave out or be hidden by does not matter.
     let loaded = row.not_loaded.is_none();
     if let Some(same) = row
@@ -1072,6 +1080,29 @@ mod tests {
         assert!(
             said.contains(&"off in 1 of 3 projects: /p1".to_owned()),
             "{said:?}"
+        );
+        // Off in all it knows: new projects still load it.
+        let all_off = ServerRow {
+            enabled: false,
+            disabled_in: 3,
+            disabled_projects: Vec::new(),
+            blocked: None,
+            ..row.clone()
+        };
+        let said = notes(&all_off, 3);
+        assert!(
+            said.contains(&"off in all 3 projects, on in new ones".to_owned()),
+            "{said:?}"
+        );
+        assert_eq!(state(&all_off, 3), "off");
+        let local = ServerRow {
+            scope: Scope::Local,
+            project: Some("/p1".into()),
+            ..all_off.clone()
+        };
+        assert!(
+            !notes(&local, 3).iter().any(|n| n.contains("new ones")),
+            "a local server is in one project only"
         );
         assert!(!said.iter().any(|n| n.contains("policy")), "{said:?}");
         let json = row_json(&row, 3);

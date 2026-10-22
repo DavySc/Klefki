@@ -127,10 +127,13 @@ fn plan(destructive: bool) -> PlanView {
             title: "gateway would run:".to_owned(),
             lines: vec!["URL: https://gw.example.com/mcp".to_owned()],
         }],
-        warnings: vec![
-            "A running Claude Code session may need a restart before it notices this.".to_owned(),
-        ],
+        warnings: Vec::new(),
         notes: vec!["A backup is kept first.".to_owned()],
+        sessions: Some(
+            "Claude Code sessions already open in WebApp keep the servers they started with until you restart \
+             them, or switch the same servers there with /mcp. New sessions get this."
+                .to_owned(),
+        ),
         nothing_to_do: false,
         already: Vec::new(),
         others_on: false,

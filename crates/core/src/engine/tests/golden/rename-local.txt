@@ -1,8 +1,8 @@
 == review
 summary:
   Rename loc to Loc in a
-notes:
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open in a keep the servers they started with until you restart them. New sessions get this.
 diff .claude.json:
     projects["/work/a"].mcpServers
   - loc

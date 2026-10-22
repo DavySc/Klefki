@@ -3,7 +3,8 @@ summary:
   Turn off gw and loc in a, as the old switch-off list says
 notes:
   Older Claude Code versions kept this list; current ones ignore it, so these servers have been on since.
-  A running Claude Code session may need a restart before it notices this.
+sessions:
+  Claude Code sessions already open in a keep the servers they started with until you restart them. New sessions get this.
 diff .claude.json:
     projects["/work/a"].mcpServersDisabled
   - gw
