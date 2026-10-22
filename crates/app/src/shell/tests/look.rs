@@ -10,7 +10,7 @@
 use super::*;
 use crate::theme::{Tone, set_tone};
 use egui_kittest::{SnapshotOptions, SnapshotResults};
-use klefki_core::api::{FileDiff, Review, UpdateCheck, fixture_snapshot};
+use klefki_core::api::{FileDiff, Preflight, PreflightKind, Review, UpdateCheck, fixture_snapshot};
 
 /// The size Klefki opens at, about.
 const PAGE: egui::Vec2 = egui::vec2(1100.0, 800.0);
@@ -260,6 +260,37 @@ fn each_tab_of_a_server() {
         }
         all.extend_harness(&mut h);
     }
+}
+
+#[test]
+fn what_keeps_a_server_from_starting() {
+    // Found before anything runs: a badge in the list, and each finding with what to do in the details.
+    let mut snapshot = (*fixture_snapshot()).clone();
+    let azure = snapshot
+        .servers
+        .iter_mut()
+        .find(|s| s.name == "azure-devops")
+        .unwrap();
+    // As a check from Klefki finds it: Claude Code can't start what isn't there.
+    azure.status = Status::Failed;
+    azure.preflight = vec![
+        Preflight {
+            kind: PreflightKind::NotFound,
+            problem: "Can't find npx on the PATH Klefki was started with.".to_owned(),
+            fix: "Install it, or write its full path. Claude Code looks on its own PATH, which a terminal can \
+                  set differently."
+                .to_owned(),
+        },
+        Preflight {
+            kind: PreflightKind::UnsetVariable,
+            problem: "${AZURE_DEVOPS_PAT} isn't set, so Claude Code passes it on as written.".to_owned(),
+            fix: "Set it before you start Claude Code and Klefki, or give a default: ${AZURE_DEVOPS_PAT:-value}."
+                .to_owned(),
+        },
+    ];
+    let (mut h, _engine) = app_showing(Arc::new(snapshot), PAGE, ThemeChoice::Dark, Tone::Cool);
+    select(&mut h, "azure-devops", Scope::User);
+    shot(&mut h, "preflight-findings");
 }
 
 #[test]

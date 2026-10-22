@@ -6,7 +6,9 @@ use crate::theme;
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use klefki_core::api::words::parent_folder;
-use klefki_core::api::{Approval, Command, Hint, Scope, ServerRow, Status, words};
+use klefki_core::api::{
+    Approval, Command, Hint, Preflight, PreflightKind, Scope, ServerRow, Status, words,
+};
 use std::sync::Arc;
 
 pub(super) enum GridRow {
@@ -155,7 +157,7 @@ fn group_header(ui: &mut Ui, group: &Group, right: f32) {
     response.on_hover_text(&group.full);
 }
 
-fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
+fn name_cell(ui: &mut Ui, s: &ServerRow, status: Status, project_count: usize) {
     let pal = theme::palette(ui.ctx());
     // Like a user server off in every project: a plugin's server whose plugin is.
     let color = if s.enabled && !plugin_off_everywhere(s, project_count) {
@@ -178,6 +180,14 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, project_count: usize) {
     }
     if s.approval == Some(Approval::Rejected) {
         badges.push(loud("rejected", pal.danger, None));
+    }
+    let preflight = preflight_shown(s, status);
+    if let (Some(first), None) = (preflight.first(), &s.not_loaded) {
+        badges.push(loud(
+            preflight_label(first.kind),
+            pal.warn,
+            Some(&preflight_hover(&preflight)),
+        ));
     }
     let same_as = s.plugin.as_ref().and_then(|p| p.same_as.as_deref());
     if let (true, Some(same)) = (s.shadowed, same_as) {
@@ -568,6 +578,39 @@ pub(super) fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::t
     job
 }
 
+/// A pre-flight finding on a badge, in a word or two.
+fn preflight_label(kind: PreflightKind) -> &'static str {
+    match kind {
+        PreflightKind::NotFound => "not found",
+        PreflightKind::MangledSwitch => "C:/ for /c",
+        PreflightKind::NoInput => "no -i",
+        PreflightKind::UnsetVariable => "unset variable",
+        PreflightKind::EmptyValue => "empty value",
+    }
+}
+
+/// The pre-flight findings to show while the server is `status`. Once it started, Claude Code found its program,
+/// whatever PATH Klefki has: saying it can't would contradict the status beside it.
+pub(super) fn preflight_shown(s: &ServerRow, status: Status) -> Vec<&Preflight> {
+    let started = matches!(
+        status,
+        Status::Connected | Status::Degraded | Status::NeedsAuth
+    );
+    s.preflight
+        .iter()
+        .filter(|f| !(started && f.kind == PreflightKind::NotFound))
+        .collect()
+}
+
+/// What a pre-flight badge says on hover: every finding, as the problem alone.
+fn preflight_hover(found: &[&Preflight]) -> String {
+    let problems: Vec<&str> = found.iter().map(|f| f.problem.as_str()).collect();
+    format!(
+        "This may keep the server from starting. {} The details say what to do.",
+        problems.join(" ")
+    )
+}
+
 /// The name the list shows: a plugin's server without the `plugin:<plugin>:` its group header already says, a
 /// connector without `claude.ai `. The details show the whole name, which is the one Claude Code's `/mcp` shows.
 fn short_name(s: &ServerRow) -> &str {
@@ -769,11 +812,11 @@ impl ShellApp {
                         shown.push(*i);
                         let s = &self.snapshot.servers[*i];
                         row.set_selected(self.selected.contains(i));
-                        row.col(|ui| name_cell(ui, s, project_count));
+                        let (status, detail) = self.effective(*i);
+                        row.col(|ui| name_cell(ui, s, status, project_count));
                         row.col(|ui| {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
-                        let (status, detail) = self.effective(*i);
                         let hint = self.hint(*i);
                         let last_known = self.last_known(*i);
                         row.col(|ui| status_cell(ui, s, status, detail, hint, last_known));

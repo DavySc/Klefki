@@ -49,6 +49,7 @@ impl Env {
             claude: Some(fake_claude().to_path_buf()),
             home: Some(self.dir.path().join("home")),
             path_var: None,
+            vars: std::sync::Arc::new(|_: &str| None),
             cli_env: vec![
                 (
                     "FAKE_CLAUDE_SCENARIO".into(),

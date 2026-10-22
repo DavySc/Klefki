@@ -6,6 +6,7 @@ use super::{Event, Shared, State, lock};
 use crate::api::{Scope, ServerRow, Snapshot, Status};
 use crate::cli::locate;
 use crate::config::inventory::{self, FileKeys};
+use crate::config::preflight::Probe;
 use crate::sanitize::sanitize;
 use crate::swap;
 use crate::watch;
@@ -44,7 +45,9 @@ impl State {
                 if let Some(watch) = &self.watch {
                     watch.rebase(watch::watched_files(paths, &self.snapshot));
                 }
-                let next = inventory::load(paths);
+                let vars = &*shared.config.vars;
+                let probe = Probe::new(shared.config.path_var.as_deref(), vars, cfg!(windows));
+                let next = inventory::load_probed(paths, Some(&probe));
                 if let Some(watch) = &self.watch {
                     // Projects that just appeared start being watched from now.
                     watch.extend(watch::watched_files(paths, &next.snapshot));

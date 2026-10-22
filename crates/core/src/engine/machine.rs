@@ -534,6 +534,7 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             backup_dir: Some(dir.path().join("data").join("backups")),
             verify_delay: delay,
             path_var: None,
+            vars: std::sync::Arc::new(|_: &str| None),
             cli_env: Vec::new(),
             max_checks: 1,
             check_timeout: Duration::from_secs(5),

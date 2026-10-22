@@ -1,6 +1,7 @@
 //! Builds the server list from `.claude.json`, project `.mcp.json` files and Claude's health caches.
 //! Everything read here is untrusted: sizes are limited, text is sanitised and secrets are never shown.
 use super::docstore::LEGACY;
+use super::preflight::{self, Probe};
 use super::{ConfigPaths, fsx, managed, plugins, policy};
 use crate::api::{
     Approval, LegacyDisabled, OAuthInfo, PluginInfo, Scope, ServerId, ServerRow, Snapshot, Status,
@@ -73,22 +74,36 @@ pub(crate) fn locate<'a>(
 }
 
 pub(crate) fn load(paths: &ConfigPaths) -> Inventory {
+    load_probed(paths, None)
+}
+
+/// [`load`], with each server's pre-flight findings looked up with `probe` (none without one).
+pub(crate) fn load_probed(paths: &ConfigPaths, probe: Option<&Probe<'_>>) -> Inventory {
     let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON).map_err(|e| e.to_string());
-    load_text(
+    let mut keys = FileKeys::new();
+    let snapshot = build(
         paths,
         text.as_ref().map(Option::as_deref).map_err(String::clone),
-    )
+        &mut keys,
+        probe,
+    );
+    Inventory { snapshot, keys }
 }
 
 /// [`load`] with `.claude.json` already read (`Ok(None)`: it does not exist), so a caller that needs the text too
 /// reads the file once.
 pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>) -> Inventory {
     let mut keys = FileKeys::new();
-    let snapshot = build(paths, text, &mut keys);
+    let snapshot = build(paths, text, &mut keys, None);
     Inventory { snapshot, keys }
 }
 
-fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut FileKeys) -> Snapshot {
+fn build(
+    paths: &ConfigPaths,
+    text: Result<Option<&str>, String>,
+    keys: &mut FileKeys,
+    probe: Option<&Probe<'_>>,
+) -> Snapshot {
     let mut snap = Snapshot::default();
     let root = match text.and_then(|t| t.map(parse_claude_json).transpose()) {
         Ok(Some(v)) => v,
@@ -170,6 +185,7 @@ fn build(paths: &ConfigPaths, text: Result<Option<&str>, String>, keys: &mut Fil
         disabled_by_project: &disabled_by_project,
         shown_projects: &shown_projects,
         all_places: &all_places,
+        probe,
     };
     let mut found = Found {
         snap,
@@ -242,9 +258,18 @@ struct Judge<'a> {
     shown_projects: &'a [String],
     /// Every place: outside every project (0), then each project in the inventory's order.
     all_places: &'a [usize],
+    /// What pre-flight checks look things up in; `None`: no checks.
+    probe: Option<&'a Probe<'a>>,
 }
 
 impl Judge<'_> {
+    /// What keeps the server `entry` defines from starting. `trusted`: it is in the user's own files.
+    fn preflight(&self, entry: &Value, trusted: bool) -> Vec<crate::api::Preflight> {
+        self.probe
+            .map(|probe| preflight::findings(entry, trusted, probe))
+            .unwrap_or_default()
+    }
+
     /// Why the organisation keeps Claude Code from loading a server called `name`, if it does.
     fn replaced_by(&self, name: &str) -> Option<String> {
         if let Some(only) = &self.only {
@@ -298,6 +323,7 @@ impl Judge<'_> {
             user_blocked.push((snap.servers.len(), blocked));
             let (status, cached) = self.hints.status_of(name);
             let mut r = row(name, entry, Scope::User, None, true, status);
+            r.preflight = self.preflight(entry, true);
             r.status_cached = cached;
             r.not_loaded = not_loaded;
             found.keys.insert(
@@ -412,6 +438,7 @@ impl Judge<'_> {
                         Status::Unknown,
                     );
                     r.connection = ConnectionId::new(Scope::Local, Some(key), name);
+                    r.preflight = self.preflight(entry, true);
                     r.not_loaded = not_loaded.map(|w| clip(&sanitize::sanitize_line(&w)));
                     if self.replaced_by(name).is_none() {
                         r.blocked = held_back.map(|(_, why)| held_back_here(&why, project));
@@ -463,6 +490,8 @@ impl Judge<'_> {
         );
         r.approval = Some(approval);
         r.connection = ConnectionId::new(Scope::Project, Some(&project.raw), &name);
+        // A repository's own file: looked at with care (see `preflight`).
+        r.preflight = self.preflight(entry, false);
         found.keys.insert(
             r.connection.clone(),
             FileKey {
@@ -1100,6 +1129,7 @@ fn row(
         shadowed_in: Vec::new(),
         casing_collision: false,
         relative_paths: super::relative::relative_paths(entry),
+        preflight: Vec::new(),
         status_cached: false,
         oauth: oauth_info(entry),
         plugin: None,
@@ -2323,6 +2353,60 @@ mod tests {
         assert_eq!(
             find(&s, Scope::Project, "repo").relative_paths,
             ["tools/mcp.js"]
+        );
+    }
+
+    #[test]
+    fn rows_say_what_keeps_them_from_starting_and_a_repository_is_trusted_less() {
+        let e = Env::new();
+        let p = e.project("pre");
+        let gone = e.dir.path().join("gone").join("server");
+        let gone = gone.to_string_lossy();
+        std::fs::write(
+            p.join(".mcp.json"),
+            json!({"mcpServers": {
+                "repo": {"command": gone, "args": ["${PRE_UNSET}"]},
+                "bare": {"command": "nowhere"}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        e.write(
+            ".claude.json",
+            &json!({
+                "mcpServers": {
+                    "mine": {"command": gone},
+                    "web": {"type": "http", "url": "https://${PRE_UNSET}/mcp"}
+                },
+                "projects": {p.to_string_lossy(): {"mcpServers": {"local": {"command": "nowhere", "env": {"E": ""}}}}}
+            }),
+        );
+        let paths = e.paths();
+        let kinds = |s: &Snapshot, scope, name| -> Vec<crate::api::PreflightKind> {
+            find(s, scope, name)
+                .preflight
+                .iter()
+                .map(|f| f.kind)
+                .collect()
+        };
+        let none = |_: &str| None;
+        let empty_path = std::ffi::OsString::from(e.dir.path().join("empty"));
+        let probe = Probe::new(Some(&empty_path), &none, cfg!(windows));
+        let s = load_probed(&paths, Some(&probe)).snapshot;
+        use crate::api::PreflightKind::{EmptyValue, NotFound, UnsetVariable};
+        assert_eq!(kinds(&s, Scope::User, "mine"), [NotFound]);
+        assert_eq!(kinds(&s, Scope::User, "web"), [UnsetVariable]);
+        assert_eq!(kinds(&s, Scope::Local, "local"), [NotFound, EmptyValue]);
+        // A path a repository names is not looked at; a bare name is, on Klefki's own PATH.
+        assert_eq!(kinds(&s, Scope::Project, "repo"), [UnsetVariable]);
+        assert_eq!(kinds(&s, Scope::Project, "bare"), [NotFound]);
+        // Without a probe, as when a change is prepared, nothing is looked up.
+        assert!(
+            load(&paths)
+                .snapshot
+                .servers
+                .iter()
+                .all(|r| r.preflight.is_empty())
         );
     }
 

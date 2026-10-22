@@ -902,11 +902,9 @@ fn undo_git_bash_drive(entry: &mut Value, notes: &mut Vec<String>) {
     };
     let (mut drives, mut switches) = (Vec::new(), Vec::new());
     for arg in args {
-        let Some(s) = arg.as_str() else { break };
-        if !(s.len() == 3 && s.as_bytes()[0].is_ascii_alphabetic() && &s[1..] == ":/") {
+        let Some((s, switch)) = arg.as_str().and_then(|s| Some((s, git_bash_drive(s)?))) else {
             break;
-        }
-        let switch = format!("/{}", s[..1].to_ascii_lowercase());
+        };
         drives.push(s.to_owned());
         switches.push(switch.clone());
         *arg = Value::String(switch);
@@ -923,6 +921,12 @@ fn undo_git_bash_drive(entry: &mut Value, notes: &mut Vec<String>) {
             switches.join(" ")
         )),
     }
+}
+
+/// The switch Git Bash turned into the drive `arg` (`C:/` was `/c`), if `arg` is one.
+pub(crate) fn git_bash_drive(arg: &str) -> Option<String> {
+    (arg.len() == 3 && arg.as_bytes()[0].is_ascii_alphabetic() && &arg[1..] == ":/")
+        .then(|| format!("/{}", arg[..1].to_ascii_lowercase()))
 }
 
 /// What a definition runs or connects to, on one line, masked as the list of servers masks it.

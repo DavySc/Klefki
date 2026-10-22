@@ -240,6 +240,10 @@ pub struct ServerRow {
     /// folder the session started in, so on a user server, which every project loads, these work only in a folder
     /// that has them, while klefki's own check runs in the home folder. Empty for other rows.
     pub relative_paths: Vec<String>,
+    /// What in the definition keeps the server from starting, found by reading it and looking on the PATH, never by
+    /// running anything: a program that is not there, a `${VAR}` that is not set, and the like. For servers in the
+    /// user's own files and `.mcp.json` files; empty for other rows. Sanitised.
+    pub preflight: Vec<Preflight>,
     /// `status` is what Claude's own cache last said, which can be old, not an answer klefki got itself. Such rows
     /// are checked again in the background; until then the app shows the status as last known.
     pub status_cached: bool,
@@ -263,6 +267,30 @@ pub struct ServerRow {
     /// Claude Code may not load this server, for a reason Klefki cannot check: why, as a note rather than a warning.
     /// A claude.ai connector under an allowed list of addresses, as Klefki does not know its address (decision 011).
     pub may_not_load: Option<String>,
+}
+
+/// Something in a server's definition that keeps it from starting, or from working, found before anything runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Preflight {
+    pub kind: PreflightKind,
+    /// What is wrong, as a sentence.
+    pub problem: String,
+    /// What to do about it, as a sentence.
+    pub fix: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightKind {
+    /// The program is not on the PATH, or not at the path written.
+    NotFound,
+    /// `C:/` where `/c` was meant: Git Bash rewrote the switch of a `cmd /c` command.
+    MangledSwitch,
+    /// `docker run` (or podman's) without `-i`: the container never reads what Claude Code sends.
+    NoInput,
+    /// A `${VAR}` with no default, and no such variable set: Claude Code passes it on as written.
+    UnsetVariable,
+    /// An environment variable set to nothing.
+    EmptyValue,
 }
 
 /// Where policy keeps a server from loading, and why. Sanitised.
@@ -416,6 +444,7 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         backup_dir: default_backup_dir(),
         verify_delay: std::time::Duration::from_secs(1),
         path_var: std::env::var_os("PATH"),
+        vars: std::sync::Arc::new(|name: &str| std::env::var_os(name)),
         cli_env: Vec::new(),
         max_checks: 3,
         check_timeout: std::time::Duration::from_secs(30),
