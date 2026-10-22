@@ -62,8 +62,10 @@ impl Place {
         std::fs::write(self.dir.path().join(rel), doc.to_string()).unwrap();
     }
 
+    /// `rel` written with `/`, as this system writes paths.
     fn file(&self, rel: &str) -> PathBuf {
-        self.dir.path().join(rel)
+        rel.split('/')
+            .fold(self.dir.path().to_path_buf(), |path, part| path.join(part))
     }
 
     fn plan(&self, members: &[ConnectionId]) -> Result<StartPlan, String> {
@@ -92,7 +94,10 @@ fn with_no_other_list_only_the_profiles_servers_load() {
     assert_eq!(plan.args, ["--settings", settings]);
     assert_eq!(
         plan.line,
-        format!("cd {} && claude --settings '{settings}'", p.project())
+        format!(
+            "cd {} && claude --settings '{settings}'",
+            crate::inspector::posix_word(&p.project()).unwrap()
+        )
     );
     assert!(plan.to_do.is_empty());
 }
