@@ -604,6 +604,7 @@ mod tests {
             shadowed_in: Vec::new(),
             casing_collision: false,
             relative_paths: Vec::new(),
+            preflight: Vec::new(),
             status_cached: false,
             connection: ConnectionId::new(scope, project, name),
             oauth: oauth.then(|| crate::api::OAuthInfo {

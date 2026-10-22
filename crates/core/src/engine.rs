@@ -641,6 +641,8 @@ pub(crate) struct EngineConfig {
     /// How long after a write to look again for an unlocked overwrite by Claude Code.
     pub verify_delay: Duration,
     pub path_var: Option<OsString>,
+    /// The environment variables Klefki was started with, which pre-flight checks look `${VAR}` references up in.
+    pub vars: Variables,
     /// Extra environment for the CLI. Used by tests to point `fake-claude` at a scenario.
     pub cli_env: Vec<(String, OsString)>,
     pub max_checks: usize,
@@ -680,6 +682,9 @@ pub(crate) struct EngineConfig {
     /// release stays newer whatever the workspace's version is.
     pub version: crate::update::Version,
 }
+
+/// Looks up an environment variable by name.
+pub(crate) type Variables = Arc<dyn Fn(&str) -> Option<OsString> + Send + Sync>;
 
 /// Opens an https link in the user's browser.
 pub(crate) type OpenUrl = Arc<dyn Fn(&str) -> io::Result<()> + Send + Sync>;

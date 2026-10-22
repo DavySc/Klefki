@@ -43,6 +43,7 @@ fn grid_renders_any_snapshot_not_just_the_fixture() {
         shadowed_in: Vec::new(),
         casing_collision: false,
         relative_paths: Vec::new(),
+        preflight: Vec::new(),
         status_cached: false,
         oauth: None,
         plugin: None,
@@ -155,6 +156,101 @@ fn a_user_server_with_a_relative_path_is_marked_and_its_details_name_the_paths()
     h.get_by_label_contains("so the check can pass here");
     click(&mut h, "tools");
     assert!(h.query_by_label_contains("Use full paths").is_none());
+}
+
+#[test]
+fn what_keeps_a_server_from_starting_is_a_badge_and_its_details_say_what_to_do() {
+    use klefki_core::api::{Preflight, PreflightKind};
+    let (mut h, engine) = live_harness();
+    let found = |kind, problem: &str, fix: &str| Preflight {
+        kind,
+        problem: problem.to_owned(),
+        fix: fix.to_owned(),
+    };
+    let mut docker = live_row("fetch", Scope::User, None);
+    docker.preflight = vec![
+        found(
+            PreflightKind::NoInput,
+            "docker run has no -i, so the container never reads what Claude Code sends.",
+            "Add -i after run.",
+        ),
+        found(
+            PreflightKind::EmptyValue,
+            "API_KEY is empty.",
+            "Give it a value.",
+        ),
+    ];
+    // Claude Code loads it nowhere: that is what its row says, not why it would not start.
+    let mut replaced = live_row("wiki", Scope::User, None);
+    replaced.preflight = vec![found(
+        PreflightKind::NotFound,
+        "Can't find x.",
+        "Install it.",
+    )];
+    replaced.not_loaded = Some("Your organisation decides which servers Claude Code loads.".into());
+    engine
+        .events
+        .send(snapshot_with_projects(1, vec![docker, replaced]))
+        .unwrap();
+    h.run();
+    assert_eq!(
+        h.query_all_by_label("missing -i").count(),
+        1,
+        "the first finding names the badge"
+    );
+    assert!(
+        h.query_by_label("no program").is_none(),
+        "not on a server that is not loaded"
+    );
+    h.get_by_label("missing -i").hover();
+    h.run();
+    h.get_by_label_contains("docker run has no -i, so the container never reads what Claude Code sends. API_KEY is empty.");
+    click(&mut h, "fetch");
+    h.get_by_label("Before it can start");
+    h.get_by_label("docker run has no -i, so the container never reads what Claude Code sends.");
+    h.get_by_label("Add -i after run.");
+    h.get_by_label("API_KEY is empty.");
+    h.get_by_label("Give it a value.");
+}
+
+#[test]
+fn a_server_that_started_is_not_said_to_be_missing_its_program() {
+    use klefki_core::api::{Preflight, PreflightKind};
+    let (mut h, engine) = live_harness();
+    let found = |kind, problem: &str| Preflight {
+        kind,
+        problem: problem.to_owned(),
+        fix: "Do something.".to_owned(),
+    };
+    let mut row = live_row("npx-server", Scope::User, None);
+    row.preflight = vec![
+        found(
+            PreflightKind::NotFound,
+            "Can't find npx on the PATH Klefki was started with.",
+        ),
+        found(PreflightKind::EmptyValue, "LEVEL is empty."),
+    ];
+    engine
+        .events
+        .send(snapshot_with_projects(1, vec![row.clone()]))
+        .unwrap();
+    h.run();
+    h.get_by_label("no program");
+    // Claude Code found it after all (another PATH): only what still holds is said, and an empty variable is the
+    // details' to say, not the list's.
+    for status in [Status::Connected, Status::Degraded, Status::NeedsAuth] {
+        engine
+            .events
+            .send(status_event(&row, status, None))
+            .unwrap();
+        h.run();
+        assert!(h.query_by_label("no program").is_none(), "{status:?}");
+        assert!(h.query_by_label("empty value").is_none(), "{status:?}");
+    }
+    click(&mut h, "npx-server");
+    assert!(h.query_by_label_contains("Can't find npx").is_none());
+    h.get_by_label("Before it can start");
+    h.get_by_label("LEVEL is empty.");
 }
 
 #[test]

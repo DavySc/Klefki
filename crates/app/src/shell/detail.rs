@@ -4,7 +4,8 @@ use super::editor::EditorState;
 use super::list::{
     ABOUT_CONNECTORS, CONNECTOR_READ_ONLY, NOT_LOADED, PLUGIN_STATUS, in_projects_text,
     managed_read_only, not_checked, plugin_off_everywhere, plugin_on_text, plugin_read_only,
-    projects_paths, relative_job, replaced_by_organisation, shadowed_paths, shadowed_text,
+    preflight_shown, projects_paths, relative_job, replaced_by_organisation, shadowed_paths,
+    shadowed_text,
 };
 use super::{DetailTab, ShellApp, flat_items};
 use crate::command::shortcut;
@@ -489,6 +490,17 @@ impl ShellApp {
                         )
                         .wrap(),
                     );
+                }
+                // What keeps it from starting, each with what to do about it, under a heading of their own.
+                let preflight = preflight_shown(s, status);
+                if !preflight.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Before it can start").color(pal.text_muted));
+                }
+                for found in preflight {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(RichText::new(&found.problem).color(pal.warn)).wrap());
+                    ui.add(egui::Label::new(RichText::new(&found.fix).color(pal.text)).wrap());
                 }
                 if s.scope == Scope::Project
                     && s.approval.is_some_and(|a| a != Approval::Approved)

@@ -103,6 +103,7 @@ pub(crate) fn load() -> Snapshot {
                 shadowed_in: s.shadowed_in.iter().map(|p| sanitize(p)).collect(),
                 casing_collision: s.casing_collision,
                 relative_paths: s.relative_paths.iter().map(|p| sanitize(p)).collect(),
+                preflight: Vec::new(),
                 status_cached: false,
                 oauth: None,
                 plugin: s.plugin.as_deref().map(|p| {

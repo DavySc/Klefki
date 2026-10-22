@@ -207,3 +207,45 @@ fn with_no_configuration_found_the_snapshot_says_so() {
         ["Could not determine where Claude Code keeps its configuration."]
     );
 }
+
+#[test]
+fn the_snapshot_says_what_keeps_a_server_from_starting() {
+    // The engine looks programs up on its own PATH and `${VAR}` references in its own variables, never the test's.
+    let env = Env::new(
+        &serde_json::json!({"mcpServers": {
+            "gone": {"command": "mcp-server-nowhere"},
+            "token": {"command": "here", "args": ["${KLEFKI_TEST_TOKEN}"]},
+            "fine": {"command": "here", "env": {"T": "${KLEFKI_TEST_SET}"}}
+        }}),
+        r#"{"rules":[]}"#,
+        &[],
+    );
+    let bin = env.dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for name in ["here", "here.exe"] {
+        std::fs::write(bin.join(name), b"stub").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+    }
+    let mut config = env.config();
+    config.claude = None;
+    config.path_var = Some(bin.into());
+    config.vars = std::sync::Arc::new(|name: &str| (name == "KLEFKI_TEST_SET").then(|| "x".into()));
+    let core = start_with(config, || {});
+    let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+    let Some(Event::Snapshot(s)) = events.iter().find(|e| matches!(e, Event::Snapshot(_))) else {
+        unreachable!()
+    };
+    use crate::api::PreflightKind;
+    let kinds = |name: &str| -> Vec<PreflightKind> {
+        let row = s.servers.iter().find(|r| r.name == name).unwrap();
+        row.preflight.iter().map(|f| f.kind).collect()
+    };
+    assert_eq!(kinds("gone"), [PreflightKind::NotFound]);
+    assert_eq!(kinds("token"), [PreflightKind::UnsetVariable]);
+    assert_eq!(kinds("fine"), []);
+}

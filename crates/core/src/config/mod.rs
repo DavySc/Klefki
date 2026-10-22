@@ -10,6 +10,7 @@ pub(crate) mod managed;
 pub(crate) mod owner_only;
 pub(crate) mod plugins;
 pub(crate) mod policy;
+pub(crate) mod preflight;
 pub(crate) mod relative;
 pub(crate) mod secretlike;
 

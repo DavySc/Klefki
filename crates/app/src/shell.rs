@@ -2080,6 +2080,7 @@ mod tests {
             shadowed_in: Vec::new(),
             casing_collision: false,
             relative_paths: Vec::new(),
+            preflight: Vec::new(),
             status_cached: false,
             oauth: None,
             plugin: None,
@@ -3791,6 +3792,7 @@ mod tests {
         let mine = ServerRow {
             not_loaded: Some(why.into()),
             relative_paths: vec!["mine.js".into()],
+            preflight: Vec::new(),
             ..live_row("mine", Scope::User, None)
         };
         show_rows(&mut h, &engine, vec![mine, organisation_row("other")]);
