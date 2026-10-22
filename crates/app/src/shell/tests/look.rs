@@ -714,8 +714,10 @@ fn the_inspector_command_under_the_actions() {
             id,
             line: Ok(InspectorCommand {
                 text: "npx @modelcontextprotocol/inspector -- npx -y @azure-devops/mcp contoso".to_owned(),
+                to_do: vec![
+                    "Enter AZURE_DEVOPS_PAT in the Inspector, under Environment Variables: its environment is not in the line, so no secret reaches your shell.".to_owned(),
+                ],
                 notes: vec![
-                    "Its environment (AZURE_DEVOPS_PAT) is not in the line, so no secret is typed into a shell: enter it in the Inspector, under Environment Variables.".to_owned(),
                     "Needs Node 22.19 or newer. Running the line downloads the Inspector and opens it in your browser; Klefki does not run it.".to_owned(),
                 ],
             }),

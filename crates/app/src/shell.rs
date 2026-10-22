@@ -1216,7 +1216,8 @@ impl ShellApp {
                     add(
                         icon::TERMINAL_WINDOW,
                         format!("Copy Inspector command for {}", s.name),
-                        "Opens it in the MCP Inspector; no secrets in the line".into(),
+                        "Copies the line that opens it in the MCP Inspector; no secrets in it"
+                            .into(),
                         None,
                         command::Action::CopyInspector,
                     );

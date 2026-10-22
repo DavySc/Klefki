@@ -25,6 +25,19 @@ tools, read replies) is one paste away. Never run by Klefki; no secret in the li
   separator and heading now show in the window).
 - PLAN item 10 marked done.
 
+## Review fixes (cross-review of #96)
+- B1: the address is parsed only to check it, and written as spelled (`${TENANT}` in the path and `${HOST}` were mangled
+  and their note lost); tests for the path, the host and a query value.
+- B2: every `${NAME}` (with or without a default) is written as `REPLACE_ME` on every system, with a note naming the
+  variables; Windows no longer refuses the line for one.
+- B3: the Inspector section is drawn after the diagnosis in the Status tab; test; `detail-diagnosis.png` redrawn.
+- B4: the palette hint says it copies the line.
+- Polish: a word that starts with `=` is quoted (zsh); what to do (`to_do`, normal text, action first: replace,
+  enter, add) is apart from what is only good to know (`notes`, muted); the user name and password in an address are
+  named as such, and an address in an argument keeps its host (`keep_address`); a line that arrives after the user
+  left the Status tab or server is not copied; a comment on PowerShell 7.3's trailing backslash.
+- The reviewer read `npx.ps1` (npm 10.9.4 and 12.2.1): the `--` reaches the Inspector under PowerShell; read, not run.
+
 ## Checks
 - `cargo fmt --check`: exit 0. `cargo clippy --workspace --all-targets -- -D warnings`: exit 0.
 - `cargo test --workspace`: exit 0 (app 488, core 1068, cli 26 + 43). New: 18 core + 2 engine + 9 app tests.

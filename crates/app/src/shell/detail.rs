@@ -705,13 +705,14 @@ impl ShellApp {
                     explanation.show(ui, ui.id().with("status"));
                 }
                 self.last_starts_section(ui, s);
-                self.inspector_section(ui, s);
                 if let Some(d) = self.diagnoses.get(&s.id()) {
                     let shown = ui.scope(|ui| diagnosis_panel(ui, s, d)).response;
                     if self.reveal_diagnosis.take_if(|id| s.is(id)).is_some() {
                         shown.scroll_to_me(Some(Align::TOP));
                     }
                 }
+                // Last: the diagnosis reads as part of the status above it, not of this section.
+                self.inspector_section(ui, s);
             }
             DetailTab::Auth => {
                 let muted = |ui: &mut Ui, text: &str| {

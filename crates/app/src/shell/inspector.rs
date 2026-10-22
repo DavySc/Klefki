@@ -1,8 +1,8 @@
 //! The Status tab's "Copy Inspector command": the line that opens the server in the MCP Inspector, to paste in a
 //! terminal (decision 014). Klefki never runs it. The engine reads the definition and leaves out what may be a secret.
 
-use super::ShellApp;
 use super::export::{COPIED_SECS, announce};
+use super::{DetailTab, ShellApp};
 use crate::theme;
 use egui::{Frame, Margin, RichText, Ui};
 use klefki_core::api::{Command, InspectorCommand, Scope, ServerId, ServerRow, TransportKind};
@@ -54,7 +54,11 @@ impl ShellApp {
         id: &ServerId,
         line: Result<InspectorCommand, String>,
     ) {
+        // Not copied after the user went elsewhere: the clipboard is not theirs to have changed then.
+        let here =
+            self.tab == DetailTab::Status && self.single_selected().is_some_and(|s| s.is(id));
         if let Some(seen) = self.inspector.as_mut().filter(|seen| seen.id == *id) {
+            seen.copy &= here;
             seen.line = Some(line);
         }
     }
@@ -123,6 +127,11 @@ impl ShellApp {
                     .show(ui, |ui| {
                         ui.add(egui::Label::new(RichText::new(&found.text).monospace()).wrap());
                     });
+                // What to do is in the text colour, first; what is only good to know is muted.
+                for item in &found.to_do {
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(format!("• {item}")).wrap());
+                }
                 for note in &found.notes {
                     ui.add_space(2.0);
                     muted(ui, &format!("• {note}"));

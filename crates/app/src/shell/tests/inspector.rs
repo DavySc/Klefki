@@ -9,10 +9,8 @@ const LINE: &str = "npx @modelcontextprotocol/inspector -- npx -y @scope/server"
 fn found() -> InspectorCommand {
     InspectorCommand {
         text: LINE.to_owned(),
-        notes: vec![
-            "Its environment (TOKEN) is not in the line.".to_owned(),
-            "Needs Node 22.19 or newer.".to_owned(),
-        ],
+        to_do: vec!["Enter TOKEN in the Inspector, under Environment Variables.".to_owned()],
+        notes: vec!["Needs Node 22.19 or newer.".to_owned()],
     }
 }
 
@@ -79,7 +77,7 @@ fn pressing_it_asks_the_engine_once_and_copies_the_line_when_it_comes() {
     assert_eq!(copied(&h), vec![LINE.to_owned()]);
     // Shown too, with what to know before running it.
     h.get_by_label(LINE);
-    h.get_by_label_contains("Its environment (TOKEN) is not in the line.");
+    h.get_by_label_contains("Enter TOKEN in the Inspector");
     h.get_by_label_contains("Needs Node 22.19 or newer.");
     // Once, not every frame; the button says Copied in the next one.
     h.step();
@@ -204,4 +202,49 @@ fn copying_says_copied_for_a_moment_and_a_screen_reader_hears_it() {
         assert!(steps < 100, "still Copied");
     }
     h.get_by_label(COPY);
+}
+
+#[test]
+fn a_line_that_comes_after_the_user_went_to_another_tab_is_not_copied_then_or_later() {
+    use egui::accesskit::Role;
+    let (mut h, engine, row) = shown(live_row("s", Scope::User, None));
+    h.get_by_label(COPY).click();
+    h.step();
+    h.get_by_role_and_label(Role::Button, "General").click();
+    h.run();
+    answer(&mut h, &engine, &row, Ok(found()));
+    h.run();
+    assert!(copied(&h).is_empty());
+    // Back on the Status tab, the line is there to be seen, and the clipboard was not touched.
+    h.get_by_role_and_label(Role::Button, "Status").click();
+    h.step();
+    assert!(copied(&h).is_empty());
+    h.run();
+    assert!(copied(&h).is_empty());
+    h.get_by_label(LINE);
+}
+
+#[test]
+fn a_diagnosis_stays_with_the_status_above_it_and_the_section_comes_after() {
+    let (mut h, engine) = live_harness();
+    let row = live_row("bad", Scope::User, None);
+    engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+    engine
+        .events
+        .send(Event::Diagnosis {
+            id: row.id(),
+            diagnosis: diagnosis(
+                Status::Failed,
+                &[("The command was not found", "It is not on the PATH.")],
+                &[],
+                &[],
+                None,
+            ),
+        })
+        .unwrap();
+    h.run();
+    open_status_tab(&mut h, "bad");
+    let diagnosis = h.get_by_label("The command was not found").rect().top();
+    let section = h.get_by_label("MCP Inspector").rect().top();
+    assert!(diagnosis < section, "{diagnosis} {section}");
 }

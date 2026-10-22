@@ -17,12 +17,15 @@ pub(crate) const HIDDEN: &str = "REPLACE_ME";
 /// The Inspector, as `npx` names it. Version 2 (Node 22.19 or newer): it takes the server on its command line.
 const PROGRAM: &str = "npx @modelcontextprotocol/inspector";
 
-/// The line, and what to know before it is used. Text other than the line is sanitised.
+/// The line, what to do before it is used and what to know. Text other than the line is sanitised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectorCommand {
     /// One line for a shell, on this system's rules for quoting.
     pub text: String,
-    /// What the line leaves out or does not do, each a sentence.
+    /// What the user must do before the line works, each a sentence that starts with the action: values the line
+    /// leaves out and where to enter them.
+    pub to_do: Vec<String>,
+    /// What the line does not do, each a sentence.
     pub notes: Vec<String>,
 }
 
@@ -38,8 +41,12 @@ pub(crate) fn command(
     let Some(object) = definition.as_object() else {
         return Err("its definition is not a JSON object".to_owned());
     };
+    let mut to_do = Vec::new();
     let mut notes = Vec::new();
     let mut words: Vec<String> = Vec::new();
+    // What stands for a secret, and the variables the Inspector would not fill in.
+    let mut hidden: Vec<String> = Vec::new();
+    let mut variables: Vec<String> = Vec::new();
     match object.get("type").and_then(Value::as_str) {
         None | Some("stdio") => {
             let program = object
@@ -52,7 +59,7 @@ pub(crate) fn command(
                 words.push(quote(folder)?);
             }
             words.push("--".to_owned());
-            words.push(quote(program)?);
+            words.push(quote(&filled_in(program, &mut variables))?);
             let args: Vec<&str> = object
                 .get("args")
                 .and_then(Value::as_array)
@@ -60,19 +67,22 @@ pub(crate) fn command(
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
-            let mut hidden: Vec<String> = Vec::new();
-            let args = rewritten_args(args, false, &mut |flag, _| {
-                hidden.push(flag.to_owned());
+            // An address that signs in keeps its host and path: only the user name and password go.
+            let args = rewritten_args(args, true, &mut |flag, _| {
+                hidden.push(if flag.is_empty() {
+                    "a secret in an argument".to_owned()
+                } else {
+                    shown(flag)
+                });
                 HIDDEN.to_owned()
             });
             for arg in &args {
-                words.push(quote(arg)?);
+                words.push(quote(&filled_in(arg, &mut variables))?);
             }
-            hidden_note(&hidden, &mut notes);
             let names = keys(object.get("env"));
             if !names.is_empty() {
-                notes.push(format!(
-                    "Its environment ({}) is not in the line, so no secret is typed into a shell: enter it in the Inspector, under Environment Variables.",
+                to_do.push(format!(
+                    "Enter {} in the Inspector, under Environment Variables: its environment is not in the line, so no secret reaches your shell.",
                     shown(&names.join(", "))
                 ));
             }
@@ -82,34 +92,35 @@ pub(crate) fn command(
                         .to_owned(),
                 );
             }
-            references(program, &args, &mut notes);
         }
         Some(kind @ ("http" | "sse")) => {
             let address = object
                 .get("url")
                 .and_then(Value::as_str)
-                .ok_or("it has no address")?;
-            let parsed = url::Url::parse(address.trim()).map_err(|_| "its address is not valid")?;
+                .ok_or("it has no address")?
+                .trim();
+            // Parsed only to check it: written back, it would change `${HOST}` into `${host}` and escape `{`.
+            let parsed = url::Url::parse(address).map_err(|_| "its address is not valid")?;
             if !matches!(parsed.scheme(), "http" | "https") {
                 return Err("its address is not http or https".to_owned());
             }
-            let mut hidden: Vec<String> = Vec::new();
-            let address = match rewritten_url(parsed.as_str(), &mut |part, _| {
-                hidden.push(part.to_owned());
+            let address = rewritten_url(address, &mut |part, _| {
+                hidden.push(if part.is_empty() {
+                    "the user name and password in the address".to_owned()
+                } else {
+                    shown(part)
+                });
                 HIDDEN.to_owned()
-            }) {
-                Some(rewritten) => rewritten,
-                None => parsed.to_string(),
-            };
+            })
+            .unwrap_or_else(|| address.to_owned());
             words.push("--transport".to_owned());
             words.push(kind.to_owned());
             words.push("--server-url".to_owned());
-            words.push(quote(&address)?);
-            hidden_note(&hidden, &mut notes);
+            words.push(quote(&filled_in(&address, &mut variables))?);
             let names = keys(object.get("headers"));
             if !names.is_empty() {
-                notes.push(format!(
-                    "Its headers ({}) are not in the line, so no token is typed into a shell: add them in the Inspector, under Authentication.",
+                to_do.push(format!(
+                    "Add {} in the Inspector, under Authentication: its headers are not in the line, so no token reaches your shell.",
                     shown(&names.join(", "))
                 ));
             }
@@ -119,10 +130,29 @@ pub(crate) fn command(
                         .to_owned(),
                 );
             }
-            references(&address, &[], &mut notes);
         }
         Some("ws") => return Err("the Inspector does not speak WebSocket".to_owned()),
         Some(_) => return Err("its type is not one the Inspector knows".to_owned()),
+    }
+    if !variables.is_empty() {
+        variables.dedup();
+        to_do.insert(
+            0,
+            format!(
+                "Replace {HIDDEN} with the value of {}: Claude Code fills in a ${{NAME}} from its environment, the Inspector does not.",
+                shown(&variables.join(", "))
+            ),
+        );
+    }
+    if !hidden.is_empty() {
+        hidden.dedup();
+        to_do.insert(
+            0,
+            format!(
+                "Replace {HIDDEN} with {} before running the line: it looked like a secret, so Klefki left it out.",
+                hidden.join(", ")
+            ),
+        );
     }
     notes.push(
         "Needs Node 22.19 or newer. Running the line downloads the Inspector and opens it in your browser; Klefki does not run it."
@@ -130,6 +160,7 @@ pub(crate) fn command(
     );
     Ok(InspectorCommand {
         text: format!("{PROGRAM} {}", words.join(" ")),
+        to_do,
         notes,
     })
 }
@@ -142,37 +173,35 @@ fn keys(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn hidden_note(hidden: &[String], notes: &mut Vec<String>) {
-    if hidden.is_empty() {
-        return;
-    }
-    let named: Vec<String> = hidden
-        .iter()
-        .map(|h| {
-            if h.is_empty() {
-                "an unnamed value".to_owned()
-            } else {
-                shown(h)
+/// `text` with each `${NAME}` (or `${NAME:-default}`) written as [`HIDDEN`], and the names added to `variables`:
+/// the Inspector does not fill them in, and a line that kept them would need a shell-specific escape.
+fn filled_in(text: &str, variables: &mut Vec<String>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        let after = &rest[at + 2..];
+        let named = after.find('}').map(|end| {
+            let name = after[..end].split(":-").next().unwrap_or_default();
+            (name, end)
+        });
+        match named {
+            Some((name, end))
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                out.push_str(&rest[..at]);
+                out.push_str(HIDDEN);
+                variables.push(name.to_owned());
+                rest = &after[end + 1..];
             }
-        })
-        .collect();
-    notes.push(format!(
-        "Left out what looks like a secret ({}); the line says {HIDDEN} there. Replace it before running the line.",
-        named.join(", ")
-    ));
-}
-
-/// Claude Code fills `${NAME}` in from its environment; the Inspector does not.
-fn references(program: &str, args: &[String], notes: &mut Vec<String>) {
-    if std::iter::once(program)
-        .chain(args.iter().map(String::as_str))
-        .any(|part| part.contains("${"))
-    {
-        notes.push(
-            "It has ${NAME} references. Claude Code fills those in from its environment; the Inspector does not, so write their values in before running the line."
-                .to_owned(),
-        );
+            _ => {
+                out.push_str(&rest[..at + 2]);
+                rest = after;
+            }
+        }
     }
+    out.push_str(rest);
+    out
 }
 
 /// A character no quoting can make safe to paste: a line break would end the command, other controls and bidi
@@ -182,8 +211,21 @@ fn unsafe_char(text: &str) -> Option<char> {
         .find(|&c| c.is_control() || crate::sanitize::is_bad(c))
 }
 
-fn plain(c: char, extra: &str) -> bool {
-    c.is_ascii_alphanumeric() || "_-./:=+".contains(c) || extra.contains(c)
+/// A character that needs no quoting. `=` does only after the first: zsh, macOS's shell, turns a word that starts
+/// with one into a path.
+fn plain(index: usize, c: char, extra: &str) -> bool {
+    c.is_ascii_alphanumeric()
+        || "_-./:+".contains(c)
+        || (c == '=' && index > 0)
+        || extra.contains(c)
+}
+
+fn all_plain(text: &str, extra: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .enumerate()
+            .all(|(index, c)| plain(index, c, extra))
 }
 
 /// One word for a POSIX shell: as it is when plain, else in single quotes, which read nothing (`$`, backticks, `!`).
@@ -191,20 +233,21 @@ fn posix_word(text: &str) -> Result<String, String> {
     if let Some(c) = unsafe_char(text) {
         return Err(refused(text, c));
     }
-    if !text.is_empty() && text.chars().all(|c| plain(c, "@%,")) {
+    if all_plain(text, "@%,") {
         return Ok(text.to_owned());
     }
     Ok(format!("'{}'", text.replace('\'', "'\\''")))
 }
 
 /// One word for PowerShell and `cmd` alike: as it is when plain, else in double quotes with the backslashes before
-/// the closing one doubled. Neither shell reads `"`, `$`, a backtick, `%`, `^` or `!` the same way inside them, so a
+/// the closing one doubled (PowerShell 7.3 and `cmd` read a doubled trailing backslash differently, which a path
+/// does not mind). Neither shell reads `"`, `$`, a backtick, `%`, `^` or `!` the same way inside them, so a
 /// word with one is refused rather than guessed at.
 fn windows_word(text: &str) -> Result<String, String> {
     if let Some(c) = unsafe_char(text) {
         return Err(refused(text, c));
     }
-    if !text.is_empty() && text.chars().all(|c| plain(c, "\\")) {
+    if all_plain(text, "\\") {
         return Ok(text.to_owned());
     }
     if let Some(c) = text.chars().find(|c| "\"$`%^!".contains(*c)) {

@@ -41,13 +41,16 @@ fn environment_values_are_never_in_the_line_whatever_they_look_like() {
     for value in ["debug", "ghp_", "hunter2"] {
         assert!(!got.text.contains(value), "{}", got.text);
         assert!(
-            got.notes.iter().all(|n| !n.contains(value)),
+            got.to_do
+                .iter()
+                .chain(&got.notes)
+                .all(|n| !n.contains(value)),
             "{:?}",
             got.notes
         );
     }
     let note = got
-        .notes
+        .to_do
         .iter()
         .find(|n| n.contains("environment"))
         .unwrap();
@@ -57,7 +60,7 @@ fn environment_values_are_never_in_the_line_whatever_they_look_like() {
     assert!(
         !unix(&json!({"command": "srv"}))
             .unwrap()
-            .notes
+            .to_do
             .iter()
             .any(|n| n.contains("environment"))
     );
@@ -77,7 +80,7 @@ fn an_argument_that_looks_like_a_secret_is_replaced_and_said_so() {
         got.text
     );
     assert!(
-        got.notes
+        got.to_do
             .iter()
             .any(|n| n.contains(HIDDEN) && n.contains("--api-key"))
     );
@@ -100,7 +103,7 @@ fn headers_are_named_but_their_values_stay_out() {
     let server = json!({"type": "http", "url": "https://example.com/mcp", "headers": {"Authorization": "Bearer abcdefghijklmnop", "X-Team": "blue"}});
     let got = unix(&server).unwrap();
     assert!(!got.text.contains("abcdefghijklmnop") && !got.text.contains("blue"));
-    let note = got.notes.iter().find(|n| n.contains("headers")).unwrap();
+    let note = got.to_do.iter().find(|n| n.contains("headers")).unwrap();
     assert!(
         note.contains("Authorization") && note.contains("X-Team"),
         "{note}"
@@ -123,7 +126,7 @@ fn a_secret_in_the_address_is_replaced_and_the_rest_kept() {
         got.text
     );
     assert!(got.text.contains(HIDDEN), "{}", got.text);
-    assert!(got.notes.iter().any(|n| n.contains(HIDDEN)));
+    assert!(got.to_do.iter().any(|n| n.contains(HIDDEN)));
 }
 
 #[test]
@@ -214,13 +217,110 @@ fn a_local_server_starts_where_claude_code_starts_it() {
 }
 
 #[test]
-fn a_reference_to_the_environment_is_kept_literal_and_pointed_out() {
-    let server = json!({"command": "srv", "args": ["--dir", "${HOME}/x"]});
+fn a_reference_to_the_environment_becomes_a_value_to_write_in_and_is_said_so() {
+    let server = json!({"command": "srv", "args": ["--dir", "${HOME}/x", "--n=${N:-3}"]});
     let got = unix(&server).unwrap();
-    assert!(got.text.ends_with("--dir '${HOME}/x'"), "{}", got.text);
-    assert!(got.notes.iter().any(|n| n.contains("${NAME}")));
-    let remote = unix(&json!({"type": "http", "url": "https://${HOST}/mcp"})).unwrap();
-    assert!(remote.notes.iter().any(|n| n.contains("${NAME}")));
+    assert!(
+        got.text
+            .ends_with(&format!("--dir {HIDDEN}/x --n={HIDDEN}")),
+        "{}",
+        got.text
+    );
+    assert!(!got.text.contains("${"), "{}", got.text);
+    let first = &got.to_do[0];
+    assert!(
+        first.contains(HIDDEN) && first.contains("HOME, N") && first.contains("${NAME}"),
+        "{first}"
+    );
+}
+
+#[test]
+fn a_reference_in_an_address_is_found_whole_in_the_path_and_the_host() {
+    // The address is written as it is, not as the parser spells it (`$%7BTENANT%7D`, `${host}`).
+    for (address, expected, name) in [
+        (
+            "https://api.example.com/${TENANT}/mcp",
+            "https://api.example.com/REPLACE_ME/mcp",
+            "TENANT",
+        ),
+        ("https://${HOST}/mcp", "https://REPLACE_ME/mcp", "HOST"),
+        (
+            "https://example.com/mcp?region=${REGION}",
+            "'https://example.com/mcp?region=REPLACE_ME'",
+            "REGION",
+        ),
+    ] {
+        let got = unix(&json!({"type": "http", "url": address})).unwrap();
+        assert!(
+            got.text.ends_with(&format!("--server-url {expected}")),
+            "{}",
+            got.text
+        );
+        assert!(
+            got.to_do[0].contains(name) && got.to_do[0].contains("${NAME}"),
+            "{:?}",
+            got.to_do
+        );
+    }
+}
+
+#[test]
+fn an_address_is_written_as_it_is_spelled() {
+    let got = line(&json!({"type": "http", "url": " https://Example.com:8443/a%20b/mcp?x=1 "}));
+    assert!(
+        got.ends_with("--server-url 'https://Example.com:8443/a%20b/mcp?x=1'"),
+        "{got}"
+    );
+}
+
+#[test]
+fn a_word_that_starts_with_an_equals_sign_is_quoted_for_zsh() {
+    let got = line(&json!({"command": "srv", "args": ["=python", "a=b", "=", "--x=y"]}));
+    assert!(got.ends_with("-- srv '=python' a=b '=' --x=y"), "{got}");
+}
+
+#[test]
+fn an_address_in_an_argument_keeps_its_host_and_loses_only_its_credentials() {
+    let got = unix(
+        &json!({"command": "npx", "args": ["mcp-remote", "https://u:pw12345678@example.com/mcp"]}),
+    )
+    .unwrap();
+    assert!(
+        got.text.ends_with(&format!(
+            "-- npx mcp-remote https://{HIDDEN}@example.com/mcp"
+        )),
+        "{}",
+        got.text
+    );
+    assert!(!got.text.contains("pw12345678"));
+}
+
+#[test]
+fn what_was_hidden_is_named_in_words() {
+    let got =
+        unix(&json!({"type": "http", "url": "https://u:pw12345678@example.com/mcp"})).unwrap();
+    assert!(
+        got.to_do[0].contains("the user name and password in the address"),
+        "{:?}",
+        got.to_do
+    );
+}
+
+#[test]
+fn what_is_to_be_done_comes_first_in_the_order_it_matters() {
+    let got = unix(
+        &json!({"command": "srv", "args": ["--api-key", "sk-live-0123456789abcdef", "${X}"], "env": {"K": "v"}}),
+    )
+    .unwrap();
+    assert!(
+        got.to_do[0].contains("looked like a secret"),
+        "{:?}",
+        got.to_do
+    );
+    assert!(got.to_do[1].contains("value of X"), "{:?}", got.to_do);
+    assert!(got.to_do[2].starts_with("Enter K"), "{:?}", got.to_do);
+    // What is only good to know stays apart.
+    assert!(got.notes.iter().all(|n| !n.contains("Replace")));
 }
 
 #[test]
@@ -233,7 +333,7 @@ fn the_line_always_says_it_is_not_run_and_what_it_needs() {
 #[test]
 fn notes_are_sanitised() {
     let got = unix(&json!({"command": "srv", "env": {"A\u{1b}[31mB": "x"}})).unwrap();
-    assert!(got.notes.iter().all(|n| !n.contains('\u{1b}')));
+    assert!(got.to_do.iter().all(|n| !n.contains('\u{1b}')));
 }
 
 mod windows {
@@ -262,10 +362,27 @@ mod windows {
 
     #[test]
     fn a_word_the_two_shells_read_differently_is_refused() {
-        for bad in ["%PATH%", "$env:X", "a\"b", "a`b", "a^b", "${HOME}"] {
+        for bad in ["%PATH%", "$env:X", "a\"b", "a`b", "a^b"] {
             let err = win(&json!({"command": "srv", "args": [bad]})).unwrap_err();
             assert!(err.contains("write the line by hand"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn a_reference_does_not_refuse_the_line_here_either() {
+        let got = win(
+            &json!({"type": "http", "url": "https://example.com/${TENANT}/mcp?key=${KEY}", "headers": {"Authorization": "${AUTH}"}}),
+        )
+        .unwrap();
+        assert!(!got.text.contains('$'), "{}", got.text);
+        assert!(got.text.contains(&format!("/{HIDDEN}/mcp")), "{}", got.text);
+        let stdio =
+            win(&json!({"command": "srv", "args": ["--header", "Authorization:${AUTH}"]})).unwrap();
+        assert!(
+            stdio.text.contains(HIDDEN) && !stdio.text.contains('$'),
+            "{}",
+            stdio.text
+        );
     }
 
     #[test]
