@@ -25,6 +25,9 @@ pub(crate) struct Seen {
     stale: bool,
     /// Brought into view when the answer is first drawn: in a small window it is below the buttons.
     reveal: bool,
+    /// Answers still on their way: only the last is copied, as an earlier one may be about the profile before an
+    /// edit (review of #106).
+    waiting: u32,
 }
 
 impl Seen {
@@ -37,6 +40,7 @@ impl Seen {
             copied: None,
             stale: false,
             reveal: true,
+            waiting: 1,
         }
     }
 
@@ -53,6 +57,7 @@ impl Seen {
     ) {
         if self.is_for(profile, project) {
             self.plan = Some(plan);
+            self.waiting = self.waiting.saturating_sub(1);
         }
     }
 
@@ -67,9 +72,11 @@ impl Seen {
         self.stale = true;
     }
 
-    /// Whether to ask again now, once, for the files as they are.
+    /// Whether to ask again now, once, for the files as they are. `true` counts the answer it is asked for.
     pub(super) fn take_stale(&mut self) -> bool {
-        std::mem::take(&mut self.stale)
+        let stale = std::mem::take(&mut self.stale);
+        self.waiting += u32::from(stale);
+        stale
     }
 
     /// Whether the button says "Copied" now.
@@ -108,7 +115,7 @@ pub(super) fn panel(ui: &mut Ui, seen: &mut Seen) {
     let copied = seen.copied(now);
     let shown = ui.scope(|ui| match plan {
         Ok(plan) => {
-            let mut copy = std::mem::take(&mut seen.copy) && plan.exact();
+            let mut copy = seen.waiting == 0 && std::mem::take(&mut seen.copy) && plan.exact();
             Frame::new()
                 .fill(pal.field)
                 .inner_margin(Margin::same(8))

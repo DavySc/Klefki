@@ -50,10 +50,10 @@ server loc, each a tiny stdio server that logs its start; `claude --settings 'â€
   exit codes in decision 006. Decisions 006 and 012 updated.
 
 ## Tests
-- Core `start/tests.rs` (14): each live case above; names that cannot be let in; no line; unknown project; Windows
+- Core `start/tests.rs` (14, 15 after review round 1): each live case above; names that cannot be let in; no line; unknown project; Windows
   line; `run` refuses arguments Klefki would not make. Seen failing by mutation: with the flag's list not counting (7
   fail) and with it replacing the user's list (2 fail).
-- App `shell/tests/start_command.rs` (6): offered only for one project; asks once and copies on arrival; differences
+- App `shell/tests/start_command.rs` (6, 9 after the reviews): offered only for one project; asks once and copies on arrival; differences
   said; no line says why and copies nothing; a file change asks again without copying (seen failing with the re-ask
   removed); an answer after leaving the page copies nothing.
 - CLI (3): `--print` and a real start through fake-claude (argv and folder checked, `.claude.json` unchanged); a
@@ -85,7 +85,16 @@ server loc, each a tiny stdio server that logs its start; `claude --settings 'â€
   a name the profile lets in is said as such (core test).
 - Pictures `profile-start-command(-800x480)` changed (Copy anyway, summary first). Not tried on a real Windows.
 
+## Review round 2
+- Approved at 9f85d8a (CI green on ubuntu, macOS, windows). Its one leftover, folded in: a profile edited after the
+  ask but before the answer copied that first answer, about the servers before the edit. `Seen` counts the answers
+  on their way and copies only the last. Regression test `an_answer_from_before_an_edit_is_not_copied` (seen failing
+  first). A re-ask after a file change is no longer lost when another card asked for something in the same frame.
+- 9f85d8a: the Windows CLI test expects "paste the line above in PowerShell" where Unix says "add --yes".
+
 ## Open / next
 - A plugin's server can only be let in by its command; left out on purpose (see above). Said on the card.
+- Starting Claude Code from `run` on Windows needs a console Ctrl+C handler (more `unsafe` in core, an owner
+  decision); until then it prints the line.
 - The lens menu (S3) has no "Copy start command"; the card has it.
 - Next in the plan: S6 (overlap and cost) after the tools view.

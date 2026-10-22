@@ -176,6 +176,31 @@ fn an_edited_profile_is_asked_for_again() {
     );
 }
 
+/// Nearby (review of #106, round 2): edited after it was asked for but before the answer came, the first answer is
+/// about the servers before the edit, so only the answer for the profile as it is now is copied.
+#[test]
+fn an_answer_from_before_an_edit_is_not_copied() {
+    let (mut h, engine) = work_in_notes();
+    click(&mut h, COPY);
+    sent(&engine);
+    let mut edited = work_profile();
+    edited.profiles[0]
+        .members
+        .push(id_of("beta", Scope::User, None));
+    engine.events.send(Event::Profiles(edited)).unwrap();
+    h.run();
+    assert!(
+        sent(&engine)
+            .iter()
+            .any(|c| matches!(c, Command::StartCommand { .. }))
+    );
+    answer(&mut h, &engine, Ok(plan(&[], &[])));
+    assert!(copied(&h).is_empty(), "the answer from before the edit");
+    h.run();
+    answer(&mut h, &engine, Ok(plan(&[], &[])));
+    assert_eq!(copied(&h), [LINE]);
+}
+
 /// Nearby: a profile renamed or deleted while its panel is open takes the panel with it.
 #[test]
 fn a_renamed_profile_takes_its_start_command_with_it() {

@@ -803,7 +803,7 @@ fn card(
             if let Some(Some(project)) = &choice.place
                 && let Some(seen) = start.as_mut().filter(|s| s.is_for(&profile.name, project))
             {
-                if seen.take_stale() && out.is_none() {
+                if out.is_none() && seen.take_stale() {
                     out = Some(Card::Asked(Asked::StartCommand {
                         profile: profile.name.clone(),
                         members: profile.members.clone(),
