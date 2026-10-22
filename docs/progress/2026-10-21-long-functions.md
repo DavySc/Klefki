@@ -66,9 +66,33 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    next command on the line is searched for, are not equivalent (a panic inside a two-byte character; the closing
    backtick read as opening code) and gave a test for both, so all 9 are caught. Merged in #88.
 
+7. `ops::use_profile` (293 lines, using a profile) in named steps: `profile_places` (the project, or every one),
+   `ProfileWalk::of` and `server` (what each server is in each place: its switch, whether it is on now, held back,
+   elsewhere or not approved), `held`, `remember` (what stopping the profile puts back), `really_off`,
+   `left_as_they_are`, `not_approved` and `already_on`; `use_profile` (89 lines) writes the review in the same
+   order with the same words. Mutants on the changed lines: main 34 (3 missed), branch 64 (the same 3): whether a
+   switch that goes off hides a duplicate (two) and grouping the places of a member held back. Tests now catch each:
+   `a_duplicate_stays_out_while_what_it_repeats_stays_on`, `two_members_held_back_are_each_named`. Merged in #89
+   (5486245). Review's polish (`ProfileWalk` built with `Default`, a line of doc on four fields) came with part 8.
+8. `inventory::build` (452 lines, the list of every server Claude Code loads) in named steps: `Found` (what the files
+   hold: snapshot, file keys, servers named by hand), `Judge` (what decides whether a server loads: the
+   organisation's rules, policy, hints, the projects shown) with `user_servers`, `project_servers`,
+   `local_servers`, `shared_server`, `user_verdicts`, `organisation_servers` and `connector`; `build` (132 lines)
+   reads the files and calls them in the same order with the same words. Mutants on the changed lines: main 53 (7
+   missed), branch 68 (the same 7): which project's rules a local server answers to (its own rules blocking its
+   local server), nothing counted as off with no project known, an organisation's server off in every project, off in
+   one and held back in the other, and a connector held back by a setting that is not policy. Five tests now catch
+   all 7 (each seen failing against its mutant). Start-up (`scripts/perf-baseline.py --runs 9`, release builds):
+   first snapshot with 950 rows 105.2 ms on main, 106.0 ms here; with 70 rows 111.8 and 109.8 ms; `klefki-cli list`
+   12.1 and 12.4 ms; memory the same (about 130 MB resident, 44 MB private dirty). Merged in #90 (136909c).
+9. `swap::run` (222 lines, an edit, move or copy of a server through Claude Code) in named steps: `checked` (the
+   entry as it is and as it will be, or why not), `secret_for` (the client secret to hand over), `remove_old`,
+   `undo_remove` (putting the old entry back when adding the new one failed) and `move_secret`; `run` (64 lines) does
+   them in the same order with the same words. Mutants on the changed lines: main 18 (17 caught, 1 unviable), branch
+   12 (11 caught, 1 unviable); none missed. `same_settings`' inverted stdio condition is left as it is (owner).
+
 ## Next
-7. The rest, file by file: `ops::use_profile`,
-   `inventory::build`, `swap::run` last; the engine ideas from A2's review where they stay moves.
+10. The engine ideas from A2's review, as moves.
 
 ## Follow-ups for the owner (not in this slice)
 - From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…

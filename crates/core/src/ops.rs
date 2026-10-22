@@ -697,202 +697,28 @@ fn use_profile(
     out: &mut Resolved,
 ) -> Result<(), String> {
     let shown_profile = sanitize(name);
-    let places: Vec<&String> = match project {
-        Some(p) => vec![
-            snapshot
-                .projects
-                .iter()
-                .find(|known| *known == p)
-                .ok_or_else(|| format!("Claude Code does not know the project {}.", sanitize(p)))?,
-        ],
-        None => snapshot.projects.iter().collect(),
-    };
-    if places.is_empty() {
-        return Err(format!(
-            "Claude Code knows no projects yet, so there is nowhere to use {shown_profile}."
-        ));
-    }
-    let mut found = Vec::new();
-    // The members that load in a place it is used in, as shown, once each, by their place in the profile.
-    let mut here_names: Vec<(usize, String)> = Vec::new();
-    // Without `only`: other servers on there now, by (project, name as the file spells it).
-    let mut others_on: Vec<(String, String)> = Vec::new();
-    let mut elsewhere = Vec::new();
-    let mut unapproved = Vec::new();
-    let mut turned_off = BTreeSet::new();
-    // (project, name as the file spells it) and whether it goes off, in the order the servers are listed.
-    let mut switches: Vec<((String, String), bool)> = Vec::new();
-    // Whether each of `switches` is off now, in the same order.
-    let mut off_before: Vec<bool> = Vec::new();
-    // The members and the places they are turned on in: judged once every switch is known.
-    let mut loaded_here: Vec<(&ServerRow, &String)> = Vec::new();
-    for row in &snapshot.servers {
-        // The scope, project and name as the files spell them.
-        let Some((scope, own_project, file_name)) =
-            crate::model::ConnectionId::parse(row.connection.as_str())
-        else {
-            continue;
-        };
-        let member = members.contains(&row.connection);
-        if member {
-            found.push(&row.connection);
-        }
-        let mut here_any = false;
-        for place in &places {
-            // A local or project server loads in its own project only.
-            let here = match scope {
-                Scope::Local | Scope::Project => own_project.as_deref() == Some(place.as_str()),
-                _ => true,
-            };
-            if !here {
-                continue;
-            }
-            here_any = true;
-            if member || only {
-                // Claude Code switches by name: where a member and another server share one, the member wins.
-                let key = ((*place).clone(), file_name.clone());
-                match switches.iter_mut().find(|(k, _)| *k == key) {
-                    Some((_, off)) => *off &= !member,
-                    None => {
-                        switches.push((key, !member));
-                        off_before.push(off_now(row, scope, place));
-                    }
-                }
-            }
-            // Said only when it is on there now: one already off is not turned off by this.
-            if !member && !off_now(row, scope, place) {
-                if only {
-                    turned_off.insert((row.name.clone(), (*place).clone(), file_name.clone()));
-                } else {
-                    others_on.push(((*place).clone(), file_name.clone()));
-                }
-            }
-            if member {
-                loaded_here.push((row, *place));
-            }
-        }
-        if let Some(at) = members.iter().position(|m| *m == row.connection)
-            && here_any
-            && !here_names.iter().any(|(_, n)| *n == row.name)
-        {
-            here_names.push((at, row.name.clone()));
-        }
-        if member && !here_any {
-            elsewhere.push(format!(
-                "{} ({})",
-                row.name,
-                row.project
-                    .as_deref()
-                    .map(|p| sanitize(folder_name(p)))
-                    .unwrap_or_default()
-            ));
-        }
-        if member
-            && here_any
-            && row.scope == Scope::Project
-            && row.approval != Some(Approval::Approved)
-        {
-            unapproved.push(row.name.clone());
-        }
-    }
-    // A member that will still not load, and why → the places (folder names) where. Judged as things will be after
-    // this change: what it turns off no longer hides a duplicate.
-    let off_after = |place: &str, name: &str| {
-        switches
-            .iter()
-            .any(|((p, n), off)| *off && p == place && n == name)
-    };
-    let mut held: Vec<((String, String), Vec<String>)> = Vec::new();
-    for (row, place) in loaded_here {
-        if let Some(why) = held_back(row, place, snapshot, &off_after) {
-            let at = project_label(place, snapshot);
-            let key = (row.name.clone(), why);
-            match held.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, at_places)) => at_places.push(at),
-                None => held.push((key, vec![at])),
-            }
-        }
-    }
-    for ((project, name), disabled) in &switches {
+    let places = profile_places(project, snapshot, &shown_profile)?;
+    let walk = ProfileWalk::of(members, &places, only, snapshot);
+    let held = walk.held(snapshot);
+    for ((project, name), disabled) in &walk.switches {
         out.claude.push(Op::SetDisabled {
             project: project.clone(),
             name: name.clone(),
             disabled: *disabled,
         });
     }
-    // Remembered once saved, so stopping the profile puts back what this flips.
-    let mut used = UsedProfile {
-        profile: name.to_owned(),
-        flipped: Vec::new(),
-        already: Vec::new(),
-    };
-    for (((project, server), off), before) in switches.iter().zip(&off_before) {
-        let switch = Switch {
-            project: project.clone(),
-            name: server.clone(),
-            off: *off,
-        };
-        if before == off {
-            used.already.push(switch);
-        } else {
-            used.flipped.push(switch);
-        }
-    }
-    if !used.flipped.is_empty() {
-        match &snapshot.profile_uses.problem {
-            Some(problem) => out.warnings.push(format!(
-                "Klefki cannot remember what this switches, so stopping {shown_profile} later will not put it back: \
-                 {problem}"
-            )),
-            None => out.notes.push(format!(
-                "Klefki remembers what this switches: stop using {shown_profile}, or delete it, to put it back."
-            )),
-        }
-    }
-    out.profiles_used.push(used);
-    // Only what is really turned off: not a server that shares its name with a member.
-    let turned_off: Vec<(String, String, String)> = turned_off
-        .into_iter()
-        .filter(|(_, place, name)| {
-            switches
-                .iter()
-                .any(|((p, n), off)| *off && p == place && n == name)
-        })
-        .collect();
-    // In every project: in how many something goes off, since the names alone do not say where.
-    let off_places = turned_off
-        .iter()
-        .map(|(_, place, _)| place)
-        .collect::<BTreeSet<_>>()
-        .len();
-    let turned_off: BTreeSet<String> = turned_off.into_iter().map(|(shown, ..)| shown).collect();
-    let missing: Vec<String> = members
-        .iter()
-        .filter(|m| !found.contains(m))
-        .map(|m| m.shown_name())
-        .collect();
-    if !missing.is_empty() {
-        out.notes.push(format!(
-            "{} {} in {shown_profile} but no longer configured, so nothing is switched for {}.",
-            some_of(&missing),
-            if missing.len() == 1 { "is" } else { "are" },
-            if missing.len() == 1 { "it" } else { "them" }
-        ));
-    }
-    if !elsewhere.is_empty() {
-        out.notes.push(format!(
-            "In {shown_profile}, these load only in a project of their own, so they stay as they are: {}.",
-            some_of(&elsewhere)
-        ));
-    }
+    walk.remember(name, &shown_profile, snapshot, out);
+    let (turned_off, off_places) = walk.really_off();
+    walk.left_as_they_are(members, &shown_profile, out);
     // A server that shares a member's name is on as the member, and "only" would leave it on too.
     // Not when none of its servers loads there: "only" would then turn everything off and nothing on.
-    out.others_on |= !here_names.is_empty()
-        && others_on
+    out.others_on |= !walk.here_names.is_empty()
+        && walk
+            .others_on
             .iter()
-            .any(|key| !switches.iter().any(|(k, _)| k == key));
+            .any(|key| !walk.switches.iter().any(|(k, _)| k == key));
     // None of its servers loads there: why, rather than a bare "nothing to change".
-    if here_names.is_empty() {
+    if walk.here_names.is_empty() {
         let place = match project {
             Some(p) => project_label(p, snapshot),
             None => "any project Claude Code knows".to_owned(),
@@ -911,17 +737,8 @@ fn use_profile(
         out.warnings
             .push(format!("{server} will still not load in {at}: {why}"));
     }
-    if !unapproved.is_empty() {
-        out.warnings.push(format!(
-            "{} {} project server{} that you have not approved in Claude Code. Turning {} on does not approve {}, \
-             so Claude will still not run {}.",
-            and_list(&unapproved),
-            if unapproved.len() == 1 { "is a" } else { "are" },
-            if unapproved.len() == 1 { "" } else { "s" },
-            if unapproved.len() == 1 { "it" } else { "them" },
-            if unapproved.len() == 1 { "it" } else { "them" },
-            if unapproved.len() == 1 { "it" } else { "them" },
-        ));
+    if !walk.unapproved.is_empty() {
+        out.warnings.push(not_approved(&walk.unapproved));
     }
     if !turned_off.is_empty() {
         let names: Vec<String> = turned_off.into_iter().collect();
@@ -945,37 +762,314 @@ fn use_profile(
             count(snapshot.projects.len(), "project")
         ));
     }
-    if !here_names.is_empty() {
-        here_names.sort();
-        let here_names: Vec<String> = here_names.into_iter().map(|(_, n)| n).collect();
-        let one = here_names.len() == 1;
-        let place = match project {
-            Some(p) => project_label(p, snapshot),
-            None => "every project Claude Code knows".to_owned(),
-        };
-        out.already.push(format!(
-            "The {} of {shown_profile}, {}, {} already {} in {place}.{}",
-            if one { "server" } else { "servers" },
-            some_of(&here_names),
-            if one { "is" } else { "are" },
-            match (only, one) {
-                (true, true) => "the only one on",
-                (true, false) => "the only ones on",
-                (false, _) => "on",
-            },
-            if only {
-                ""
-            } else {
-                " Other servers there are left as they are."
-            }
+    if !walk.here_names.is_empty() {
+        out.already.push(already_on(
+            walk.here_names,
+            &shown_profile,
+            project,
+            only,
+            snapshot,
         ));
     }
-    if found.is_empty() {
+    if walk.found.is_empty() {
         return Err(format!(
             "None of the servers in {shown_profile} is configured any more."
         ));
     }
     Ok(())
+}
+
+/// Where a profile is used: `project`, or every project Claude Code knows.
+fn profile_places<'s>(
+    project: Option<&str>,
+    snapshot: &'s Snapshot,
+    shown_profile: &str,
+) -> Result<Vec<&'s String>, String> {
+    let places: Vec<&String> = match project {
+        Some(p) => vec![
+            snapshot
+                .projects
+                .iter()
+                .find(|known| *known == p)
+                .ok_or_else(|| format!("Claude Code does not know the project {}.", sanitize(p)))?,
+        ],
+        None => snapshot.projects.iter().collect(),
+    };
+    if places.is_empty() {
+        return Err(format!(
+            "Claude Code knows no projects yet, so there is nowhere to use {shown_profile}."
+        ));
+    }
+    Ok(places)
+}
+
+/// What using a profile finds, server by server, in the places it is used in.
+#[derive(Default)]
+struct ProfileWalk<'s> {
+    /// The members still in the configuration.
+    found: Vec<&'s crate::model::ConnectionId>,
+    /// The members that load in a place it is used in, as shown, once each, by their place in the profile.
+    here_names: Vec<(usize, String)>,
+    /// Without `only`: other servers on there now, by (project, name as the file spells it).
+    others_on: Vec<(String, String)>,
+    /// The members that load in none of the places, as "name (folder)".
+    elsewhere: Vec<String>,
+    /// The members that are project servers not approved in a place they load in, as shown.
+    unapproved: Vec<String>,
+    /// With `only`: other servers on there now, by (name as shown, project, name as the file spells it).
+    turned_off: BTreeSet<(String, String, String)>,
+    /// (project, name as the file spells it) and whether it goes off, in the order the servers are listed.
+    switches: Vec<((String, String), bool)>,
+    /// Whether each of `switches` is off now, in the same order.
+    off_before: Vec<bool>,
+    /// The members and the places they are turned on in: judged once every switch is known.
+    loaded_here: Vec<(&'s ServerRow, &'s String)>,
+}
+
+impl<'s> ProfileWalk<'s> {
+    fn of(
+        members: &[crate::model::ConnectionId],
+        places: &[&'s String],
+        only: bool,
+        snapshot: &'s Snapshot,
+    ) -> Self {
+        let mut walk = Self::default();
+        for row in &snapshot.servers {
+            walk.server(row, members, places, only);
+        }
+        walk
+    }
+
+    fn server(
+        &mut self,
+        row: &'s ServerRow,
+        members: &[crate::model::ConnectionId],
+        places: &[&'s String],
+        only: bool,
+    ) {
+        // The scope, project and name as the files spell them.
+        let Some((scope, own_project, file_name)) =
+            crate::model::ConnectionId::parse(row.connection.as_str())
+        else {
+            return;
+        };
+        let member = members.contains(&row.connection);
+        if member {
+            self.found.push(&row.connection);
+        }
+        let mut here_any = false;
+        for place in places {
+            // A local or project server loads in its own project only.
+            let here = match scope {
+                Scope::Local | Scope::Project => own_project.as_deref() == Some(place.as_str()),
+                _ => true,
+            };
+            if !here {
+                continue;
+            }
+            here_any = true;
+            if member || only {
+                // Claude Code switches by name: where a member and another server share one, the member wins.
+                let key = ((*place).clone(), file_name.clone());
+                match self.switches.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, off)) => *off &= !member,
+                    None => {
+                        self.switches.push((key, !member));
+                        self.off_before.push(off_now(row, scope, place));
+                    }
+                }
+            }
+            // Said only when it is on there now: one already off is not turned off by this.
+            if !member && !off_now(row, scope, place) {
+                if only {
+                    self.turned_off
+                        .insert((row.name.clone(), (*place).clone(), file_name.clone()));
+                } else {
+                    self.others_on.push(((*place).clone(), file_name.clone()));
+                }
+            }
+            if member {
+                self.loaded_here.push((row, *place));
+            }
+        }
+        if let Some(at) = members.iter().position(|m| *m == row.connection)
+            && here_any
+            && !self.here_names.iter().any(|(_, n)| *n == row.name)
+        {
+            self.here_names.push((at, row.name.clone()));
+        }
+        if member && !here_any {
+            self.elsewhere.push(format!(
+                "{} ({})",
+                row.name,
+                row.project
+                    .as_deref()
+                    .map(|p| sanitize(folder_name(p)))
+                    .unwrap_or_default()
+            ));
+        }
+        if member
+            && here_any
+            && row.scope == Scope::Project
+            && row.approval != Some(Approval::Approved)
+        {
+            self.unapproved.push(row.name.clone());
+        }
+    }
+
+    /// A member that will still not load, and why → the places (folder names) where. Judged as things will be after
+    /// this change: what it turns off no longer hides a duplicate.
+    fn held(&self, snapshot: &Snapshot) -> Vec<((String, String), Vec<String>)> {
+        let off_after = |place: &str, name: &str| {
+            self.switches
+                .iter()
+                .any(|((p, n), off)| *off && p == place && n == name)
+        };
+        let mut held: Vec<((String, String), Vec<String>)> = Vec::new();
+        for (row, place) in &self.loaded_here {
+            if let Some(why) = held_back(row, place, snapshot, &off_after) {
+                let at = project_label(place, snapshot);
+                let key = (row.name.clone(), why);
+                match held.iter_mut().find(|(k, _)| *k == key) {
+                    Some((_, at_places)) => at_places.push(at),
+                    None => held.push((key, vec![at])),
+                }
+            }
+        }
+        held
+    }
+
+    /// Remembered once saved, so stopping the profile puts back what this flips.
+    fn remember(&self, name: &str, shown_profile: &str, snapshot: &Snapshot, out: &mut Resolved) {
+        let mut used = UsedProfile {
+            profile: name.to_owned(),
+            flipped: Vec::new(),
+            already: Vec::new(),
+        };
+        for (((project, server), off), before) in self.switches.iter().zip(&self.off_before) {
+            let switch = Switch {
+                project: project.clone(),
+                name: server.clone(),
+                off: *off,
+            };
+            if before == off {
+                used.already.push(switch);
+            } else {
+                used.flipped.push(switch);
+            }
+        }
+        if !used.flipped.is_empty() {
+            match &snapshot.profile_uses.problem {
+                Some(problem) => out.warnings.push(format!(
+                    "Klefki cannot remember what this switches, so stopping {shown_profile} later will not put it \
+                     back: {problem}"
+                )),
+                None => out.notes.push(format!(
+                    "Klefki remembers what this switches: stop using {shown_profile}, or delete it, to put it back."
+                )),
+            }
+        }
+        out.profiles_used.push(used);
+    }
+
+    /// The other servers really turned off, as shown, and in how many projects: not one that shares its name with a
+    /// member. In every project the names alone do not say where.
+    fn really_off(&self) -> (BTreeSet<String>, usize) {
+        let turned_off: Vec<&(String, String, String)> = self
+            .turned_off
+            .iter()
+            .filter(|(_, place, name)| {
+                self.switches
+                    .iter()
+                    .any(|((p, n), off)| *off && p == place && n == name)
+            })
+            .collect();
+        let off_places = turned_off
+            .iter()
+            .map(|(_, place, _)| place)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let shown = turned_off
+            .into_iter()
+            .map(|(shown, ..)| shown.clone())
+            .collect();
+        (shown, off_places)
+    }
+
+    /// Notes on the members nothing is switched for: no longer configured, or loading only in a project of their own.
+    fn left_as_they_are(
+        &self,
+        members: &[crate::model::ConnectionId],
+        shown_profile: &str,
+        out: &mut Resolved,
+    ) {
+        let missing: Vec<String> = members
+            .iter()
+            .filter(|m| !self.found.contains(m))
+            .map(|m| m.shown_name())
+            .collect();
+        if !missing.is_empty() {
+            out.notes.push(format!(
+                "{} {} in {shown_profile} but no longer configured, so nothing is switched for {}.",
+                some_of(&missing),
+                if missing.len() == 1 { "is" } else { "are" },
+                if missing.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        if !self.elsewhere.is_empty() {
+            out.notes.push(format!(
+                "In {shown_profile}, these load only in a project of their own, so they stay as they are: {}.",
+                some_of(&self.elsewhere)
+            ));
+        }
+    }
+}
+
+/// The warning that turning project servers on does not approve them.
+fn not_approved(unapproved: &[String]) -> String {
+    format!(
+        "{} {} project server{} that you have not approved in Claude Code. Turning {} on does not approve {}, so \
+         Claude will still not run {}.",
+        and_list(unapproved),
+        if unapproved.len() == 1 { "is a" } else { "are" },
+        if unapproved.len() == 1 { "" } else { "s" },
+        if unapproved.len() == 1 { "it" } else { "them" },
+        if unapproved.len() == 1 { "it" } else { "them" },
+        if unapproved.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// What a profile's members that load there already are, in the profile's order.
+fn already_on(
+    mut here_names: Vec<(usize, String)>,
+    shown_profile: &str,
+    project: Option<&str>,
+    only: bool,
+    snapshot: &Snapshot,
+) -> String {
+    here_names.sort();
+    let here_names: Vec<String> = here_names.into_iter().map(|(_, n)| n).collect();
+    let one = here_names.len() == 1;
+    let place = match project {
+        Some(p) => project_label(p, snapshot),
+        None => "every project Claude Code knows".to_owned(),
+    };
+    format!(
+        "The {} of {shown_profile}, {}, {} already {} in {place}.{}",
+        if one { "server" } else { "servers" },
+        some_of(&here_names),
+        if one { "is" } else { "are" },
+        match (only, one) {
+            (true, true) => "the only one on",
+            (true, false) => "the only ones on",
+            (false, _) => "on",
+        },
+        if only {
+            ""
+        } else {
+            " Other servers there are left as they are."
+        }
+    )
 }
 
 /// The projects (as [`Snapshot::projects`] spells them) where a profile is on alone now: of the servers Claude Code
@@ -3750,5 +3844,76 @@ mod profile_review_regressions {
         // Without "only", what it repeats stays on, and it stays left out.
         let out = use_profile(&inv, vec![dup.connection.clone()], false);
         assert!(warned(&out), "{:?}", out.warnings);
+    }
+
+    /// Nearby: with "only", another server going off does not let the duplicate load while what it repeats stays on.
+    #[test]
+    fn a_duplicate_stays_out_while_what_it_repeats_stays_on() {
+        let dir = tempfile::tempdir().unwrap();
+        two_plugins(dir.path());
+        let inv = inv(
+            dir.path(),
+            json!({"mcpServers": {"x": {"command": "x"}}, "projects": {"/q": {}}}),
+        );
+        let plugin = |dup: bool| {
+            inv.snapshot
+                .servers
+                .iter()
+                .find(|r| {
+                    r.plugin
+                        .as_ref()
+                        .is_some_and(|p| p.same_as.is_some() == dup)
+                })
+                .unwrap_or_else(|| panic!("fixture: {:?}", inv.snapshot.servers))
+                .connection
+                .clone()
+        };
+        let out = use_profile(&inv, vec![plugin(false), plugin(true)], true);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("same command or address")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(
+            out.warnings.iter().any(|w| w.contains("also turns off x")),
+            "fixture: x goes off: {:?}",
+            out.warnings
+        );
+    }
+
+    /// Each member held back is named with its own reason.
+    #[test]
+    fn two_members_held_back_are_each_named() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"deniedMcpServers":[{"serverName":"a"},{"serverName":"b"}]}"#,
+        )
+        .unwrap();
+        let inv = inv(
+            dir.path(),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {"/q": {}}
+            }),
+        );
+        let members = inv
+            .snapshot
+            .servers
+            .iter()
+            .map(|r| r.connection.clone())
+            .collect();
+        let out = use_profile(&inv, members, false);
+        for name in ["a", "b"] {
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{name} will still not load in q: "))),
+                "{name}: {:?}",
+                out.warnings
+            );
+        }
     }
 }
