@@ -642,6 +642,7 @@ fn last_starts_from_claude_codes_logs() {
     };
     let start = |folder: &str, when: &str, outcome: StartOutcome| {
         LastStart {
+        project: None,
         folder: folder.to_owned(),
         when: when.to_owned(),
         exact: format!("22 Oct 2026, {when} (UTC+02:00)"),

@@ -538,7 +538,7 @@ impl ShellApp {
             }
             Event::Snapshot(snapshot) => self.take_snapshot(snapshot),
             Event::Diagnosis { id, diagnosis } => {
-                self.diagnosed_in(&id);
+                self.diagnosed_in(&id, &diagnosis);
                 if self.snapshot.servers.iter().any(|r| r.is(&id)) {
                     // It is drawn under the status and its explanation, often below the window: brought into view
                     // when it is for the server being looked at, and left where it is otherwise.

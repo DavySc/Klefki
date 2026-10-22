@@ -358,6 +358,8 @@ pub struct LastStarts {
 pub struct LastStart {
     /// The folder Claude Code was started in, as shown (`~/code/app`).
     pub folder: String,
+    /// That folder as a project of [`Snapshot::projects`] would spell it, to match it with one; never shown.
+    pub project: Option<String>,
     /// When, in local time: "Today 14:05".
     pub when: String,
     /// To the second, with its offset from UTC.
@@ -446,6 +448,9 @@ pub struct Snapshot {
     pub project_count: usize,
     /// The same projects as paths, in one normal spelling.
     pub projects: Vec<String>,
+    /// Those of [`Snapshot::projects`] whose folder is gone, or is one Klefki does not run anything in (a network
+    /// folder): a server cannot be diagnosed there ([`crate::engine::Command::DiagnoseIn`]).
+    pub unusable_projects: Vec<String>,
     pub servers: Vec<ServerRow>,
     /// Problems found while reading the configuration. Already sanitised.
     pub warnings: Vec<String>,

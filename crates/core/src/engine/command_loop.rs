@@ -602,6 +602,12 @@ fn diagnose_in(shared: &Shared, state: &State, id: &ServerId, project: &str) {
         || project.to_owned(),
         |paths| crate::swap::spelled_in(&paths.claude_json, project),
     );
+    // Asked before the folder is looked at: Windows would contact the server of a network folder.
+    if !inventory::is_safe_project_path(&folder) {
+        return refuse(
+            "Klefki does not run anything in a network folder (\\\\server\\share) or an unusual path".to_owned(),
+        );
+    }
     if !Folders::default().usable(&folder) {
         return refuse("the project folder was not found".to_owned());
     }

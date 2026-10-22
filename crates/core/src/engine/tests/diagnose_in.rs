@@ -22,7 +22,7 @@ fn diagnose_folders(env: &Env) -> Vec<String> {
 }
 
 /// A user server `bad-stdio` (and the servers in `more`) and `projects`, entries by folder name, each folder made in
-/// the test's own unless its name starts with `missing`. Every diagnose of `bad-stdio` answers with a failed start.
+/// the test's own unless its name starts with `missing` or is a network folder (`//…`), kept as it is. Every diagnose of `bad-stdio` answers with a failed start.
 fn env_with(projects: &[(&str, serde_json::Value)], more: serde_json::Value) -> (Env, Vec<String>) {
     let rule = r#",{"args":["--debug","mcp","--debug-file","*","mcp","get","bad-stdio"],"debug_file_from":"dbg.log","stdout_file":"failed.txt"}"#;
     let env = Env::new(
@@ -33,11 +33,16 @@ fn env_with(projects: &[(&str, serde_json::Value)], more: serde_json::Value) -> 
     let mut entries = serde_json::Map::new();
     let mut paths = Vec::new();
     for (name, entry) in projects {
-        let folder = env.dir.path().join("projects").join(name);
-        if !name.starts_with("missing") {
-            std::fs::create_dir_all(&folder).unwrap();
-        }
-        let path = folder.to_string_lossy().replace('\\', "/");
+        // A network folder is named as it is; nothing is made for it.
+        let path = if name.starts_with("//") {
+            (*name).to_owned()
+        } else {
+            let folder = env.dir.path().join("projects").join(name);
+            if !name.starts_with("missing") {
+                std::fs::create_dir_all(&folder).unwrap();
+            }
+            folder.to_string_lossy().replace('\\', "/")
+        };
         entries.insert(path.clone(), entry.clone());
         paths.push(path);
     }
@@ -150,6 +155,7 @@ fn a_project_where_claude_code_would_not_start_it_is_refused_without_running_any
                 "fine",
                 serde_json::json!({"mcpServers": {"loc": {"command": "x"}}}),
             ),
+            ("//nas/share/app", serde_json::json!({})),
         ],
         serde_json::json!({"http": {"type": "http", "url": "https://example.com/mcp"}}),
     );
@@ -175,6 +181,7 @@ fn a_project_where_claude_code_would_not_start_it_is_refused_without_running_any
         "another server called bad-stdio",
     );
     refused(user("bad-stdio"), paths[2].clone(), "folder was not found");
+    refused(user("bad-stdio"), paths[4].clone(), "network folder");
     refused(
         user("bad-stdio"),
         "/nowhere/known".to_owned(),
@@ -189,4 +196,36 @@ fn a_project_where_claude_code_would_not_start_it_is_refused_without_running_any
     // The folder plays no part in how Claude Code reaches an HTTP server.
     refused(user("http"), paths[3].clone(), "by its address");
     assert_eq!(diagnose_folders(&env), Vec::<String>::new(), "nothing ran");
+}
+
+/// The projects whose folder is gone, or is a network folder Klefki does not run in, are in the snapshot, so they are
+/// not offered; a folder that is there is not.
+#[test]
+fn the_snapshot_says_which_project_folders_cannot_be_run_in() {
+    let (env, paths) = env_with(
+        &[
+            ("app", serde_json::json!({})),
+            ("missing", serde_json::json!({})),
+            ("//nas/share/app", serde_json::json!({})),
+        ],
+        serde_json::json!({}),
+    );
+    let core = start_with(
+        EngineConfig {
+            background_checks: false,
+            ..env.config()
+        },
+        || {},
+    );
+    let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+    let snapshot = snapshots(&events).pop().unwrap().clone();
+    assert!(
+        snapshot.projects.contains(&paths[0]),
+        "{:?}",
+        snapshot.projects
+    );
+    assert_eq!(
+        snapshot.unusable_projects,
+        [paths[2].clone(), paths[1].clone()]
+    );
 }

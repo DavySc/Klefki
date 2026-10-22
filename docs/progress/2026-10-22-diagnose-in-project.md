@@ -62,3 +62,21 @@ folder and environment:
 
 ## Next
 Pull request, cross-review, merge; then P9 (klefki-cli status exit codes).
+
+## Review fixes (cross-review of #98)
+- 1: a refusal is headed "Not diagnosed in <project>", not "Diagnosed in <project>: Not checked"
+  (`diagnose_in::refused`). Test `a_refusal_is_headed_not_diagnosed`.
+- 2: `Snapshot::unusable_projects`: projects whose folder is gone or is a network folder (one stat each per read, a
+  network folder never looked at). They are not offered, and "Not listed" counts them apart ("…; 2 projects whose
+  folder is gone or is a network folder."). Engine test `the_snapshot_says_which_project_folders_cannot_be_run_in`,
+  app test `a_project_whose_folder_is_gone_is_not_offered` (with the variant where every project is gone).
+- 3: a network folder is refused as such ("Klefki does not run anything in a network folder …"), before the folder
+  is looked at.
+- 4: chosen first: the project of Claude Code's newest failed start, or else its newest start, when offered
+  (`LastStart::project`, the start's folder spelled as a project, never shown). Test with the variant.
+- 5: next to the button after a run: "<status> in <folder>: see below" (or "Not diagnosed: see below"), a link that
+  brings the diagnosis into view.
+- 6: the explanation is one line; the rest is its hover.
+- 7: only a diagnosis with a folder ends the wait. Test `a_diagnosis_from_the_home_folder_does_not_end_the_wait`.
+- All new tests failed before their fix. `diagnose-in-project.png` redrawn for the shorter line.
+- After: fmt, clippy `-D warnings`, `cargo test --workspace` exit 0 (app 514, core 1094, cli 26 + 43).

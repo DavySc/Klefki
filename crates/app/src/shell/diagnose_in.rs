@@ -7,11 +7,16 @@ use crate::profiles::{project_choices, shown_project};
 use crate::shell::folder_name;
 use crate::theme;
 use egui::{RichText, Ui};
-use klefki_core::api::{Command, Scope, ServerId, ServerRow, Snapshot, TransportKind, words};
+use klefki_core::api::{
+    Command, Diagnosis, LastStarts, Scope, ServerId, ServerRow, Snapshot, StartOutcome, Status,
+    TransportKind, words,
+};
 
 pub(super) const HEADING: &str = "Diagnose in a project";
-const ABOUT: &str = "Claude Code starts this server in each session's folder; Klefki checks it from your home \
-     folder. Run it from a project's folder to see what a session there sees.";
+const ABOUT: &str = "Run it from a project's folder, as a session there does.";
+const ABOUT_HOVER: &str = "Claude Code starts a user server in the folder each session starts in, and Klefki checks \
+     it from your home folder. A relative path, a .env file and the like are looked for in that folder, so it can work \
+     from one and not the other. Its status here stays the home folder's.";
 pub(super) const DIAGNOSE: &str = "Diagnose there";
 const NONE: &str = "Claude Code knows no project where it starts this server.";
 
@@ -28,25 +33,80 @@ pub(super) fn offers(s: &ServerRow) -> bool {
     s.scope == Scope::User && s.transport == TransportKind::Stdio
 }
 
-/// The projects where Claude Code starts `s`, by folder name, and how many it leaves out: off there, another server
-/// of its name in its place, or held back by policy.
-fn places<'a>(s: &ServerRow, snapshot: &'a Snapshot) -> (Vec<&'a String>, usize) {
+/// Whether nothing ran: the engine refused, and says why in the note.
+pub(super) fn refused(d: &Diagnosis) -> bool {
+    d.status == Status::Unknown
+        && d.note
+            .as_deref()
+            .is_some_and(|n| n.starts_with("not diagnosed"))
+}
+
+/// The projects to offer for `s`, by folder name; how many are left out because Claude Code does not start it there
+/// (off, another server of its name, policy), and how many because the folder is gone or is a network folder.
+fn places<'a>(s: &ServerRow, snapshot: &'a Snapshot) -> (Vec<&'a String>, usize, usize) {
     let held = |p: &String| s.blocked.as_ref().is_some_and(|b| b.projects.contains(p));
-    let (mut on, off): (Vec<&String>, Vec<&String>) = snapshot
-        .projects
+    let (mut offered, mut not_started, mut unusable) = (Vec::new(), 0, 0);
+    for p in &snapshot.projects {
+        if s.disabled_projects.contains(p) || s.shadowed_in.contains(p) || held(p) {
+            not_started += 1;
+        } else if snapshot.unusable_projects.contains(p) {
+            unusable += 1;
+        } else {
+            offered.push(p);
+        }
+    }
+    offered.sort_by_cached_key(|p| (folder_name(p).to_lowercase(), p.to_lowercase()));
+    (offered, not_started, unusable)
+}
+
+/// The project to choose first: where Claude Code's newest failed start was, or else its newest start, when it is
+/// offered; or else the first.
+fn likeliest(places: &[&String], last: Option<&LastStarts>) -> String {
+    let offered = |start: &&klefki_core::api::LastStart| {
+        start
+            .project
+            .as_ref()
+            .filter(|p| places.contains(p))
+            .cloned()
+    };
+    let starts = last.map(|l| l.starts.as_slice()).unwrap_or_default();
+    starts
         .iter()
-        .partition(|p| !s.disabled_projects.contains(p) && !s.shadowed_in.contains(p) && !held(p));
-    on.sort_by_cached_key(|p| (folder_name(p).to_lowercase(), p.to_lowercase()));
-    (on, off.len())
+        .filter(|s| matches!(s.outcome, StartOutcome::Failed { .. }))
+        .find_map(|s| offered(&s))
+        .or_else(|| starts.iter().find_map(|s| offered(&s)))
+        .unwrap_or_else(|| places[0].clone())
+}
+
+/// "Not listed: 1 project where it is off or another server called x loads; 2 projects whose folder is gone or is
+/// a network folder."
+fn left_out(name: &str, not_started: usize, unusable: usize) -> Option<String> {
+    let mut parts = Vec::new();
+    if not_started > 0 {
+        parts.push(format!(
+            "{} where it is off or another server called {name} loads",
+            words::count(not_started, "project")
+        ));
+    }
+    if unusable > 0 {
+        parts.push(format!(
+            "{} whose folder is gone or is a network folder",
+            words::count(unusable, "project")
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("Not listed: {}.", parts.join("; ")))
 }
 
 impl ShellApp {
-    /// A diagnosis arrived: the one asked for here is no longer running.
-    pub(super) fn diagnosed_in(&mut self, id: &ServerId) {
-        self.diagnose_in.running.take_if(|(r, _)| r == id);
+    /// A diagnosis arrived: one run in a project ends the wait for it (one from the home folder can come first).
+    pub(super) fn diagnosed_in(&mut self, id: &ServerId, d: &Diagnosis) {
+        if d.folder.is_some() {
+            self.diagnose_in.running.take_if(|(r, _)| r == id);
+        }
     }
 
-    /// Under the status and its explanation: what it is for, the project to run it in and the button.
+    /// Under the status and its explanation: what it is for, the project to run it in, the button and, once it ran,
+    /// how it went, leading to the diagnosis below.
     pub(super) fn diagnose_in_section(&mut self, ui: &mut Ui, s: &ServerRow, can_check: bool) {
         // Not before Claude Code was started in a folder: there is nothing to choose.
         if self.core.is_none() || !offers(s) || self.snapshot.projects.is_empty() {
@@ -54,7 +114,7 @@ impl ShellApp {
         }
         let pal = theme::palette(ui.ctx());
         let muted = |ui: &mut Ui, text: &str| {
-            ui.add(egui::Label::new(RichText::new(text).color(pal.text_muted)).wrap());
+            ui.add(egui::Label::new(RichText::new(text).color(pal.text_muted)).wrap())
         };
         ui.add_space(10.0);
         ui.separator();
@@ -63,9 +123,9 @@ impl ShellApp {
                 .family(theme::bold_family())
                 .size(16.0),
         );
-        muted(ui, ABOUT);
+        muted(ui, ABOUT).on_hover_text(ABOUT_HOVER);
         let snapshot = self.snapshot.clone();
-        let (places, left_out) = places(s, &snapshot);
+        let (places, not_started, unusable) = places(s, &snapshot);
         let id = s.id();
         let running = self
             .diagnose_in
@@ -76,13 +136,17 @@ impl ShellApp {
         if places.is_empty() {
             muted(ui, NONE);
         } else {
-            // The one chosen for this server while it is still listed, or else the first.
+            // The one chosen for this server while it is still offered, or else the likeliest.
             let chosen = self
                 .diagnose_in
                 .chosen
                 .as_ref()
                 .filter(|(c, p)| *c == id && places.contains(&p))
-                .map_or_else(|| places[0].clone(), |(_, p)| p.clone());
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| {
+                    let last = self.last_starts.get(&id).and_then(|l| l.starts.as_ref());
+                    likeliest(&places, last)
+                });
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 let label = ui.label("Project");
@@ -93,18 +157,22 @@ impl ShellApp {
                     .width(220.0)
                     .height(320.0)
                     .show_ui(ui, |ui| {
-                        picked = project_choices(ui, &places, Some(&chosen), &mut self.diagnose_in.filter);
+                        picked = project_choices(
+                            ui,
+                            &places,
+                            Some(&chosen),
+                            &mut self.diagnose_in.filter,
+                        );
                     });
-                combo.response.labelled_by(label.id).on_hover_text(chosen.as_str());
-                if let Some(p) = picked {
-                    self.diagnose_in.chosen = Some((id.clone(), p));
+                combo
+                    .response
+                    .labelled_by(label.id)
+                    .on_hover_text(chosen.as_str());
+                // Kept only once picked: until then the likeliest may change as the last starts arrive.
+                if let Some(p) = &picked {
+                    self.diagnose_in.chosen = Some((id.clone(), p.clone()));
                 }
-                let chosen = self
-                    .diagnose_in
-                    .chosen
-                    .as_ref()
-                    .filter(|(c, _)| *c == id)
-                    .map_or(chosen, |(_, p)| p.clone());
+                let chosen = picked.unwrap_or(chosen);
                 if ui
                     .add_enabled(can_check && running.is_none(), egui::Button::new(DIAGNOSE))
                     .on_hover_text(format!(
@@ -119,28 +187,30 @@ impl ShellApp {
                         project: chosen,
                     });
                 }
+                // How it went, by the button; the diagnosis itself is below the last starts.
+                if running.is_none()
+                    && let Some(d) = self.diagnoses.get(&id)
+                    && let Some(folder) = &d.folder
+                {
+                    let outcome = if refused(d) {
+                        "Not diagnosed: see below".to_owned()
+                    } else {
+                        format!("{} in {}: see below", d.status.label(), folder_name(folder))
+                    };
+                    if ui.link(outcome).clicked() {
+                        self.reveal_diagnosis = Some(id.clone());
+                    }
+                }
             });
         }
         if let Some(project) = &running {
-            let line = ui.add(
-                egui::Label::new(
-                    RichText::new(format!("Diagnosing in {project}…")).color(pal.text_muted),
-                )
-                .wrap(),
-            );
+            let line = muted(ui, &format!("Diagnosing in {project}…"));
             ui.ctx().accesskit_node_builder(line.id, |node| {
-                node.set_live(egui::accesskit::Live::Polite)
+                node.set_live(egui::accesskit::Live::Polite);
             });
         }
-        if left_out > 0 {
-            muted(
-                ui,
-                &format!(
-                    "Not listed: {} where it is off or another server called {} loads.",
-                    words::count(left_out, "project"),
-                    s.name
-                ),
-            );
+        if let Some(left_out) = left_out(&s.name, not_started, unusable) {
+            muted(ui, &left_out);
         }
     }
 }

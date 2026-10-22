@@ -197,6 +197,7 @@ fn the_report_holds_the_diagnosis_and_the_last_starts_when_there_are_some() {
         &row,
         LastStarts {
             starts: vec![LastStart {
+                project: None,
                 folder: "~/proj".to_owned(),
                 when: "Today 07:32".to_owned(),
                 exact: String::new(),

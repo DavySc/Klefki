@@ -77,9 +77,14 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
     ui.separator();
     // Run from a project: where, and how it went there, as the status above is the home folder's.
     if let Some(folder) = &d.folder {
+        let heading = if super::diagnose_in::refused(d) {
+            format!("Not diagnosed in {folder}")
+        } else {
+            format!("Diagnosed in {folder}: {}", d.status.label())
+        };
         ui.add(
             egui::Label::new(
-                RichText::new(format!("Diagnosed in {folder}: {}", d.status.label()))
+                RichText::new(heading)
                     .family(theme::bold_family())
                     .size(16.0),
             )

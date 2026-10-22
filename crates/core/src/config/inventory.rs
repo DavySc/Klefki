@@ -152,6 +152,12 @@ fn build(
     let projects = merged_projects(root);
     snap.project_count = projects.len();
     snap.projects = projects.keys().cloned().collect();
+    // A folder that is gone (a deleted clone) or that Klefki does not run in: one stat each, on each read.
+    snap.unusable_projects = projects
+        .iter()
+        .filter(|(_, p)| !(is_safe_project_path(&p.raw) && Path::new(&p.raw).is_dir()))
+        .map(|(key, _)| key.clone())
+        .collect();
     // The on/off toggle is a list of names in each project's entry (decision 002).
     let disabled_by_project: BTreeMap<&String, BTreeSet<String>> = projects
         .iter()
