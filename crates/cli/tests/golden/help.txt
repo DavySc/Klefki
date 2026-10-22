@@ -58,13 +58,17 @@ Options:
 Exit status:
   0  Done; for status, every server checked is connected; for export, every
      server named is in the block.
-  1  status found a server that is not connected; export left one out; use
-     could not make or save the change.
+  1  status found a server that is not connected, or a NAME that Claude Code
+     does not run (off, rejected, not loaded); export left one out; use could
+     not make or save the change.
   2  The command line was wrong, a NAME matches no server, or use names a
      profile or folder that is not there.
   3  Claude Code could not be used: not found, or no check got an answer.
   4  export could not write the --output file (it is there, or not allowed);
      use saved nothing: not confirmed, or nobody at a terminal and no --yes.
+  5  status was given a NAME that Klefki does not check (a plugin's, the
+     organisation's, a claude.ai connector), so nothing is known about it.
+     Like any code but 0, `&&` and `set -e` treat it as a failure.
 
 Reads CLAUDE_CONFIG_DIR like Claude Code does.
 --- stderr

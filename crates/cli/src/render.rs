@@ -2,7 +2,8 @@
 //! functions of the snapshot and the answers, so they are tested without running anything. All text in a snapshot
 //! and in the engine's answers is already sanitised by core.
 use klefki_core::api::{
-    Approval, Hint, NameError, Scope, ServerName, ServerRow, Snapshot, Status, TransportKind, words,
+    Approval, Hint, NameError, Preflight, PreflightKind, Scope, ServerName, ServerRow, Snapshot,
+    Status, TransportKind, words,
 };
 use serde_json::{Value, json};
 use std::cmp::Ordering;
@@ -90,6 +91,55 @@ impl Outcome {
 
     pub(crate) fn was_checked(&self) -> bool {
         matches!(self, Outcome::Checked(_) | Outcome::NoAnswer)
+    }
+
+    /// Named, whether this server fails `status`'s exit code though nothing ran: Claude Code does not run it, so it
+    /// does not work there.
+    pub(crate) fn will_not_run(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Off | Outcome::Rejected | Outcome::NotLoaded(_)
+        )
+    }
+
+    /// Named, whether Klefki leaves this server to Claude Code's `/mcp`, so nothing is known about it.
+    pub(crate) fn not_checkable(&self) -> bool {
+        matches!(
+            self,
+            Outcome::Plugin | Outcome::Organisation | Outcome::ClaudeAi
+        )
+    }
+
+    /// The status the server is shown with: this run's answer, or the last known one for a row not checked.
+    fn shown_status(&self, row: &ServerRow) -> Status {
+        match self {
+            Outcome::Checked(c) => c.status,
+            Outcome::NoAnswer => Status::Unknown,
+            _ => row.status,
+        }
+    }
+}
+
+/// The pre-flight findings to show for a server with this outcome, as the app shows them: once it started, Claude
+/// Code found its program, whatever PATH Klefki has, so "not found" would contradict the status beside it.
+pub(crate) fn preflight_shown<'a>(row: &'a ServerRow, outcome: &Outcome) -> Vec<&'a Preflight> {
+    let started = matches!(
+        outcome.shown_status(row),
+        Status::Connected | Status::Degraded | Status::NeedsAuth
+    );
+    row.preflight
+        .iter()
+        .filter(|f| !(started && f.kind == PreflightKind::NotFound))
+        .collect()
+}
+
+fn preflight_key(kind: PreflightKind) -> &'static str {
+    match kind {
+        PreflightKind::NotFound => "not_found",
+        PreflightKind::MangledSwitch => "mangled_switch",
+        PreflightKind::NoInput => "no_input",
+        PreflightKind::UnsetVariable => "unset_variable",
+        PreflightKind::EmptyValue => "empty_value",
     }
 }
 
@@ -765,6 +815,16 @@ pub(crate) fn status_text(rows: &[(&ServerRow, Outcome)], home: Option<&str>) ->
                 let _ = write!(out, "\n{indent}- {}", one_line(step));
             }
         }
+        // What in the definition keeps it from starting, problem then fix, the same way. A connected server's
+        // findings stay in the app's details: here they would only lengthen a row that works.
+        let outcome = &rows[at].1;
+        if !matches!(outcome, Outcome::Checked(c) if c.status == Status::Connected) {
+            let indent = " ".repeat(2 + name_w + 2);
+            for found in preflight_shown(row, outcome) {
+                let _ = write!(out, "\n{indent}{}: {}", row.name, one_line(&found.problem));
+                let _ = write!(out, "\n{indent}- {}", one_line(&found.fix));
+            }
+        }
         at += 1;
     });
     out.push('\n');
@@ -776,6 +836,7 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
     let mut counts: Vec<(&'static str, usize)> = Vec::new();
     let mut skipped = 0;
     for (_, outcome) in rows {
+        // Why Claude Code does not run it is said apart from "not checked": named, it is why the run failed.
         let label = match outcome {
             Outcome::Checked(c) if c.refused().is_some() => "could not be checked",
             Outcome::Checked(c) if c.failed() => "check failed",
@@ -789,13 +850,13 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
                 Status::Checking | Status::Unknown => "check failed",
             },
             Outcome::NoAnswer => "no answer",
-            Outcome::Off
-            | Outcome::Rejected
-            | Outcome::ProjectServer
+            Outcome::Off => "off",
+            Outcome::Rejected => "rejected",
+            Outcome::NotLoaded(_) => "not loaded",
+            Outcome::ProjectServer
             | Outcome::Plugin
             | Outcome::Organisation
-            | Outcome::ClaudeAi
-            | Outcome::NotLoaded(_) => {
+            | Outcome::ClaudeAi => {
                 skipped += 1;
                 continue;
             }
@@ -805,6 +866,8 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
             None => counts.push((label, 1)),
         }
     }
+    // What the checks found first, then what was not run, in that order.
+    counts.sort_by_key(|&(label, _)| matches!(label, "off" | "rejected" | "not loaded"));
     let mut parts: Vec<String> = counts
         .iter()
         .map(|&(label, n)| match label {
@@ -877,6 +940,11 @@ pub(crate) fn status_json(
                     None => Value::Null,
                 },
             );
+            let preflight: Vec<Value> = preflight_shown(row, outcome)
+                .into_iter()
+                .map(|f| json!({"kind": preflight_key(f.kind), "problem": f.problem, "fix": f.fix}))
+                .collect();
+            o.insert("preflight".into(), Value::Array(preflight));
             Value::Object(o)
         })
         .collect();
@@ -1427,6 +1495,41 @@ mod tests {
     fn skipped_servers_are_not_problems() {
         for o in [Outcome::Off, Outcome::Rejected, Outcome::ProjectServer] {
             assert!(!o.is_problem() && !o.tool_failed() && !o.was_checked());
+        }
+    }
+
+    #[test]
+    fn preflight_kinds_have_stable_json_names() {
+        // Scripts match on these: a rename is a schema change.
+        let all = [
+            (PreflightKind::NotFound, "not_found"),
+            (PreflightKind::MangledSwitch, "mangled_switch"),
+            (PreflightKind::NoInput, "no_input"),
+            (PreflightKind::UnsetVariable, "unset_variable"),
+            (PreflightKind::EmptyValue, "empty_value"),
+        ];
+        for (kind, key) in all {
+            assert_eq!(preflight_key(kind), key);
+        }
+    }
+
+    #[test]
+    fn a_server_left_unchecked_is_either_not_run_or_not_checkable_never_both() {
+        let run = [
+            Outcome::Off,
+            Outcome::Rejected,
+            Outcome::NotLoaded("x".into()),
+        ];
+        let left = [Outcome::Plugin, Outcome::Organisation, Outcome::ClaudeAi];
+        for o in &run {
+            assert!(o.will_not_run() && !o.not_checkable(), "{o:?}");
+        }
+        for o in &left {
+            assert!(o.not_checkable() && !o.will_not_run(), "{o:?}");
+        }
+        // Checked or to be checked: the answer decides, not the name.
+        for o in [Outcome::ProjectServer, Outcome::NoAnswer] {
+            assert!(!o.will_not_run() && !o.not_checkable(), "{o:?}");
         }
     }
 }
