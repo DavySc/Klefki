@@ -712,6 +712,7 @@ fn what_was_added_is_selected_once_it_is_in_the_list() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -751,6 +752,7 @@ fn nothing_is_selected_for_an_add_that_was_cancelled() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -1225,6 +1227,7 @@ fn what_was_added_is_selected_however_its_project_is_spelled() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -1259,6 +1262,7 @@ fn an_oauth_add_says_to_sign_in_once_it_is_added() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -1527,6 +1531,7 @@ fn a_server_that_exists_is_kept_replaced_or_imported_under_another_name() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();

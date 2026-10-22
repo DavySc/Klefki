@@ -540,6 +540,7 @@ pub(crate) mod tests {
                 changed: true,
                 backup: Some("/data/backups/claude.json.1-0.bak".into()),
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -613,6 +614,7 @@ pub(crate) mod tests {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         };
         engine.events.send(applied()).unwrap();
         h.run();

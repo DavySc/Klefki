@@ -283,6 +283,10 @@ pub enum Change {
         project: Option<String>,
         delete: bool,
     },
+    /// Put back what a change that only flipped switches did, as [`Event::Applied`] gave it: each switch while it
+    /// is still as that change left it, and what Klefki remembers of profiles. Reviewed on its own, not with other
+    /// changes.
+    Undo(crate::undo::Undo),
 }
 
 /// What a plan would change in one file. Lines starting with `+ ` are additions, `- ` removals, two spaces a
@@ -466,6 +470,8 @@ pub enum Event {
         backup: Option<String>,
         /// Good to know about how it went (settings Claude Code left out, say). Sanitised.
         notes: Vec<String>,
+        /// What puts it back, for a change that only flipped switches and changed something.
+        undo: Option<crate::undo::Undo>,
     },
     /// A change is under way, slowly (Claude Code's own commands take seconds each): what it does now. Sanitised.
     Applying {

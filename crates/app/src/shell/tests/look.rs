@@ -575,6 +575,7 @@ fn reviews_and_how_they_end() {
                 changed: true,
                 backup: Some("~/.klefki/backups/claude.json.1-0.bak".to_owned()),
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         shot(&mut h, &format!("outcome-saved-{theme}"));

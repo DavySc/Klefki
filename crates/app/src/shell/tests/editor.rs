@@ -385,6 +385,7 @@ fn after_a_save_the_definition_is_read_again() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -411,6 +412,7 @@ fn apply_another_change(
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -528,6 +530,7 @@ fn apply_while_editing(
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();

@@ -567,7 +567,8 @@ impl ShellApp {
                 changed,
                 backup,
                 notes,
-            } => self.applied(plan, changed, backup, notes),
+                undo,
+            } => self.applied(plan, changed, backup, notes, undo),
             Event::Applying { plan, step } => {
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.applying_step = Some(step);
@@ -3183,6 +3184,7 @@ mod tests {
                 changed: true,
                 backup: Some("/data/backups/claude.json.1.bak".to_owned()),
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -3235,6 +3237,7 @@ mod tests {
                 changed: true,
                 backup: Some("b".to_owned()),
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         engine.events.send(Event::Reapplied { plan: 7 }).unwrap();
@@ -3278,6 +3281,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -3349,6 +3353,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -3493,6 +3498,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -5225,6 +5231,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();

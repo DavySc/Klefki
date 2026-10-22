@@ -24,6 +24,7 @@ pub use crate::profile_uses::{ProfileUse, ProfileUses, Switch};
 pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
+pub use crate::undo::{Record as UndoRecord, Undo};
 pub use crate::update::{UpdateCheck, Version};
 
 /// How lists, counts, folders and sentences are put in words, as the engine says them.
