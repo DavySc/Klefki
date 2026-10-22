@@ -7,9 +7,9 @@ use crate::theme::{self, ThemeChoice, Tone};
 use egui::{Frame, Margin, RichText, Sense, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, ConnectionId, Core, Diagnosis, Event, Hint, ImportFile, LastStarts,
-    PlanView, Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, Timing,
-    TransportKind, UpdateDownload, same_project,
+    Approval, Change, Command, ConnectionId, Core, Diagnosis, Event, Here, Hint, ImportFile,
+    LastStarts, PlanView, Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target,
+    Timing, TransportKind, UpdateDownload, same_project,
     words::{self, capitalized},
 };
 use std::collections::{BTreeSet, HashMap};
@@ -225,6 +225,19 @@ pub(crate) struct ShellApp {
     /// The outcome whose Undo is under review: shown again when that review is cancelled, so backing out of it
     /// does not cost the Undo.
     undoing: Option<Outcome>,
+    /// The project the Connections list is seen from (as [`Snapshot::projects`] spells it), or every project when
+    /// `None`. In one project the list shows what Claude Code loads there, and switches act there only.
+    lens: Option<String>,
+    /// How each server stands in `lens`, by its place in the snapshot: worked out when either changes.
+    lens_here: Option<Arc<[Option<Here>]>>,
+    /// What is typed to find a project in the Where list.
+    lens_filter: String,
+    /// A switch in one project (or its Undo) was asked for: once its plan is ready it is saved straight away, with
+    /// no review, unless the plan has something to weigh. What the outcome then says was done; empty: said from
+    /// the plan.
+    quiet_asked: Option<String>,
+    /// The plan being saved that way, and what the outcome says once it is: no review is drawn for it.
+    quiet_plan: Option<(u64, String)>,
     /// The servers the change under review moves or renames, with the name and place each lands at: an open
     /// definition follows its server there, unsaved edits and all.
     relocating: Vec<(ServerId, String, Target)>,
@@ -330,6 +343,11 @@ impl ShellApp {
             moving: None,
             moved_from: None,
             undoing: None,
+            lens: None,
+            lens_here: None,
+            lens_filter: String::new(),
+            quiet_asked: None,
+            quiet_plan: None,
             relocating: Vec::new(),
             applying_step: None,
             forgetting: None,
@@ -426,10 +444,7 @@ impl ShellApp {
         let Some(i) = self.snapshot.servers.iter().position(|r| r.is(id)) else {
             return;
         };
-        if !self.visible().contains(&i) {
-            // A search that hides it would hide what was asked for.
-            self.search.clear();
-        }
+        self.bring_into_list(i);
         self.selected = BTreeSet::from([i]);
         self.reveal = Some(i);
         self.tab = match tab {
@@ -636,6 +651,7 @@ impl ShellApp {
                         sign_in: None,
                         logged: false,
                         type_path: false,
+                        quiet: false,
                     });
                 }
             }
@@ -731,6 +747,43 @@ impl ShellApp {
             self.cli_version = snapshot.cli_version.clone();
         }
         self.snapshot = snapshot;
+        // A project Claude Code no longer knows: the list is seen from every project again.
+        let lens = self
+            .lens
+            .take()
+            .filter(|p| self.snapshot.projects.contains(p));
+        self.look_in(lens);
+    }
+
+    /// Sees the list from `project` (as [`Snapshot::projects`] spells it), or from every project. A selected server
+    /// that does not load there is let go: a switch must not reach what the list does not show.
+    pub(crate) fn look_in(&mut self, project: Option<String>) {
+        self.lens_here = project
+            .as_deref()
+            .map(|p| klefki_core::api::in_project(&self.snapshot, p).into());
+        self.lens = project;
+        if let Some(here) = &self.lens_here {
+            self.selected
+                .retain(|&i| here.get(i).is_some_and(Option::is_some));
+        }
+        self.grid_cache = None;
+        self.command.invalidate();
+    }
+
+    /// Makes the list show server `i`, about to be selected: a search that hides it is cleared, and a project it does
+    /// not load in gives way to every project. A selection the list does not show would be acted on unseen.
+    fn bring_into_list(&mut self, i: usize) {
+        if !self.visible().contains(&i) {
+            self.search.clear();
+        }
+        if !self.visible().contains(&i) && self.lens.is_some() {
+            self.look_in(None);
+        }
+    }
+
+    /// How server `i` stands in the project the list is seen from; `None` when it is seen from every project.
+    pub(super) fn here(&self, i: usize) -> Option<&Here> {
+        self.lens_here.as_ref()?.get(i)?.as_ref()
     }
 
     /// What to show for row `i`: the engine's latest answer, else what Claude's own cache said.
@@ -763,6 +816,12 @@ impl ShellApp {
         let q = self.search.trim().to_lowercase();
         let idx: Vec<usize> = (0..self.snapshot.servers.len())
             .filter(|&i| matches_search(&self.snapshot.servers[i], &q))
+            // Seen from one project: what loads there.
+            .filter(|&i| {
+                self.lens_here
+                    .as_ref()
+                    .is_none_or(|here| here.get(i).is_some_and(Option::is_some))
+            })
             .collect();
         self.in_list_order(idx)
     }
@@ -828,6 +887,10 @@ impl ShellApp {
             if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
                 self.prepare_delete();
             }
+            // Not while a button has the keyboard (then egui wants it): Space is the button's to press.
+            if !self.selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                self.toggle_selected();
+            }
             if self.selected.len() == 1
                 && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::E))
             {
@@ -851,6 +914,14 @@ impl ShellApp {
         }
         if idle && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
             self.ask_import();
+        }
+        // The outcome's Undo, from the keyboard; never while a text field has it, where it undoes typing.
+        if idle
+            && self.core.is_some()
+            && ui
+                .input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z))
+        {
+            self.undo_outcome();
         }
         let pal = theme::palette(ui.ctx());
         self.save_bar_shown = false;
@@ -922,6 +993,7 @@ impl ShellApp {
                     self.organisation_notes(ui);
                     self.legacy_notice(ui);
                     self.kept_notice(ui);
+                    self.where_picker(ui);
                     self.toolbar(ui);
                     ui.add_space(6.0);
                     self.grid(ui);
@@ -1150,9 +1222,16 @@ impl ShellApp {
             [one] => one.name.clone(),
             _ => format!("{} servers", rows.len()),
         };
-        // Every server is switched, a plugin's too.
+        // Every server is switched, a plugin's too; seen from one project, there only.
         if live && !selected.is_empty() {
-            let what = named(&selected);
+            let what = match &self.lens {
+                Some(p) => format!(
+                    "{} in {}",
+                    named(&selected),
+                    crate::profiles::shown_project(p, &self.snapshot)
+                ),
+                None => named(&selected),
+            };
             add(
                 icon::TOGGLE_RIGHT,
                 format!("Turn on {what}"),
@@ -1409,6 +1488,7 @@ impl ShellApp {
         use command::Action as A;
         match action {
             A::Select(i) => {
+                self.bring_into_list(i);
                 self.selected.clear();
                 self.selected.insert(i);
                 self.go(Page::Connections);
@@ -1626,6 +1706,7 @@ impl ShellApp {
             undo: None,
             logged: false,
             type_path,
+            quiet: false,
         });
     }
     fn single_selected(&self) -> Option<&ServerRow> {
@@ -1679,8 +1760,38 @@ impl ShellApp {
         self.note_plugins_left_out(changed, left_out);
     }
 
-    /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet.
+    /// Asks the engine what switching the selected servers on or off would change. Nothing is written yet. Seen
+    /// from one project, they are switched there only, and saved without a review when there is nothing to weigh.
     fn prepare_toggle(&mut self, enabled: bool) {
+        if let Some(project) = self.lens.clone() {
+            let rows: Vec<&ServerRow> = self
+                .selected
+                .iter()
+                .filter(|&&i| self.here(i).is_some())
+                .filter_map(|&i| self.snapshot.servers.get(i))
+                .collect();
+            if rows.is_empty() || !self.can_prepare() {
+                return;
+            }
+            let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+            let done = format!(
+                "Turned {} {} in {}.",
+                if enabled { "on" } else { "off" },
+                list_in_words(&names, "server"),
+                crate::profiles::shown_project(&project, &self.snapshot)
+            );
+            let changes = rows
+                .iter()
+                .map(|row| Change::SetEnabledIn {
+                    id: row.id(),
+                    project: project.clone(),
+                    enabled,
+                })
+                .collect();
+            self.prepare(changes);
+            self.quiet_asked = Some(done);
+            return;
+        }
         let changes: Vec<Change> = self
             .selected
             .iter()
@@ -1695,6 +1806,15 @@ impl ShellApp {
         }
     }
 
+    /// Space: turns the selected servers off when every one is on (where the list is seen from), and on otherwise.
+    fn toggle_selected(&mut self) {
+        let all_on = self.selected.iter().all(|&i| match self.here(i) {
+            Some(here) => !here.off,
+            None => self.snapshot.servers.get(i).is_none_or(|r| r.enabled),
+        });
+        self.prepare_toggle(!all_on);
+    }
+
     /// No plan is open or on its way, so a new one may be asked for.
     fn can_prepare(&self) -> bool {
         self.plan.is_none() && !self.preparing
@@ -1704,6 +1824,7 @@ impl ShellApp {
         if self.can_prepare() {
             self.outcome = None;
             self.preparing = true;
+            self.quiet_asked = None;
             self.adding_signs_in = false;
             self.moved_from = None;
             // What will be in the list afterwards, selected once it is there.
@@ -1820,10 +1941,7 @@ impl ShellApp {
         let Some(&first) = added.iter().next() else {
             return;
         };
-        if !self.visible().contains(&first) {
-            // A search that hides it would hide what was just added.
-            self.search.clear();
-        }
+        self.bring_into_list(first);
         self.selected = added;
         self.reveal = Some(first);
     }
@@ -3635,7 +3753,6 @@ mod tests {
         h.key_press(egui::Key::Delete);
         h.run();
         h.get_by_label_contains("plugin:docs:search comes from the plugin docs");
-        h.key_press(egui::Key::Space);
         for key in [egui::Key::E, egui::Key::D] {
             h.key_press_modifiers(egui::Modifiers::COMMAND, key);
         }
@@ -3664,6 +3781,21 @@ mod tests {
         assert_eq!(drain(&engine), vec![Command::LastStarts(p.id())]);
         // Switched like a user server, through a review.
         press(&mut h, Tool::TurnOff);
+        assert_eq!(
+            drain(&engine),
+            vec![Command::Prepare(vec![Change::SetEnabled {
+                id: p.id(),
+                enabled: false
+            }])]
+        );
+        // Space switches it too (it is on, so off), the same way.
+        engine
+            .events
+            .send(klefki_core::api::Event::PlanFailed("refused".into()))
+            .unwrap();
+        h.run();
+        h.key_press(egui::Key::Space);
+        h.run();
         assert_eq!(
             drain(&engine),
             vec![Command::Prepare(vec![Change::SetEnabled {
@@ -6172,6 +6304,7 @@ mod tests {
     mod list;
     mod move_dialog;
     mod notices;
+    mod one_project;
     mod outcome;
     mod review;
     mod settings;

@@ -1,0 +1,44 @@
+== review
+summary:
+  Turn off gw in b
+sessions:
+  Claude Code sessions already open in b keep their servers until you restart them (or switch them there with /mcp). New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open in b to pick it up.
+diff .claude.json:
+    projects["/work/b"].disabledMcpServers
+  + gw
+button: Turn off
+== applied, changed: true
+== files after
+--- cfg/.claude.json
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "gw": {
+      "type": "stdio",
+      "command": "node",
+      "env": {
+        "TOKEN": "s3cret-value"
+      }
+    }
+  },
+  "projects": {
+    "/work/a": {
+      "mcpServers": {
+        "loc": {
+          "type": "stdio",
+          "command": "x"
+        }
+      },
+      "disabledMcpServers": []
+    },
+    "/work/b": {
+      "disabledMcpServers": [
+        "other",
+        "gw"
+      ]
+    }
+  },
+  "tail": "end"
+}

@@ -36,6 +36,7 @@ pub(crate) fn kind_undoable(changes: &[Change]) -> bool {
         matches!(
             c,
             Change::SetEnabled { .. }
+                | Change::SetEnabledIn { .. }
                 | Change::UseProfile { .. }
                 | Change::StopProfile { delete: false, .. }
                 | Change::Undo(_)

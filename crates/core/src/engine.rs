@@ -213,6 +213,14 @@ pub struct SignInFailure {
 pub enum Change {
     /// Turn a server on or off (`/mcp disable`). For a user server this covers every project Claude knows.
     SetEnabled { id: ServerId, enabled: bool },
+    /// Turn a server on or off in `project` only (a project as [`crate::api::Snapshot::projects`] spells it), where
+    /// it loads: a user, plugin, organisation or claude.ai server, or a local or project server of that project.
+    /// Every other project stays as it is.
+    SetEnabledIn {
+        id: ServerId,
+        project: String,
+        enabled: bool,
+    },
     /// Let Claude Code run a project (`.mcp.json`) server: the one thing written inside a repository. The plan
     /// shows everything the server would run first.
     Approve { id: ServerId },

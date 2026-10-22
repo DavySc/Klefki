@@ -56,6 +56,14 @@ impl ShellApp {
             self.diff_tops = DiffTops::default();
             return;
         };
+        // Saved without a review: nothing to draw while it is.
+        if self
+            .quiet_plan
+            .as_ref()
+            .is_some_and(|(id, _)| *id == plan.id)
+        {
+            return;
+        }
         let applying = self.applying;
         let from_add = self.add.as_ref().is_some_and(|f| f.reviewing);
         let diff_tops = &mut self.diff_tops;
@@ -339,6 +347,36 @@ impl ShellApp {
         }
         let saves_draft = std::mem::take(&mut self.draft_asked);
         let profile = self.profile_asked.take();
+        // A switch in one project: saved straight away when there is nothing to weigh, with Undo on its outcome.
+        // Anything the review would warn of is reviewed as ever.
+        if let Some(done) = self.quiet_asked.take()
+            && self.plan.is_none()
+        {
+            if plan.nothing_to_do {
+                self.send(Command::Discard(plan.id));
+                // Nothing to back out of: an Undo found already done is not offered again.
+                self.undoing = None;
+                let text = if plan.already.is_empty() {
+                    "Nothing needed to change.".to_owned()
+                } else {
+                    plan.already.join(" ")
+                };
+                self.outcome = Some(Outcome::done(text));
+                return;
+            }
+            if plan.warnings.is_empty() && plan.reviews.is_empty() && !plan.destructive {
+                let done = if done.is_empty() {
+                    said_done(&plan.summary)
+                } else {
+                    done
+                };
+                self.quiet_plan = Some((plan.id, done));
+                self.applying = true;
+                self.send(Command::Apply(plan.id));
+                self.plan = Some(Arc::new(plan));
+                return;
+            }
+        }
         // Said on the profile's card while the page is shown; once it is left, the review says it.
         let card = profile
             .filter(|_| plan.nothing_to_do && self.plan.is_none())
@@ -359,6 +397,7 @@ impl ShellApp {
     pub(super) fn plan_failed(&mut self, why: String) {
         self.preparing = false;
         self.undoing = None;
+        self.quiet_asked = None;
         self.draft_asked = false;
         self.profile_asked = None;
         self.adding.clear();
@@ -370,5 +409,21 @@ impl ShellApp {
             (None, Some(form)) => form.review_failed(why),
             (None, None) => self.outcome = Some(Outcome::problem(why)),
         }
+    }
+}
+
+/// What a plan's summary did, in the past: "Turn gw back on in a" says "Turned gw back on in a.".
+fn said_done(summary: &[String]) -> String {
+    let lines: Vec<String> = summary
+        .iter()
+        .map(|line| match line.strip_prefix("Turn ") {
+            Some(rest) => format!("Turned {rest}."),
+            None => format!("{line}."),
+        })
+        .collect();
+    if lines.is_empty() {
+        "Saved.".to_owned()
+    } else {
+        lines.join(" ")
     }
 }

@@ -7,7 +7,8 @@ use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use klefki_core::api::words::parent_folder;
 use klefki_core::api::{
-    Approval, Command, Hint, Preflight, PreflightKind, Scope, ServerRow, Status, Timing, words,
+    Approval, Command, Here, Hint, Preflight, PreflightKind, Scope, ServerRow, Status, Timing,
+    words,
 };
 use std::sync::Arc;
 
@@ -157,14 +158,21 @@ fn group_header(ui: &mut Ui, group: &Group, right: f32) {
     response.on_hover_text(&group.full);
 }
 
-fn name_cell(ui: &mut Ui, s: &ServerRow, status: Status, project_count: usize) {
+fn name_cell(
+    ui: &mut Ui,
+    s: &ServerRow,
+    status: Status,
+    project_count: usize,
+    here: Option<&Here>,
+) {
     let pal = theme::palette(ui.ctx());
-    // Like a user server off in every project: a plugin's server whose plugin is.
-    let color = if s.enabled && !plugin_off_everywhere(s, project_count) {
-        pal.text
-    } else {
-        pal.disabled
+    // Like a user server off in every project: a plugin's server whose plugin is. Seen from one project: off or
+    // not loaded there.
+    let loads = match here {
+        Some(h) => !h.off && h.held.is_none(),
+        None => s.enabled && !plugin_off_everywhere(s, project_count),
     };
+    let color = if loads { pal.text } else { pal.disabled };
     ui.add(egui::Label::new(RichText::new(short_name(s)).color(color)).truncate());
     let loud = |text: &str, fill: Color32, hover: Option<&str>| Badge {
         text: text.to_owned(),
@@ -219,6 +227,20 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, status: Status, project_count: usize) {
                  find a file its command names. The details say which.",
             ),
         ));
+    }
+    // Seen from one project, the status says how it stands there; how it stands across projects is for the list
+    // of every project.
+    if here.is_some() {
+        if let Some(why) = &s.may_not_load {
+            badges.push(Badge {
+                text: "may not load".to_owned(),
+                fill: pal.border,
+                color: pal.text,
+                hover: Some(why.clone()),
+            });
+        }
+        show_badges(ui, &badges);
+        return;
     }
     // Switched off in some projects and held back in others: one badge with where it does load, so the state is
     // in view rather than behind a "+".
@@ -329,6 +351,12 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, status: Status, project_count: usize) {
             )),
         });
     }
+    show_badges(ui, &badges);
+}
+
+/// The badges beside a name, most important first, as many as fit and a "+N" for the rest.
+fn show_badges(ui: &mut Ui, badges: &[Badge]) {
+    let pal = theme::palette(ui.ctx());
     // Badges never widen the column into the next one's text.
     let gap = ui.spacing().item_spacing.x;
     for (i, b) in badges.iter().enumerate() {
@@ -397,16 +425,35 @@ fn badge_width(ui: &Ui, text: &str) -> f32 {
     galley.size().x + 12.0
 }
 
+/// The status of a server seen from a project where its switch is off.
+pub(super) const OFF_HERE: &str = "Off here";
+
+/// A server's status cell. Seen from one project (`here`), a server off there, or held back there whatever its
+/// switch says, is said as that.
 fn status_cell(
     ui: &mut Ui,
     s: &ServerRow,
-    status: Status,
-    detail: Option<&str>,
+    (status, detail): (Status, Option<&str>),
     hint: Option<&Hint>,
     timing: Option<&Timing>,
     last_known: bool,
+    here: Option<&Here>,
 ) {
     let pal = theme::palette(ui.ctx());
+    if let Some(h) = here {
+        if h.off {
+            ui.label(RichText::new(OFF_HERE).color(pal.disabled))
+                .on_hover_text(
+                    "Switched off in this project. Other projects keep their own switch.",
+                );
+            return;
+        }
+        if let Some(why) = &h.held {
+            ui.label(RichText::new(NOT_LOADED).color(pal.text_muted))
+                .on_hover_text(format!("Claude Code does not load this server here: {why}"));
+            return;
+        }
+    }
     // Before the switch: on or off, Claude Code runs another server in its place, or policy keeps it out. Policy
     // says so: Claude Code itself drops such a server without a word.
     if let Some(why) = not_checked(s).filter(|_| s.not_loaded.is_some()) {
@@ -419,7 +466,8 @@ fn status_cell(
             .on_hover_text(why);
         return;
     }
-    if !s.enabled {
+    // Off in every project; seen from one, its switch there is what counts, said above.
+    if !s.enabled && here.is_none() {
         ui.label(RichText::new("Disabled").color(pal.disabled));
         return;
     }
@@ -830,7 +878,8 @@ impl ShellApp {
                         let s = &self.snapshot.servers[*i];
                         row.set_selected(self.selected.contains(i));
                         let (status, detail) = self.effective(*i);
-                        row.col(|ui| name_cell(ui, s, status, project_count));
+                        let here = self.here(*i);
+                        row.col(|ui| name_cell(ui, s, status, project_count, here));
                         row.col(|ui| {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
@@ -838,7 +887,7 @@ impl ShellApp {
                         let timing = self.timing(*i);
                         let last_known = self.last_known(*i);
                         row.col(|ui| {
-                            status_cell(ui, s, status, detail, hint, timing, last_known);
+                            status_cell(ui, s, (status, detail), hint, timing, last_known, here);
                         });
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
@@ -892,3 +941,69 @@ pub(super) fn all_known(project_count: usize) -> String {
         format!("all {project_count} projects")
     }
 }
+
+impl ShellApp {
+    /// Where the list is seen from: every project, or one, where it shows what Claude Code loads and switches act
+    /// there only. Not shown while Claude Code knows no project.
+    pub(super) fn where_picker(&mut self, ui: &mut Ui) {
+        if self.snapshot.projects.is_empty() {
+            return;
+        }
+        let pal = theme::palette(ui.ctx());
+        let mut picked: Option<Option<String>> = None;
+        let shown = match &self.lens {
+            None => ALL_PROJECTS.to_owned(),
+            Some(p) => crate::profiles::shown_project(p, &self.snapshot),
+        };
+        ui.horizontal(|ui| {
+            let label = ui.label(RichText::new("Where").color(pal.text_muted));
+            let lens = self.lens.as_deref();
+            let filter = &mut self.lens_filter;
+            let projects: Vec<&String> = self.snapshot.projects.iter().collect();
+            let combo = egui::ComboBox::from_id_salt("where")
+                .selected_text(shown)
+                .width((ui.available_width() - 8.0).clamp(120.0, 240.0))
+                .height(320.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(lens.is_none(), ALL_PROJECTS)
+                        .on_hover_text("Every server, and how it stands across the projects Claude Code knows.")
+                        .clicked()
+                    {
+                        picked = Some(None);
+                    }
+                    ui.separator();
+                    if let Some(p) = crate::profiles::project_choices(ui, &projects, lens, filter) {
+                        picked = Some(Some(p));
+                    }
+                });
+            let combo = combo.response.labelled_by(label.id);
+            match lens {
+                Some(p) => {
+                    combo.on_hover_text(p);
+                    // Beside it where there is room; the hover says the rest.
+                    if ui.available_width() > 200.0 {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Switches act in this project only")
+                                    .color(pal.text_muted),
+                            )
+                            .truncate(),
+                        );
+                    }
+                }
+                None => {
+                    combo.on_hover_text("Pick a project to see what Claude Code loads there and switch it there only.");
+                }
+            }
+        });
+        ui.add_space(4.0);
+        if let Some(project) = picked {
+            self.lens_filter.clear();
+            self.look_in(project);
+        }
+    }
+}
+
+/// The Where list's choice of every project.
+pub(super) const ALL_PROJECTS: &str = "All projects";

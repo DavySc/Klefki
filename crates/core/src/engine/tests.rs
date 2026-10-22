@@ -749,6 +749,7 @@ mod golden;
 mod inspector;
 mod last_starts;
 mod oauth;
+mod one_project;
 mod profiles;
 mod reload;
 mod renames;

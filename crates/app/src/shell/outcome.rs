@@ -25,6 +25,8 @@ pub(super) struct Outcome {
     pub(super) logged: bool,
     /// No file came of asking for one to import: the card offers to type its path instead.
     pub(super) type_path: bool,
+    /// It was a switch in one project, saved without a review: its Undo is saved the same way.
+    pub(super) quiet: bool,
 }
 
 impl Outcome {
@@ -39,6 +41,15 @@ impl Outcome {
             sign_in: None,
             logged: false,
             type_path: false,
+            quiet: false,
+        }
+    }
+
+    /// Something done, or found already so, with nothing more to offer: it fades like any success.
+    pub(super) fn done(text: String) -> Self {
+        Self {
+            ok: true,
+            ..Self::problem(text)
         }
     }
 }
@@ -162,16 +173,7 @@ impl ShellApp {
                     self.start_sign_in(&row);
                 }
             }
-            Some(OutcomeChoice::Undo) => {
-                if let Some(change) = outcome.undo.clone() {
-                    self.outcome = None;
-                    self.prepare(vec![change]);
-                    self.undoing = Some(Outcome {
-                        shown_at: None,
-                        ..outcome
-                    });
-                }
-            }
+            Some(OutcomeChoice::Undo) => self.undo_outcome(),
             Some(OutcomeChoice::OpenLog) => {
                 self.outcome = None;
                 self.go(Page::ActivityLog);
@@ -186,6 +188,27 @@ impl ShellApp {
             Some(OutcomeChoice::Dismiss) => self.outcome = None,
             None => {}
         }
+    }
+
+    /// Undoes what the outcome message offers to (its Undo, or Ctrl/⌘+Z): after a review, as the change was, or
+    /// straight away for a switch in one project.
+    pub(super) fn undo_outcome(&mut self) {
+        let Some(outcome) = self.outcome.clone().filter(|_| self.can_prepare()) else {
+            return;
+        };
+        let Some(change) = outcome.undo.clone() else {
+            return;
+        };
+        self.outcome = None;
+        self.prepare(vec![change]);
+        if outcome.quiet {
+            // Said from the undo's plan once it is saved.
+            self.quiet_asked = Some(String::new());
+        }
+        self.undoing = Some(Outcome {
+            shown_at: None,
+            ..outcome
+        });
     }
 
     /// How wide the outcome message's text can be beside the detail panel, over the list.
@@ -280,8 +303,17 @@ impl ShellApp {
                     && ui
                         .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
                         .on_hover_text(match undo {
-                            Change::Move { .. } => "Move it back, after a review",
-                            _ => "Put it back as it was, after a review",
+                            Change::Move { .. } => format!(
+                                "Move it back, after a review ({})",
+                                crate::command::shortcut("Z")
+                            ),
+                            _ if outcome.quiet => {
+                                format!("Put it back as it was ({})", crate::command::shortcut("Z"))
+                            }
+                            _ => format!(
+                                "Put it back as it was, after a review ({})",
+                                crate::command::shortcut("Z")
+                            ),
                         })
                         .clicked()
                 {
@@ -314,6 +346,11 @@ impl ShellApp {
         if changed {
             self.editor_after_change(plan);
         }
+        // A switch in one project, saved without a review: said as what it did.
+        let quiet = self
+            .quiet_plan
+            .take_if(|(id, _)| *id == plan)
+            .map(|(_, done)| done);
         // Which sessions to restart, said again now that it is so: the review said why, in full.
         let mut sessions = None;
         if let Some(p) = self.plan.take_if(|p| p.id == plan) {
@@ -347,13 +384,15 @@ impl ShellApp {
             .chain(&notes)
             .map(|n| format!(" {n}"))
             .collect();
-        if let Some(b) = backup {
+        // A switch in one project is put back with Undo; the backup is on the Activity log, a click away.
+        if let Some(b) = backup.filter(|_| quiet.is_none()) {
             kept.push_str(&format!(" The previous file is kept in {b}"));
         }
         self.outcome = Some(Outcome {
             // What was saved is read again next time it is shown.
             text: match (changed, added) {
                 (false, _) => "Nothing needed to change.".to_owned(),
+                (true, _) if let Some(done) = &quiet => format!("{done}{kept}"),
                 (true, None) if let Some(gone) = self.forgetting.take() => {
                     format!("Klefki no longer keeps the definition of {gone}.{kept}")
                 }
@@ -370,6 +409,7 @@ impl ShellApp {
             sign_in,
             logged: changed,
             type_path: false,
+            quiet: quiet.is_some(),
         });
     }
 
@@ -378,6 +418,7 @@ impl ShellApp {
     pub(super) fn apply_failed(&mut self, plan: u64, error: String) {
         self.moved_from = None;
         self.undoing = None;
+        self.quiet_plan = None;
         if self.plan.as_ref().is_some_and(|p| p.id == plan) {
             self.plan = None;
             self.applying = false;

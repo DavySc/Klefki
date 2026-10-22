@@ -137,6 +137,23 @@ fn golden_turn_a_user_server_off() {
     );
 }
 
+/// Slice S3: the same server switched in one project only; the other project's entry stays byte for byte.
+#[test]
+fn golden_turn_a_user_server_off_in_one_project() {
+    let (env, core) = two_projects_env();
+    let change = Change::SetEnabledIn {
+        id: user_id("gw"),
+        project: "/work/b".to_owned(),
+        enabled: false,
+    };
+    check(
+        &env,
+        &core,
+        vec![change],
+        expect_file!["golden/turn-off-user-in-one-project.txt"],
+    );
+}
+
 #[test]
 fn golden_turn_a_local_server_off() {
     let (env, core) = two_projects_env();
