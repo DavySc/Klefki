@@ -2322,7 +2322,13 @@ fn run_says_what_differs_from_the_profile_and_starts_only_when_confirmed() {
         ),
         "{said}"
     );
-    assert!(said.contains("Nothing started: add --yes"), "{said}");
+    // On Windows nothing is started either way, so there is nothing to confirm.
+    let not_confirmed = if cfg!(windows) {
+        "paste the line above in PowerShell"
+    } else {
+        "Nothing started: add --yes"
+    };
+    assert!(said.contains(not_confirmed), "{said}");
     assert!(sessions(&env).is_empty());
     let claude = fake_claude().to_string_lossy().into_owned();
     env.run(&[
