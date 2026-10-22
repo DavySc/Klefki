@@ -183,10 +183,16 @@ fn text_that_could_disguise_the_line_is_refused_not_written() {
 #[test]
 fn a_local_server_starts_where_claude_code_starts_it() {
     let server = json!({"command": "node", "args": ["server.js"]});
-    let got = command(&server, Some("/home/u/my proj"), false).unwrap();
+    // Absolute on the system running the test.
+    let folder = if cfg!(windows) {
+        "C:\\Users\\u\\my proj"
+    } else {
+        "/home/u/my proj"
+    };
+    let got = command(&server, Some(folder), false).unwrap();
     assert_eq!(
         got.text,
-        format!("{OPEN} --cwd '/home/u/my proj' -- node server.js")
+        format!("{OPEN} --cwd '{folder}' -- node server.js")
     );
     // A user server has no folder of its own; a relative path is pointed out.
     let user = unix(&server).unwrap();
