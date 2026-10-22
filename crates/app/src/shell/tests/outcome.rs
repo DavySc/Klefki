@@ -213,3 +213,83 @@ fn a_success_stays_while_pointed_at() {
     steps(&mut h, SUCCESS_SECONDS + 1.0);
     assert!(h.state().outcome.is_some(), "held while pointed at");
 }
+
+/// Opens the Undo of a change that only switched, and its review.
+fn undo_under_review(h: &mut Harness<'static, ShellApp>, engine: &klefki_core::api::Detached) {
+    engine
+        .events
+        .send(Event::Applied {
+            plan: 1,
+            changed: true,
+            backup: None,
+            notes: Vec::new(),
+            undo: Some(switched_off()),
+        })
+        .unwrap();
+    h.run();
+    click(h, "Undo");
+    engine
+        .events
+        .send(Event::PlanReady(plan_view(2, &["+ gw"], &[], false)))
+        .unwrap();
+    h.run();
+    drain(engine);
+}
+
+/// Found in the cross-review of #103: Cancel in the Undo's review threw the Undo away, leaving only Restore. Backing
+/// out of it must cost nothing: the card comes back, Undo and all.
+#[test]
+fn cancelling_the_undo_review_keeps_the_undo() {
+    let (mut h, engine) = live_harness();
+    undo_under_review(&mut h, &engine);
+    click(&mut h, "Cancel");
+    assert_eq!(drain(&engine), [Command::Discard(2)]);
+    h.get_by_label("Undo");
+    // And it can be used again.
+    click(&mut h, "Undo");
+    assert_eq!(
+        drain(&engine),
+        [Command::Prepare(vec![Change::Undo(switched_off())])]
+    );
+}
+
+/// Variant: Esc backs out the same way.
+#[test]
+fn escape_from_the_undo_review_keeps_the_undo() {
+    let (mut h, engine) = live_harness();
+    undo_under_review(&mut h, &engine);
+    h.key_press(egui::Key::Escape);
+    h.run();
+    h.get_by_label("Undo");
+}
+
+/// Variant: once the undo is saved, its card is the new outcome, not the old one.
+#[test]
+fn a_saved_undo_does_not_bring_the_old_card_back() {
+    let (mut h, engine) = live_harness();
+    undo_under_review(&mut h, &engine);
+    engine
+        .events
+        .send(Event::Applied {
+            plan: 2,
+            changed: true,
+            backup: None,
+            notes: Vec::new(),
+            undo: None,
+        })
+        .unwrap();
+    h.run();
+    assert!(h.state().undoing.is_none());
+    assert_eq!(h.state().outcome.as_ref().unwrap().text, "Saved.");
+}
+
+/// Cross-review of #103: a success message also stays while the keyboard is on one of its buttons.
+#[test]
+fn a_success_stays_while_the_keyboard_is_in_it() {
+    let (mut h, engine) = live_harness_at_60fps();
+    applied(&mut h, &engine);
+    h.get_by_label("Open activity log").focus();
+    h.run();
+    steps(&mut h, SUCCESS_SECONDS + 1.0);
+    assert!(h.state().outcome.is_some(), "held while focused");
+}

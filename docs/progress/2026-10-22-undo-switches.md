@@ -38,3 +38,12 @@ the success message faded after 4 s while it now carries a restart sentence and 
 - S3 can make a one-project switch's Undo apply without the review dialog (owner-approved for S3 only); here Undo
   still goes through the review, as the Prepare → diff → Apply invariant says.
 - `klefki-cli` has no undo (it prints the backup it kept; Restore covers it).
+
+## Review round 1 (cross-review on #103)
+- Finding 1: Cancel or Esc in the Undo's review threw the Undo away (Move's Undo too). The card is now kept while
+  its review is open and shown again when the review is cancelled (not when there was nothing left to undo).
+  Regression tests: Cancel, Esc, and a saved undo not bringing the old card back (Cancel and Esc seen failing first).
+- Polish: hover text "Put it back as it was, after a review"; a success message also holds while keyboard focus is
+  inside it (test seen failing first).
+- Checks after the fix: fmt, clippy exit 0; `cargo test --workspace` exit 0 (1106 core, 525 app, 28 + 48 CLI).
+- Left for S3: Ctrl/⌘+Z for the Undo card.

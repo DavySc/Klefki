@@ -163,9 +163,13 @@ impl ShellApp {
                 }
             }
             Some(OutcomeChoice::Undo) => {
-                if let Some(change) = outcome.undo {
+                if let Some(change) = outcome.undo.clone() {
                     self.outcome = None;
                     self.prepare(vec![change]);
+                    self.undoing = Some(Outcome {
+                        shown_at: None,
+                        ..outcome
+                    });
                 }
             }
             Some(OutcomeChoice::OpenLog) => {
@@ -213,9 +217,15 @@ impl ShellApp {
         self.outcome_inline = true;
     }
 
-    /// A success message stays while the pointer is on it, and for its full time after: it is being read.
+    /// A success message stays while the pointer is on it or the keyboard is in it, and for its full time after:
+    /// it is being read or used.
     fn hold_while_pointed_at(&mut self, card: &egui::Response, now: f64) {
-        if card.contains_pointer()
+        let ctx = &card.ctx;
+        let focused_in = ctx
+            .memory(|m| m.focused())
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|r| card.rect.contains_rect(r.rect));
+        if (card.contains_pointer() || focused_in)
             && let Some(outcome) = self.outcome.as_mut()
         {
             outcome.shown_at = Some(now);
@@ -271,7 +281,7 @@ impl ShellApp {
                         .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
                         .on_hover_text(match undo {
                             Change::Move { .. } => "Move it back, after a review",
-                            _ => "Switch them back as they were, after a review",
+                            _ => "Put it back as it was, after a review",
                         })
                         .clicked()
                 {
@@ -300,6 +310,7 @@ impl ShellApp {
         notes: Vec<String>,
         undo: Option<Undo>,
     ) {
+        self.undoing = None;
         if changed {
             self.editor_after_change(plan);
         }
@@ -366,6 +377,7 @@ impl ShellApp {
     /// outcome.
     pub(super) fn apply_failed(&mut self, plan: u64, error: String) {
         self.moved_from = None;
+        self.undoing = None;
         if self.plan.as_ref().is_some_and(|p| p.id == plan) {
             self.plan = None;
             self.applying = false;

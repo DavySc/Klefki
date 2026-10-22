@@ -314,6 +314,12 @@ impl ShellApp {
             // The dialog stays until the engine answers, so a second click cannot apply twice.
         } else if back || cancel {
             self.send(Command::Discard(plan.id));
+            // Backing out of an Undo's review keeps the Undo, unless there was nothing left to undo.
+            self.outcome = self
+                .undoing
+                .take()
+                .filter(|_| !plan.nothing_to_do)
+                .or(self.outcome.take());
             self.plan = None;
             self.applying = false;
             self.adding.clear();
@@ -352,6 +358,7 @@ impl ShellApp {
     /// No plan could be made: said in the dialog that asked for it, which comes back as it was, or as the outcome.
     pub(super) fn plan_failed(&mut self, why: String) {
         self.preparing = false;
+        self.undoing = None;
         self.draft_asked = false;
         self.profile_asked = None;
         self.adding.clear();
