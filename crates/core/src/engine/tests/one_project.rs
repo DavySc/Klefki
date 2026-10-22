@@ -146,3 +146,27 @@ fn several_servers_in_one_project_are_switched_and_undone_together() {
     applied(&core, &plan);
     assert_eq!(disabled_list(&env, "/work/designs"), serde_json::json!([]));
 }
+
+/// Found in review of #104: a switch in one project has no warning but a note when a profile switched the same
+/// server there; the app says notes on the outcome when it skips the review, so the note must be in the plan.
+#[test]
+fn a_switch_a_profile_made_says_the_profile_will_leave_it() {
+    let env = quiet_env(&designs_config());
+    let core = env.start();
+    let plan = plan_for(
+        &core,
+        vec![use_profile("Writing", &["gw"], Some("/work/designs"), true)],
+    );
+    applied(&core, &plan);
+    let plan = plan_for(
+        &core,
+        vec![switch_in(user_id("memory"), "/work/designs", true)],
+    );
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    assert_eq!(
+        plan.notes,
+        [
+            "Writing switched memory in designs; after this, stopping Writing leaves it as you set it."
+        ]
+    );
+}
