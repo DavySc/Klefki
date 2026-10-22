@@ -158,6 +158,9 @@ pub(crate) struct ShellApp {
     diagnoses: HashMap<ServerId, Diagnosis>,
     /// A diagnosis that came in for the server shown on its Status tab, to bring into view once drawn.
     reveal_diagnosis: Option<ServerId>,
+    /// The server checked with more time, and when that was asked for (egui's clock, in seconds): the Status tab
+    /// counts the seconds while it runs.
+    longer_since: Option<(ServerId, f64)>,
     /// The detail panel's tab drew a definition that can be saved: the save bar goes under it this frame.
     save_bar_wanted: bool,
     /// How tall the save bar was last frame (none: 0), so the scroll area above it leaves that much room.
@@ -282,6 +285,7 @@ impl ShellApp {
             legacy_cache: None,
             diagnoses: HashMap::new(),
             reveal_diagnosis: None,
+            longer_since: None,
             save_bar_wanted: false,
             save_bar_height: 0.0,
             save_bar_shown: false,
@@ -617,6 +621,15 @@ impl ShellApp {
                 hint,
                 timing,
             } => {
+                // The check given more time has answered (or another has): the seconds stop.
+                if status != Status::Checking
+                    && self
+                        .longer_since
+                        .as_ref()
+                        .is_some_and(|(asked, _)| *asked == id)
+                {
+                    self.longer_since = None;
+                }
                 if let Some(i) = self.snapshot.servers.iter().position(|r| r.is(&id)) {
                     self.live[i] = Some(Live {
                         status,

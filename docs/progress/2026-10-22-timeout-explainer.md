@@ -40,9 +40,26 @@ say how to give it that time in Claude Code. Does not read Claude Code's log fol
 - New look pictures `timeout-explained.png`, `timeout-needs-more-time.png`; no other picture or golden file changed.
 - Fixture `fixtures/mcp-get/timed-out-stdio.txt`: real 2.1.308 output.
 
+## Review (#94)
+- B1: a limit from any settings file, a cloned repository's too, set Klefki's own wait with no bound (a reviewer's
+  probe: 23 days; three such servers hold every worker). Now `checks::wait_for` caps it at the usual wait plus
+  `LONGER_CHECK` minus 30 s (2.5 minutes in the app). Tests: the cap, just under it, at it, past it, `Duration::MAX`,
+  and an engine check with `"MCP_TIMEOUT": "2000000000"` in the project's settings. Past the cap the explanation says
+  Klefki waits at most about 2 minutes. Measured: Claude Code 2.1.308 with `MCP_TIMEOUT` 2147483648 or 3000000000
+  still waits (a 5 s server connects), so "Claude Code's limit is …" holds for huge values.
+- U1: a server that connected only with more time is "Slow to start" in the warning colour, in the list and on the
+  Status line, not a green "Connected"; its list hover shows the explanation.
+- U2: the default now reads "MCP_TIMEOUT is not set in its settings files or in Klefki's environment" (a
+  desktop-started Klefki may not have the shell's environment).
+- Polish folded in: the button is "Check again, waiting up to 2 minutes"; while it runs the Status tab counts the
+  seconds ("Waiting: 41 s of up to 2 minutes", one repaint a second, only then); the value to set also reads as a
+  time ("70000" (70 s)) with a "Copy setting" button; "It gave up after 28 s; Claude Code's limit for connecting is
+  30 s"; the TimedOut hint's own help is left out beside the timing (a remote server gets a firewall/proxy line).
+- The two new look pictures changed with it (new in this PR); no other picture or golden file.
+
 ## Checks
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`: exit 0
-  (app 465, core 1019, cli 26 + 43). `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
+  (app 467, core 1021, cli 26 + 43 after the review round). `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
 - New tests seen failing: the engine's timing tests fail (5 of 7) with the timing turned off and the wait not
   lengthened.
 - By hand with real Claude Code 2.1.308 through `api::start_headless` (scratch test, not kept), server answering after

@@ -979,7 +979,7 @@ fn timed_event(
     }
 }
 
-const LONGER: &str = "Check again with 2 minutes";
+const LONGER: &str = "Check again, waiting up to 2 minutes";
 
 #[test]
 fn a_timeout_says_how_long_claude_code_waits_and_offers_more_time() {
@@ -1000,7 +1000,7 @@ fn a_timeout_says_how_long_claude_code_waits_and_offers_more_time() {
         .unwrap();
     h.run();
     open_status_tab(&mut h, "slow");
-    h.get_by_label_contains("It gave up after 28 s. Claude Code waits 30 s");
+    h.get_by_label_contains("It gave up after 28 s; Claude Code's limit for connecting is 30 s");
     click(&mut h, LONGER);
     assert_eq!(
         next_command(&engine).unwrap(),
@@ -1018,7 +1018,19 @@ fn a_timeout_says_how_long_claude_code_waits_and_offers_more_time() {
         .unwrap();
     h.run();
     h.get_by_label_contains("giving it up to 2 minutes to connect");
+    // The harness runs frames until nothing more is asked, so some seconds may have gone by.
+    h.get_by_label_contains("Waiting: ");
+    h.get_by_label_contains(" s of up to 2 minutes");
     assert!(h.query_by_label(LONGER).is_none());
+    // The answer stops the seconds.
+    let default = klefki_core::api::LimitSetIn::Default;
+    engine
+        .events
+        .send(timed_event(&row, Status::Connected, None, 8, default, true))
+        .unwrap();
+    h.run();
+    assert!(h.query_by_label_contains("Waiting:").is_none());
+    assert!(h.state().longer_since.is_none());
 }
 
 #[test]
@@ -1042,9 +1054,21 @@ fn a_server_that_connects_given_more_time_says_where_to_give_it_that_time() {
     open_status_tab(&mut h, "slow");
     h.get_by_label_contains("It needs more time to start than Claude Code gives it");
     h.get_by_label_contains(
-        "set \"MCP_TIMEOUT\": \"70000\" under \"env\" in ~/.claude/settings.json",
+        "set \"MCP_TIMEOUT\": \"70000\" (70 s) under \"env\" in ~/.claude/settings.json",
     );
     assert!(h.query_by_label(LONGER).is_none(), "it was given more time");
+    // Not a green "Connected" beside a warning: in Claude Code it still fails.
+    assert!(h.query_by_label_contains("Connected").is_none());
+    assert!(
+        h.query_all_by_label_contains("Slow to start").count() >= 2,
+        "in the list and on the Status line"
+    );
+    h.get_by_label("Copy setting").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().any(
+        |c| matches!(c, egui::OutputCommand::CopyText(t) if t == "\"MCP_TIMEOUT\": \"70000\""),
+    );
+    assert!(copied, "{:?}", h.output().platform_output.commands);
 }
 
 #[test]

@@ -7,9 +7,26 @@ use klefki_core::api::{
 };
 use std::time::Duration;
 
-/// The button that gives a server more time, and its hover text.
+/// The button that gives a server more time.
 pub(crate) fn longer_button() -> String {
-    format!("Check again with {}", duration(LONGER_CHECK))
+    format!("Check again, waiting up to {}", duration(LONGER_CHECK))
+}
+
+/// What the list and the Status tab call a server that connected only with more time than Claude Code gives it.
+pub(crate) const SLOW_START: &str = "Slow to start";
+
+/// The check given more time connected, but after more than a session's limit: in Claude Code it still fails.
+pub(crate) fn slow_start(status: Status, timing: Option<&Timing>) -> bool {
+    timing.is_some_and(|t| {
+        t.given.is_some() && !t.timed_out && t.took > t.limit.limit && status == Status::Connected
+    })
+}
+
+/// The settings entry to copy for a server that is slow to start, when the user can set it.
+pub(crate) fn snippet(status: Status, timing: Option<&Timing>) -> Option<String> {
+    let t = timing.filter(|_| slow_start(status, timing))?;
+    t.limit.change_in.as_ref()?;
+    Some(format!("\"MCP_TIMEOUT\": \"{}\"", suggested_ms(t.took)))
 }
 
 /// Whether to offer a check given more time: after a timeout, when more time is more than Claude Code gives it and
@@ -23,7 +40,12 @@ pub(crate) fn offers_longer(timing: &Timing) -> bool {
 /// Where the limit comes from, after its length: `(Claude Code's default; MCP_TIMEOUT is not set)`.
 fn source(limit: &TimeLimit) -> String {
     let at = match &limit.set_in {
-        LimitSetIn::Default => return "Claude Code's default; MCP_TIMEOUT is not set".to_owned(),
+        // Klefki sees only its own environment: one started from a desktop menu may not have the shell's.
+        LimitSetIn::Default => {
+            return "Claude Code's default; MCP_TIMEOUT is not set in its settings files or in Klefki's \
+                    environment"
+                .to_owned();
+        }
         LimitSetIn::Environment => "the environment Klefki was started with".to_owned(),
         LimitSetIn::File(file) => file.clone(),
         LimitSetIn::Organisation(file) => format!("your organisation's {file}"),
@@ -37,10 +59,10 @@ fn source(limit: &TimeLimit) -> String {
     }
 }
 
-/// `Claude Code waits 30 s for a server to connect (…).`
+/// `Claude Code's limit for connecting is 30 s (…).`
 fn limit_line(limit: &TimeLimit) -> String {
     format!(
-        "Claude Code waits {} for a server to connect ({}).",
+        "Claude Code's limit for connecting is {} ({}).",
         duration(limit.limit),
         source(limit)
     )
@@ -55,25 +77,30 @@ fn suggested_ms(took: Duration) -> u128 {
 /// How to give the server `took` in Claude Code.
 fn raise_line(limit: &TimeLimit, took: Duration) -> String {
     let ms = suggested_ms(took);
+    let readable = duration(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)));
     match (&limit.set_in, &limit.change_in) {
         (LimitSetIn::Organisation(file), _) => format!(
-            "Your organisation sets this limit in {file}, so only it can raise it: ask for at least {ms} ms."
+            "Your organisation sets this limit in {file}, so only it can raise it: ask for at least {ms} ms ({readable})."
         ),
         (_, Some(file)) => format!(
-            "To give it that time, set \"MCP_TIMEOUT\": \"{ms}\" under \"env\" in {file}, then start Claude Code again."
+            "To give it that time, set \"MCP_TIMEOUT\": \"{ms}\" ({readable}) under \"env\" in {file}, then start Claude Code again."
         ),
         (_, None) => format!(
-            "To give it that time, set \"MCP_TIMEOUT\": \"{ms}\" under \"env\" in Claude Code's settings.json, then start Claude Code again."
+            "To give it that time, set \"MCP_TIMEOUT\": \"{ms}\" ({readable}) under \"env\" in Claude Code's settings.json, then start Claude Code again."
         ),
     }
 }
 
-fn first_start_line(row: &ServerRow) -> Option<String> {
-    (row.transport == TransportKind::Stdio).then(|| {
+/// Why a server can need longer: the hint's own help is left out beside it, as it says the same and "Try again"
+/// competes with the button.
+fn why_slow_line(row: &ServerRow) -> String {
+    if row.transport == TransportKind::Stdio {
         "A first run of npx or uvx downloads the server's package before it starts, and a container or a large \
          program can take long to start too."
             .to_owned()
-    })
+    } else {
+        "A remote server can be slow to wake up, or held up by a firewall or proxy.".to_owned()
+    }
 }
 
 impl Explanation {
@@ -109,7 +136,7 @@ impl Explanation {
             if timing.took > timing.limit.limit {
                 let mut help = vec![
                     format!(
-                        "Given {}, it connected after {took}. {}",
+                        "Given {}, it connected after {took}; {}",
                         duration(given),
                         limit_line(&timing.limit)
                     ),
@@ -149,19 +176,24 @@ impl Explanation {
                     duration(given)
                 ));
                 help.push("Diagnose shows what it printed while it waited.".to_owned());
-                e.help.clear();
             }
             None => {
                 let ran = if status == Status::Unknown {
-                    format!("Klefki stopped waiting for Claude Code's answer after {took}.")
+                    format!("Klefki stopped waiting for Claude Code's answer after {took}")
                 } else {
-                    format!("It gave up after {took}.")
+                    format!("It gave up after {took}")
                 };
-                help.push(format!("{ran} {}", limit_line(&timing.limit)));
-                help.extend(first_start_line(row));
+                help.push(format!("{ran}; {}", limit_line(&timing.limit)));
+                if status == Status::Unknown && timing.limit.limit > LONGER_CHECK {
+                    help.push(format!(
+                        "Klefki waits at most about {} for a check, however long the limit is.",
+                        duration(LONGER_CHECK)
+                    ));
+                }
+                help.push(why_slow_line(row));
                 if offers_longer(timing) {
                     help.push(format!(
-                        "{} tells a server that is slow to start from one that never answers.",
+                        "To tell a server that is slow to start from one that never answers, use \"{}\".",
                         longer_button()
                     ));
                 } else if let LimitSetIn::Organisation(file) = &timing.limit.set_in {
@@ -171,7 +203,6 @@ impl Explanation {
                 }
             }
         }
-        help.append(&mut e.help);
         e.help = help;
         Some(e)
     }

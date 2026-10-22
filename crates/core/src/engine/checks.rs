@@ -654,8 +654,19 @@ pub(super) fn time_limit(shared: &Shared, job: &Job) -> TimeLimit {
 /// How long to wait for Claude Code's answer: the usual wait, longer by as much as the limit there is above Claude
 /// Code's own, so that a server given more time is answered for by Claude Code and not cut off by Klefki.
 pub(super) fn run_timeout(shared: &Shared, limit: &TimeLimit, longer: bool) -> Duration {
-    let limit = if longer { LONGER_CHECK } else { limit.limit };
-    shared.config.check_timeout + limit.saturating_sub(timeout::DEFAULT)
+    wait_for(shared.config.check_timeout, limit.limit, longer)
+}
+
+/// [`run_timeout`] for a usual wait of `usual` and a limit of `limit`. Never longer than a check given more time
+/// waits: the limit can come from a cloned repository's settings, and an endless wait would hold a worker, and with
+/// a few such servers every check.
+pub(super) fn wait_for(usual: Duration, limit: Duration, longer: bool) -> Duration {
+    let limit = if longer {
+        LONGER_CHECK
+    } else {
+        limit.min(LONGER_CHECK)
+    };
+    usual + limit.saturating_sub(timeout::DEFAULT)
 }
 
 /// The timing to show with an answer: for a check that ran out of time, Claude Code's (`Request timed out`) or

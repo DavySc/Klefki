@@ -70,8 +70,8 @@ fn a_timeout_says_how_long_it_ran_how_long_claude_code_waits_and_offers_more_tim
     );
     assert!(
         text.contains(
-            "= help: It gave up after 28 s. Claude Code waits 30 s for a server to connect \
-             (Claude Code's default; MCP_TIMEOUT is not set).\n"
+            "= help: It gave up after 28 s; Claude Code's limit for connecting is 30 s \
+             (Claude Code's default; MCP_TIMEOUT is not set in its settings files or in Klefki's environment).\n"
         ),
         "{text}"
     );
@@ -80,12 +80,15 @@ fn a_timeout_says_how_long_it_ran_how_long_claude_code_waits_and_offers_more_tim
         "{text}"
     );
     assert!(
-        text.contains("= help: Check again with 2 minutes tells a server that is slow to start"),
+        text.contains(
+            "= help: To tell a server that is slow to start from one that never answers, use \
+             \"Check again, waiting up to 2 minutes\".\n"
+        ),
         "{text}"
     );
     assert!(
-        text.contains("= help: The server may be slow to start"),
-        "the hint's own help stays, after: {text}"
+        !text.contains("Try again") && !text.contains("The server may be slow"),
+        "the hint's own help says the same, and \"Try again\" competes with the button: {text}"
     );
     assert!(
         text.contains("= note: Claude Code said: Request timed out"),
@@ -104,7 +107,11 @@ fn a_remote_server_gets_no_word_about_npx() {
         &t,
     );
     assert!(!text.contains("npx"), "{text}");
-    assert!(text.contains("Check again with 2 minutes"), "{text}");
+    assert!(text.contains("held up by a firewall or proxy"), "{text}");
+    assert!(
+        text.contains("Check again, waiting up to 2 minutes"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -144,7 +151,7 @@ fn more_time_is_not_offered_where_it_would_not_be_more_or_cannot_be_given() {
     let t = timing(10, limit(10, org), None);
     assert!(!offers_longer(&t));
     let text = explained(&stdio(), Status::Failed, "Request timed out", &t);
-    assert!(!text.contains("Check again with"), "{text}");
+    assert!(!text.contains("Check again"), "{text}");
     assert!(
         text.contains("Your organisation sets this limit in /etc/claude-code/managed-settings.json, so only it can raise it."),
         "{text}"
@@ -156,9 +163,7 @@ fn more_time_is_not_offered_where_it_would_not_be_more_or_cannot_be_given() {
     // Already 2 minutes or more.
     let t = timing(120, limit(120, LimitSetIn::Environment), None);
     assert!(!offers_longer(&t));
-    assert!(
-        !explained(&stdio(), Status::Failed, "Request timed out", &t).contains("Check again with")
-    );
+    assert!(!explained(&stdio(), Status::Failed, "Request timed out", &t).contains("Check again"));
     // Once given more time, not again.
     assert!(!offers_longer(&timing(
         5,
@@ -176,7 +181,7 @@ fn klefki_giving_up_first_is_explained_too() {
         "{text}"
     );
     assert!(
-        text.contains("= help: Klefki stopped waiting for Claude Code's answer after 30 s. Claude Code waits 30 s"),
+        text.contains("= help: Klefki stopped waiting for Claude Code's answer after 30 s; Claude Code's limit"),
         "{text}"
     );
     assert!(
@@ -201,18 +206,65 @@ fn a_server_that_connects_given_more_time_says_how_to_give_it_that_time() {
         "{text}"
     );
     assert!(
-        text.contains("= help: Given 2 minutes, it connected after 41 s. Claude Code waits 30 s"),
+        text.contains("= help: Given 2 minutes, it connected after 41 s; Claude Code's limit for connecting is 30 s"),
         "{text}"
     );
     assert!(
         text.contains(
-            "= help: To give it that time, set \"MCP_TIMEOUT\": \"70000\" under \"env\" in ~/.claude/settings.json, \
-             then start Claude Code again.\n"
+            "= help: To give it that time, set \"MCP_TIMEOUT\": \"70000\" (70 s) under \"env\" in \
+             ~/.claude/settings.json, then start Claude Code again.\n"
         ),
         "41 s and half again is 61.5 s, so 70 s: {text}"
     );
     assert!(text.contains("use Check now to see"), "{text}");
     assert_eq!(Explanation::timing_note(Status::Connected, Some(&t)), None);
+    assert!(slow_start(Status::Connected, Some(&t)));
+    assert_eq!(
+        snippet(Status::Connected, Some(&t)).as_deref(),
+        Some("\"MCP_TIMEOUT\": \"70000\"")
+    );
+}
+
+#[test]
+fn only_a_server_that_connected_after_the_limit_is_slow_to_start() {
+    let l = || limit(30, LimitSetIn::Default);
+    for (t, status, want) in [
+        (timing(41, l(), Some(LONGER_CHECK)), Status::Connected, true),
+        (
+            timing(30, l(), Some(LONGER_CHECK)),
+            Status::Connected,
+            false,
+        ),
+        (timing(41, l(), Some(LONGER_CHECK)), Status::Failed, false),
+        (
+            timing(120, l(), Some(LONGER_CHECK)),
+            Status::Connected,
+            false,
+        ),
+        (timing(41, l(), None), Status::Connected, false),
+    ] {
+        assert_eq!(slow_start(status, Some(&t)), want, "{t:?} {status:?}");
+    }
+    assert!(!slow_start(Status::Connected, None));
+    assert_eq!(
+        snippet(Status::Failed, Some(&timing(41, l(), Some(LONGER_CHECK)))),
+        None
+    );
+}
+
+#[test]
+fn past_the_most_klefki_waits_it_says_so() {
+    let t = timing(93, limit(2_000_000, LimitSetIn::Environment), None);
+    let text = explained(&stdio(), Status::Unknown, "check timed out after 93.0s", &t);
+    assert!(
+        text.contains(
+            "= help: Klefki waits at most about 2 minutes for a check, however long the limit is.\n"
+        ),
+        "{text}"
+    );
+    // Within it, nothing to say.
+    let t = timing(30, limit(60, LimitSetIn::Environment), None);
+    assert!(!explained(&stdio(), Status::Unknown, "x", &t).contains("at most"));
 }
 
 #[test]
@@ -227,7 +279,7 @@ fn where_the_organisation_sets_the_limit_it_is_asked_to_raise_it() {
         .unwrap()
         .text();
     assert!(
-        text.contains("Your organisation sets this limit in /etc/x/managed-settings.json, so only it can raise it: ask for at least 70000 ms."),
+        text.contains("Your organisation sets this limit in /etc/x/managed-settings.json, so only it can raise it: ask for at least 70000 ms (70 s)."),
         "{text}"
     );
 }
@@ -284,7 +336,7 @@ fn a_server_still_silent_given_more_time_is_called_stuck() {
         "{text}"
     );
     assert!(!text.contains("Try again"), "no longer the advice: {text}");
-    assert!(!text.contains("Check again with"), "{text}");
+    assert!(!text.contains("Check again"), "{text}");
 }
 
 #[test]

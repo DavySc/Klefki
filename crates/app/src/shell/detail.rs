@@ -563,6 +563,8 @@ impl ShellApp {
                             ui.label(PLUGIN_STATUS);
                         } else if self.last_known(i) {
                             ui.label(format!("{} (last known)", status.label()));
+                        } else if explain::slow_start(status, self.timing(i)) {
+                            ui.label(RichText::new(explain::SLOW_START).color(pal.warn));
                         } else {
                             ui.label(status.label());
                         }
@@ -630,9 +632,41 @@ impl ShellApp {
                         ))
                         .clicked()
                 {
+                    self.longer_since = Some((s.id(), ui.input(|input| input.time)));
                     self.send(Command::CheckLonger(s.id()));
                 }
+                if let Some(snippet) = explain::snippet(status, timing.as_ref())
+                    && ui
+                        .button("Copy setting")
+                        .on_hover_text(format!("Copy {snippet}, to paste under \"env\""))
+                        .clicked()
+                {
+                    ui.ctx().copy_text(snippet);
+                }
                 });
+                // A check given more time can take minutes: the seconds go by while it runs, and only then.
+                if let Some((id, since)) = &self.longer_since
+                    && s.is(id)
+                    && status == Status::Checking
+                {
+                    let now = ui.input(|input| input.time);
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "whole seconds since a moment in the past, never negative"
+                    )]
+                    let waited = (now - since).max(0.0) as u64;
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Waiting: {waited} s of up to {}",
+                            words::duration(LONGER_CHECK)
+                        ))
+                        .color(pal.text_muted),
+                    );
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs(1));
+                }
                 if let Some(note) = Explanation::timing_note(status, timing.as_ref()) {
                     ui.add_space(6.0);
                     ui.add(egui::Label::new(RichText::new(note).color(pal.text_muted)).wrap());

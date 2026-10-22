@@ -195,6 +195,59 @@ fn a_check_given_more_time_runs_with_the_longer_limit_and_always_says_how_long_i
 }
 
 #[test]
+fn klefki_waits_longer_with_a_raised_limit_but_never_longer_than_a_check_given_more_time() {
+    use crate::engine::checks::wait_for;
+    let usual = Duration::from_secs(30);
+    let ms = Duration::from_millis;
+    let most = usual + LONGER_CHECK - Duration::from_secs(30);
+    for (limit, want) in [
+        (ms(2000), usual),
+        (ms(30_000), usual),
+        (ms(45_000), usual + ms(15_000)),
+        // Just under, at and over the most: a repository's `"MCP_TIMEOUT": "2000000000"` once made it 23 days.
+        (LONGER_CHECK - ms(1), most - ms(1)),
+        (LONGER_CHECK, most),
+        (LONGER_CHECK + ms(1), most),
+        (ms(2_000_000_000), most),
+        (Duration::MAX, most),
+    ] {
+        assert_eq!(wait_for(usual, limit, false), want, "{limit:?}");
+    }
+    assert_eq!(wait_for(usual, ms(2000), true), most, "given more time");
+    assert_eq!(wait_for(usual, Duration::MAX, true), most);
+}
+
+#[test]
+fn a_repositorys_huge_limit_is_told_as_it_is_and_the_answer_still_comes() {
+    // Claude Code answers after 4.5 s; Klefki's own wait is 3 s. The project's settings ask for 23 days: Klefki
+    // waits its most (3 s + 90 s, see the test above), long enough for the answer.
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+    std::fs::write(
+        project.path().join(".claude").join("settings.json"),
+        r#"{"env":{"MCP_TIMEOUT":"2000000000"}}"#,
+    )
+    .unwrap();
+    let key = project.path().to_string_lossy().into_owned();
+    let env = Env::new(
+        &serde_json::json!({"projects": {&key: {"mcpServers": {"slow": {"command": "x"}}}}}),
+        r#"{"rules":[{"args":["--version"]},{"args":["mcp","get","slow"],"stdout_file":"t.txt","delay_ms":4500}]}"#,
+        &[("t.txt", TIMED_OUT)],
+    );
+    let core = start_quiet(EngineConfig {
+        check_timeout: Duration::from_secs(3),
+        ..env.config()
+    });
+    let (status, _, timing, _) = check(&core, Command::Check(local_id("slow", &key)));
+    assert_eq!(status, Status::Failed, "Claude Code's answer came");
+    assert_eq!(
+        timing.unwrap().limit.limit,
+        Duration::from_millis(2_000_000_000),
+        "the limit is still told as it is"
+    );
+}
+
+#[test]
 fn the_longer_settings_give_the_longer_limit() {
     let settings: serde_json::Value =
         serde_json::from_str(crate::engine::checks::LONGER_SETTINGS).unwrap();
