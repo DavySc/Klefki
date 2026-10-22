@@ -86,15 +86,29 @@ pub(crate) fn load_probed(paths: &ConfigPaths, probe: Option<&Probe<'_>>) -> Inv
         text.as_ref().map(Option::as_deref).map_err(String::clone),
         &mut keys,
         probe,
+        None,
     );
     Inventory { snapshot, keys }
+}
+
+/// [`load`], as a session started with `names` in `allowedMcpServers` through `--settings` sees it: Klefki's start
+/// command (on/off plan S5).
+pub(crate) fn load_started_with(paths: &ConfigPaths, names: &[String]) -> Snapshot {
+    let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON).map_err(|e| e.to_string());
+    build(
+        paths,
+        text.as_ref().map(Option::as_deref).map_err(String::clone),
+        &mut FileKeys::new(),
+        None,
+        Some(names),
+    )
 }
 
 /// [`load`] with `.claude.json` already read (`Ok(None)`: it does not exist), so a caller that needs the text too
 /// reads the file once.
 pub(crate) fn load_text(paths: &ConfigPaths, text: Result<Option<&str>, String>) -> Inventory {
     let mut keys = FileKeys::new();
-    let snapshot = build(paths, text, &mut keys, None);
+    let snapshot = build(paths, text, &mut keys, None, None);
     Inventory { snapshot, keys }
 }
 
@@ -103,6 +117,7 @@ fn build(
     text: Result<Option<&str>, String>,
     keys: &mut FileKeys,
     probe: Option<&Probe<'_>>,
+    started_with: Option<&[String]>,
 ) -> Snapshot {
     let mut snap = Snapshot::default();
     let root = match text.and_then(|t| t.map(parse_claude_json).transpose()) {
@@ -180,7 +195,7 @@ fn build(
     // Policy (decision 010), per place: outside every project (0), then each project in the inventory's order.
     let raw_projects: Vec<&str> = projects.values().map(|p| p.raw.as_str()).collect();
     let mut policy_warnings = Vec::new();
-    let policy = policy::load(paths, &raw_projects, &mut policy_warnings);
+    let policy = policy::load(paths, &raw_projects, started_with, &mut policy_warnings);
     add_warnings(&mut snap, policy_warnings);
     let all_places: Vec<usize> = (0..=projects.len()).collect();
     let judge = Judge {

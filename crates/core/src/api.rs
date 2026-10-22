@@ -24,6 +24,7 @@ pub use crate::profile_uses::{ProfileUse, ProfileUses, Switch};
 pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
+pub use crate::start::StartPlan;
 pub use crate::undo::{Record as UndoRecord, Undo};
 pub use crate::update::{UpdateCheck, Version};
 
@@ -695,6 +696,33 @@ pub fn save_export(path: &std::path::Path, text: &str, replace: bool) -> Result<
 
 pub fn load_snapshot_from(paths: &ConfigPaths) -> Arc<Snapshot> {
     Arc::new(crate::config::inventory::load(paths).snapshot)
+}
+
+/// What starting Claude Code in `project` with only the servers `members` of the profile `profile` does, from the
+/// files as they are now (on/off plan S5). Reads only. `Err` says why there is no start command.
+pub fn start_plan(
+    profile: &str,
+    members: &[ConnectionId],
+    project: &str,
+) -> Result<StartPlan, String> {
+    let paths = ConfigPaths::discover()
+        .ok_or("Klefki cannot find your home folder, so it cannot read Claude Code's files.")?;
+    crate::start::plan(&paths, profile, members, project, cfg!(windows))
+}
+
+/// Starts Claude Code as `plan` says, attached to this terminal: the one named `claude`, or the one the app would use.
+/// On Unix this process becomes Claude Code and this returns only when it could not be started; elsewhere it answers
+/// Claude Code's exit code.
+pub fn run_claude(plan: &StartPlan, claude: Option<&std::path::Path>) -> Result<i32, String> {
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    let path_var = std::env::var_os("PATH");
+    let program = crate::cli::locate::locate(&crate::cli::locate::Search {
+        explicit: claude,
+        home: home.as_deref(),
+        path_var: path_var.as_deref(),
+    })
+    .map_err(|e| format!("Claude Code could not be found: {e}"))?;
+    crate::start::run(plan, &program)
 }
 
 /// Demo data from an embedded fixture, passed through the same sanitising path real data uses.

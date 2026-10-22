@@ -895,3 +895,52 @@ fn switching_profiles() {
         all.extend_harness(&mut h);
     }
 }
+
+/// A profile's start command (on/off plan S5), with what would still differ from the profile, at the default size and
+/// the smallest window.
+#[test]
+fn a_profiles_start_command() {
+    let Event::Snapshot(snapshot) = snapshot_with_beta_off_in_notes(false) else {
+        unreachable!()
+    };
+    let mut all = SnapshotResults::new();
+    for (size, name) in [
+        (PAGE, "profile-start-command"),
+        (SMALL, "profile-start-command-800x480"),
+    ] {
+        let (mut h, engine) =
+            app_showing(Arc::clone(&snapshot), size, ThemeChoice::Dark, Tone::Cool);
+        open_profiles(&mut h, &engine, work_profile());
+        h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Use in")
+            .click();
+        h.run();
+        h.get_by_label_contains("notes").click();
+        h.run();
+        h.get_by_label("Copy start command").click();
+        h.run();
+        let settings = r#"{"allowedMcpServers":[{"serverName":"alpha"}]}"#;
+        engine
+            .events
+            .send(Event::StartCommand {
+                profile: "Work".to_owned(),
+                project: "/home/notes".to_owned(),
+                plan: Ok(klefki_core::api::StartPlan {
+                    profile: "Work".to_owned(),
+                    project: "/home/notes".to_owned(),
+                    args: vec!["--settings".to_owned(), settings.to_owned()],
+                    line: format!("cd /home/notes && claude --settings '{settings}'"),
+                    to_do: Vec::new(),
+                    loads: vec!["alpha".to_owned()],
+                    missing: vec!["One server of Work is no longer configured.".to_owned()],
+                    extra: vec![
+                        "beta: allowedMcpServers in .claude/settings.local.json lets it load too."
+                            .to_owned(),
+                    ],
+                }),
+            })
+            .unwrap();
+        h.run();
+        shot(&mut h, name);
+        all.extend_harness(&mut h);
+    }
+}

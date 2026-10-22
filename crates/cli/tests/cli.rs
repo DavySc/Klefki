@@ -2200,3 +2200,147 @@ fn switch_and_stop_move_a_project_between_profiles_and_back() {
         "{stderr}"
     );
 }
+
+/// The arguments and folder of each Claude Code the fake CLI was started as by `run` (no `mcp` command).
+fn sessions(env: &Env) -> Vec<(Vec<String>, String)> {
+    std::fs::read_to_string(env.root().join("log.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|l| l["event"] == "start" && l["argv"][0] == "--settings")
+        .map(|l| {
+            let argv = l["argv"].as_array().unwrap();
+            (
+                argv.iter()
+                    .map(|a| a.as_str().unwrap().to_owned())
+                    .collect(),
+                l["cwd"].as_str().unwrap_or_default().replace('\\', "/"),
+            )
+        })
+        .collect()
+}
+
+/// On/off plan S5: `run` starts Claude Code in the project with only the profile's servers, through `--settings`,
+/// and saves nothing. The fake CLI stands in for Claude Code.
+#[test]
+fn run_starts_claude_code_in_the_project_with_only_the_profiles_servers() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    env.profiles(&[(
+        "Work",
+        &[(Scope::User, false, "alpha"), (Scope::Local, true, "gamma")],
+    )]);
+    let project = env.project();
+    let before = std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap();
+    let settings = r#"{"allowedMcpServers":[{"serverName":"alpha"},{"serverName":"gamma"}]}"#;
+
+    let out = env.run(&["run", "work", "--project", &project, "--print"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let line = text(&out.stdout);
+    if cfg!(windows) {
+        assert!(line.starts_with("claude --% --settings \""), "{line}");
+    } else {
+        assert!(
+            line.ends_with(&format!("claude --settings '{settings}'\n")),
+            "{line}"
+        );
+        assert!(line.starts_with("cd "), "{line}");
+    }
+    let said = text(&out.stderr);
+    assert!(
+        said.contains("Claude Code started this way loads only Work's servers: alpha and gamma."),
+        "{said}"
+    );
+    assert!(!env.any_run(), "--print starts nothing");
+
+    // From the project's folder, started at once: nothing differs from the profile.
+    let out = env
+        .command(&["run", "Work", "--claude", &fake_claude().to_string_lossy()])
+        .current_dir(env.root().join("Repo"))
+        .output()
+        .unwrap();
+    assert!(
+        text(&out.stderr).contains("loads only Work's servers"),
+        "{}",
+        text(&out.stderr)
+    );
+    let started = sessions(&env);
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0].0, ["--settings", settings]);
+    let real = |p: &str| std::fs::canonicalize(p).unwrap();
+    assert_eq!(real(&started[0].1), real(&project));
+    assert_eq!(
+        std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap(),
+        before,
+        "nothing is saved"
+    );
+}
+
+/// What would differ from the profile is said, and nothing starts unless confirmed.
+#[test]
+fn run_says_what_differs_from_the_profile_and_starts_only_when_confirmed() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    // delta is off in the project; a rule in the project's local settings lets remote in too.
+    env.profiles(&[(
+        "Work",
+        &[(Scope::User, false, "alpha"), (Scope::User, false, "delta")],
+    )]);
+    let claude_dir = env.root().join("Repo").join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("settings.local.json"),
+        r#"{"allowedMcpServers":[{"serverName":"remote"}]}"#,
+    )
+    .unwrap();
+    let project = env.project();
+    let out = env.run(&["run", "Work", "--project", &project]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out.stderr));
+    let said = text(&out.stderr);
+    assert!(said.contains("loads from Work: alpha."), "{said}");
+    assert!(
+        said.contains("Not loaded, though in Work:\n  - delta is off in Repo"),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "Loaded too, though not in Work:\n  - remote: allowedMcpServers in .claude/settings.local.json lets it load too."
+        ),
+        "{said}"
+    );
+    assert!(said.contains("Nothing started: add --yes"), "{said}");
+    assert!(sessions(&env).is_empty());
+    let claude = fake_claude().to_string_lossy().into_owned();
+    env.run(&[
+        "run",
+        "Work",
+        "--project",
+        &project,
+        "--yes",
+        "--claude",
+        &claude,
+    ]);
+    assert_eq!(sessions(&env).len(), 1);
+}
+
+#[test]
+fn run_takes_one_profile_in_one_project() {
+    let env = Env::new();
+    env.work();
+    for (args, said) in [
+        (&["run"][..], "run needs the name of a profile"),
+        (
+            &["run", "Work", "--all"][..],
+            "run starts one session in one project",
+        ),
+        (&["run", "Work", "--only"][..], "leave out --only"),
+        (&["list", "--print"][..], "--print is only for run"),
+        (&["run", "Wrok"][..], "did you mean \"Work\"?"),
+    ] {
+        let out = env.run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains(said), "{args:?}: {stderr}");
+    }
+    assert!(!env.any_run());
+}

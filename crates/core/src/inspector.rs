@@ -229,7 +229,7 @@ fn all_plain(text: &str, extra: &str) -> bool {
 }
 
 /// One word for a POSIX shell: as it is when plain, else in single quotes, which read nothing (`$`, backticks, `!`).
-fn posix_word(text: &str) -> Result<String, String> {
+pub(crate) fn posix_word(text: &str) -> Result<String, String> {
     if let Some(c) = unsafe_char(text) {
         return Err(refused(text, c));
     }

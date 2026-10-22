@@ -41,6 +41,17 @@ pub(crate) enum Cmd {
         place: Place,
         yes: bool,
     },
+    /// Start Claude Code in one project with only a profile's servers, saving nothing (on/off plan S5).
+    Run {
+        profile: String,
+        /// [`Place::Here`] or [`Place::Project`]: a session starts in one project.
+        place: Place,
+        /// Print the line to paste instead of starting Claude Code.
+        print: bool,
+        /// Start without asking when the session would load other servers than the profile's.
+        yes: bool,
+        claude: Option<PathBuf>,
+    },
     /// Stop the profiles in use in one project and use this one there instead, once confirmed.
     Switch {
         profile: String,
@@ -87,6 +98,7 @@ Examples:
   klefki-cli export github -o servers.json
   klefki-cli use Writing --only     only the Writing profile's servers in this project
   klefki-cli switch Code --only     from the profile in use here to Code
+  klefki-cli run Writing            start Claude Code here with only Writing's servers
 
 Usage:
   klefki-cli list   [NAME...] [--json]
@@ -96,6 +108,7 @@ Usage:
   klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]
   klefki-cli switch PROFILE [--project DIR] [--only] [--yes]
   klefki-cli stop PROFILE [--project DIR | --all] [--yes]
+  klefki-cli run PROFILE [--project DIR] [--print] [--yes] [--claude PATH]
   klefki-cli help
   klefki-cli --version
 
@@ -122,20 +135,29 @@ Commands:
            it later puts back what was there before all of them.
   stop     Stop using a profile: put back what it switched, here, in the
            --project folder, or --all projects, unless switched again since.
+  run      Start Claude Code in a project (this folder's, or --project) with
+           only a profile's servers, through its --settings. Saves nothing, so
+           other sessions keep theirs. Says first which of the profile's
+           servers would still not load, and which others would load too (a
+           server off there, a rule in a settings file), and asks before
+           starting then. --print shows the line to paste instead.
 
 Options:
   NAME           Only these servers (by name, in every scope).
   --json         Print JSON for scripts instead of the table (list, status).
-  --claude PATH  The Claude CLI to use (default: found like the Klefki app does).
+  --claude PATH  status, run: the Claude CLI to use (default: found like the
+                 Klefki app does).
   -o, --output FILE
                  Write the export to FILE instead of stdout. An existing file
                  is kept unless you confirm, or add --force. Claude Code's own
                  files and .mcp.json files are never written.
-  --project DIR  use, switch, stop: the project (default: this folder's; in a
-                 git worktree, its main checkout's).
+  --project DIR  use, switch, stop, run: the project (default: this folder's;
+                 in a git worktree, its main checkout's).
   --all          use, stop: every project Claude Code knows today.
   --only         use, switch: turn every other server there off.
-  -y, --yes      use, switch, stop: save without asking.
+  -y, --yes      use, switch, stop: save without asking. run: start even when
+                 the session would not load just the profile's servers.
+  --print        run: print the line that starts Claude Code; start nothing.
   -h, --help     Show this help.
   -V, --version  Show the version.
 
@@ -146,13 +168,15 @@ Exit status:
      server named is in the block.
   1  status found a server that is not connected, or a NAME that Claude Code
      does not run (off, rejected, not loaded); export left one out; use,
-     switch or stop could not make or save the change.
-  2  The command line was wrong, a NAME matches no server, or use, switch or
-     stop names a profile or folder that is not there.
+     switch or stop could not make or save the change; run could not make
+     the start command.
+  2  The command line was wrong, a NAME matches no server, or use, switch,
+     stop or run names a profile or folder that is not there.
   3  Claude Code could not be used: not found, or no check got an answer.
   4  export could not write the --output file (it is there, or not allowed);
-     use, switch or stop saved nothing: not confirmed, or nobody at a
-     terminal and no --yes.
+     use, switch or stop saved nothing, or run started nothing: not
+     confirmed, or nobody at a terminal and no --yes. Once run has started
+     Claude Code, the exit status is Claude Code's.
   5  status was given a NAME that Klefki does not check (a plugin's, the
      organisation's, a claude.ai connector), so nothing is known about it.
      Like any code but 0, `&&` and `set -e` treat it as a failure.
@@ -174,6 +198,7 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usa
         "use" => Kind::Use,
         "switch" => Kind::Switch,
         "stop" => Kind::Stop,
+        "run" => Kind::Run,
         "help" | "-h" | "--help" => return Ok(Cmd::Help),
         "-V" | "--version" => return Ok(Cmd::Version),
         other if other.starts_with('-') => return Err(bad(format!("unknown option {other}"))),
@@ -182,7 +207,8 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Cmd, Usa
                 match crate::suggest::closest(
                     other,
                     [
-                        "list", "status", "export", "profiles", "use", "switch", "stop", "help",
+                        "list", "status", "export", "profiles", "use", "switch", "stop", "run",
+                        "help",
                     ],
                 ) {
                     Some(meant) => format!("unknown command {other:?}; did you mean {meant:?}?"),
@@ -210,6 +236,7 @@ struct Options {
     every: bool,
     only: bool,
     yes: bool,
+    print: bool,
 }
 
 impl Options {
@@ -220,9 +247,11 @@ impl Options {
         command: &str,
         mut args: impl Iterator<Item = OsString>,
     ) -> Result<Option<Self>, Usage> {
-        let status = kind == Kind::Status;
+        let run = kind == Kind::Run;
+        // `--claude`: the commands that start Claude Code.
+        let status = matches!(kind, Kind::Status | Kind::Run);
         let export = kind == Kind::Export;
-        let using = matches!(kind, Kind::Use | Kind::Switch | Kind::Stop);
+        let using = matches!(kind, Kind::Use | Kind::Switch | Kind::Stop | Kind::Run);
         let mut o = Self::default();
         let mut only_names = false;
         while let Some(arg) = args.next() {
@@ -262,6 +291,25 @@ impl Options {
                 }
                 "--json" => o.json = true,
                 "--project" if using => set_project(&mut o.project, args.next())?,
+                "--all" if run => {
+                    return Err(bad(
+                        "run starts one session in one project: leave out --all, or use --project"
+                            .to_owned(),
+                    ));
+                }
+                "--only" if run => {
+                    return Err(bad(
+                        "run always starts Claude Code with only the profile's servers, and turns nothing off; \
+                         leave out --only"
+                            .to_owned(),
+                    ));
+                }
+                "--print" if run => o.print = true,
+                "--print" => {
+                    return Err(bad(format!(
+                        "--print is only for run: {command} starts no session"
+                    )));
+                }
                 "--all" if kind == Kind::Switch => {
                     return Err(bad(
                         "switch works in one project: leave out --all, or use --project".to_owned(),
@@ -278,14 +326,14 @@ impl Options {
                 "-y" | "--yes" if using => o.yes = true,
                 "--project" | "--all" | "--only" | "-y" | "--yes" => {
                     return Err(bad(format!(
-                        "{arg} is only for use, switch and stop: {command} changes no project"
+                        "{arg} is only for use, switch, stop and run: {command} changes no project"
                     )));
                 }
                 "-h" | "--help" => return Ok(None),
                 "--claude" if status => o.claude = Some(claude_path(args.next())?),
                 "--claude" => {
                     return Err(bad(format!(
-                        "--claude is only for status: {command} starts no program"
+                        "--claude is only for status and run: {command} starts no program"
                     )));
                 }
                 "-o" | "--output" if export => set_output(&mut o.output, args.next())?,
@@ -321,6 +369,7 @@ impl Options {
             every,
             only,
             yes,
+            print,
         } = self;
         Ok(match kind {
             Kind::Status => Cmd::Status {
@@ -345,6 +394,16 @@ impl Options {
                 ));
             }
             Kind::Profiles => Cmd::Profiles { json },
+            Kind::Run => match profile_cmd(kind, names, project, every, only, yes)? {
+                Cmd::Use { profile, place, .. } => Cmd::Run {
+                    profile,
+                    place,
+                    print,
+                    yes,
+                    claude,
+                },
+                other => other,
+            },
             Kind::Use | Kind::Switch | Kind::Stop => {
                 profile_cmd(kind, names, project, every, only, yes)?
             }
@@ -416,6 +475,7 @@ enum Kind {
     Use,
     Switch,
     Stop,
+    Run,
 }
 
 impl Kind {
@@ -429,6 +489,7 @@ impl Kind {
             Self::Use => "use",
             Self::Switch => "switch",
             Self::Stop => "stop",
+            Self::Run => "run",
         }
     }
 }

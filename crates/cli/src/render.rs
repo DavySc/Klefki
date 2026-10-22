@@ -653,6 +653,54 @@ pub(crate) fn profiles_text(
     out
 }
 
+/// What a session started with `plan` loads in its project, for `run` (on/off plan S5): the profile's servers that
+/// load, then each one that would not and each other server that would, with why. Ends with a newline.
+pub(crate) fn start_text(plan: &klefki_core::api::StartPlan, home: Option<&str>) -> String {
+    let place = short_path(&plan.project, home);
+    let mut out = String::new();
+    let loads = klefki_core::api::words::and_list(&plan.loads);
+    let _ = if plan.exact() {
+        writeln!(
+            out,
+            "In {place}, Claude Code started this way loads only {}'s servers: {loads}.",
+            plan.profile
+        )
+    } else if plan.loads.is_empty() {
+        writeln!(
+            out,
+            "In {place}, Claude Code started this way loads none of {}'s servers.",
+            plan.profile
+        )
+    } else {
+        writeln!(
+            out,
+            "In {place}, Claude Code started this way loads from {}: {loads}.",
+            plan.profile
+        )
+    };
+    for (heading, items) in [
+        (
+            format!("Not loaded, though in {}:", plan.profile),
+            &plan.missing,
+        ),
+        (
+            format!("Loaded too, though not in {}:", plan.profile),
+            &plan.extra,
+        ),
+    ] {
+        if !items.is_empty() {
+            let _ = writeln!(out, "{heading}");
+            for item in items {
+                let _ = writeln!(out, "  - {item}");
+            }
+        }
+    }
+    for item in &plan.to_do {
+        let _ = writeln!(out, "{item}");
+    }
+    out
+}
+
 pub(crate) fn profiles_json(profiles: &klefki_core::api::Profiles, snapshot: &Snapshot) -> String {
     let list: Vec<Value> = profiles
         .profiles
