@@ -143,6 +143,13 @@ impl ShellApp {
         let id = s.id();
         if self.core.is_some() {
             let seen = self.last_starts.entry(id.clone()).or_default();
+            // Not drawn in the frame before: the tab or the server was just chosen, so read again (a session may
+            // have started it meanwhile). It takes milliseconds.
+            let frame = ui.ctx().cumulative_frame_nr();
+            if seen.drawn.is_none_or(|drawn| drawn + 1 < frame) {
+                seen.asked = false;
+            }
+            seen.drawn = Some(frame);
             if !seen.asked {
                 seen.asked = true;
                 self.send(Command::LastStarts(id.clone()));

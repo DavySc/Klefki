@@ -7,9 +7,15 @@ use egui::{RichText, Ui};
 use klefki_core::api::{LastStart, LastStarts, ServerRow, StartOutcome, Status, words};
 
 pub(super) const HEADING: &str = "Last starts by Claude Code";
-const ABOUT: &str = "From Claude Code's own logs: each start of this server, in a session or by a check (Klefki's \
-     own checks run in your home folder for user servers, and in the project for the others), newest first, one per \
-     folder. Claude Code keeps them for 30 days.";
+/// Said under the heading, not only in a hover: it decides how a start in the home folder reads.
+pub(super) const ABOUT: &str =
+    "Newest first, one per folder. Klefki's own checks are listed too (in ~ for user servers).";
+/// Claude Code removes its logs after 30 days unless `cleanupPeriodDays` says otherwise.
+const NONE: &str =
+    "Claude Code has no log of starting it (it keeps logs for 30 days unless set otherwise)";
+pub(super) const COPY: &str = "Copy last starts";
+const COPY_HOVER: &str =
+    "Copy these starts as plain text. Known secrets are hidden; check before sharing.";
 
 /// "connected in 62 ms", "failed (CONNECTION_CLOSED)", as a start's line says it.
 fn outcome_words(outcome: &StartOutcome) -> String {
@@ -107,8 +113,8 @@ pub(super) fn panel(ui: &mut Ui, row: &ServerRow, last: &LastStarts) {
         RichText::new(HEADING)
             .family(theme::bold_family())
             .size(16.0),
-    )
-    .on_hover_text(ABOUT);
+    );
+    muted(ui, ABOUT);
     if let Some(problem) = &last.problem {
         muted(ui, problem);
     }
@@ -132,12 +138,7 @@ pub(super) fn panel(ui: &mut Ui, row: &ServerRow, last: &LastStarts) {
                 .looked_in
                 .as_deref()
                 .map_or(String::new(), |dir| format!(" ({dir})"));
-            muted(
-                ui,
-                &format!(
-                    "Claude Code has not started it in the last 30 days, or its logs{place} were cleared."
-                ),
-            );
+            muted(ui, &format!("{NONE}{place}."));
         }
         return;
     }
@@ -207,11 +208,22 @@ pub(super) fn panel(ui: &mut Ui, row: &ServerRow, last: &LastStarts) {
         }
     }
     ui.add_space(4.0);
-    if ui
-        .button("Copy last starts")
-        .on_hover_text("Copy these starts as plain text. Secrets are already removed.")
-        .clicked()
-    {
+    // The button says "Copied" for a few seconds, as Export's does, and a screen reader hears it.
+    let copied_id = egui::Id::new(("last starts copied", row.id()));
+    let now = ui.input(|i| i.time);
+    let copied = ui
+        .data(|d| d.get_temp::<f64>(copied_id))
+        .is_some_and(|at| now - at < super::export::COPIED_SECS);
+    let button = ui
+        .button(if copied { "Copied" } else { COPY })
+        .on_hover_text(COPY_HOVER);
+    super::export::announce(ui.ctx(), button.id);
+    if button.clicked() {
         ui.ctx().copy_text(report(row, last));
+        ui.data_mut(|d| d.insert_temp(copied_id, now));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(
+                super::export::COPIED_SECS,
+            ));
     }
 }

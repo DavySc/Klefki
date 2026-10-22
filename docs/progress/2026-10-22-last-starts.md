@@ -33,9 +33,26 @@ name rule with its hash for names over 200 characters, the lines a start writes)
 - Seven app tests that counted the commands sent after opening the Status tab now also expect the one
   `Command::LastStarts` for that server (one filters it out before checking `Inspect`); none was loosened otherwise.
 
+## Review fixes (cross-review of #95)
+- B1: a header's last word (`Bearer <token>`, `Basic <credentials>`) is hidden on its own too, when at least 6
+  characters; the longest values go first. Test `a_header_token_is_hidden_without_its_scheme_too` (Bearer, Basic
+  variant, a short last word kept).
+- B2: a start that connected keeps only what the server printed before the connect line: what it prints while serving
+  tool calls is not shown or copied. Failures keep their stderr. Test with the chatter after the connect, and in the
+  tail of a log over 128 KB.
+- B3: the project's folder-name prefix is compared in any ASCII case on Windows (`starts_like`, testable on every
+  system), as the `cwd` check already was.
+- Optional hardening taken: on Unix the log is opened with `O_NOFOLLOW | O_NONBLOCK` (no separate test: the
+  check before it catches the same files in the tests).
+- UX: the caveat about Klefki's own checks is a muted line under the heading, not a hover; Copy says "Copied" for a
+  few seconds (announced to screen readers) and its hover says known secrets are hidden, check before sharing; the
+  section reads again whenever it is shown again (tab or server chosen); the empty state no longer promises 30 days.
+  `last-starts.png` redrawn for the caveat line; no other picture changed.
+
 ## Checks
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`: exit 0
-  (app 474, core 1042, cli 26 + 43). `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
+  (app 474, core 1042, cli 26 + 43); after the review fixes exit 0 (app 476, core 1046, cli 26 + 43).
+- Review fixes: the three reproducers and the re-read test failed before their fixes. `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
 - New tests seen failing: with `read` returning nothing, 14 of the 20 reader tests fail.
 - By hand: the debug app under Xvfb with a scratch `HOME` holding real 2.1.308 logs (a server that exits, one that
   connects, a timeout, a missing program, a refused HTTP server): the failed server's Status tab showed Klefki's own
@@ -44,8 +61,10 @@ name rule with its hash for names over 200 characters, the lines a start writes)
 - A 1 GB (sparse) log is read in two 64 KB pieces (counted) and answered in well under 2 s.
 
 ## Not in this slice
-- Telling Klefki's own checks from a session's start: both are starts; the hover says Klefki checks user servers from
-  the home folder.
+- Telling Klefki's own checks from a session's start: both are starts; a line under the heading says Klefki checks
+  user servers from the home folder.
+- Diagnose's "Copy report" hover makes the same too-strong promise and gives no feedback (review UX 2): follow-up.
+- `${VAR}` values in env or headers are hidden as written, not as Claude Code expands them (review note): follow-up.
 - macOS and Windows not tried live (folder from `env-paths` and decision 003).
 - `klefki-cli`: no last starts there (its golden files would change); fits P9.
 

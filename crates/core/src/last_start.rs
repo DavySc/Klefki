@@ -137,7 +137,10 @@ pub(crate) fn read(ask: &Ask<'_>) -> LastStarts {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if prefix.as_deref().is_some_and(|p| !name.starts_with(p)) {
+        if prefix
+            .as_deref()
+            .is_some_and(|p| !starts_like(name, p, cfg!(windows)))
+        {
             continue;
         }
         let dir = entry.path().join(&logs);
@@ -160,6 +163,17 @@ pub(crate) fn read(ask: &Ask<'_>) -> LastStarts {
         out.starts.push(start);
     }
     out
+}
+
+/// Whether a folder's name starts with a project's: in any case on Windows, where `c:\app` and `C:\app` are one
+/// folder. Names are ASCII letters, digits and `-` only, so comparing ASCII case is exact.
+fn starts_like(name: &str, prefix: &str, any_case: bool) -> bool {
+    if any_case {
+        name.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+    } else {
+        name.starts_with(prefix)
+    }
 }
 
 /// The newest log file's name in `dir`, by the time in its name.
@@ -196,7 +210,15 @@ fn open(path: &Path) -> io::Result<(File, u64)> {
     if !meta.is_file() {
         return Err(io::Error::other("not a regular file"));
     }
-    let file = File::open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    // Something swapped in after the check above: a link is refused, and a pipe does not make the open wait.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let file = options.open(path)?;
     let opened = file.metadata()?;
     if !opened.is_file() {
         return Err(io::Error::other("not a regular file"));
@@ -292,6 +314,8 @@ fn start_in(
             outcome = StartOutcome::Connected {
                 after: millis(c.get(1)),
             };
+            // What the server prints from here on is about its work (tool calls), not its start.
+            break;
         } else if let Some(c) = FAILED_AFTER.captures(&line.text) {
             after = millis(c.get(1));
         } else if let Some(c) = FAILED.captures(&line.text).filter(|_| line.error) {
@@ -384,11 +408,20 @@ fn native(project: &str) -> String {
 }
 
 /// Untrusted text made safe to show: the server's own values hidden, then anything that looks like a secret.
+/// A value's last word counts on its own too: a header such as `Bearer <token>` or `Basic <credentials>`, whose
+/// token a server may print without its scheme. The longest go first, so a whole value is hidden in one piece.
 fn scrub(text: &str, secrets: &[String]) -> String {
+    let mut hidden: Vec<&str> = secrets
+        .iter()
+        .flat_map(|s| [s.as_str(), s.split_whitespace().last().unwrap_or("")])
+        .filter(|s| s.chars().count() >= MIN_SECRET)
+        .collect();
+    hidden.sort_by_key(|s| (std::cmp::Reverse(s.len()), *s));
+    hidden.dedup();
     let mut text = text.to_owned();
-    for secret in secrets.iter().filter(|s| s.chars().count() >= MIN_SECRET) {
-        if text.contains(secret.as_str()) {
-            text = text.replace(secret.as_str(), "***");
+    for secret in hidden {
+        if text.contains(secret) {
+            text = text.replace(secret, "***");
         }
     }
     redact(&sanitize(&text))

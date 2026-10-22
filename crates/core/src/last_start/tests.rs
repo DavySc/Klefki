@@ -595,3 +595,87 @@ fn folders_under_home_keep_their_own_separator() {
         );
     }
 }
+
+/// One log line as Claude Code writes it, in the fixtures' folder.
+fn line(text: &str, error: bool) -> String {
+    let key = if error { "error" } else { "debug" };
+    serde_json::json!({key: text, "timestamp": "2026-10-22T07:32:16.385Z", "cwd": PROJ}).to_string()
+}
+
+#[test]
+fn a_header_token_is_hidden_without_its_scheme_too() {
+    // Review B1: the server prints the token alone, not "Bearer <token>" as the header holds it.
+    let logs = Logs::new();
+    let text = [
+        line("Starting connection with timeout of 30000ms", false),
+        line("Server stderr: login with t0kenvalue42xyz failed", true),
+        line("Server stderr: basic dXNlcjpwYXNzd29yZA== refused", true),
+        line(
+            "Connection failed (CONNECTION_CLOSED): t0kenvalue42xyz rejected",
+            true,
+        ),
+    ]
+    .join("\n");
+    logs.put(PROJ, "s", T1, &text);
+    let secrets = [
+        "Bearer t0kenvalue42xyz".to_owned(),
+        // The nearby variant: another scheme.
+        "Basic dXNlcjpwYXNzd29yZA==".to_owned(),
+        // A short last word is too common to hide.
+        "Token ab12".to_owned(),
+    ];
+    let got = logs.ask("s", None, &[], &secrets);
+    let s = &got.starts[0];
+    let all = format!("{s:?}");
+    assert!(!all.contains("t0kenvalue42xyz"), "{all}");
+    assert!(!all.contains("dXNlcjpwYXNzd29yZA"), "{all}");
+    assert_eq!(
+        s.server_said,
+        ["login with *** failed", "basic *** refused"]
+    );
+    // The scheme word itself is not a secret: "Bearer" elsewhere stays.
+    assert_eq!(
+        scrub("Bearer realm=x, ab12", &secrets),
+        "Bearer realm=x, ab12"
+    );
+}
+
+#[test]
+fn a_start_that_connected_shows_only_what_was_printed_on_the_way_up() {
+    // Review B2: what a server prints while it serves tool calls is not part of its start.
+    let logs = Logs::new();
+    let chatter = line(
+        "Server stderr: handled read_file: PRIVATE-NOTES contents",
+        true,
+    );
+    logs.put(PROJ, "s", T1, &format!("{OK}{chatter}\n"));
+    let s = &logs.read("s").starts[0];
+    assert_eq!(s.server_said, ["ok server up"]);
+
+    // The nearby variant: the chatter at the end of a log too big to read whole, so it is in the tail.
+    let filler = line("Calling MCP tool: read", false);
+    let mut text = OK.to_owned();
+    while text.len() < 3 * END as usize {
+        text.push_str(&filler);
+        text.push('\n');
+    }
+    text.push_str(&chatter);
+    text.push('\n');
+    logs.put(PROJ, "big", T1, &text);
+    let s = &logs.read("big").starts[0];
+    assert!(s.partly);
+    assert_eq!(s.server_said, ["ok server up"]);
+}
+
+#[test]
+fn a_projects_folder_name_is_compared_in_any_case_on_windows() {
+    // Review B3: a session started in `c:\users\ana\app` writes `c--users-ana-app`.
+    let project = folder_name("C:\\Users\\Ana\\app");
+    assert!(starts_like("c--users-ana-app-sub", &project, true));
+    assert!(starts_like("C--Users-Ana-app", &project, true));
+    // Elsewhere a folder's case is its name.
+    assert!(!starts_like("c--users-ana-app", &project, false));
+    assert!(starts_like("C--Users-Ana-app", &project, false));
+    // The nearby variant: another folder is still another folder in any case.
+    assert!(!starts_like("c--users-bob-app", &project, true));
+}

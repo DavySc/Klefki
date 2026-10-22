@@ -1975,11 +1975,14 @@ struct Live {
 }
 
 /// A server's last starts as last read, and whether they have been asked for since they could have changed (a check
-/// ended: it is a start too; the files changed). Kept while read again, so the section does not blink.
+/// ended: it is a start too; the files changed; the section was shown again). Kept while read again, so the section
+/// does not blink.
 #[derive(Default)]
 struct LastStartsSeen {
     starts: Option<LastStarts>,
     asked: bool,
+    /// The frame the section was last drawn in.
+    drawn: Option<u64>,
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! The Status tab's last starts by Claude Code, from its logs (decision 013).
 
 use super::*;
-use crate::shell::last_starts::{HEADING, report};
+use crate::shell::last_starts::{ABOUT, COPY, HEADING, report};
 use klefki_core::api::{LastStart, LastStarts, StartOutcome};
 use std::time::Duration;
 
@@ -104,6 +104,44 @@ fn the_status_tab_shows_the_last_starts_the_failed_one_open() {
     // The other start is closed.
     assert!(h.query_by_label("ok server up").is_none());
     h.get_by_label("Copy last starts");
+    // That Klefki's own checks are starts too is said where everyone sees it, not only in a hover.
+    h.get_by_label(ABOUT);
+}
+
+#[test]
+fn copying_says_copied_for_a_moment() {
+    let (mut h, _engine, _row) = shown(LastStarts {
+        starts: vec![failed_in_proj()],
+        ..LastStarts::default()
+    });
+    h.get_by_label(COPY).click();
+    h.run();
+    h.get_by_label("Copied");
+    assert!(h.query_by_label(COPY).is_none());
+    // A screen reader hears it too.
+    let node = h.get_by_label("Copied");
+    assert_eq!(node.accesskit_node().live(), egui::accesskit::Live::Polite);
+}
+
+#[test]
+fn showing_the_status_tab_again_reads_the_logs_again() {
+    // A session may have started the server since: going back to the tab, or to the server, shows that.
+    use egui::accesskit::Role;
+    let (mut h, engine, row) = shown(LastStarts {
+        starts: vec![failed_in_proj()],
+        ..LastStarts::default()
+    });
+    h.get_by_role_and_label(Role::Button, "General").click();
+    h.run();
+    h.run();
+    assert_eq!(drain(&engine), Vec::<Command>::new());
+    h.get_by_role_and_label(Role::Button, "Status").click();
+    h.run();
+    assert_eq!(drain(&engine), vec![Command::LastStarts(row.id())]);
+    // What was read stays meanwhile, so the section does not blink.
+    h.get_by_label(HEADING);
+    h.run();
+    assert_eq!(drain(&engine), Vec::<Command>::new());
 }
 
 #[test]
@@ -112,7 +150,9 @@ fn nothing_logged_says_so_and_where_it_looked() {
         looked_in: Some("~/.cache/claude-cli-nodejs".to_owned()),
         ..LastStarts::default()
     });
-    h.get_by_label_contains("has not started it in the last 30 days");
+    // Claude Code keeps its logs for as long as `cleanupPeriodDays` says, so no number of days is promised.
+    h.get_by_label_contains("Claude Code has no log of starting it");
+    assert!(h.query_by_label_contains("in the last 30 days").is_none());
     h.get_by_label_contains("~/.cache/claude-cli-nodejs");
     assert!(h.query_by_label("Copy last starts").is_none());
 }
