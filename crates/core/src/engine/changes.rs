@@ -1,10 +1,10 @@
 //! Changes to the configuration: prepared as a plan the user reviews, then applied, and checked again a moment
 //! later in case Claude Code wrote over them.
-use super::checks::claude_program;
 use super::client_secrets::{secret_store, store_problem};
-use super::command_loop::{kept_list, profiles_changed, reload_after_change};
+use super::reload::{kept_list, profiles_changed, reload_after_change};
 use super::{
-    Change, Event, FileDiff, Input, MAX_DETAIL_CHARS, PlanView, Shared, State, backup_dir, lock,
+    Change, Event, FileDiff, Input, MAX_DETAIL_CHARS, PlanView, Shared, State, backup_dir,
+    claude_program, lock,
 };
 use crate::api::Scope;
 use crate::cli::runner::RunOutput;
@@ -54,8 +54,15 @@ struct CliSteps {
 
 #[derive(Default)]
 pub(super) struct Plans {
-    pub(super) next: u64,
-    pub(super) stored: HashMap<u64, Stored>,
+    next: u64,
+    stored: HashMap<u64, Stored>,
+}
+
+impl Plans {
+    /// Takes the plan `id` out, to apply it or because it was discarded.
+    pub(super) fn forget(&mut self, id: u64) -> Option<Stored> {
+        self.stored.remove(&id)
+    }
 }
 
 /// What runs Claude Code's commands that change servers: the CLI found on disk, or the stand-in a test gave.
@@ -604,7 +611,7 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
         profiles_used,
         profile_stopped,
         switched,
-    }) = plans.stored.remove(&id)
+    }) = plans.forget(id)
     else {
         return fail("This change was already applied or discarded. Prepare it again.".to_owned());
     };

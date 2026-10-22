@@ -89,14 +89,31 @@ place; `swap.rs` `same_settings`' stdio condition, inverted against its comment.
    entry as it is and as it will be, or why not), `secret_for` (the client secret to hand over), `remove_old`,
    `undo_remove` (putting the old entry back when adding the new one failed) and `move_secret`; `run` (64 lines) does
    them in the same order with the same words. Mutants on the changed lines: main 18 (17 caught, 1 unviable), branch
-   12 (11 caught, 1 unviable); none missed. `same_settings`' inverted stdio condition is left as it is (owner).
+   12 (11 caught, 1 unviable); none missed. `same_settings`' inverted stdio condition is left as it is (owner). Merged
+   in #91 (cf488d9). Review's note on `remove_old`'s doc (it drops the recovery file) came with part 10.
+10. The engine ideas from A2's review, as moves: reading the configuration again (`State::reload`, `refresh`,
+    `reload_after_change`, `queue_checks`, `show_edited`, `needs_check`, `kept_list`, `profiles_changed`) moves from
+    `command_loop.rs` to `engine/reload.rs`, which ends the `changes.rs`/`command_loop.rs` import cycle;
+    `claude_program` moves from `checks.rs` to `engine.rs`, beside the shared state it reads; `Plans`' fields are
+    private, and the two places that dropped a stored plan call `Plans::forget`. The queue's dropping of an edited
+    server's waiting background checks is `Queue::drop_background_checks`, so a test can reach it. Checked by
+    script: removed and added lines are the same apart from imports and visibility. Mutants on the changed lines:
+    main 58 (7 missed), branch 60 (the same 7): the "could not determine" warning with no configuration found, an
+    edited server not checked again counted as tried by a refresh, the three conditions of dropping a waiting
+    check, and an unchecked edited server's "changed since its last check" (two). Four tests now catch all 7 (each
+    seen failing against its mutant).
 
 ## Next
-10. The engine ideas from A2's review, as moves.
+A4 is done once part 10 is merged.
 
 ## Follow-ups for the owner (not in this slice)
 - From #82's review, also on main: at 800×480 the kept notice's "back without some settings" row draws Forget…
   over its own label (WCAG 2.2 SC 1.4.10 Reflow). Wrapping the label above the buttons would fix it; a look change.
+- Fix casing offers a rename, then refuses it when both spellings are in one place (`ops.rs`); not touched here.
+- `swap.rs` `same_settings`: its stdio condition is inverted against its comment (unreachable today); not touched.
+- Six missed mutants in `restore.rs` outside `compare` (`Servers::read`, `places_of`, `mentions`, `server`).
+- The reviewers of #89 to #91 saw `cargo deny check` fail on main too: tokio 1.54.0 in `Cargo.lock` was yanked.
+  It passed in this session's container and in CI. Updating the lock file would be its own slice.
 
 ## Checks
 See each pull request description.

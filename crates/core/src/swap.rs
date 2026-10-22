@@ -421,7 +421,8 @@ fn secret_for(ctx: &Ctx, swap: &Swap, old: &Value, new: &Value) -> Result<Option
     }
 }
 
-/// Removes the server `swap` starts from. Fails only when it is still there, or where it stands is unknown.
+/// Removes the server `swap` starts from. Fails only when it is still there (and then drops the recovery file: nothing
+/// changed), or where it stands is unknown (and then keeps it).
 fn remove_old(
     ctx: &Ctx,
     swap: &Swap,

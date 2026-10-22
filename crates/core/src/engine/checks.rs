@@ -1,7 +1,10 @@
 //! Live status checks: the queue, the workers that take jobs from it, and how `claude mcp get` and
 //! `claude mcp list` answers are read.
 use super::diagnose::run_diagnose;
-use super::{Diagnosis, Event, MAX_CHECK_OUTPUT, MAX_DETAIL_CHARS, ProgramStamp, Shared, lock};
+use super::{
+    Diagnosis, Event, MAX_CHECK_OUTPUT, MAX_DETAIL_CHARS, ProgramStamp, Shared, claude_program,
+    lock,
+};
 use crate::api::{Scope, ServerId, ServerRow, Status};
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
@@ -83,6 +86,14 @@ impl Queue {
             .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
         let at = self.jobs.iter().take_while(|q| q.now).count();
         self.jobs.insert(at, Job { now: true, ..job });
+    }
+
+    /// Drops the background checks still waiting of the servers in `edited`: they may not have said they were
+    /// checking, and a new check replaces each.
+    pub(super) fn drop_background_checks(&mut self, edited: &HashSet<crate::model::ConnectionId>) {
+        self.jobs.retain(|q| {
+            !(q.background && q.kind == JobKind::Check && edited.contains(&q.id.connection))
+        });
     }
 
     /// Takes the other background checks waiting to run in `cwd`, to be answered by one `claude mcp list`. None when
@@ -455,14 +466,6 @@ fn cli_version(shared: &Shared, program: &Path) -> Option<String> {
     let token = out.stdout.split_whitespace().next()?;
     (out.exit_code == Some(0) && token.starts_with(|c: char| c.is_ascii_digit()))
         .then(|| clip(token, 32))
-}
-
-pub(super) fn claude_program(shared: &Shared) -> Option<PathBuf> {
-    shared
-        .claude
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
 }
 
 /// What `check_listed` made of the job it was given.

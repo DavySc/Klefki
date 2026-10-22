@@ -1,6 +1,6 @@
 //! Engine tests: live status checks at start-up, on request and after edits.
 use super::*;
-use crate::engine::checks::{BackgroundSlot, list_env};
+use crate::engine::checks::{BackgroundSlot, Job, JobKind, list_env};
 
 #[test]
 fn servers_claude_already_knows_are_rechecked_at_startup_keeping_their_last_known_status() {
@@ -1446,4 +1446,98 @@ fn cli_failures_become_unknown_with_a_reason() {
         let detail = detail.unwrap_or_default();
         assert!(detail.contains(needle), "{name}: {detail:?}");
     }
+}
+
+/// What an edited server that is not checked again says after `reread` read the files: background checks are off.
+fn unchecked_edit_says(
+    watch: bool,
+    reread: impl FnOnce(&Core),
+) -> Option<(Status, Option<String>)> {
+    let env = quiet_env(&serde_json::json!({"mcpServers": {"mine": {"command": "old"}}}));
+    let core = start_with(
+        EngineConfig {
+            background_checks: false,
+            watch_interval: if watch {
+                env.config().watch_interval
+            } else {
+                None
+            },
+            ..env.config()
+        },
+        || {},
+    );
+    collect(&core, |e| !snapshots(e).is_empty());
+    write_config(
+        &env,
+        &serde_json::json!({"mcpServers": {"mine": {"command": "new"}}}),
+    );
+    reread(&core);
+    let mut events = collect(&core, |e| after_target(e, "mine", "new").is_some());
+    // Anything said after it would be among these.
+    std::thread::sleep(Duration::from_millis(300));
+    while let Some(e) = core.try_recv() {
+        events.push(e);
+    }
+    status_of(after_target(&events, "mine", "new").unwrap(), "mine")
+}
+
+#[test]
+fn an_edited_server_not_checked_again_no_longer_claims_a_verdict_after_a_refresh() {
+    assert_eq!(
+        unchecked_edit_says(false, |core| core
+            .send(Command::Refresh { live_all: false })),
+        Some((
+            Status::Unknown,
+            Some("changed since its last check".to_owned())
+        ))
+    );
+}
+
+#[test]
+fn an_edited_server_not_checked_again_no_longer_claims_a_verdict_when_the_file_changes() {
+    assert_eq!(
+        unchecked_edit_says(true, |_| {}),
+        Some((
+            Status::Unknown,
+            Some("changed since its last check".to_owned())
+        ))
+    );
+}
+
+#[test]
+fn only_the_waiting_background_checks_of_edited_servers_are_dropped() {
+    let job = |name: &str, kind, background| Job {
+        id: user_id(name),
+        name: crate::model::ServerName::parse(name).unwrap(),
+        cwd: PathBuf::new(),
+        kind,
+        announce: false,
+        background,
+        now: false,
+        alone: false,
+    };
+    let mut queue = Queue {
+        jobs: [
+            job("edited", JobKind::Check, true),
+            job("edited", JobKind::Check, false),
+            job("edited", JobKind::Diagnose, true),
+            job("other", JobKind::Check, true),
+        ]
+        .into(),
+        ..Queue::default()
+    };
+    queue.drop_background_checks(&[user_id("edited").connection].into());
+    let left: Vec<_> = queue
+        .jobs
+        .iter()
+        .map(|j| (j.id.name.as_str(), j.kind == JobKind::Check, j.background))
+        .collect();
+    assert_eq!(
+        left,
+        [
+            ("edited", true, false),
+            ("edited", false, true),
+            ("other", true, true),
+        ]
+    );
 }
