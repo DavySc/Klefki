@@ -15,13 +15,15 @@ connector server.
   `PlanView::sessions` (not in `notes`). It names the projects when every edit is inside projects (folder names, at
   most three, then "and N more"), and adds "or switch the same servers there with /mcp" only when the plan is
   nothing but switches. Used for changes, profiles (use and stop) and Restore. Nothing written: `None`.
-  Example: "Claude Code sessions already open in a keep the servers they started with until you restart them, or
-  switch the same servers there with /mcp. New sessions get this."
+  Example: "Claude Code sessions already open in a keep their servers until you restart them (or switch them there
+  with /mcp). New sessions get the change." A short form, `PlanView::restart` ("Restart Claude Code sessions
+  already open in a to pick it up."), is what the toast says once saved.
 - App: the review shows it in full text under the warnings (it was a muted note under the diff); once saved, the
-  outcome toast says it again (only when something was written; not shown as a warning).
+  outcome toast says the short form (only when something was written; not shown as a warning; the toast fades after
+  4 s, so it stays short).
 - CLI: `klefki-cli use` prints it as a `note:`.
-- "Off" is not off for new projects: a user, plugin, organisation or claude.ai row off in every known project gets a
-  `new: on` badge (hover: "Switched off in all N projects Claude Code knows. A project it opens for the first time
+- "Off" is not off for new projects: a user, plugin, organisation or claude.ai row off in every known project that would
+  load there otherwise (not replaced, held back or with its plugin off everywhere) gets a quiet `on in new` badge (hover: "Switched off in all N projects Claude Code knows. A project it opens for the first time
   still loads it."), the details' Enabled says "no, in all N projects; on in projects Claude Code opens later", and
   `klefki-cli list` adds "(off in all N projects, on in new ones)". The state stays `off`; JSON is unchanged.
 - Tests: core `edits.rs` (one project with /mcp, user server naming both projects, user delete without projects,
@@ -34,12 +36,19 @@ connector server.
 - `cargo fmt --check`: exit 0. `cargo clippy --workspace --all-targets -- -D warnings`: exit 0.
 - `cargo test --workspace`: exit 0; 1097 core, 516 app, 26 + 43 CLI tests passed.
 - `cargo deny check`: advisories ok, bans ok, licenses ok, sources ok.
-- Look snapshots: the review, toast and list images checked by eye (sentence under the warnings; `new: on` beside
-  legacy-events).
+- Look snapshots: the review, toast and list images checked by eye (sentence under the warnings; short toast;
+  `on in new` beside legacy-events).
+
+## Review round 1 (cross-review on #102)
+- B1: the badge, detail text and CLI note also showed for a server that loads nowhere (replaced by the
+  organisation's server, or its plugin off everywhere). Fixed in all three; reproducer and plugin variant kept as
+  regression tests (app `list.rs`, CLI `render.rs`).
+- B2: the toast held about 45 words but fades after 4 s. It now says only the short `restart` sentence; a test pins
+  that the full sentence is not in it.
+- Polish folded in: neutral badge `on in new`; shorter review sentence ending "New sessions get the change."
 - Not run here: macOS and Windows (CI); a real Claude Code session.
 
 ## Open / next
-- Toast text is long (about five lines at 800 px); fine with today's toast, but S2 (Undo) also adds to it.
 - The sentence is not given for a plan that only approves a project server (`settings.local.json`): whether a
   running session picks up an approval was not checked live.
 - Next: S2 Undo for switches and profile use.

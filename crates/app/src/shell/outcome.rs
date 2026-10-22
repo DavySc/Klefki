@@ -277,10 +277,10 @@ impl ShellApp {
         if changed {
             self.editor_after_change(plan);
         }
-        // What a session already open gets, said again now that it is so: the review may have been read quickly.
+        // Which sessions to restart, said again now that it is so: the review said why, in full.
         let mut sessions = None;
         if let Some(p) = self.plan.take_if(|p| p.id == plan) {
-            sessions = p.sessions.clone().filter(|_| changed);
+            sessions = p.restart.clone().filter(|_| changed);
             self.applying = false;
             self.applying_step = None;
         }

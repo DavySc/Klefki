@@ -31,6 +31,8 @@ fn once_saved_the_outcome_says_again_what_open_sessions_get() {
         let (mut h, engine) = live_harness();
         let mut plan = plan_view(4, &["+ alpha"], &[], false);
         plan.sessions = Some(SESSIONS.into());
+        plan.restart =
+            Some("Restart Claude Code sessions already open in a, b and c to pick it up.".into());
         engine.events.send(Event::PlanReady(plan)).unwrap();
         h.run();
         click(&mut h, "Apply");
@@ -48,10 +50,14 @@ fn once_saved_the_outcome_says_again_what_open_sessions_get() {
         // Said plainly, not as a warning: nothing went wrong.
         assert!(!outcome.warn);
         assert_eq!(
-            outcome.text.contains("until you restart them"),
+            outcome
+                .text
+                .contains("Restart Claude Code sessions already open in a, b and c"),
             changed,
             "only when something was written: {}",
             outcome.text
         );
+        // Short enough to read before it fades: the review said it in full.
+        assert!(!outcome.text.contains(SESSIONS), "{}", outcome.text);
     }
 }

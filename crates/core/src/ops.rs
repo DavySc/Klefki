@@ -33,6 +33,8 @@ pub(crate) struct Resolved {
     pub notes: Vec<String>,
     /// What a Claude Code session already open gets from this once it is saved (see [`open_sessions`]).
     pub sessions: Option<String>,
+    /// The same, short, for once it is saved: which sessions to restart.
+    pub restart: Option<String>,
     /// One plain sentence per change, for the top of the review ("Turn off github in 3 projects").
     pub summary: Vec<String>,
     /// What the confirm button says: the verb all changes share, else "Apply".
@@ -243,7 +245,7 @@ pub(crate) fn resolve(
         [one] => (*one).to_owned(),
         _ => "Apply".to_owned(),
     };
-    out.sessions = open_sessions(&out);
+    (out.sessions, out.restart) = open_sessions(&out).unzip();
     out.warnings
         .extend(relative_in_user_servers(&out, snapshot));
     // Several changes can raise the same point; it is said once, where it first came up.
@@ -257,8 +259,8 @@ pub(crate) fn resolve(
 /// What a Claude Code session already open gets from this plan once it is saved: nothing. A session never drops a
 /// server switched off from outside, and never starts one switched on or added, until it is restarted; `/mcp` in
 /// the session switches a server there at once. Names the projects when every change is inside one; `None` when the
-/// plan writes no server or switch.
-pub(crate) fn open_sessions(out: &Resolved) -> Option<String> {
+/// plan writes no server or switch. Said in full for the review, then short for once it is saved.
+pub(crate) fn open_sessions(out: &Resolved) -> Option<(String, String)> {
     let through_claude = !out.cli.is_empty() || !out.swaps.is_empty() || !out.put_back.is_empty();
     if out.claude.is_empty() && !through_claude {
         return None;
@@ -288,13 +290,16 @@ pub(crate) fn open_sessions(out: &Resolved) -> Option<String> {
             .iter()
             .all(|op| matches!(op, Op::SetDisabled { .. }));
     let or = if switches {
-        ", or switch the same servers there with /mcp"
+        " (or switch them there with /mcp)"
     } else {
         ""
     };
-    Some(format!(
-        "Claude Code sessions already open{place} keep the servers they started with until you restart them{or}. \
-         New sessions get this."
+    Some((
+        format!(
+            "Claude Code sessions already open{place} keep their servers until you restart them{or}. New sessions \
+             get the change."
+        ),
+        format!("Restart Claude Code sessions already open{place} to pick it up."),
     ))
 }
 

@@ -317,6 +317,8 @@ pub struct PlanView {
     /// What a Claude Code session already open gets once this is saved: its servers stay as they were until it is
     /// restarted. `None` when nothing is written.
     pub sessions: Option<String>,
+    /// [`Self::sessions`] in one short sentence, for once it is saved: which sessions to restart.
+    pub restart: Option<String>,
     /// The configuration already looks like this; applying would write nothing.
     pub nothing_to_do: bool,
     /// When [`Self::nothing_to_do`]: what is already so, one sentence per change that can say it, naming the servers

@@ -403,7 +403,7 @@ fn closing_notes(left_out: &[String], out: &mut Resolved) {
                 .to_owned(),
         );
     }
-    out.sessions = crate::ops::open_sessions(out);
+    (out.sessions, out.restart) = crate::ops::open_sessions(out).unzip();
     for said in [&mut out.warnings, &mut out.notes] {
         let mut seen = std::collections::HashSet::new();
         said.retain(|s| seen.insert(s.clone()));

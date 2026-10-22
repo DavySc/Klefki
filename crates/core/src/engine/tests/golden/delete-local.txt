@@ -4,7 +4,9 @@ summary:
 warnings:
   Deleting removes the definition only. A sign-in Claude Code keeps for this server is not removed.
 sessions:
-  Claude Code sessions already open in a keep the servers they started with until you restart them. New sessions get this.
+  Claude Code sessions already open in a keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open in a to pick it up.
 diff .claude.json:
     projects["/work/a"].mcpServers
   - loc

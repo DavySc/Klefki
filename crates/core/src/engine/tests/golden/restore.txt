@@ -6,7 +6,9 @@ notes:
   Only servers and where they are switched off are restored. The rest of .claude.json, Claude Code's own settings and history, stays as it is now.
   Klefki keeps a copy of the configuration as it is now before it restores, so the activity log can undo this restore too.
 sessions:
-  Claude Code sessions already open keep the servers they started with until you restart them. New sessions get this.
+  Claude Code sessions already open keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open to pick it up.
 review gw for the user would run:
   Command: node
   Environment: TOKEN=<hidden>

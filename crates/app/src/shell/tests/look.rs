@@ -130,10 +130,11 @@ fn plan(destructive: bool) -> PlanView {
         warnings: Vec::new(),
         notes: vec!["A backup is kept first.".to_owned()],
         sessions: Some(
-            "Claude Code sessions already open in WebApp keep the servers they started with until you restart \
-             them, or switch the same servers there with /mcp. New sessions get this."
+            "Claude Code sessions already open in WebApp keep their servers until you restart them (or switch \
+             them there with /mcp). New sessions get the change."
                 .to_owned(),
         ),
+        restart: Some("Restart Claude Code sessions already open in WebApp to pick it up.".to_owned()),
         nothing_to_do: false,
         already: Vec::new(),
         others_on: false,

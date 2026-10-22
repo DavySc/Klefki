@@ -322,7 +322,12 @@ fn notes(row: &ServerRow, project_count: usize) -> Vec<String> {
         notes.push(note);
     }
     // Off in every project Claude Code knows is not off for good: a project it opens later loads it.
-    if everywhere && !row.enabled && project_count > 0 {
+    // Not one that loads nowhere anyway: replaced, held back, or its plugin off everywhere.
+    let plugin_off = row
+        .plugin
+        .as_ref()
+        .is_some_and(|p| p.off_in.len() == project_count);
+    if everywhere && !row.enabled && project_count > 0 && row.not_loaded.is_none() && !plugin_off {
         notes.push(if project_count == 1 {
             "off in the 1 project, on in new ones".to_owned()
         } else {
@@ -1103,6 +1108,32 @@ mod tests {
         assert!(
             !notes(&local, 3).iter().any(|n| n.contains("new ones")),
             "a local server is in one project only"
+        );
+        // Loads nowhere anyway: replaced, or its plugin off in every project.
+        let replaced = ServerRow {
+            not_loaded: Some("Your organisation's server of the same name replaces it.".into()),
+            ..all_off.clone()
+        };
+        assert!(
+            !notes(&replaced, 3).iter().any(|n| n.contains("new ones")),
+            "{:?}",
+            notes(&replaced, 3)
+        );
+        let plugin_off = ServerRow {
+            scope: Scope::Plugin,
+            plugin: Some(klefki_core::api::PluginInfo {
+                plugin: "tools".into(),
+                marketplace: "market".into(),
+                same_as: None,
+                written_target: None,
+                off_in: vec!["/p1".into(), "/p2".into(), "/p3".into()],
+            }),
+            ..all_off.clone()
+        };
+        assert!(
+            !notes(&plugin_off, 3).iter().any(|n| n.contains("new ones")),
+            "{:?}",
+            notes(&plugin_off, 3)
         );
         assert!(!said.iter().any(|n| n.contains("policy")), "{said:?}");
         let json = row_json(&row, 3);

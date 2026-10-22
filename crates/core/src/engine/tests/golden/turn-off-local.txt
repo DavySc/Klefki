@@ -2,7 +2,9 @@
 summary:
   Turn off loc in a
 sessions:
-  Claude Code sessions already open in a keep the servers they started with until you restart them, or switch the same servers there with /mcp. New sessions get this.
+  Claude Code sessions already open in a keep their servers until you restart them (or switch them there with /mcp). New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open in a to pick it up.
 diff .claude.json:
     projects["/work/a"].disabledMcpServers
   + loc

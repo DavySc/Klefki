@@ -2876,6 +2876,7 @@ mod tests {
             destructive: false,
             notes: Vec::new(),
             sessions: None,
+            restart: None,
         }
     }
 

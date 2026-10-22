@@ -6,7 +6,9 @@ warnings:
 notes:
   Klefki remembers what this switches: stop using Writing, or delete it, to put it back.
 sessions:
-  Claude Code sessions already open in designs keep the servers they started with until you restart them, or switch the same servers there with /mcp. New sessions get this.
+  Claude Code sessions already open in designs keep their servers until you restart them (or switch them there with /mcp). New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open in designs to pick it up.
 diff .claude.json:
     projects["/work/designs"].disabledMcpServers
   + memory

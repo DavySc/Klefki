@@ -4,7 +4,9 @@ summary:
 notes:
   Older Claude Code versions kept this list; current ones ignore it, so these servers have been on since.
 sessions:
-  Claude Code sessions already open in a keep the servers they started with until you restart them. New sessions get this.
+  Claude Code sessions already open in a keep their servers until you restart them. New sessions get the change.
+once saved:
+  Restart Claude Code sessions already open in a to pick it up.
 diff .claude.json:
     projects["/work/a"].mcpServersDisabled
   - gw

@@ -6,7 +6,7 @@ Use the profile Work in Repo, and turn off every other server there
 warning: This also turns off beta, docs and remote, which are not in Work.
 note: Klefki remembers what this switches: stop using Work, or delete it, to put it back.
 note: gone is in Work but no longer configured, so nothing is switched for it.
-note: Claude Code sessions already open in Repo keep the servers they started with until you restart them, or switch the same servers there with /mcp. New sessions get this.
+note: Claude Code sessions already open in Repo keep their servers until you restart them (or switch them there with /mcp). New sessions get the change.
 
 .claude.json
     projects["<project>"].disabledMcpServers

@@ -704,14 +704,19 @@ fn a_switch_in_one_project_says_open_sessions_there_keep_their_servers_until_res
             // Already on: nothing is written, so nothing reaches any session.
             assert!(plan.nothing_to_do);
             assert_eq!(plan.sessions, None);
+            assert_eq!(plan.restart, None);
             continue;
         }
         assert_eq!(
             plan.sessions.as_deref(),
             Some(
-                "Claude Code sessions already open in a keep the servers they started with until you restart \
-                 them, or switch the same servers there with /mcp. New sessions get this."
+                "Claude Code sessions already open in a keep their servers until you restart them (or switch \
+                 them there with /mcp). New sessions get the change."
             )
+        );
+        assert_eq!(
+            plan.restart.as_deref(),
+            Some("Restart Claude Code sessions already open in a to pick it up.")
         );
     }
 }
@@ -741,9 +746,13 @@ fn a_change_outside_projects_says_every_open_session_keeps_its_servers() {
     assert_eq!(
         plan.sessions.as_deref(),
         Some(
-            "Claude Code sessions already open keep the servers they started with until you restart them. New \
-             sessions get this."
+            "Claude Code sessions already open keep their servers until you restart them. New sessions get the \
+             change."
         )
+    );
+    assert_eq!(
+        plan.restart.as_deref(),
+        Some("Restart Claude Code sessions already open to pick it up.")
     );
     // A local server deleted: its project is named, but switching it there with /mcp is no answer.
     let plan = plan_for(
