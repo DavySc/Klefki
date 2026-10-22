@@ -22,9 +22,10 @@ connector server.
   outcome toast says the short form (only when something was written; not shown as a warning; the toast fades after
   4 s, so it stays short).
 - CLI: `klefki-cli use` prints it as a `note:`.
-- "Off" is not off for new projects: a user, plugin, organisation or claude.ai row off in every known project that would
-  load there otherwise (not replaced, held back or with its plugin off everywhere) gets a quiet `on in new` badge (hover: "Switched off in all N projects Claude Code knows. A project it opens for the first time
-  still loads it."), the details' Enabled says "no, in all N projects; on in projects Claude Code opens later", and
+- "Off" is not off for new projects: a user, plugin, organisation or claude.ai row off in every known project that
+  would load there otherwise (not replaced, held back or with its plugin off everywhere) gets a quiet `on in new`
+  badge (hover: "Switched off in all N projects Claude Code knows. A project it opens for the first time still loads
+  it."), the details' Enabled says "no, in all N projects; on in projects Claude Code opens later", and
   `klefki-cli list` adds "(off in all N projects, on in new ones)". The state stays `off`; JSON is unchanged.
 - Tests: core `edits.rs` (one project with /mcp, user server naming both projects, user delete without projects,
   local delete without /mcp, nothing to do gives none), restore test asserts the sentence; app `review.rs` (review
@@ -46,9 +47,13 @@ connector server.
 - B2: the toast held about 45 words but fades after 4 s. It now says only the short `restart` sentence; a test pins
   that the full sentence is not in it.
 - Polish folded in: neutral badge `on in new`; shorter review sentence ending "New sessions get the change."
-- Not run here: macOS and Windows (CI); a real Claude Code session.
+- Round 2: approved on f0369df (CI green on all three systems).
+- After merging main (#100): fmt, clippy, `cargo test --workspace` (1097 core, 517 app, 28 + 48 CLI) and
+  `cargo deny check` all exit 0.
+- Not run here: a real Claude Code session.
 
 ## Open / next
 - The sentence is not given for a plan that only approves a project server (`settings.local.json`): whether a
   running session picks up an approval was not checked live.
+- For S2 (cross-review leftover): the success toast fades after 4 s and is still tight with the backup path in it.
 - Next: S2 Undo for switches and profile use.
