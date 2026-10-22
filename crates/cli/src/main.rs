@@ -35,6 +35,9 @@ const USAGE: u8 = 2;
 const UNAVAILABLE: u8 = 3;
 /// `export --output` wrote nothing: the file is there, or Klefki does not write there.
 const NOT_WRITTEN: u8 = 4;
+/// `status` was asked about a server Klefki does not check (a plugin's, the organisation's, a claude.ai connector),
+/// so nothing is known about it.
+const NOT_CHECKED: u8 = 5;
 
 const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 const USE_USAGE: &str = "Usage: klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]. See `klefki-cli help`.";
@@ -294,10 +297,15 @@ fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u
         .map(|(_, o)| o)
         .filter(|o| o.was_checked())
         .collect();
+    // Named, a server is a question a script asks: one Claude Code does not run fails, one Klefki cannot check is
+    // its own answer. Unnamed, only what was checked counts.
+    let named_rows = || rows.iter().map(|(_, o)| o).filter(|_| named);
     let code = if !checked.is_empty() && checked.iter().all(|o| o.tool_failed()) {
         UNAVAILABLE
-    } else if checked.iter().any(|o| o.is_problem()) {
+    } else if checked.iter().any(|o| o.is_problem()) || named_rows().any(Outcome::will_not_run) {
         PROBLEM
+    } else if named_rows().any(Outcome::not_checkable) {
+        NOT_CHECKED
     } else {
         OK
     };

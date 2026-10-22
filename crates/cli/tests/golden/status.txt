@@ -15,6 +15,8 @@ Local in <project>
 
 Project in <project>
   docs    Pending approval  not checked: it may run the repository's own command (node tools/docs-mcp.js); to check it: klefki-cli status docs
+          docs: Can't find node on the PATH Klefki was started with.
+          - Install it, or write its full path. Claude Code looks on its own PATH, which a terminal can set differently.
 
 2 connected, 1 failed, 1 needs auth, 2 not checked.
 --- stderr
