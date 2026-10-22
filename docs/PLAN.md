@@ -192,7 +192,7 @@ Everything not yet built, ranked by impact and by how much it sets Klefki apart 
 | 7 | VS Code servers | M read-only, L to write | Medium-high: the other client the owner uses | No: add-mcp, mcpm, MCPMate and Docker cover it | Below |
 | 8 | Bounded log tail, reframed as the last starts by Claude Code (done, decision 013) | M | Medium | Partly: MCP Router has logs; redaction and flat memory are Klefki's own | Nice to have 2, decision 013 |
 | 9 | Scope drift watcher and Refresh scopes | M | Low-medium: OAuth gateway users only | Yes, but niche | Milestones, M3 |
-| 10 | Copy MCP Inspector command | S | Low | No | Nice to have 7 |
+| 10 | Copy MCP Inspector command (done, decision 014) | S | Low | No | Nice to have 7, decision 014 |
 | 11 | Import: `${VAR}` value entry and leftovers | S–M | Low-medium | No | Progress file of Import |
 | 12 | Per-configuration record of stored client secrets | S–M | Low: safety of Secrets page clean-up | No | Secrets page progress file |
 | 13 | Legacy v1 secret and settings import | S | Low: v1 users only | No | Core, `legacy.rs` |

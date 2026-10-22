@@ -88,6 +88,7 @@ pub(super) fn engine_main(
             Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose, false),
             Command::Inspect(id) => inspect(&shared, &state, id),
             Command::LastStarts(id) => last_starts(&shared, &state, id),
+            Command::InspectorCommand(id) => inspector_command(&shared, &state, id),
             Command::Export(ids) => {
                 let sources = crate::export::sources(
                     shared.config.paths.as_ref(),
@@ -432,6 +433,30 @@ fn last_starts(shared: &Shared, state: &State, id: ServerId) {
         }
     };
     shared.emitter.emit(Event::LastStarts { id, starts });
+}
+
+/// The line that opens the server in the MCP Inspector. Only reads the definition (decision 014).
+fn inspector_command(shared: &Shared, state: &State, id: ServerId) {
+    let project = inventory::locate(&state.snapshot, &state.keys, &id)
+        .filter(|(row, _)| matches!(row.scope, Scope::Local | Scope::Project))
+        .and_then(|(_, file)| file.project.clone());
+    let source = crate::export::sources(
+        shared.config.paths.as_ref(),
+        &state.snapshot,
+        &state.keys,
+        std::slice::from_ref(&id),
+    )
+    .pop();
+    let line = match source {
+        Some(source) => source
+            .definition
+            .and_then(|definition| {
+                crate::inspector::command(&definition, project.as_deref(), cfg!(windows))
+            })
+            .map_err(|why| crate::sanitize::shown(&why)),
+        None => Err("the server is no longer in the configuration".to_owned()),
+    };
+    shared.emitter.emit(Event::InspectorCommand { id, line });
 }
 
 fn inspect(shared: &Shared, state: &State, id: ServerId) {

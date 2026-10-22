@@ -22,6 +22,7 @@ mod fixtures;
 mod form;
 mod hex;
 mod import_file;
+mod inspector;
 mod install;
 mod last_start;
 mod model;

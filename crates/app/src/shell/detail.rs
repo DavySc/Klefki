@@ -613,6 +613,7 @@ impl ShellApp {
                 if let Some(why) = not_checked(s) {
                     ui.add(egui::Label::new(RichText::new(why).color(pal.text_muted)).wrap());
                     self.last_starts_section(ui, s);
+                    self.inspector_section(ui, s);
                     return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
@@ -710,6 +711,8 @@ impl ShellApp {
                         shown.scroll_to_me(Some(Align::TOP));
                     }
                 }
+                // Last: the diagnosis reads as part of the status above it, not of this section.
+                self.inspector_section(ui, s);
             }
             DetailTab::Auth => {
                 let muted = |ui: &mut Ui, text: &str| {
