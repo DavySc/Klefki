@@ -159,8 +159,10 @@ pub(crate) fn resolve(
     let mut verbs: Vec<&str> = Vec::new();
     for change in changes {
         let verb = match change {
-            Change::SetEnabled { enabled: true, .. } => "Turn on",
-            Change::SetEnabled { enabled: false, .. } => "Turn off",
+            Change::SetEnabled { enabled: true, .. }
+            | Change::SetEnabledIn { enabled: true, .. } => "Turn on",
+            Change::SetEnabled { enabled: false, .. }
+            | Change::SetEnabledIn { enabled: false, .. } => "Turn off",
             Change::Approve { .. } => "Approve",
             Change::Delete { .. } => "Delete",
             Change::Replace { .. } => "Save",
@@ -188,6 +190,11 @@ pub(crate) fn resolve(
             Change::SetEnabled { id, enabled } => {
                 set_enabled(id, *enabled, snapshot, keys, &mut out)?;
             }
+            Change::SetEnabledIn {
+                id,
+                project,
+                enabled,
+            } => set_enabled_in(id, project, *enabled, snapshot, keys, &mut out)?,
             Change::Approve { id } => approve(id, snapshot, keys, &mut out)?,
             Change::Delete { id } => delete(id, snapshot, keys, &mut out)?,
             Change::Replace { id, json } => replace(id, json, snapshot, keys, &mut out)?,
@@ -376,6 +383,18 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
     };
     let (id, verb) = match change {
         Change::SetEnabled { id, enabled } => (id, if *enabled { "Turn on" } else { "Turn off" }),
+        Change::SetEnabledIn {
+            id,
+            project,
+            enabled,
+        } => {
+            return format!(
+                "{} {} in {}",
+                if *enabled { "Turn on" } else { "Turn off" },
+                shown(id).2,
+                project_label(project, snapshot)
+            );
+        }
         Change::Approve { id } => (id, "Approve"),
         Change::Delete { id } => (id, "Delete"),
         Change::Replace { id, .. } => (id, "Save changes to"),
@@ -596,6 +615,99 @@ fn set_enabled(
             stays_off(row, out);
         } else {
             loads_instead(row, snapshot, out);
+        }
+    }
+    Ok(())
+}
+
+/// Switches a server in `project` only, where it loads; every other project stays as it is. The review says when it
+/// will still not load there, or when another server loads in its place once it is off.
+fn set_enabled_in(
+    id: &ServerId,
+    project: &str,
+    enabled: bool,
+    snapshot: &Snapshot,
+    keys: &FileKeys,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let place = snapshot
+        .projects
+        .iter()
+        .find(|known| *known == project)
+        .ok_or_else(|| {
+            format!(
+                "Claude Code does not know the project {}.",
+                sanitize(project)
+            )
+        })?;
+    let gone = || {
+        format!(
+            "{} is no longer in the configuration. Refresh and try again.",
+            sanitize(&id.name)
+        )
+    };
+    let row = snapshot
+        .servers
+        .iter()
+        .find(|r| r.is(id))
+        .ok_or_else(gone)?;
+    // The scope, own project and name as the files spell them.
+    let (scope, own, name) =
+        crate::model::ConnectionId::parse(row.connection.as_str()).ok_or_else(gone)?;
+    let label = project_label(place, snapshot);
+    match scope {
+        Scope::Local | Scope::Project => {
+            if own.as_deref() != Some(place.as_str()) {
+                let home = own.as_deref().map(folder_name).unwrap_or_default();
+                return Err(format!(
+                    "{} loads only in its own project, {}.",
+                    row.name,
+                    sanitize(home)
+                ));
+            }
+            // Its own switch, the same as everywhere it loads.
+            switch(id, enabled, snapshot, keys, out)?;
+        }
+        _ => out.claude.push(Op::SetDisabled {
+            project: place.clone(),
+            name: name.clone(),
+            disabled: !enabled,
+        }),
+    }
+    out.already.push(format!(
+        "{} is already {} in {label}.",
+        row.name,
+        if enabled { "on" } else { "off" }
+    ));
+    let now = SwitchedNow::new(snapshot);
+    if enabled {
+        // As things will be: this one on, the rest as they are.
+        let off_after = |p: &str, n: &str| n != name && now.off(p, n) == Some(true);
+        if let Some(why) = held_back(row, place, snapshot, &off_after) {
+            out.warnings.push(format!(
+                "{} will still not load in {label}: {why}",
+                row.name
+            ));
+        }
+    } else {
+        let here = crate::sanitize::shown(place);
+        for other in &snapshot.servers {
+            let repeats = other
+                .plugin
+                .as_ref()
+                .and_then(|p| p.same_as.as_deref())
+                .is_some_and(|same| same == row.name);
+            if repeats
+                && (other.shadowed || other.shadowed_in.contains(&here))
+                && !off_now(other, other.scope, place)
+                && held_back(other, place, snapshot, &|_, _| true).is_none()
+            {
+                out.warnings.push(format!(
+                    "{} has the same command or address as {}, so Claude Code leaves it out. Once {} is off in \
+                     {label}, Claude Code loads {} there instead.",
+                    other.name, row.name, row.name, other.name
+                ));
+            }
         }
     }
     Ok(())
@@ -1250,6 +1362,56 @@ pub fn profile_in_use(name: &str, snapshot: &Snapshot) -> Vec<String> {
                 .any(|s| s.project == **place && now.off(place, &s.name) == Some(s.off))
         })
         .cloned()
+        .collect()
+}
+
+/// How a server stands in one project, for the list seen from that project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Here {
+    /// Its switch is off there.
+    pub off: bool,
+    /// Claude Code does not load it there whatever its switch says: why, as a sentence ("its plugin docs is off
+    /// there."). Sanitised.
+    pub held: Option<String>,
+}
+
+/// How each of [`Snapshot::servers`] stands in `project` (as [`Snapshot::projects`] spells it), by its place in that
+/// list: `None` for a local or project server of another project, which never loads there. Worked out from the
+/// files each time, like [`profile_alone_in`].
+pub fn in_project(snapshot: &Snapshot, project: &str) -> Vec<Option<Here>> {
+    let now = SwitchedNow::new(snapshot);
+    let off_now_by_name = |p: &str, n: &str| now.off(p, n) == Some(true);
+    snapshot
+        .servers
+        .iter()
+        .map(|row| {
+            let (scope, own, _) = crate::model::ConnectionId::parse(row.connection.as_str())?;
+            if matches!(scope, Scope::Local | Scope::Project) && own.as_deref() != Some(project) {
+                return None;
+            }
+            let held = held_back(row, project, snapshot, &off_now_by_name).or_else(|| {
+                if row.scope != Scope::Project {
+                    return None;
+                }
+                if row.shadowed {
+                    return Some(format!(
+                        "the local server {} has its name there, and Claude Code loads that one instead.",
+                        row.name
+                    ));
+                }
+                match row.approval {
+                    Some(Approval::Approved) => None,
+                    Some(Approval::Rejected) => {
+                        Some("you rejected this project server in Claude Code.".to_owned())
+                    }
+                    _ => Some("you have not approved this project server in Claude Code.".to_owned()),
+                }
+            });
+            Some(Here {
+                off: off_now(row, scope, project),
+                held,
+            })
+        })
         .collect()
 }
 
@@ -3962,5 +4124,144 @@ mod profile_review_regressions {
                 out.warnings
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod one_project {
+    //! Slice S3 of the on/off plan: the list seen from one project, and a switch made there only.
+    use super::*;
+    use crate::engine::Change;
+    use serde_json::json;
+
+    /// User servers `a` (off in q) and `b`; local `l` in q and `b` in r (which replaces the user `b` there); in the
+    /// folder `p`, a project server `t` not approved yet and `u` approved.
+    fn inv(dir: &Path) -> (inventory::Inventory, String) {
+        let p = dir.join("p");
+        std::fs::create_dir(&p).unwrap();
+        std::fs::write(
+            p.join(".mcp.json"),
+            json!({"mcpServers": {"t": {"command": "t"}, "u": {"command": "u"}}}).to_string(),
+        )
+        .unwrap();
+        let p = p.to_string_lossy().replace('\\', "/");
+        std::fs::write(
+            dir.join(".claude.json"),
+            json!({
+                "mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}},
+                "projects": {
+                    "/q": {"disabledMcpServers": ["a"], "mcpServers": {"l": {"command": "l"}}},
+                    "/r": {"mcpServers": {"b": {"command": "local-b"}}},
+                    p.clone(): {"enabledMcpjsonServers": ["u"]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (inventory::load(&crate::config::ConfigPaths::in_dir(dir)), p)
+    }
+
+    fn here<'a>(
+        inv: &'a inventory::Inventory,
+        seen: &'a [Option<Here>],
+        scope: Scope,
+        name: &str,
+    ) -> Option<&'a Here> {
+        let at = inv
+            .snapshot
+            .servers
+            .iter()
+            .position(|r| r.scope == scope && r.name == name)
+            .unwrap_or_else(|| panic!("no {name}"));
+        seen[at].as_ref()
+    }
+
+    #[test]
+    fn each_server_is_seen_as_it_stands_in_that_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inv, p) = inv(dir.path());
+        let q = in_project(&inv.snapshot, "/q");
+        assert_eq!(q.len(), inv.snapshot.servers.len());
+        let on = Here {
+            off: false,
+            held: None,
+        };
+        assert_eq!(
+            here(&inv, &q, Scope::User, "a"),
+            Some(&Here {
+                off: true,
+                held: None
+            })
+        );
+        assert_eq!(here(&inv, &q, Scope::User, "b"), Some(&on));
+        assert_eq!(here(&inv, &q, Scope::Local, "l"), Some(&on));
+        // Another project's own servers never load in q.
+        assert_eq!(here(&inv, &q, Scope::Local, "b"), None);
+        assert_eq!(here(&inv, &q, Scope::Project, "t"), None);
+        // In r the user a is on, and the user b is replaced by r's own.
+        let r = in_project(&inv.snapshot, "/r");
+        assert_eq!(here(&inv, &r, Scope::User, "a"), Some(&on));
+        let b = here(&inv, &r, Scope::User, "b").unwrap();
+        assert!(!b.off);
+        assert_eq!(
+            b.held.as_deref(),
+            Some("the local server b has its name there, and Claude Code loads that one instead.")
+        );
+        assert_eq!(here(&inv, &r, Scope::Local, "b"), Some(&on));
+        // A project server Claude Code has not been allowed to run does not load, on or not.
+        let in_p = in_project(&inv.snapshot, &p);
+        assert_eq!(
+            here(&inv, &in_p, Scope::Project, "t").and_then(|h| h.held.as_deref()),
+            Some("you have not approved this project server in Claude Code.")
+        );
+        assert_eq!(here(&inv, &in_p, Scope::Project, "u"), Some(&on));
+    }
+
+    #[test]
+    fn a_switch_in_one_project_writes_that_project_only_and_says_what_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (inv, p) = inv(dir.path());
+        let id = |scope, project: Option<&str>, name| ServerId::new(scope, project, name);
+        let switch = |id: ServerId, project: &str, enabled| {
+            resolve(
+                &[Change::SetEnabledIn {
+                    id,
+                    project: project.to_owned(),
+                    enabled,
+                }],
+                &inv.snapshot,
+                &inv.keys,
+            )
+        };
+        let out = switch(id(Scope::User, None, "a"), "/q", true).unwrap();
+        assert_eq!(
+            out.claude,
+            [Op::SetDisabled {
+                project: "/q".into(),
+                name: "a".into(),
+                disabled: false
+            }]
+        );
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        // Turned on where another server of its name loads instead: the review says it still will not load.
+        let out = switch(id(Scope::User, None, "b"), "/r", true).unwrap();
+        assert_eq!(
+            out.warnings,
+            [
+                "b will still not load in r: the local server b has its name there, and Claude Code loads that one \
+              instead."
+            ]
+        );
+        // A project server not approved: turning it on there does not approve it.
+        let out = switch(id(Scope::Project, Some(&p), "t"), &p, true).unwrap();
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("Turning it on does not approve it")),
+            "{:?}",
+            out.warnings
+        );
+        let out = switch(id(Scope::Project, Some(&p), "u"), &p, false).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
     }
 }

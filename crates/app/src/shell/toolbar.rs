@@ -113,10 +113,24 @@ impl ShellApp {
         // Wraps onto a second line when the window is narrow: buttons past the edge would be cut off and unreachable.
         ui.horizontal_wrapped(|ui| {
             for tool in Tool::ALL {
-                let tip = if tool == Tool::Export {
-                    export_tip
-                } else {
-                    tool.tip()
+                let switch_tip;
+                let tip = match tool {
+                    Tool::Export => export_tip,
+                    // Seen from one project: switched there only, saved at once with Undo.
+                    Tool::TurnOn | Tool::TurnOff => {
+                        switch_tip = match &self.lens {
+                            Some(p) => format!(
+                                "{} in {} (Space), saved at once with Undo",
+                                tool.tip(),
+                                crate::profiles::shown_project(p, &self.snapshot)
+                            ),
+                            None => {
+                                format!("{} (Space)", tool.tip())
+                            }
+                        };
+                        &switch_tip
+                    }
+                    _ => tool.tip(),
                 };
                 let button = egui::Button::new(RichText::new(tool.glyph()).size(16.0))
                     .min_size(egui::vec2(44.0, 38.0));

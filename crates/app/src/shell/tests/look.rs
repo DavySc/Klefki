@@ -801,3 +801,57 @@ fn a_user_server_diagnosed_in_a_project() {
         .unwrap();
     shot(&mut h, "diagnosed-in-project");
 }
+
+/// The list seen from one project (Gateway): what Claude Code loads there, off there, and a switch made there with
+/// its Undo; and the same at the smallest window.
+#[test]
+fn the_list_seen_from_one_project() {
+    let mut snapshot = (*fixture_snapshot()).clone();
+    snapshot.projects = ["C:/Repos/Gateway", "C:/Repos/WebApp", "C:/Repos/shop"]
+        .map(str::to_owned)
+        .to_vec();
+    for s in &mut snapshot.servers {
+        if s.scope == Scope::User && s.name == "gateway" {
+            s.disabled_projects = vec!["C:/Repos/Gateway".to_owned()];
+        }
+    }
+    let snapshot = Arc::new(snapshot);
+    let mut all = SnapshotResults::new();
+    for (size, name) in [
+        (PAGE, "connections-one-project"),
+        (SMALL, "connections-one-project-800x480"),
+    ] {
+        let (mut h, _engine) =
+            app_showing(Arc::clone(&snapshot), size, ThemeChoice::Dark, Tone::Cool);
+        h.state_mut().look_in(Some("C:/Repos/Gateway".to_owned()));
+        select(&mut h, "gateway", Scope::User);
+        shot(&mut h, name);
+        all.extend_harness(&mut h);
+    }
+    let (mut h, engine) = app_showing(snapshot, PAGE, ThemeChoice::Dark, Tone::Cool);
+    h.state_mut().look_in(Some("C:/Repos/Gateway".to_owned()));
+    select(&mut h, "issue-tracker", Scope::User);
+    let mut switched = plan(false);
+    switched.id = 3;
+    switched.restart =
+        Some("Restart Claude Code sessions already open in Gateway to pick it up.".to_owned());
+    h.state_mut().plan = Some(Arc::new(switched));
+    h.state_mut().quiet_plan = Some((3, "Turned off issue-tracker in Gateway.".to_owned()));
+    engine
+        .events
+        .send(Event::Applied {
+            plan: 3,
+            changed: true,
+            backup: Some("C:/Users/me/AppData/Roaming/klefki/backups/claude.json.1".to_owned()),
+            notes: Vec::new(),
+            undo: Some(klefki_core::api::Undo {
+                switches: Vec::new(),
+                records: Vec::new(),
+            }),
+        })
+        .unwrap();
+    h.run();
+    h.step();
+    shot(&mut h, "switched-in-one-project");
+    all.extend_harness(&mut h);
+}

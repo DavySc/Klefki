@@ -126,6 +126,7 @@ Changed from the original look at the owner's request. Dark (Mocha) is the defau
   - Top bar: title, CLI version, global search, refresh.
   - Icon toolbar: Add, Edit, Duplicate, Move/Copy, Enable, Disable, Delete, Re-authorize, Refresh scopes, Export, Import.
   - Grid (`TableBuilder`): grouped by scope/project, sortable, multi-select, badges for shadowed, casing and invalid.
+  - Where: All projects, or one project. In one, the grid shows what Claude Code loads there (off, or not loaded and why), and Turn on / Turn off and Space act there only, saved straight away with Undo (Ctrl/Cmd+Z) when nothing needs weighing.
   - Detail form on the right, with tabs: General, Auth, Headers/Env (masked), Raw JSON (live validation), Status/CLI output.
 - **Dialogs**: plan confirmation with a unified diff, add wizard, login (PTY pane), duplicate (several local targets, default name `<name>_copy`), move/copy, import preview, secret prompt, casing fix.
 - **Shortcuts**:

@@ -403,6 +403,7 @@ impl ShellApp {
                             u.scope == Scope::User && u.name == s.name && u.shadowed_in.contains(p)
                         })
                     });
+                let here = self.here(i).cloned();
                 egui::Grid::new("general")
                     .num_columns(2)
                     .spacing([12.0, 6.0])
@@ -469,6 +470,16 @@ impl ShellApp {
                             "no".to_owned()
                         };
                         let enabled = kv("Enabled", enabled);
+                        // Seen from one project: how it stands there, beside how it stands across them.
+                        if let (Some(here), Some(project)) = (&here, &self.lens) {
+                            let place = crate::profiles::shown_project(project, &self.snapshot);
+                            let text = match (&here.held, here.off) {
+                                (_, true) => "off".to_owned(),
+                                (Some(why), false) => format!("on, but not loaded: {why}"),
+                                (None, false) => "on".to_owned(),
+                            };
+                            kv(&format!("In {place}"), text).on_hover_text(project.as_str());
+                        }
                         if !s.disabled_projects.is_empty() {
                             enabled.on_hover_text(projects_paths(&s.disabled_projects));
                         }

@@ -440,6 +440,7 @@ fn the_outcome_message_never_covers_the_save_bar() {
                 // With the button that opens the log, the widest the card's buttons get.
                 logged: kind != "success",
                 type_path: false,
+                quiet: false,
                 undo,
             });
             h.run();

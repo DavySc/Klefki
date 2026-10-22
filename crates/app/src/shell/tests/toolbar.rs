@@ -27,8 +27,8 @@ fn each_toolbar_button_says_on_hover_what_it_does_and_its_shortcut() {
         (Tool::Duplicate, "Duplicate (Ctrl+D)"),
         (Tool::Move, "Move (Ctrl+Shift+M)"),
         (Tool::SignIn, "Sign in"),
-        (Tool::TurnOn, "Turn on"),
-        (Tool::TurnOff, "Turn off"),
+        (Tool::TurnOn, "Turn on (Space)"),
+        (Tool::TurnOff, "Turn off (Space)"),
         (Tool::Delete, "Delete (Del)"),
         (Tool::Export, "Export the servers in the list"),
     ] {

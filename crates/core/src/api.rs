@@ -18,7 +18,7 @@ pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
 pub use crate::inspector::InspectorCommand;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
-pub use crate::ops::{profile_alone_in, profile_in_use};
+pub use crate::ops::{Here, in_project, profile_alone_in, profile_in_use};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::profile_uses::{ProfileUse, ProfileUses, Switch};
 pub use crate::profiles::{Profile, Profiles};
