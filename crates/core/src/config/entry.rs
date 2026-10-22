@@ -24,6 +24,15 @@ pub(crate) fn masked(entry: &Value) -> Value {
     out
 }
 
+/// The environment and header values of `entry`: what [`masked`] hides, for hiding them in text read elsewhere.
+pub(crate) fn values(entry: &Value) -> Vec<String> {
+    MASKED_KEYS
+        .iter()
+        .filter_map(|key| entry.get(key).and_then(Value::as_object))
+        .flat_map(|values| values.values().filter_map(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
 /// Puts the values back that the user left as [`MASK`], from `old`. A mask for a name that had no value is an error:
 /// there is nothing to keep.
 pub(crate) fn unmasked(new: &Value, old: &Value) -> Result<Value, String> {

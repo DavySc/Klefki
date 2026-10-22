@@ -548,6 +548,7 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             sign_in_timeout: Duration::from_secs(5),
             changer: Some(changer),
             desktop: crate::desktop::DesktopRoots::default(),
+            claude_logs: None,
             releases: Arc::new(crate::update::Offline),
             release_key: None,
             install: crate::install::InstallKind::Manual("Updated by hand in tests.".into()),

@@ -337,6 +337,55 @@ pub struct Timing {
     pub timed_out: bool,
 }
 
+/// The last times Claude Code started a server, from its own logs ([`Command::LastStarts`], decision 013). Read, never
+/// written; text is sanitised and what may be a secret is hidden.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LastStarts {
+    /// The newest start in each folder Claude Code was started in, newest first, at most a few.
+    pub starts: Vec<LastStart>,
+    /// Other servers whose names Claude Code writes the same in a folder name (`my.server`, `my-server`): their
+    /// starts may be among these.
+    pub shares_log_with: Vec<String>,
+    /// Why nothing could be read, or why the logs are about another server.
+    pub problem: Option<String>,
+    /// Where Claude Code keeps the logs, as shown, for when there is no start.
+    pub looked_in: Option<String>,
+}
+
+/// One start of a server, as Claude Code's log for it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastStart {
+    /// The folder Claude Code was started in, as shown (`~/code/app`).
+    pub folder: String,
+    /// When, in local time: "Today 14:05".
+    pub when: String,
+    /// To the second, with its offset from UTC.
+    pub exact: String,
+    pub outcome: StartOutcome,
+    /// What the server printed on stderr, the latest lines last.
+    pub server_said: Vec<String>,
+    /// What the failure most likely means.
+    pub hints: Vec<Hint>,
+    /// The log was too large to read whole: only its start and its end were read.
+    pub partly: bool,
+    /// The log file, as shown.
+    pub file: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// It connected, after this long when the log says.
+    Connected { after: Option<std::time::Duration> },
+    /// It did not: Claude Code's code for why (`CONNECTION_CLOSED`, `CONNECT_TIMEOUT`, `ENOENT`) and its message.
+    Failed {
+        code: Option<String>,
+        said: String,
+        after: Option<std::time::Duration>,
+    },
+    /// The log says neither: the start is still going on, or it was stopped before it ended.
+    Unknown,
+}
+
 /// Where policy keeps a server from loading, and why. Sanitised.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blocked {
@@ -502,6 +551,7 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         sign_in_timeout: std::time::Duration::from_secs(5 * 60),
         changer: None,
         desktop: crate::desktop::DesktopRoots::discover(),
+        claude_logs: directories::BaseDirs::new().map(|d| crate::last_start::root(d.cache_dir())),
         // Only the app looks for updates ([`start`]): the command-line tool then carries no TLS code at all.
         releases: std::sync::Arc::new(crate::update::Offline),
         release_key: None,

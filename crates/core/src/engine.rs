@@ -49,6 +49,9 @@ pub enum Command {
     /// limit, to tell a server that is slow to start from one that never answers. Its answer always comes with a
     /// [`crate::api::Timing`].
     CheckLonger(ServerId),
+    /// The last times Claude Code started this server, read from its own logs (see [`Event::LastStarts`], decision
+    /// 013). Starts nothing and writes nothing.
+    LastStarts(ServerId),
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
@@ -409,6 +412,11 @@ pub enum Event {
         id: ServerId,
         diagnosis: Diagnosis,
     },
+    /// What Claude Code's logs say about the server's last starts, after [`Command::LastStarts`].
+    LastStarts {
+        id: ServerId,
+        starts: crate::api::LastStarts,
+    },
     PlanReady(PlanView),
     /// The changes could not be turned into a plan (nothing was written).
     PlanFailed(String),
@@ -684,6 +692,9 @@ pub(crate) struct EngineConfig {
     pub install: crate::install::InstallKind,
     /// Where downloaded updates wait to be installed; `None` turns downloading off.
     pub updates_dir: Option<PathBuf>,
+    /// Where Claude Code keeps its MCP logs (`claude-cli-nodejs` in the cache folder); `None` when unknown. Tests give a
+    /// folder of their own.
+    pub claude_logs: Option<PathBuf>,
     /// The version this copy of Klefki is, which a release must be newer than. Tests fix it, so their signed test
     /// release stays newer whatever the workspace's version is.
     pub version: crate::update::Version,
@@ -887,7 +898,7 @@ struct State {
 }
 
 /// `said` is the text the failure was recognised in, where its error code is looked up.
-fn hint(kind: HintKind, said: &str) -> Hint {
+pub(crate) fn hint(kind: HintKind, said: &str) -> Hint {
     Hint {
         title: kind.title().to_owned(),
         code: kind.code_in(said).map(str::to_owned),

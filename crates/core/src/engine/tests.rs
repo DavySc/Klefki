@@ -84,6 +84,7 @@ impl Env {
             sign_in_timeout: Duration::from_secs(20),
             changer: None,
             desktop: crate::desktop::DesktopRoots::default(),
+            claude_logs: None,
             releases: Arc::new(crate::update::Offline),
             release_key: None,
             install: crate::install::InstallKind::Manual("Updated by hand in tests.".into()),
@@ -743,6 +744,7 @@ mod diagnose;
 mod edits;
 mod export;
 mod golden;
+mod last_starts;
 mod oauth;
 mod profiles;
 mod reload;

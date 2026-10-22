@@ -1,0 +1,6 @@
+{"debug":"Starting connection with timeout of 5000ms","timestamp":"2026-10-22T07:32:16.385Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"version negotiation probe closed the stdio server (rmcp-class pre-init hard close); respawning pinned legacy","timestamp":"2026-10-22T07:32:16.675Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"stderr of the stdio server before restarting it: starting fail server, token=[REDACTED]\nError: Cannot find module 'foo'\n    at Module._resolve (node:internal)\n","timestamp":"2026-10-22T07:32:16.680Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"error":"Server stderr: starting fail server, token=[REDACTED]\nError: Cannot find module 'foo'\n    at Module._resolve (node:internal)\n","timestamp":"2026-10-22T07:32:16.758Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"debug":"Connection failed after 388ms, 389ms of it awake (CONNECTION_CLOSED): Connection closed","timestamp":"2026-10-22T07:32:16.763Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}
+{"error":"Connection failed (CONNECTION_CLOSED): Connection closed","timestamp":"2026-10-22T07:32:16.763Z","sessionId":"00000000-0000-4000-8000-000000000000","cwd":"/home/u/proj"}

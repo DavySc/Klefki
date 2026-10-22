@@ -372,7 +372,7 @@ fn shown(s: &str) -> String {
     clip(&sanitize_line(s), MAX_TEXT)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -389,7 +389,7 @@ const MONTHS: [&str; 12] = [
 
 /// `at` as the user reads it, in local time, next to `now`. `offset` gives the local offset from UTC in seconds at
 /// a moment (seconds since 1970), so a change from before a daylight-saving switch shows the hour it had then.
-fn when(at_ms: u64, now_ms: u64, offset: impl Fn(i64) -> i64) -> String {
+pub(crate) fn when(at_ms: u64, now_ms: u64, offset: impl Fn(i64) -> i64) -> String {
     let local = |ms: u64| {
         let secs = secs_of(ms);
         secs + offset(secs)
@@ -430,7 +430,7 @@ fn on_day_at(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
 }
 
 /// `at` to the second, in local time, with the offset it had then.
-fn exact(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
+pub(crate) fn exact(at_ms: u64, offset: impl Fn(i64) -> i64) -> String {
     let secs = secs_of(at_ms);
     let off = offset(secs);
     let local = secs + off;
@@ -462,8 +462,7 @@ fn civil(days: i64) -> (i64, u32, u32) {
 }
 
 /// The day number of a date, the inverse of [`civil`].
-#[cfg(any(windows, test))]
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
@@ -474,7 +473,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 }
 
 #[cfg(unix)]
-fn local_offset_secs(at: i64) -> i64 {
+pub(crate) fn local_offset_secs(at: i64) -> i64 {
     let time = at as libc::time_t;
     // SAFETY: `localtime_r` writes only into `tm`, which outlives the call; both pointers are valid.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -490,7 +489,7 @@ fn word(n: i64) -> u16 {
 }
 
 #[cfg(windows)]
-fn local_offset_secs(at: i64) -> i64 {
+pub(crate) fn local_offset_secs(at: i64) -> i64 {
     use windows_sys::Win32::Foundation::SYSTEMTIME;
     use windows_sys::Win32::System::Time::SystemTimeToTzSpecificLocalTime;
     let (day, secs) = (at.div_euclid(86_400), at.rem_euclid(86_400));
@@ -522,7 +521,7 @@ fn local_offset_secs(at: i64) -> i64 {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn local_offset_secs(_at: i64) -> i64 {
+pub(crate) fn local_offset_secs(_at: i64) -> i64 {
     0
 }
 

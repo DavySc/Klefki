@@ -19,7 +19,7 @@ const FALLBACK_LINES: usize = 25;
 const MAX_SERVER_LINES: usize = 20;
 
 /// Markers after which the client logs what the stdio server itself printed on stderr.
-const STDERR_MARKERS: &[&str] = &[
+pub(crate) const STDERR_MARKERS: &[&str] = &[
     "Server stderr: ",
     "stderr of the stdio server before restarting it: ",
 ];

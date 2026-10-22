@@ -610,7 +610,10 @@ fn definition_asked_for(
     click(&mut h, "alpha");
     ask(&mut h);
     h.run();
-    assert_eq!(drain(&engine), vec![Command::Inspect(a.id())]);
+    // Asked through the Status tab, its last starts were read first.
+    let mut sent = drain(&engine);
+    sent.retain(|c| *c != Command::LastStarts(a.id()));
+    assert_eq!(sent, vec![Command::Inspect(a.id())]);
     engine.events.send(entry_event(&a, json, true)).unwrap();
     h.run();
     (h, engine)
@@ -767,6 +770,7 @@ fn diagnose_asks_the_engine_and_waits_while_a_check_runs() {
     let row = live_row("bad-stdio", Scope::User, None);
     show_rows(&mut h, &engine, vec![row.clone()]);
     open_status_tab(&mut h, "bad-stdio");
+    assert_eq!(drain(&engine), vec![Command::LastStarts(row.id())]);
     click(&mut h, "Diagnose");
     assert_eq!(
         next_command(&engine).unwrap(),
@@ -1000,6 +1004,7 @@ fn a_timeout_says_how_long_claude_code_waits_and_offers_more_time() {
         .unwrap();
     h.run();
     open_status_tab(&mut h, "slow");
+    assert_eq!(drain(&engine), vec![Command::LastStarts(row.id())]);
     h.get_by_label_contains("It gave up after 28 s; Claude Code's limit for connecting is 30 s");
     click(&mut h, LONGER);
     assert_eq!(

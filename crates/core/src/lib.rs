@@ -23,6 +23,7 @@ mod form;
 mod hex;
 mod import_file;
 mod install;
+mod last_start;
 mod model;
 mod ops;
 mod paste;

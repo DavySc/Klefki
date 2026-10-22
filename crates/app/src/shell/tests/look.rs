@@ -626,3 +626,71 @@ fn signing_in() {
         all.extend_harness(&mut h);
     }
 }
+
+/// `azure-devops` failed in a project the last time, and connected in the home folder before.
+#[test]
+fn last_starts_from_claude_codes_logs() {
+    use klefki_core::api::{Hint, LastStart, LastStarts, StartOutcome};
+    use std::time::Duration;
+    let (mut h, engine) = app_at(PAGE);
+    select(&mut h, "azure-devops", Scope::User);
+    h.state_mut().tab = DetailTab::Status;
+    h.run();
+    let id = {
+        let i = row(&h, "azure-devops", Scope::User);
+        h.state().snapshot.servers[i].id()
+    };
+    let start = |folder: &str, when: &str, outcome: StartOutcome| {
+        LastStart {
+        folder: folder.to_owned(),
+        when: when.to_owned(),
+        exact: format!("22 Oct 2026, {when} (UTC+02:00)"),
+        outcome,
+        server_said: Vec::new(),
+        hints: Vec::new(),
+        partly: false,
+        file: "~/.cache/claude-cli-nodejs/-home-me-code-shop/mcp-logs-azure-devops/2026-10-22T07-32-16-377Z.jsonl"
+            .to_owned(),
+    }
+    };
+    let failed = LastStart {
+        server_said: vec![
+            "npm error 404 Not Found - GET https://registry.npmjs.org/@azure-devops%2fmcp"
+                .to_owned(),
+            "npm error 404  '@azure-devops/mcp@*' is not in this registry.".to_owned(),
+        ],
+        hints: vec![Hint {
+            title: "Installing the server's package failed".to_owned(),
+            code: None,
+            help: vec!["Check the package name and that npm can reach its registry.".to_owned()],
+            points_at: None,
+        }],
+        ..start(
+            "~/code/shop",
+            "Today 09:32",
+            StartOutcome::Failed {
+                code: Some("CONNECTION_CLOSED".to_owned()),
+                said: "Connection closed".to_owned(),
+                after: Some(Duration::from_millis(2380)),
+            },
+        )
+    };
+    let connected = start(
+        "~",
+        "Today 08:10",
+        StartOutcome::Connected {
+            after: Some(Duration::from_millis(1420)),
+        },
+    );
+    engine
+        .events
+        .send(Event::LastStarts {
+            id,
+            starts: LastStarts {
+                starts: vec![failed, connected],
+                ..LastStarts::default()
+            },
+        })
+        .unwrap();
+    shot(&mut h, "last-starts");
+}
