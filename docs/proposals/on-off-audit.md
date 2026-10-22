@@ -44,8 +44,8 @@ by accident.
 
 L9 changes what "waste" means. With tool search on, an extra server costs a process, start-up time, its server
 instructions and a place in the search catalogue, and it adds **ambiguity**: overlapping tools lower the model's
-chance of picking the right one ([ToolScope, arXiv 2510.20036](https://arxiv.org/abs/2510.20036), up to 38.6 %
-better tool selection after merging overlapping tools). With tool search off, the full schemas are paid on every
+chance of picking the right one ([ToolScope, arXiv 2510.20036](https://arxiv.org/abs/2510.20036), 8.4 to 38.6 %
+better tool selection after merging overlapping tools and filtering by context). With tool search off, the full schemas are paid on every
 request too. So overlap is a **quality** problem as well as a cost one, which supports the owner's framing.
 
 ## Findings, ranked by risk
@@ -59,20 +59,21 @@ request too. So overlap is a **quality** problem as well as a cost one, which su
 2. **R: the main switch of a user server, plugin server, organisation server or connector acts on every project at
    once** (`switch_everywhere`). There is no "off in this project" on the Connections page; only a profile can do
    that. A single **Turn on** wipes every per-project off switch, including ones a profile set, which that profile then
-   forgets (decision 012, B1). A single **Turn off** removes a server from every project, including those whose work
+   forgets (`docs/decisions/012-profiles.md`, line 68: a switch written by another change is the user's from then on). A single **Turn off** removes a server from every project, including those whose work
    needs it. Read; the review does list each project, but as a diff.
 3. **R: "off" is not off for new projects.** A user server shown "off" (off in every known project) loads in any
    project Claude Code opens later, and in any folder outside git; `klefki-cli list` prints `off`. The review warns once
    ("a project it first opens later is not covered"), the list never does. Verified with `klefki-cli list`.
 4. **R/F: no Undo for switches or profile use.** Undo exists only for Move. "Only these servers there" (ticked by
-   default) can turn off 11 servers, connectors and plugin servers included, with no Undo in the toast (UX pass W5).
+   default) can turn off 11 servers, connectors and plugin servers included, with no Undo in the toast (found in the UX pass before v0.2.0, 2026-10-20).
    Restore from the Activity log is the only way back, and it restores the whole `.claude.json` state. Read.
    Undo is the expected safety net for reversible actions; confirmations are for irreversible ones
    ([NN/g, Confirmation dialogs can prevent user errors, if not overused](https://www.nngroup.com/articles/confirmation-dialog/);
    [Blender HIG, Dialogs](https://developer.blender.org/docs/features/interface/human_interface_guidelines/dialogs/):
    people who see confirmations often click them away, so a dialog should not be the only protection;
-   [NN/g, User control and freedom](https://www.nngroup.com/articles/user-control-and-freedom/);
-   [Raymond Chen on undo without prompts](https://devblogs.microsoft.com/oldnewthing/20160802-00/?p=94005)).
+   [NN/g, User control and freedom](https://www.nngroup.com/articles/user-control-and-freedom/)).
+   Undo commands themselves don't usually prompt, even for undoing a copy
+   ([Raymond Chen](https://devblogs.microsoft.com/oldnewthing/20160802-00/?p=94005)): a weaker, anecdotal source.
 
 ### Medium
 5. **F: every switch is a modal review with a diff.** One server, one project: select, click, read, confirm. Frequent
@@ -114,7 +115,8 @@ already does). The CLI already prints the backup it kept; it needs nothing more 
 view) or one project, most recently used first. In one project the list shows what Claude Code loads **there**
 (what is off, held by policy, shadowed, not approved), and Turn on / Turn off and **Space** act in that project
 only. Switches made in one project skip the diff dialog and show an Undo toast instead (S2); switches across all
-projects keep the review. **Needs the owner's OK**: it relaxes "every write shows a review" for one-project switches
+projects keep the review.
+Approved by the owner (2026-10-22): it relaxes "every write shows a review" for one-project switches
 (the plan, docstore, backup and Activity log all stay).
 
 **S4. Profiles as the main way to switch (findings 6, 9, 10).** "Switch to" a profile in a project: stop the profile
@@ -124,9 +126,11 @@ in use there and use the new one, as one plan, one Undo. A project's lens (S3) s
 **S5. Start a session with a profile (findings 1, 6).** "Copy start command" on a profile: `claude --settings
 '{"allowedMcpServers":[…]}'` for that profile, plus `klefki-cli run PROFILE` that starts Claude Code with it. Nothing
 is written, nothing goes stale, nothing needs putting back, and parallel sessions can differ. Klefki first checks the
-members are on in that project (L7) and that the user's own `settings.json` has no `allowedMcpServers` (union, L7),
-and says so if not. Connector names under `allowedMcpServers` need checking with a signed-in account first. **Needs
-the owner's OK** (a new way to start Claude Code; the binary rules stay).
+members are on in that project (L7), and that no other settings source has an `allowedMcpServers` list: the flag's
+list is added to the user's `settings.json` one (L7) and, as the cross-review found, to the project's
+`.claude/settings.local.json` one, and the organisation's policy can narrow it. If one does, Klefki says so.
+Connector names under `allowedMcpServers` need checking with a signed-in account first. Approved by the owner
+(2026-10-22): a new way to start Claude Code; the binary rules stay.
 
 **S6. Overlap and cost (finding 8), after the tools view (roadmap item 3).** Per project: servers that offer the same
 tool names, the same package or the same address under two names; a token estimate per server, and whether tool
@@ -141,8 +145,9 @@ Not recommended: writing an MCP key to `settings.json` to make running sessions 
 undocumented, only works for turning on, and writes a file the user did not ask to change.
 
 ## Open questions for the owner
-- S3: may a switch in one project apply with Undo instead of a review dialog?
+- S3: may a switch in one project apply with Undo instead of a review dialog? **Answered yes** (owner, 2026-10-22).
 - S5: may Klefki offer a command (and `klefki-cli run`) that starts Claude Code with a profile's servers only?
+  **Answered yes** (owner, 2026-10-22).
 - S7: may Klefki read tool names (only) from Claude Code's session transcripts?
 - "Turn off for good" through `deniedMcpServers` in user `settings.json` (still open from item 2) would close
   finding 3 for servers someone never wants: still wanted?

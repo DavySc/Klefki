@@ -15,4 +15,4 @@ Checks run:
 Open failures:
 - `klefki-cli use` inside a git worktree is refused (finding 7); reproducer belongs in slice S4.
 
-Next: the owner picks the order and answers the open questions; then S1 (say what the running session gets).
+Next: the owner approved S1-S5 in order (S3 and S5 included); S1 started in its own thread. PR #101 holds this doc; cross-review folded in.
