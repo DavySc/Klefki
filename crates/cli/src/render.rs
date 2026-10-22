@@ -635,6 +635,13 @@ pub(crate) fn profiles_text(
             trim_end(&mut out);
             out.push('\n');
         }
+        let in_use: Vec<String> = klefki_core::api::profile_in_use(&profile.name, snapshot)
+            .iter()
+            .map(|p| short_path(p, home))
+            .collect();
+        if !in_use.is_empty() {
+            let _ = writeln!(out, "  In use in {}.", in_use.join(", "));
+        }
         let alone: Vec<String> = klefki_core::api::profile_alone_in(&profile.members, snapshot)
             .iter()
             .map(|p| short_path(p, home))
@@ -666,6 +673,7 @@ pub(crate) fn profiles_json(profiles: &klefki_core::api::Profiles, snapshot: &Sn
             json!({
                 "name": profile.name,
                 "servers": servers,
+                "in_use": klefki_core::api::profile_in_use(&profile.name, snapshot),
                 "alone_in": klefki_core::api::profile_alone_in(&profile.members, snapshot),
             })
         })

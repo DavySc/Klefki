@@ -291,6 +291,17 @@ pub enum Change {
         project: Option<String>,
         delete: bool,
     },
+    /// Stop using the profiles `from` in `project` and use the profile `name` there instead, as one change: each of
+    /// `from` is stopped as [`Change::StopProfile`] stops it, one after another, then `name` is used as
+    /// [`Change::UseProfile`] uses it on the files as they would be by then. So stopping `name` later goes back to
+    /// before all of them. With no `from` (or only `name` itself), it is using `name`.
+    SwitchProfile {
+        from: Vec<String>,
+        name: String,
+        members: Vec<crate::model::ConnectionId>,
+        project: String,
+        only: bool,
+    },
     /// Put back what a change that only flipped switches did, as [`Event::Applied`] gave it: each switch while it
     /// is still as that change left it, and what Klefki remembers of profiles. Reviewed on its own, not with other
     /// changes.

@@ -353,6 +353,17 @@ impl ProfilesPage {
                         })
                         .collect()
                 });
+                // Each profile's projects in use, in the profiles' order: which a card's Use would switch from.
+                let in_use_all: Vec<(&str, &[(String, String)])> = profiles
+                    .profiles
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.name.as_str(),
+                            in_use.get(&p.name).map_or(&[][..], Vec::as_slice),
+                        )
+                    })
+                    .collect();
                 let query = self.filter.trim().to_lowercase();
                 let shown: Vec<&Profile> = profiles
                     .profiles
@@ -380,6 +391,7 @@ impl ProfilesPage {
                         Context {
                             alone: alone.get(&profile.name).map_or(&[], Vec::as_slice),
                             in_use: in_use.get(&profile.name).map_or(&[], Vec::as_slice),
+                            in_use_all: &in_use_all,
                             reveal,
                             editable,
                         },
@@ -424,6 +436,8 @@ struct Context<'a> {
     /// The projects (as shown) where it is in use: stopping it there puts back what it switched.
     /// Each as `.claude.json` spells it, and as shown.
     in_use: &'a [(String, String)],
+    /// Every profile's [`Context::in_use`], by name, in the profiles' order: the ones a Use there would switch from.
+    in_use_all: &'a [(&'a str, &'a [(String, String)])],
     /// Bring it into view, with where to use it taking the keyboard.
     reveal: bool,
     editable: bool,
@@ -657,28 +671,89 @@ fn card(
                     "Every other server in that project is turned off, so these are the only ones Claude Code \
                      loads there.",
                 );
-                let go = egui::Button::new(
-                    RichText::new("Use profile…").strong().color(pal.on_bright),
-                )
-                .fill(pal.primary);
-                if ui
-                    .add(go)
-                    .on_hover_text("See what changes before anything is saved.")
-                    .clicked()
-                {
-                    match &choice.place {
-                        Some(place) => {
-                            out = Some(Card::Asked(Asked::Use(Box::new(Change::UseProfile {
+                // Other profiles in use in the project chosen: the main button switches from them (finding 9 of the
+                // on/off audit: using one over another stacked them, and nothing said so).
+                let others = match &choice.place {
+                    Some(Some(p)) => in_use_at(cx.in_use_all, p, &profile.name),
+                    _ => Vec::new(),
+                };
+                let use_it = |project: Option<String>, only: bool| {
+                    Card::Asked(Asked::Use(Box::new(Change::UseProfile {
+                        name: profile.name.clone(),
+                        members: profile.members.clone(),
+                        project,
+                        only,
+                    })))
+                };
+                match (&choice.place, others.is_empty()) {
+                    (Some(Some(project)), false) => {
+                        let shown = shown_project(project, snapshot);
+                        let from = named_few(&others);
+                        let go = egui::Button::new(
+                            RichText::new(format!("Switch from {from}…"))
+                                .strong()
+                                .color(pal.on_bright),
+                        )
+                        .fill(pal.primary);
+                        if ui
+                            .add(go)
+                            .on_hover_text(format!(
+                                "Stop using {from} in {shown} and use {} there, as one change. You see every \
+                                 change before it is saved, and can undo it.",
+                                profile.name
+                            ))
+                            .clicked()
+                        {
+                            out = Some(Card::Asked(Asked::Use(Box::new(Change::SwitchProfile {
+                                from: others.clone(),
                                 name: profile.name.clone(),
                                 members: profile.members.clone(),
-                                project: place.clone(),
+                                project: project.clone(),
                                 only: choice.only,
                             }))));
                         }
-                        None => choice.asked = true,
+                        if ui
+                            .button("Use as well…")
+                            .on_hover_text(format!(
+                                "Keep {from} in use there too: stopping {} later goes back to what {from} set.",
+                                profile.name
+                            ))
+                            .clicked()
+                        {
+                            out = Some(use_it(Some(project.clone()), choice.only));
+                        }
+                    }
+                    _ => {
+                        let go = egui::Button::new(
+                            RichText::new("Use profile…").strong().color(pal.on_bright),
+                        )
+                        .fill(pal.primary);
+                        if ui
+                            .add(go)
+                            .on_hover_text("See what changes before anything is saved.")
+                            .clicked()
+                        {
+                            match &choice.place {
+                                Some(place) => out = Some(use_it(place.clone(), choice.only)),
+                                None => choice.asked = true,
+                            }
+                        }
                     }
                 }
             });
+            if let Some(Some(project)) = &choice.place {
+                let others = in_use_at(cx.in_use_all, project, &profile.name);
+                if !others.is_empty() {
+                    muted(
+                        ui,
+                        &format!(
+                            "{} in use in {}.",
+                            named_few(&others),
+                            shown_project(project, snapshot)
+                        ),
+                    );
+                }
+            }
             if choice.asked && choice.place.is_none() {
                 warn(ui, "Choose a project to use it in first.");
             }
@@ -702,6 +777,14 @@ fn card(
             }
         });
     out
+}
+
+/// The profiles other than `own` in use in `project` (as `.claude.json` spells it), in the profiles' order.
+fn in_use_at(all: &[(&str, &[(String, String)])], project: &str, own: &str) -> Vec<String> {
+    all.iter()
+        .filter(|(name, places)| *name != own && places.iter().any(|(p, _)| p == project))
+        .map(|(name, _)| (*name).to_owned())
+        .collect()
 }
 
 /// The project list: by folder name, with the folder it is in muted, then Every project. Typed into, when long.

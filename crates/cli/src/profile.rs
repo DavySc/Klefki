@@ -95,33 +95,49 @@ fn known(snapshot: &Snapshot, folder: &std::path::Path) -> Option<String> {
 }
 
 /// The root of the git repository `folder` is in: the nearest folder, itself or above, that holds `.git` (a folder,
-/// or a file in a worktree).
+/// or a file). In a worktree, the main checkout's root: Claude Code uses its project there.
 fn git_root(folder: &std::path::Path) -> Option<std::path::PathBuf> {
-    folder
-        .ancestors()
-        .find(|dir| dir.join(".git").exists())
-        .map(std::path::Path::to_path_buf)
+    let root = folder.ancestors().find(|dir| dir.join(".git").exists())?;
+    Some(main_checkout(root).unwrap_or_else(|| root.to_path_buf()))
 }
 
-/// Uses `profile` in `project` (every project when `None`): shows the plan on stdout, asks at a terminal unless
+/// The main checkout of the worktree at `root`: its `.git` file names the worktree's folder inside the main `.git`
+/// (`gitdir: …`, absolute or relative to `root`), whose `commondir` leads back to that `.git`. `None` for anything
+/// else: a `.git` folder, a submodule (no `commondir`), a bare repository, a file that cannot be read.
+fn main_checkout(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+    /// A `.git` file or `commondir` holds one path; more than this is not one git wrote.
+    const MAX: u64 = 4096;
+    let read = |path: &std::path::Path| {
+        let mut text = String::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(MAX)
+            .read_to_string(&mut text)
+            .ok()?;
+        Some(text)
+    };
+    let dot_git = root.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let text = read(&dot_git)?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir = root.join(gitdir);
+    let common = gitdir.join(read(&gitdir.join("commondir"))?.trim());
+    let common = std::fs::canonicalize(common).ok()?;
+    (common.file_name()? == ".git").then(|| common.parent().map(std::path::Path::to_path_buf))?
+}
+
+/// Makes the plan for `change` (using, switching or stopping a profile): shows it on stdout, asks at a terminal unless
 /// `yes`, and saves it.
-pub(crate) fn use_profile(
-    profile: &api::Profile,
-    project: Option<String>,
-    only: bool,
-    yes: bool,
-) -> Used {
+pub(crate) fn run(change: Change, yes: bool) -> Used {
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     // The engine the app uses, without background checks or watching: only what is asked for here runs.
     let core = api::start_headless(None, move || {
         let _ = wake_tx.send(());
     });
-    core.send(Command::Prepare(vec![Change::UseProfile {
-        name: profile.name.clone(),
-        members: profile.members.clone(),
-        project,
-        only,
-    }]));
+    core.send(Command::Prepare(vec![change]));
     let deadline = Instant::now() + PREPARE;
     let plan = loop {
         match next(&core, &wake_rx, deadline) {

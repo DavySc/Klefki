@@ -61,8 +61,8 @@ pub(crate) struct Resolved {
     pub others_on: bool,
     /// Profiles used: what each switches, remembered once it is saved so that stopping the profile can put it back.
     pub profiles_used: Vec<UsedProfile>,
-    /// A profile stopped: what is forgotten (and whether the profile is deleted) once it is saved.
-    pub profile_stopped: Option<StoppedProfile>,
+    /// Profiles stopped, in order: what is forgotten (and whether the profile is deleted) once it is saved.
+    pub profiles_stopped: Vec<StoppedProfile>,
     /// Switches (project, name) a change other than a profile's writes: no profile puts them back once it is saved.
     pub switched: Vec<(String, String)>,
     /// An undo: profiles' records of what they switched, put back once it is saved.
@@ -176,6 +176,10 @@ pub(crate) fn resolve(
             Change::UseProfile { .. } => "Use profile",
             Change::StopProfile { delete: false, .. } => "Stop using",
             Change::StopProfile { delete: true, .. } => "Stop using and delete",
+            Change::SwitchProfile { from, name, .. } if from.iter().any(|f| f != name) => {
+                "Switch profile"
+            }
+            Change::SwitchProfile { .. } => "Use profile",
             Change::Restore { .. } => {
                 return Err("A restore is reviewed on its own.".to_owned());
             }
@@ -229,12 +233,27 @@ pub(crate) fn resolve(
                 members,
                 project,
                 only,
-            } => use_profile(name, members, project.as_deref(), *only, snapshot, &mut out)?,
+            } => use_profile(
+                name,
+                members,
+                project.as_deref(),
+                *only,
+                snapshot,
+                snapshot,
+                &mut out,
+            )?,
             Change::StopProfile {
                 name,
                 project,
                 delete,
-            } => stop_profile(name, project.as_deref(), *delete, snapshot, &mut out)?,
+            } => stop_profile(name, project.as_deref(), *delete, true, snapshot, &mut out)?,
+            Change::SwitchProfile {
+                from,
+                name,
+                members,
+                project,
+                only,
+            } => switch_profile(from, name, members, project, *only, snapshot, &mut out)?,
             Change::Add {
                 name,
                 json,
@@ -455,6 +474,30 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
                 ""
             };
             return format!("Use the profile {} in {place}{rest}", sanitize(name));
+        }
+        Change::SwitchProfile {
+            from,
+            name,
+            project,
+            only,
+            ..
+        } => {
+            let rest = if *only {
+                ", and turn off every other server there"
+            } else {
+                ""
+            };
+            let place = project_label(project, snapshot);
+            let from = switched_from(from, name);
+            if from.is_empty() {
+                return format!("Use the profile {} in {place}{rest}", sanitize(name));
+            }
+            let from: Vec<String> = from.into_iter().map(sanitize).collect();
+            return format!(
+                "Switch {place} from {} to {}{rest}",
+                and_list(&from),
+                sanitize(name)
+            );
         }
         Change::StopProfile {
             name,
@@ -846,13 +889,15 @@ fn switch_everywhere(
 /// Turns on the servers of a profile in `project`, or in every project Claude Code knows, and with `only` turns off
 /// every other server there (decision 012). Each is switched by the name Claude Code gives it, like any toggle: only
 /// `disabledMcpServers` changes. The review says where a member will still not load, and why, so it promises only
-/// what Claude Code will do.
+/// what Claude Code will do. `files` is the files as they are, when `snapshot` is them as an earlier step of the
+/// same plan leaves them (a switch): what "only" turns off is said of the servers on now.
 fn use_profile(
     name: &str,
     members: &[crate::model::ConnectionId],
     project: Option<&str>,
     only: bool,
     snapshot: &Snapshot,
+    files: &Snapshot,
     out: &mut Resolved,
 ) -> Result<(), String> {
     let shown_profile = sanitize(name);
@@ -867,7 +912,8 @@ fn use_profile(
         });
     }
     walk.remember(name, &shown_profile, snapshot, out);
-    let (turned_off, off_places) = walk.really_off();
+    let files_now = (!std::ptr::eq(files, snapshot)).then(|| SwitchedNow::new(files));
+    let (turned_off, off_places) = walk.really_off(files_now.as_ref());
     walk.left_as_they_are(members, &shown_profile, out);
     // A server that shares a member's name is on as the member, and "only" would leave it on too.
     // Not when none of its servers loads there: "only" would then turn everything off and nothing on.
@@ -1132,8 +1178,9 @@ impl<'s> ProfileWalk<'s> {
     }
 
     /// The other servers really turned off, as shown, and in how many projects: not one that shares its name with a
-    /// member. In every project the names alone do not say where.
-    fn really_off(&self) -> (BTreeSet<String>, usize) {
+    /// member, nor one already off in the files as they are, `files_now`, when the walk's snapshot is them as a switch
+    /// leaves them. In every project the names alone do not say where.
+    fn really_off(&self, files_now: Option<&SwitchedNow>) -> (BTreeSet<String>, usize) {
         let turned_off: Vec<&(String, String, String)> = self
             .turned_off
             .iter()
@@ -1141,6 +1188,7 @@ impl<'s> ProfileWalk<'s> {
                 self.switches
                     .iter()
                     .any(|((p, n), off)| *off && p == place && n == name)
+                    && files_now.is_none_or(|now| now.off(place, name) != Some(true))
             })
             .collect();
         let off_places = turned_off
@@ -1459,11 +1507,13 @@ pub(crate) fn no_longer_put_back(
 }
 
 /// Puts back what the uses of the profile `name` switched in `project` (or wherever it was used), each switch only
-/// while it is still as the profile left it (decision 012). The review names each switch left, and why.
+/// while it is still as the profile left it (decision 012). The review names each switch left, and why; with
+/// `say_back`, each switch put back too.
 fn stop_profile(
     name: &str,
     project: Option<&str>,
     delete: bool,
+    say_back: bool,
     snapshot: &Snapshot,
     out: &mut Resolved,
 ) -> Result<(), String> {
@@ -1518,7 +1568,9 @@ fn stop_profile(
                         name: s.name.clone(),
                         disabled: !s.off,
                     });
-                    say(5, &s.project, if s.off { "on" } else { "off" }, &s.name);
+                    if say_back {
+                        say(5, &s.project, if s.off { "on" } else { "off" }, &s.name);
+                    }
                 }
             }
             continue;
@@ -1582,13 +1634,176 @@ fn stop_profile(
             )),
         }
     }
-    out.profile_stopped = Some(StoppedProfile {
+    out.profiles_stopped.push(StoppedProfile {
         profile: name.to_owned(),
         project: project.map(str::to_owned),
         handed,
         delete,
     });
     Ok(())
+}
+
+/// The profiles a switch to `to` stops: each of `from` once, not `to` itself (using it again leaves it in use).
+fn switched_from<'a>(from: &'a [String], to: &str) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for f in from {
+        if f != to && !out.contains(&f.as_str()) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+/// Stops each profile of `from` in `project`, each on the files as the one before leaves them, then uses the profile
+/// `name` there on the files as they will be by then: one plan, so one review and one Undo. The switches each stop
+/// puts back are not said one by one (the next profile may switch them again at once): what the plan does is said by
+/// the use, and the diff shows the files as they end.
+fn switch_profile(
+    from: &[String],
+    name: &str,
+    members: &[crate::model::ConnectionId],
+    project: &str,
+    only: bool,
+    snapshot: &Snapshot,
+    out: &mut Resolved,
+) -> Result<(), String> {
+    let from = switched_from(from, name);
+    // Refused before anything is stopped, as using it would be.
+    profile_places(Some(project), snapshot, &sanitize(name))?;
+    let begin = out.claude.len();
+    let mut after: Option<Snapshot> = None;
+    for stopped in &from {
+        let now = after.as_ref().unwrap_or(snapshot);
+        let start = out.claude.len();
+        stop_profile(stopped, Some(project), false, false, now, out)?;
+        let handed = out
+            .profiles_stopped
+            .last()
+            .map_or(&[][..], |s| s.handed.as_slice());
+        after = Some(after_stop(
+            now,
+            &out.claude[start..],
+            stopped,
+            project,
+            handed,
+        ));
+        out.notes.push(format!(
+            "{} is no longer in use in {}.",
+            sanitize(stopped),
+            project_label(project, snapshot)
+        ));
+    }
+    use_profile(
+        name,
+        members,
+        Some(project),
+        only,
+        after.as_ref().unwrap_or(snapshot),
+        snapshot,
+        out,
+    )?;
+    // Each switch once, as it ends: one a stop puts back and the use sets again is not written at all, so the list
+    // keeps its order.
+    let now = SwitchedNow::new(snapshot);
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut last: Vec<Op> = Vec::new();
+    for op in out.claude.drain(begin..).rev() {
+        if let Op::SetDisabled {
+            project: place,
+            name,
+            disabled,
+        } = &op
+        {
+            let key = (place.clone(), name.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            if now.off(place, name) == Some(*disabled) {
+                continue;
+            }
+        }
+        last.push(op);
+    }
+    last.reverse();
+    out.claude.extend(last);
+    Ok(())
+}
+
+/// `snapshot` as it reads once `ops` (switches only) are saved and `profile` no longer remembers what it switched in
+/// `project`, nor the others what `handed` names: what the next step of a switch is worked out on.
+fn after_stop(
+    snapshot: &Snapshot,
+    ops: &[Op],
+    profile: &str,
+    project: &str,
+    handed: &[(String, Switch)],
+) -> Snapshot {
+    let mut next = snapshot.clone();
+    for op in ops {
+        let Op::SetDisabled {
+            project: place,
+            name,
+            disabled,
+        } = op
+        else {
+            continue;
+        };
+        let shown = crate::sanitize::shown(place);
+        for row in &mut next.servers {
+            let Some((scope, own, file_name)) =
+                crate::model::ConnectionId::parse(row.connection.as_str())
+            else {
+                continue;
+            };
+            if file_name != *name {
+                continue;
+            }
+            match scope {
+                Scope::Local | Scope::Project => {
+                    if own.as_deref() == Some(place.as_str()) {
+                        row.enabled = !disabled;
+                    }
+                }
+                _ => {
+                    row.disabled_projects.retain(|p| *p != shown);
+                    if *disabled {
+                        row.disabled_projects.push(shown.clone());
+                    }
+                }
+            }
+        }
+    }
+    for used in &mut next.profile_uses.uses {
+        if used.profile == profile {
+            used.switches.retain(|s| s.project != project);
+        }
+        used.switches.retain(|s| {
+            !handed
+                .iter()
+                .any(|(owner, h)| *owner == used.profile && h == s)
+        });
+    }
+    next.profile_uses.uses.retain(|u| !u.switches.is_empty());
+    next
+}
+
+/// The profiles in use in `project` (as [`Snapshot::projects`] spells it), in the order Klefki remembers them: a
+/// switch one of them flipped there is still as it left it, so stopping it there would put something back. Like
+/// [`profile_in_use`], for one project.
+pub fn profiles_in_use_in(snapshot: &Snapshot, project: &str) -> Vec<String> {
+    let now = SwitchedNow::new(snapshot);
+    snapshot
+        .profile_uses
+        .uses
+        .iter()
+        .filter(|u| {
+            u.switches
+                .iter()
+                .any(|s| s.project == project && now.off(project, &s.name) == Some(s.off))
+        })
+        .map(|u| u.profile.clone())
+        .collect()
 }
 
 /// A project by its folder's name, with the folder that holds it when another project's folder has that name too.

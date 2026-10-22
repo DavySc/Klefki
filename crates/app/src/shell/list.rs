@@ -5,10 +5,11 @@ use crate::explain::{self, Explanation};
 use crate::theme;
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
+use egui_phosphor::regular as icon;
 use klefki_core::api::words::parent_folder;
 use klefki_core::api::{
-    Approval, Command, Here, Hint, Preflight, PreflightKind, Scope, ServerRow, Status, Timing,
-    words,
+    Approval, Change, Command, Here, Hint, Preflight, PreflightKind, Scope, ServerRow, Snapshot,
+    Status, Timing, words,
 };
 use std::sync::Arc;
 
@@ -951,18 +952,27 @@ impl ShellApp {
         }
         let pal = theme::palette(ui.ctx());
         let mut picked: Option<Option<String>> = None;
+        let mut asked: Option<Change> = None;
         let shown = match &self.lens {
             None => ALL_PROJECTS.to_owned(),
             Some(p) => crate::profiles::shown_project(p, &self.snapshot),
         };
+        // The profile menu beside the Where list where both fit, else on the next line, never out of sight.
+        let menu = self.lens.is_some() && !self.snapshot.profiles.is_empty();
+        let mut menu_below = false;
         ui.horizontal(|ui| {
             let label = ui.label(RichText::new("Where").color(pal.text_muted));
+            let room = ui.available_width() - 8.0;
+            let beside = menu && room - PROFILE_MENU_WIDTH >= 120.0;
+            menu_below = menu && !beside;
             let lens = self.lens.as_deref();
             let filter = &mut self.lens_filter;
             let projects: Vec<&String> = self.snapshot.projects.iter().collect();
             let combo = egui::ComboBox::from_id_salt("where")
                 .selected_text(shown)
-                .width((ui.available_width() - 8.0).clamp(120.0, 240.0))
+                .width(
+                    (room - if beside { PROFILE_MENU_WIDTH } else { 0.0 }).clamp(120.0, 240.0),
+                )
                 .height(320.0)
                 .show_ui(ui, |ui| {
                     if ui
@@ -981,6 +991,11 @@ impl ShellApp {
             match lens {
                 Some(p) => {
                     combo.on_hover_text(p);
+                    if beside
+                        && let Some(change) = profile_menu(ui, &self.snapshot, p, &self.lens_profiles)
+                    {
+                        asked = Some(change);
+                    }
                     // Beside it where there is room; the hover says the rest.
                     if ui.available_width() > 200.0 {
                         ui.add(
@@ -997,12 +1012,119 @@ impl ShellApp {
                 }
             }
         });
+        if menu_below && let Some(p) = &self.lens {
+            ui.horizontal(|ui| {
+                asked = profile_menu(ui, &self.snapshot, p, &self.lens_profiles).or(asked.take());
+            });
+        }
         ui.add_space(4.0);
         if let Some(project) = picked {
             self.lens_filter.clear();
             self.look_in(project);
         }
+        if let Some(change) = asked {
+            self.prepare(vec![change]);
+        }
     }
+}
+
+/// What the profile menu takes beside the Where list, about: its label, a profile's name, the caret and the gaps.
+const PROFILE_MENU_WIDTH: f32 = 180.0;
+
+/// The profile in use in `project` (`in_use`, in the profiles' order), as a menu that switches to another profile
+/// there, uses one, or stops one: each a change reviewed before it is saved (it can turn many servers off), with
+/// Undo once saved. Not drawn when there are no profiles.
+fn profile_menu(
+    ui: &mut Ui,
+    snapshot: &Snapshot,
+    project: &str,
+    in_use: &[String],
+) -> Option<Change> {
+    if snapshot.profiles.is_empty() {
+        return None;
+    }
+    let shown = crate::profiles::shown_project(project, snapshot);
+    let current = match in_use {
+        [] => "No profile".to_owned(),
+        [one] => one.clone(),
+        [first, rest @ ..] => format!("{first} +{}", rest.len()),
+    };
+    let mut asked = None;
+    // Named as what it is in both layouts, with a caret like the Where list's: it opens a list to choose from.
+    let label = ui.label(RichText::new("Profile").color(theme::palette(ui.ctx()).text_muted));
+    let menu = ui.menu_button(format!("{current} {}", icon::CARET_DOWN), |ui| {
+        // The profiles in use first, ticked: what is chosen now, not something to do.
+        for name in in_use {
+            ui.label(format!("{} {name}", icon::CHECK));
+        }
+        if !in_use.is_empty() {
+            ui.separator();
+        }
+        for profile in snapshot.profiles.iter().filter(|p| !in_use.contains(&p.name)) {
+            let (text, tip) = if in_use.is_empty() {
+                (
+                    format!("Use {}", profile.name),
+                    format!("Only the servers of {} on in {shown}, after a review.", profile.name),
+                )
+            } else {
+                (
+                    format!("Switch to {}", profile.name),
+                    format!(
+                        "Stop using {} in {shown} and have only the servers of {} on there, as one change, after a \
+                         review.",
+                        words::and_list(in_use),
+                        profile.name
+                    ),
+                )
+            };
+            if ui.button(text).on_hover_text(tip).clicked() {
+                asked = Some(Change::SwitchProfile {
+                    from: in_use.to_vec(),
+                    name: profile.name.clone(),
+                    members: profile.members.clone(),
+                    project: project.to_owned(),
+                    // As the Profiles page has it at first (the owner's choice, 2026-10-20).
+                    only: true,
+                });
+                ui.close();
+            }
+        }
+        if !in_use.is_empty() {
+            ui.separator();
+            for name in in_use {
+                if ui
+                    .button(format!("Stop using {name}"))
+                    .on_hover_text(format!(
+                        "Put back what {name} switched in {shown}, unless it was switched again since, after a review."
+                    ))
+                    .clicked()
+                {
+                    asked = Some(Change::StopProfile {
+                        name: name.clone(),
+                        project: Some(project.to_owned()),
+                        delete: false,
+                    });
+                    ui.close();
+                }
+            }
+        }
+    });
+    let response = menu.response.labelled_by(label.id);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            true,
+            format!("Profile in {shown}: {current}"),
+        )
+    });
+    response.on_hover_text(match in_use {
+        [] => format!("No profile is in use in {shown}. Use one here."),
+        _ => format!(
+            "In use in {shown}: {}. Switch to another profile here, or stop it.",
+            words::and_list(in_use)
+        ),
+    });
+    asked
 }
 
 /// The Where list's choice of every project.

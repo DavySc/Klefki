@@ -621,11 +621,17 @@ fn each_snapshot_names_the_profiles() {
     crate::profiles::save(&backups, "Work", &[user_id("gw").connection], None).unwrap();
     let core = env.start();
     let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
-    assert_eq!(snapshots(&events)[0].profiles, ["Work"]);
+    let names = |s: &Snapshot| {
+        s.profiles
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(snapshots(&events)[0]), ["Work"]);
     crate::profiles::save(&backups, "Notes", &[user_id("gw").connection], None).unwrap();
     core.send(Command::Refresh { live_all: false });
     let events = collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
-    assert_eq!(snapshots(&events)[0].profiles, ["Work", "Notes"]);
+    assert_eq!(names(snapshots(&events)[0]), ["Work", "Notes"]);
 }
 
 // ---- plain-language plans

@@ -230,6 +230,8 @@ pub(crate) struct ShellApp {
     lens: Option<String>,
     /// How each server stands in `lens`, by its place in the snapshot: worked out when either changes.
     lens_here: Option<Arc<[Option<Here>]>>,
+    /// The profiles in use in `lens`, in the profiles' order: worked out with `lens_here`.
+    lens_profiles: Vec<String>,
     /// What is typed to find a project in the Where list.
     lens_filter: String,
     /// A switch in one project (or its Undo) was asked for: once its plan is ready it is saved straight away, with
@@ -345,6 +347,7 @@ impl ShellApp {
             undoing: None,
             lens: None,
             lens_here: None,
+            lens_profiles: Vec::new(),
             lens_filter: String::new(),
             quiet_asked: None,
             quiet_plan: None,
@@ -742,7 +745,7 @@ impl ShellApp {
         if let Some(page) = &mut self.profiles {
             page.snapshot_changed();
         }
-        self.profile_names.clone_from(&snapshot.profiles);
+        self.profile_names = snapshot.profiles.iter().map(|p| p.name.clone()).collect();
         if snapshot.cli_version.is_some() {
             self.cli_version = snapshot.cli_version.clone();
         }
@@ -761,6 +764,18 @@ impl ShellApp {
         self.lens_here = project
             .as_deref()
             .map(|p| klefki_core::api::in_project(&self.snapshot, p).into());
+        self.lens_profiles = match &project {
+            Some(p) if !self.snapshot.profiles.is_empty() => {
+                let in_use = klefki_core::api::profiles_in_use_in(&self.snapshot, p);
+                self.snapshot
+                    .profiles
+                    .iter()
+                    .filter(|profile| in_use.contains(&profile.name))
+                    .map(|profile| profile.name.clone())
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         self.lens = project;
         if let Some(here) = &self.lens_here {
             self.selected
@@ -1053,7 +1068,8 @@ impl ShellApp {
                         }
                         Some(crate::profiles::Asked::Use(change)) => {
                             if self.can_prepare()
-                                && let Change::UseProfile { name, .. } = change.as_ref()
+                                && let Change::UseProfile { name, .. }
+                                | Change::SwitchProfile { name, .. } = change.as_ref()
                             {
                                 self.profile_asked = Some(name.clone());
                             }
@@ -5521,7 +5537,7 @@ mod tests {
         engine
             .events
             .send(klefki_core::api::Event::Snapshot(Arc::new(Snapshot {
-                profiles: vec!["Work".to_owned()],
+                profiles: work_profile().profiles,
                 ..(*h.state().snapshot).clone()
             })))
             .unwrap();
@@ -6321,6 +6337,7 @@ mod tests {
     mod outcome;
     mod review;
     mod settings;
+    mod switch_profile;
     mod toolbar;
     mod top_bar;
 }

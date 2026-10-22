@@ -1989,3 +1989,214 @@ fn use_finds_a_project_known_by_a_link_from_its_real_folder() {
         "{config:#}"
     );
 }
+
+/// Makes `worktree` a git worktree of the repository in `main`, as `git worktree add` lays it out: a `.git` file that
+/// names the worktree's folder in the main `.git`, whose `commondir` leads back to it. `relative`: the paths as
+/// `worktree.useRelativePaths` writes them.
+fn worktree_of(main: &Path, worktree: &Path, relative: bool) {
+    let admin = main.join(".git").join("worktrees").join("wt");
+    std::fs::create_dir_all(&admin).unwrap();
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+    std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+    std::fs::write(admin.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
+    std::fs::write(
+        admin.join("gitdir"),
+        format!("{}\n", worktree.join(".git").display()),
+    )
+    .unwrap();
+    let gitdir = if relative {
+        "../Repo/.git/worktrees/wt".to_owned()
+    } else {
+        admin.to_string_lossy().into_owned()
+    };
+    std::fs::write(worktree.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
+}
+
+/// Found in the on/off audit (finding 7): Claude Code uses the main checkout's project in a git worktree, so `use`
+/// there uses that project, from the worktree's root, a folder inside it, or named with --project. It said "start
+/// Claude Code there once", which could never help.
+#[test]
+fn use_in_a_git_worktree_uses_the_main_checkouts_project() {
+    use klefki_core::api::Scope;
+    for relative in [false, true] {
+        let env = Env::new();
+        env.profiles(&[("Delta", &[(Scope::User, false, "delta")])]);
+        let main = env.root().join("Repo");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        let wt = env.root().join("Repo-wt");
+        worktree_of(&main, &wt, relative);
+        for folder in [wt.clone(), wt.join("src")] {
+            let out = env
+                .command(&["use", "Delta", "-y"])
+                .current_dir(&folder)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{} (relative: {relative}): {}",
+                folder.display(),
+                text(&out.stderr)
+            );
+            assert!(
+                text(&out.stdout).contains("Use the profile Delta in Repo"),
+                "{}",
+                text(&out.stdout)
+            );
+            assert!(
+                env.disabled_in_project().is_empty(),
+                "{:?}",
+                env.disabled_in_project()
+            );
+        }
+        let out = env.run(&["use", "Delta", "--project", &wt.to_string_lossy(), "-y"]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    }
+}
+
+/// Nearby: a `.git` file that leads nowhere Klefki can follow (a submodule's, or a broken one) is not taken for a
+/// worktree: the folder is a project of its own, unknown until Claude Code starts there, as before.
+#[test]
+fn a_git_file_that_is_no_worktree_is_not_followed() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    env.profiles(&[("Delta", &[(Scope::User, false, "delta")])]);
+    let main = env.root().join("Repo");
+    // A submodule: its git folder sits in the main repository's, with no commondir.
+    let modules = main.join(".git").join("modules").join("sub");
+    std::fs::create_dir_all(&modules).unwrap();
+    let sub = main.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(&sub)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(env.disabled_in_project(), ["delta"]);
+    // Broken: no folder where it points.
+    let broken = env.root().join("Broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "gitdir: /nowhere/at/all\n").unwrap();
+    let out = env
+        .command(&["use", "Delta", "-y"])
+        .current_dir(&broken)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(env.disabled_in_project(), ["delta"]);
+}
+
+/// On/off plan S4: `switch` stops the profile in use in a project and uses another there, as one change, and `stop`
+/// puts back what a profile switched: back to before both. `profiles` says where each is in use.
+#[test]
+fn switch_and_stop_move_a_project_between_profiles_and_back() {
+    use klefki_core::api::Scope;
+    let env = Env::new();
+    env.profiles(&[
+        (
+            "Work",
+            &[(Scope::User, false, "alpha"), (Scope::Local, true, "gamma")],
+        ),
+        ("Docs", &[(Scope::User, false, "beta")]),
+    ]);
+    let project = env.project();
+    let shown = env.shown_project(env.home().as_deref());
+    let out = env.run(&["use", "Work", "--project", &project, "--only", "-y"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        env.disabled_in_project(),
+        ["beta", "delta", "docs", "remote"]
+    );
+    let out = env.run(&["profiles"]);
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(&format!("  In use in {shown}.")),
+        "{stdout}"
+    );
+    let out = env.run(&["profiles", "--json"]);
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["profiles"][0]["in_use"], serde_json::json!([project]));
+    assert_eq!(json["profiles"][1]["in_use"], serde_json::json!([]));
+
+    // Nobody to ask: shown, not saved.
+    let before = std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap();
+    expect_test::expect_file!["golden/switch-unconfirmed.txt"].assert_eq(&env.transcript(&[
+        "switch",
+        "Docs",
+        "--project",
+        &project,
+        "--only",
+    ]));
+    assert_eq!(
+        std::fs::read(env.root().join("cfg").join(".claude.json")).unwrap(),
+        before
+    );
+    // From the project's folder, saved: Work's switches go back, then only Docs' servers are on. delta was off before
+    // Work, so it stays off.
+    let out = env
+        .command(&["switch", "docs", "--only", "--yes"])
+        .current_dir(env.root().join("Repo"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        env.disabled_in_project(),
+        ["alpha", "delta", "docs", "gamma", "remote"]
+    );
+    let stdout = text(&env.run(&["profiles"]).stdout);
+    assert_eq!(stdout.matches("In use in").count(), 1, "{stdout}");
+    assert!(
+        stdout
+            .split("\n\n")
+            .any(|p| p.starts_with("Docs") && p.contains("In use in")),
+        "{stdout}"
+    );
+
+    // Stopped: before both.
+    let out = env.run(&["stop", "Docs", "--project", &project, "--yes"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Stop using the profile Docs in Repo"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(env.disabled_in_project(), ["delta"]);
+    // Again: nothing recorded, said, nothing changed.
+    let out = env.run(&["stop", "Docs", "--all", "--yes"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("no record of Docs switching anything"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(env.disabled_in_project(), ["delta"]);
+
+    // With no profile in use, a switch is a use.
+    let out = env.run(&["switch", "Docs", "--project", &project, "--yes"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("Use the profile Docs in Repo"),
+        "{}",
+        text(&out.stdout)
+    );
+
+    // Their own usage lines.
+    let out = env.run(&["switch", "Docs", "--all"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        text(&out.stderr)
+            .contains("Usage: klefki-cli switch PROFILE [--project DIR] [--only] [--yes]"),
+        "{}",
+        text(&out.stderr)
+    );
+    let out = env.run(&["stop", "Dcos"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("did you mean \"Docs\"?"), "{stderr}");
+    assert!(
+        stderr.contains("Usage: klefki-cli stop PROFILE [--project DIR | --all] [--yes]"),
+        "{stderr}"
+    );
+}

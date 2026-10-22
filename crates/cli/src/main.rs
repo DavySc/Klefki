@@ -1,5 +1,6 @@
 //! `klefki-cli`: Klefki without a window. `list` shows the configured MCP servers, `status` asks Claude Code whether
-//! they connect, `export` prints their definitions, `profiles` and `use` list and use Klefki's profiles. Output and
+//! they connect, `export` prints their definitions, `profiles`, `use`, `switch` and `stop` list, use and stop Klefki's
+//! profiles. Output and
 //! exit codes: docs/decisions/006-cli-output.md.
 #![cfg_attr(
     test,
@@ -41,6 +42,10 @@ const NOT_CHECKED: u8 = 5;
 
 const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 const USE_USAGE: &str = "Usage: klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]. See `klefki-cli help`.";
+const SWITCH_USAGE: &str =
+    "Usage: klefki-cli switch PROFILE [--project DIR] [--only] [--yes]. See `klefki-cli help`.";
+const STOP_USAGE: &str =
+    "Usage: klefki-cli stop PROFILE [--project DIR | --all] [--yes]. See `klefki-cli help`.";
 
 fn main() -> ExitCode {
     let code = match args::parse(std::env::args_os().skip(1)) {
@@ -64,13 +69,30 @@ fn main() -> ExitCode {
             only,
             yes,
         }) => use_profile(&profile, &place, only, yes),
+        Ok(Cmd::Switch {
+            profile,
+            place,
+            only,
+            yes,
+        }) => switch_profile(&profile, &place, only, yes),
+        Ok(Cmd::Stop {
+            profile,
+            place,
+            yes,
+        }) => stop_profile(&profile, &place, yes),
         Err(Usage::NoCommand) => {
             eprint!("{}", args::HELP);
             USAGE
         }
-        // `use` takes other options than the rest: its own usage is the one that helps.
+        // `use`, `switch` and `stop` take other options than the rest: their own usage is the one that helps.
         Err(Usage::Bad(why)) if std::env::args_os().nth(1).is_some_and(|c| c == "use") => {
             use_usage(&why)
+        }
+        Err(Usage::Bad(why)) if std::env::args_os().nth(1).is_some_and(|c| c == "switch") => {
+            usage_of(&why, SWITCH_USAGE)
+        }
+        Err(Usage::Bad(why)) if std::env::args_os().nth(1).is_some_and(|c| c == "stop") => {
+            usage_of(&why, STOP_USAGE)
         }
         Err(Usage::Bad(why)) => usage(&why),
     };
@@ -98,7 +120,7 @@ fn list(names: &[String], json: bool) -> u8 {
 }
 
 fn profiles(json: bool) -> u8 {
-    let snapshot = api::load_snapshot();
+    let snapshot = with_uses(&api::load_snapshot());
     let profiles = api::load_profiles();
     warn(&snapshot);
     if let Some(problem) = &profiles.problem {
@@ -124,7 +146,72 @@ fn use_profile(typed: &str, place: &args::Place, only: bool, yes: bool) -> u8 {
         Ok(found) => found,
         Err(why) => return use_usage(&why),
     };
-    match profile::use_profile(chosen, project, only, yes) {
+    ended(profile::run(
+        api::Change::UseProfile {
+            name: chosen.name.clone(),
+            members: chosen.members.clone(),
+            project,
+            only,
+        },
+        yes,
+    ))
+}
+
+/// Stops the profiles in use in the project of `place` and uses `typed` there instead, as one change. With none in
+/// use there, that is using it.
+fn switch_profile(typed: &str, place: &args::Place, only: bool, yes: bool) -> u8 {
+    let snapshot = with_uses(&api::load_snapshot());
+    warn(&snapshot);
+    let profiles = api::load_profiles();
+    let found =
+        profile::find(&profiles, typed).and_then(|p| Ok((p, profile::project(&snapshot, place)?)));
+    let (chosen, project) = match found {
+        Ok((chosen, Some(project))) => (chosen, project),
+        Ok((_, None)) => {
+            return usage_of(
+                "switch works in one project: leave out --all, or use --project",
+                SWITCH_USAGE,
+            );
+        }
+        Err(why) => return usage_of(&why, SWITCH_USAGE),
+    };
+    let from = api::profiles_in_use_in(&snapshot, &project);
+    ended(profile::run(
+        api::Change::SwitchProfile {
+            from,
+            name: chosen.name.clone(),
+            members: chosen.members.clone(),
+            project,
+            only,
+        },
+        yes,
+    ))
+}
+
+/// Puts back what `typed` switched in the project of `place`, or in every project.
+fn stop_profile(typed: &str, place: &args::Place, yes: bool) -> u8 {
+    let snapshot = api::load_snapshot();
+    warn(&snapshot);
+    let profiles = api::load_profiles();
+    let found =
+        profile::find(&profiles, typed).and_then(|p| Ok((p, profile::project(&snapshot, place)?)));
+    let (chosen, project) = match found {
+        Ok(found) => found,
+        Err(why) => return usage_of(&why, STOP_USAGE),
+    };
+    ended(profile::run(
+        api::Change::StopProfile {
+            name: chosen.name.clone(),
+            project,
+            delete: false,
+        },
+        yes,
+    ))
+}
+
+/// The exit code for how a profile's change ended.
+fn ended(used: profile::Used) -> u8 {
+    match used {
         profile::Used::Saved | profile::Used::Nothing => OK,
         profile::Used::NotSaved => NOT_WRITTEN,
         profile::Used::Failed(why) => {
@@ -132,6 +219,13 @@ fn use_profile(typed: &str, place: &args::Place, only: bool, yes: bool) -> u8 {
             PROBLEM
         }
     }
+}
+
+/// `snapshot` with what profiles switched, as the app's snapshots have it: where each profile is in use.
+fn with_uses(snapshot: &Snapshot) -> Snapshot {
+    let mut snapshot = snapshot.clone();
+    snapshot.profile_uses = api::load_profile_uses();
+    snapshot
 }
 
 /// The block goes to stdout, so `> servers.json` holds only the block, or to the `--output` file; what to know about
@@ -376,8 +470,12 @@ fn warn(snapshot: &Snapshot) {
 }
 
 fn use_usage(why: &str) -> u8 {
+    usage_of(why, USE_USAGE)
+}
+
+fn usage_of(why: &str, usage: &str) -> u8 {
     eprintln!("klefki-cli: {why}");
-    eprintln!("{USE_USAGE}");
+    eprintln!("{usage}");
     USAGE
 }
 

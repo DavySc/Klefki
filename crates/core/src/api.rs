@@ -18,7 +18,7 @@ pub use crate::form::{Part, ServerFields, secret_reference};
 pub use crate::import_file::ImportFile;
 pub use crate::inspector::InspectorCommand;
 pub use crate::model::{ConnectionId, NameError, ServerName, Target};
-pub use crate::ops::{Here, in_project, profile_alone_in, profile_in_use};
+pub use crate::ops::{Here, in_project, profile_alone_in, profile_in_use, profiles_in_use_in};
 pub use crate::paste::{Pasted, PastedServer};
 pub use crate::profile_uses::{ProfileUse, ProfileUses, Switch};
 pub use crate::profiles::{Profile, Profiles};
@@ -459,9 +459,9 @@ pub struct Snapshot {
     pub legacy_disabled: Vec<LegacyDisabled>,
     /// Definitions Klefki kept because a change removed a server and could not add it back. Oldest first.
     pub kept: Vec<Kept>,
-    /// The names of Klefki's profiles (decision 012), in their order, for the command palette. Empty when the profiles
-    /// file cannot be read.
-    pub profiles: Vec<String>,
+    /// Klefki's profiles (decision 012), in their order: for the command palette, and to switch a project to one from
+    /// the list seen from that project. Empty when the profiles file cannot be read.
+    pub profiles: Vec<crate::profiles::Profile>,
     /// What each profile's uses switched, so that stopping it can put that back (decision 012). Read with the
     /// profiles.
     pub profile_uses: crate::profile_uses::ProfileUses,
@@ -631,6 +631,21 @@ fn data_dir() -> Option<std::path::PathBuf> {
         Some(dir) if !dir.is_empty() => Some(std::path::PathBuf::from(dir)),
         _ => directories::ProjectDirs::from("dev", "klefki", "klefki")
             .map(|d| d.data_local_dir().to_path_buf()),
+    }
+}
+
+/// What Klefki remembers each profile switched (decision 012), for a command-line run, read as the app reads it: put
+/// in [`Snapshot::profile_uses`] to tell where a profile is in use. Writes nothing.
+pub fn load_profile_uses() -> ProfileUses {
+    match default_backup_dir() {
+        Some(dir) => crate::profile_uses::load(&dir),
+        None => ProfileUses {
+            problem: Some(
+                "There is no private folder for Klefki's data, so what profiles switched cannot be read."
+                    .to_owned(),
+            ),
+            ..ProfileUses::default()
+        },
     }
 }
 

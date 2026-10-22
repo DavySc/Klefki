@@ -1,0 +1,19 @@
+$ klefki-cli switch Docs --project <project> --only
+exit: Some(4)
+--- stdout
+Switch Repo from Work to Docs, and turn off every other server there
+
+warning: This also turns off alpha and gamma, which are not in Docs.
+note: Work is no longer in use in Repo.
+note: Klefki remembers what this switches: stop using Docs, or delete it, to put it back.
+note: Claude Code sessions already open in Repo keep their servers until you restart them (or switch them there with /mcp). New sessions get the change.
+
+.claude.json
+    projects["<project>"].disabledMcpServers
+  + alpha
+    projects["<project>"].disabledMcpServers
+  - beta
+    projects["<project>"].disabledMcpServers
+  + gamma
+--- stderr
+Nothing was saved: no one at a terminal to ask. Add --yes to save without asking.

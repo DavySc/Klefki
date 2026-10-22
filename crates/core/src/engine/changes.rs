@@ -34,8 +34,8 @@ pub(super) struct Stored {
     follow: Vec<(crate::model::ConnectionId, crate::model::ConnectionId)>,
     /// Profiles used, remembered once it is applied.
     profiles_used: Vec<ops::UsedProfile>,
-    /// A profile stopped, forgotten (and deleted when asked) once it is applied.
-    profile_stopped: Option<ops::StoppedProfile>,
+    /// Profiles stopped, in order, forgotten (and deleted when asked) once it is applied.
+    profiles_stopped: Vec<ops::StoppedProfile>,
     /// Switches another change writes: no profile puts them back once it is applied.
     switched: Vec<(String, String)>,
     /// A plan that only flips switches: the ones it flips, as it leaves them, for its undo.
@@ -278,7 +278,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
         // Switches a change other than a profile's writes: the user's choice from now on, which no profile puts back.
         // Not an undo: it puts back what profiles remembered before the change it undoes.
         if resolved.profiles_used.is_empty()
-            && resolved.profile_stopped.is_none()
+            && resolved.profiles_stopped.is_empty()
             && !matches!(changes, [Change::Undo(_)])
         {
             let mut switched = Vec::new();
@@ -533,7 +533,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 already,
                 others_on,
                 profiles_used,
-                profile_stopped,
+                profiles_stopped,
                 switched,
                 records_back,
                 ..
@@ -563,7 +563,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             // Stopping a profile forgets what it switched, even where nothing is left to put back.
             let nothing_to_do = cli.is_none()
                 && forget.is_empty()
-                && profile_stopped.is_none()
+                && profiles_stopped.is_empty()
                 && records_back.is_empty()
                 && parts.iter().all(|(plan, _)| plan.is_empty());
             let view = PlanView {
@@ -602,7 +602,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     summary,
                     follow,
                     profiles_used,
-                    profile_stopped,
+                    profiles_stopped,
                     switched,
                     flips,
                     records_back,
@@ -654,7 +654,7 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
         summary,
         follow,
         profiles_used,
-        profile_stopped,
+        profiles_stopped,
         switched,
         flips,
         records_back,
@@ -794,6 +794,33 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
         }
     }
     let changed = !written.is_empty() || !added.is_empty() || forgot || uses_changed;
+    // Profiles stopped first, one after another as the plan stopped them, so a profile used in their place (a switch)
+    // is remembered against what is left.
+    for stopped in &profiles_stopped {
+        let done = backup_dir(shared).and_then(|dir| {
+            crate::profile_uses::stop(
+                &dir,
+                &stopped.profile,
+                stopped.project.as_deref(),
+                &stopped.handed,
+            )?;
+            // Forgotten already, so the snapshot is read again whether or not the delete goes through.
+            uses_changed = true;
+            if stopped.delete {
+                shared.emitter.emit(Event::Profiles(crate::profiles::delete(
+                    &dir,
+                    &stopped.profile,
+                )?));
+            }
+            Ok(())
+        });
+        if let Err(why) = done {
+            notes.push(sanitize(&why));
+        }
+    }
+    // A switch whose writes all cancel out still hands the record over from the profiles stopped to the one used:
+    // it changed what Klefki remembers, and its Undo hands it back.
+    let changed = changed || (!profiles_stopped.is_empty() && !profiles_used.is_empty());
     // Klefki's own records of profile uses, once Claude Code's files are saved; read again with the snapshot below.
     if changed && let Ok(dir) = backup_dir(shared) {
         if !follow.is_empty() {
@@ -818,28 +845,6 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
                     sanitize(&used.profile)
                 )),
             }
-        }
-    }
-    if let Some(stopped) = &profile_stopped {
-        let done = backup_dir(shared).and_then(|dir| {
-            crate::profile_uses::stop(
-                &dir,
-                &stopped.profile,
-                stopped.project.as_deref(),
-                &stopped.handed,
-            )?;
-            // Forgotten already, so the snapshot is read again whether or not the delete goes through.
-            uses_changed = true;
-            if stopped.delete {
-                shared.emitter.emit(Event::Profiles(crate::profiles::delete(
-                    &dir,
-                    &stopped.profile,
-                )?));
-            }
-            Ok(())
-        });
-        if let Err(why) = done {
-            notes.push(sanitize(&why));
         }
     }
     if !written.is_empty() || forgot {

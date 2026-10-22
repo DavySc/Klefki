@@ -18,11 +18,7 @@ use std::sync::Arc;
 pub(super) fn profiles_changed(shared: &Shared, state: &mut State) {
     let mut snapshot = (*state.snapshot).clone();
     if let Some(dir) = shared.config.backup_dir.as_deref() {
-        snapshot.profiles = crate::profiles::load(dir)
-            .profiles
-            .into_iter()
-            .map(|p| p.name)
-            .collect();
+        snapshot.profiles = crate::profiles::load(dir).profiles;
         snapshot.profile_uses = crate::profile_uses::load(dir);
     }
     state.snapshot = Arc::new(snapshot);
@@ -85,13 +81,7 @@ impl State {
             .config
             .backup_dir
             .as_deref()
-            .map(|dir| {
-                crate::profiles::load(dir)
-                    .profiles
-                    .into_iter()
-                    .map(|p| p.name)
-                    .collect()
-            })
+            .map(|dir| crate::profiles::load(dir).profiles)
             .unwrap_or_default();
         snapshot.profile_uses = shared
             .config
