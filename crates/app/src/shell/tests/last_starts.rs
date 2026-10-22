@@ -115,8 +115,24 @@ fn copying_says_copied_for_a_moment() {
         ..LastStarts::default()
     });
     h.get_by_label(COPY).click();
-    h.run();
+    // The frame that takes the click.
+    h.step();
+    let copied_at = h.ctx.input(|i| i.time);
+    h.step();
     h.get_by_label("Copied");
+    // For as long as Export's Copy says it, and not a frame longer.
+    let mut steps = 0;
+    while h.query_by_label("Copied").is_some() {
+        h.step();
+        steps += 1;
+        assert!(steps < 100, "still Copied");
+    }
+    let gone_at = h.ctx.input(|i| i.time);
+    assert_eq!(gone_at - copied_at, crate::shell::export::COPIED_SECS);
+    // A second copy is confirmed again.
+    h.get_by_label(COPY).click();
+    h.step();
+    h.step();
     assert!(h.query_by_label(COPY).is_none());
     // A screen reader hears it too.
     let node = h.get_by_label("Copied");
@@ -248,5 +264,52 @@ fn the_report_to_copy_is_complete_and_plain() {
     assert!(
         !text.chars().any(|c| c.is_control() && c != '\n'),
         "{text:?}"
+    );
+}
+
+#[test]
+fn a_line_opens_and_closes_when_clicked_and_tells_the_exact_time_on_hover() {
+    use egui::accesskit::Role;
+    let (mut h, _engine, _row) = shown(LastStarts {
+        starts: vec![connected_at_home(), failed_in_proj()],
+        ..LastStarts::default()
+    });
+    let home = "Today 08:00 in ~: connected in 62 ms";
+    h.get_by_role_and_label(Role::Label, home).click();
+    h.run();
+    h.get_by_label("ok server up");
+    h.get_by_role_and_label(Role::Label, home).click();
+    h.run();
+    assert!(h.query_by_label("ok server up").is_none());
+    h.get_by_role_and_label(Role::Label, home).hover();
+    h.run();
+    h.get_by_label("22 Oct 2026, 07:32:16 (UTC+00:00)");
+}
+
+#[test]
+fn the_copied_report_points_at_the_whole_program_claude_code_named() {
+    // A program whose path has a space: Claude Code's message tells where it ends, so the marker covers all of it.
+    let mut row = live_row("s", Scope::User, None);
+    row.target = "/opt/My Tools/srv --port 1".to_owned();
+    let mut start = failed_in_proj();
+    start.outcome = StartOutcome::Failed {
+        code: None,
+        said: "spawn /opt/My Tools/srv ENOENT".to_owned(),
+        after: None,
+    };
+    start.hints[0].points_at = Some((klefki_core::api::Focus::Command, "not found".to_owned()));
+    let text = report(
+        &row,
+        &LastStarts {
+            starts: vec![start],
+            ..LastStarts::default()
+        },
+    );
+    assert!(
+        text.contains(&format!(
+            "{} not found",
+            "^".repeat("/opt/My Tools/srv".len())
+        )),
+        "{text}"
     );
 }

@@ -194,12 +194,10 @@ pub(super) fn panel(ui: &mut Ui, row: &ServerRow, last: &LastStarts) {
             egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, true, &line)
         });
         let header = header.inner;
-        if header.clicked() {
-            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
-                ui.ctx(),
-                id,
-                i == open,
-            );
+        // The body stored the state just now, so it is there to toggle.
+        if header.clicked()
+            && let Some(mut state) = egui::collapsing_header::CollapsingState::load(ui.ctx(), id)
+        {
             state.toggle(ui);
             state.store(ui.ctx());
         }

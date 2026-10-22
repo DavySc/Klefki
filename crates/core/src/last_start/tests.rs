@@ -544,9 +544,49 @@ fn log_file_names_are_checked_character_by_character() {
         "2026-13-22T07:32:16.377Z",
         "2026-10-22 07:32:16.377Z",
         "yesterday at noon",
+        // Each separator is checked on its own.
+        "2026x10-22T07:32:16.377Z",
+        "2026-10x22T07:32:16.377Z",
+        "2026-10-22T07x32:16.377Z",
+        "2026-10-22T07:32x16.377Z",
+        // And each field's range, just past its end.
+        "2026-10-22T24:00:00.000Z",
+        "2026-10-22T23:60:00.000Z",
+        "2026-10-22T23:59:61.000Z",
     ] {
         assert_eq!(timestamp_ms(bad), None, "{bad}");
     }
+    // The last moment of each range counts (60 for a leap second).
+    assert!(timestamp_ms("2026-10-22T23:59:60.000Z").is_some());
+    assert_eq!(
+        to_ms(2026, 10, 22, 23, 59, 59, 999),
+        Some(1_792_713_599_999)
+    );
+}
+
+#[test]
+fn a_log_up_to_twice_the_piece_is_read_whole() {
+    let mut text = vec![b'x'; usize::try_from(2 * END).unwrap()];
+    let (head, tail) = ends(&mut std::io::Cursor::new(&text), 2 * END).unwrap();
+    assert_eq!((head.len(), tail), (text.len(), None));
+    text.push(b'y');
+    let (head, tail) = ends(&mut std::io::Cursor::new(&text), 2 * END + 1).unwrap();
+    assert_eq!(head.len() as u64, END);
+    assert_eq!(tail.unwrap().last(), Some(&b'y'));
+}
+
+#[test]
+fn a_log_without_folders_in_it_counts_by_its_folders_name() {
+    // A log that names no folder (lines cut, or an older Claude Code): only its folder's name tells the project.
+    let logs = Logs::new();
+    let bare = FAIL.replace(",\"cwd\":\"/home/u/proj\"", "");
+    assert!(!bare.contains("cwd"));
+    logs.put("/home/u/app", "s", T1, &bare);
+    logs.put("/home/u/other", "s", T2, &bare);
+    let got = logs.ask("s", Some("/home/u/app"), &[], &[]);
+    assert_eq!(got.starts.len(), 1, "{got:?}");
+    assert_eq!(got.starts[0].folder, "an unknown folder");
+    assert!(got.starts[0].file.contains("-home-u-app"));
 }
 
 #[test]

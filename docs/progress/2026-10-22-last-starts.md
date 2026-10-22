@@ -52,7 +52,14 @@ name rule with its hash for names over 200 characters, the lines a start writes)
 ## Checks
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`: exit 0
   (app 474, core 1042, cli 26 + 43); after the review fixes exit 0 (app 476, core 1046, cli 26 + 43).
-- Review fixes: the three reproducers and the re-read test failed before their fixes. `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
+- Review fixes: the three reproducers and the re-read test failed before their fixes.
+- Mutants: the quality run on 98fff6c was cut off by the runner after 6 misses, all in the app section (`said`, the
+  header toggle, the exact-time hover). Locally `cargo mutants` on `last_start.rs` and `shell/last_starts.rs`
+  (tests filtered to the last-start ones) missed 17 more: date checks, the read-whole boundary, the folder-name
+  prefix with no `cwd`, the Copied timing. Tests added for all; a re-run of those leaves one missed, `|` to `^`
+  in the open flags (the same value: the bits do not overlap). Two `ends` mutants time out on the 1 GB test, and
+  `base36`'s `/=` hangs its test (counted as missed by the filtered run, killed by the test timeout).
+- After them: fmt, clippy, `cargo test --workspace` exit 0 (app 478, core 1048, cli 26 + 43). `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
 - New tests seen failing: with `read` returning nothing, 14 of the 20 reader tests fail.
 - By hand: the debug app under Xvfb with a scratch `HOME` holding real 2.1.308 logs (a server that exits, one that
   connects, a timeout, a missing program, a refused HTTP server): the failed server's Status tab showed Klefki's own
