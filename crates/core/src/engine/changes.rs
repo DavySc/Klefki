@@ -38,6 +38,10 @@ pub(super) struct Stored {
     profile_stopped: Option<ops::StoppedProfile>,
     /// Switches another change writes: no profile puts them back once it is applied.
     switched: Vec<(String, String)>,
+    /// A plan that only flips switches: the ones it flips, as it leaves them, for its undo.
+    flips: Option<Vec<crate::profile_uses::Switch>>,
+    /// An undo: profiles' records of what they switched, put back once it is applied.
+    records_back: Vec<crate::undo::Record>,
 }
 
 /// What Claude Code does with its own commands: servers it adds, servers it removes and adds again (or copies), and
@@ -257,10 +261,26 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 };
                 crate::restore::resolve(&backup_dir(shared)?, backup, now)?
             }
+            [Change::Undo(undo)] => {
+                let now = match &read {
+                    Ok(Some((text, _))) => text.as_str(),
+                    Ok(None) => "",
+                    Err(e) => {
+                        return Err(format!(
+                            "The configuration could not be read, so nothing is undone: {e}"
+                        ));
+                    }
+                };
+                crate::undo::resolve(undo, now, &fresh.snapshot)?
+            }
             _ => ops::resolve(changes, &fresh.snapshot, &fresh.keys)?,
         };
         // Switches a change other than a profile's writes: the user's choice from now on, which no profile puts back.
-        if resolved.profiles_used.is_empty() && resolved.profile_stopped.is_none() {
+        // Not an undo: it puts back what profiles remembered before the change it undoes.
+        if resolved.profiles_used.is_empty()
+            && resolved.profile_stopped.is_none()
+            && !matches!(changes, [Change::Undo(_)])
+        {
             let mut switched = Vec::new();
             for op in &resolved.claude {
                 match op {
@@ -322,6 +342,23 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 .and_then(|(t, _)| serde_json::from_str(t).ok())
                 .unwrap_or_default()
         };
+        // A plan that only flips switches can be undone: which ones it flips, against the file as it is now.
+        let flips = (crate::undo::kind_undoable(changes)
+            && resolved.settings.is_empty()
+            && resolved.cli.is_empty()
+            && resolved.swaps.is_empty()
+            && resolved.put_back.is_empty()
+            && resolved.forget.is_empty())
+        .then(|| {
+            let root = read
+                .as_ref()
+                .ok()
+                .and_then(|t| t.as_ref())
+                .and_then(|(t, _)| serde_json::from_str(t).ok())
+                .unwrap_or_default();
+            crate::undo::flips(&root, &resolved.claude)
+        })
+        .flatten();
         let mut parts = Vec::new();
         for (project, ops) in std::mem::take(&mut resolved.settings) {
             let file = Path::new(&project)
@@ -478,10 +515,10 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 store,
             })
         };
-        Ok::<_, String>((parts, cli, resolved))
+        Ok::<_, String>((parts, cli, resolved, flips))
     })();
     match made {
-        Ok((parts, cli, resolved)) => {
+        Ok((parts, cli, resolved, flips)) => {
             let ops::Resolved {
                 guards,
                 warnings,
@@ -498,6 +535,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                 profiles_used,
                 profile_stopped,
                 switched,
+                records_back,
                 ..
             } = resolved;
             let mut notes = notes;
@@ -526,6 +564,7 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
             let nothing_to_do = cli.is_none()
                 && forget.is_empty()
                 && profile_stopped.is_none()
+                && records_back.is_empty()
                 && parts.iter().all(|(plan, _)| plan.is_empty());
             let view = PlanView {
                 id,
@@ -565,6 +604,8 @@ pub(super) fn prepare(shared: &Shared, plans: &mut Plans, changes: &[Change]) {
                     profiles_used,
                     profile_stopped,
                     switched,
+                    flips,
+                    records_back,
                 },
             );
             shared.emitter.emit(Event::PlanReady(view));
@@ -615,6 +656,8 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
         profiles_used,
         profile_stopped,
         switched,
+        flips,
+        records_back,
     }) = plans.forget(id)
     else {
         return fail("This change was already applied or discarded. Prepare it again.".to_owned());
@@ -726,8 +769,31 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
             forgot = true;
         }
     }
-    let changed = !written.is_empty() || !added.is_empty() || forgot;
     let mut uses_changed = false;
+    // What profiles remembered before this, for its undo.
+    let uses_before = flips
+        .as_ref()
+        .and_then(|_| backup_dir(shared).ok())
+        .map(|dir| crate::profile_uses::load(&dir));
+    if !records_back.is_empty() {
+        match backup_dir(shared).and_then(|dir| crate::profile_uses::put_back(&dir, &records_back))
+        {
+            Ok((wrote, left)) => {
+                uses_changed |= wrote;
+                for profile in left {
+                    notes.push(format!(
+                        "What Klefki remembers of {} changed since, so it is left as it is.",
+                        sanitize(&profile)
+                    ));
+                }
+            }
+            Err(why) => notes.push(format!(
+                "What Klefki remembers of the profiles is left as it is: {}",
+                sanitize(&why)
+            )),
+        }
+    }
+    let changed = !written.is_empty() || !added.is_empty() || forgot || uses_changed;
     // Klefki's own records of profile uses, once Claude Code's files are saved; read again with the snapshot below.
     if changed && let Ok(dir) = backup_dir(shared) {
         if !follow.is_empty() {
@@ -791,10 +857,21 @@ pub(super) fn apply(shared: &Shared, plans: &mut Plans, state: &mut State, id: u
     {
         notes.push(format!("Its profiles still name it as it was: {why}"));
     }
+    let undo = flips.filter(|_| changed).and_then(|switches| {
+        let records = match (&uses_before, backup_dir(shared)) {
+            (Some(before), Ok(dir)) => {
+                crate::undo::records(before, &crate::profile_uses::load(&dir))
+            }
+            _ => Vec::new(),
+        };
+        (!switches.is_empty() || !records.is_empty())
+            .then_some(crate::undo::Undo { switches, records })
+    });
     check_later(shared, id, started);
     shared.emitter.emit(Event::Applied {
         plan: id,
         changed,
+        undo,
         backup: (!backups.is_empty()).then(|| {
             sanitize(
                 &backups

@@ -35,6 +35,7 @@ mod sanitize;
 mod secret_uses;
 mod secrets;
 mod swap;
+mod undo;
 mod update;
 mod watch;
 mod words;

@@ -215,6 +215,7 @@ fn a_server_back_without_some_settings_offers_only_forget() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -269,6 +270,7 @@ fn a_copy_is_selected_and_the_message_says_copied() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();

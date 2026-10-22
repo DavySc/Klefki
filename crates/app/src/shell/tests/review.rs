@@ -43,6 +43,7 @@ fn once_saved_the_outcome_says_again_what_open_sessions_get() {
                 changed,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();

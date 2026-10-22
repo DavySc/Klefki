@@ -65,6 +65,8 @@ pub(crate) struct Resolved {
     pub profile_stopped: Option<StoppedProfile>,
     /// Switches (project, name) a change other than a profile's writes: no profile puts them back once it is saved.
     pub switched: Vec<(String, String)>,
+    /// An undo: profiles' records of what they switched, put back once it is saved.
+    pub records_back: Vec<crate::undo::Record>,
 }
 
 /// A use of a profile, as [`crate::profile_uses::record`] takes it.
@@ -175,6 +177,7 @@ pub(crate) fn resolve(
             Change::Restore { .. } => {
                 return Err("A restore is reviewed on its own.".to_owned());
             }
+            Change::Undo(_) => return Err("An undo is reviewed on its own.".to_owned()),
         };
         if !verbs.contains(&verb) {
             verbs.push(verb);
@@ -213,7 +216,7 @@ pub(crate) fn resolve(
                         .to_owned(),
                 );
             }
-            Change::Restore { .. } => unreachable!("refused above"),
+            Change::Restore { .. } | Change::Undo(_) => unreachable!("refused above"),
             Change::UseProfile {
                 name,
                 members,
@@ -413,6 +416,7 @@ fn summarise(change: &Change, snapshot: &Snapshot) -> String {
             return format!("Add {}{}", sanitize(name), places(targets));
         }
         Change::Restore { .. } => return "Restore a backup".to_owned(),
+        Change::Undo(_) => return "Undo".to_owned(),
         Change::UseProfile {
             name,
             project,
@@ -1426,7 +1430,7 @@ fn stop_profile(
 }
 
 /// A project by its folder's name, with the folder that holds it when another project's folder has that name too.
-fn project_label(path: &str, snapshot: &Snapshot) -> String {
+pub(crate) fn project_label(path: &str, snapshot: &Snapshot) -> String {
     let name = folder_name(path);
     let shared = snapshot
         .projects

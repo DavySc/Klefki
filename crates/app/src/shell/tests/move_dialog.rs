@@ -141,6 +141,7 @@ fn a_moved_server_is_selected_where_it_went_and_the_message_says_moved() {
             changed: true,
             backup: None,
             notes: vec!["Claude Code left out alwaysAllow.".into()],
+            undo: None,
         })
         .unwrap();
     h.run();
@@ -244,6 +245,7 @@ fn a_server_that_signs_in_says_it_signs_in_again_after_a_move_and_offers_it() {
             changed: true,
             backup: None,
             notes: Vec::new(),
+            undo: None,
         })
         .unwrap();
     h.run();

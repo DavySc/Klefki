@@ -5,7 +5,7 @@ use crate::sign_in;
 use crate::theme::{self, Palette};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Ui};
 use egui_phosphor::regular as icon;
-use klefki_core::api::{Change, ServerId, ServerRow};
+use klefki_core::api::{Change, ServerId, ServerRow, Undo};
 
 /// What happened to the last change, for the banner.
 #[derive(Debug, Clone, PartialEq)]
@@ -18,7 +18,8 @@ pub(super) struct Outcome {
     pub(super) sign_in: Option<ServerId>,
     /// It worked, with something to take in (settings Claude Code left out, say): drawn as a warning, and it stays.
     pub(super) warn: bool,
-    /// What undoes it (a move back), offered on the card, which then stays until used or dismissed.
+    /// What undoes it (a move back, or switches put back), offered on the card, which then stays until used or
+    /// dismissed.
     pub(super) undo: Option<Change>,
     /// The change is in the Activity log, with its backup: the card offers to open it.
     pub(super) logged: bool,
@@ -52,8 +53,18 @@ pub(super) enum OutcomeChoice {
     Dismiss,
 }
 
-/// How long a success message stays.
+/// How long a success message stays, at the least.
 pub(super) const SUCCESS_SECONDS: f64 = 4.0;
+/// And at the most, however long it is.
+const SUCCESS_SECONDS_MOST: f64 = 20.0;
+
+/// How long a success message with `text` stays: two seconds to notice it, then long enough to read it slowly, at
+/// 15 characters a second (about 180 words a minute; adults read 238 on average, Brysbaert 2019), counted in
+/// characters so a long backup path counts as long; never less than [`SUCCESS_SECONDS`].
+pub(super) fn success_seconds(text: &str) -> f64 {
+    let chars = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
+    (2.0 + f64::from(chars) / 15.0).clamp(SUCCESS_SECONDS, SUCCESS_SECONDS_MOST)
+}
 
 /// The outcome message: its text's widest, its narrowest beside the detail panel, and its distance from the
 /// window's edges.
@@ -96,7 +107,7 @@ impl ShellApp {
         // A card that offers something to do stays until it is used or dismissed: time limits on a choice exclude
         // whoever reads slowly.
         if outcome.ok && !outcome.warn && outcome.sign_in.is_none() && outcome.undo.is_none() {
-            let left = SUCCESS_SECONDS - (now - shown_at);
+            let left = success_seconds(&outcome.text) - (now - shown_at);
             if left <= 0.0 {
                 self.outcome = None;
                 return;
@@ -119,7 +130,7 @@ impl ShellApp {
                 offset.x = room.right() - screen.right() - TOAST_MARGIN;
                 width = self.outcome_width_beside(ctx).min(TOAST_WIDTH);
             }
-            egui::Area::new(egui::Id::new("outcome"))
+            let shown = egui::Area::new(egui::Id::new("outcome"))
                 .anchor(egui::Align2::RIGHT_BOTTOM, offset)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
@@ -139,6 +150,7 @@ impl ShellApp {
                             }
                         });
                 });
+            self.hold_while_pointed_at(&shown.response, now);
         }
         match chosen {
             Some(OutcomeChoice::SignIn) => {
@@ -151,9 +163,13 @@ impl ShellApp {
                 }
             }
             Some(OutcomeChoice::Undo) => {
-                if let Some(change) = outcome.undo {
+                if let Some(change) = outcome.undo.clone() {
                     self.outcome = None;
                     self.prepare(vec![change]);
+                    self.undoing = Some(Outcome {
+                        shown_at: None,
+                        ..outcome
+                    });
                 }
             }
             Some(OutcomeChoice::OpenLog) => {
@@ -193,11 +209,27 @@ impl ShellApp {
         };
         let pal = theme::palette(ui.ctx());
         let (color, glyph) = outcome_look(pal, &outcome);
-        outcome_frame(pal, color).show(ui, |ui| {
+        let shown = outcome_frame(pal, color).show(ui, |ui| {
             ui.set_width(ui.available_width());
             self.outcome_chosen = self.outcome_card(ui, &outcome, glyph, color, true);
         });
+        self.hold_while_pointed_at(&shown.response, ui.ctx().input(|i| i.time));
         self.outcome_inline = true;
+    }
+
+    /// A success message stays while the pointer is on it or the keyboard is in it, and for its full time after:
+    /// it is being read or used.
+    fn hold_while_pointed_at(&mut self, card: &egui::Response, now: f64) {
+        let ctx = &card.ctx;
+        let focused_in = ctx
+            .memory(|m| m.focused())
+            .and_then(|id| ctx.read_response(id))
+            .is_some_and(|r| card.rect.contains_rect(r.rect));
+        if (card.contains_pointer() || focused_in)
+            && let Some(outcome) = self.outcome.as_mut()
+        {
+            outcome.shown_at = Some(now);
+        }
     }
 
     /// The outcome message's text and buttons, and which of them was used.
@@ -244,10 +276,13 @@ impl ShellApp {
                 {
                     chosen = Some(OutcomeChoice::OpenLog);
                 }
-                if outcome.undo.is_some()
+                if let Some(undo) = &outcome.undo
                     && ui
                         .add_enabled(self.can_prepare(), egui::Button::new("Undo"))
-                        .on_hover_text("Move it back, after a review")
+                        .on_hover_text(match undo {
+                            Change::Move { .. } => "Move it back, after a review",
+                            _ => "Put it back as it was, after a review",
+                        })
                         .clicked()
                 {
                     chosen = Some(OutcomeChoice::Undo);
@@ -266,14 +301,16 @@ impl ShellApp {
     }
 
     /// A plan was written: the outcome says what changed, offers to sign in to a server just added or to undo a
-    /// move, and names the backup.
+    /// move or switches, and names the backup.
     pub(super) fn applied(
         &mut self,
         plan: u64,
         changed: bool,
         backup: Option<String>,
         notes: Vec<String>,
+        undo: Option<Undo>,
     ) {
+        self.undoing = None;
         if changed {
             self.editor_after_change(plan);
         }
@@ -327,7 +364,9 @@ impl ShellApp {
             ok: true,
             shown_at: None,
             warn,
-            undo: self.undo_move(changed),
+            undo: self
+                .undo_move(changed)
+                .or_else(|| undo.filter(|_| changed).map(Change::Undo)),
             sign_in,
             logged: changed,
             type_path: false,
@@ -338,6 +377,7 @@ impl ShellApp {
     /// outcome.
     pub(super) fn apply_failed(&mut self, plan: u64, error: String) {
         self.moved_from = None;
+        self.undoing = None;
         if self.plan.as_ref().is_some_and(|p| p.id == plan) {
             self.plan = None;
             self.applying = false;

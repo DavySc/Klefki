@@ -222,6 +222,9 @@ pub(crate) struct ShellApp {
     moving: Option<MoveForm>,
     /// The server a move under review takes away, and whether it signs in: what Undo moves back.
     moved_from: Option<(ServerId, bool)>,
+    /// The outcome whose Undo is under review: shown again when that review is cancelled, so backing out of it
+    /// does not cost the Undo.
+    undoing: Option<Outcome>,
     /// The servers the change under review moves or renames, with the name and place each lands at: an open
     /// definition follows its server there, unsaved edits and all.
     relocating: Vec<(ServerId, String, Target)>,
@@ -326,6 +329,7 @@ impl ShellApp {
             adding_verb: "Added",
             moving: None,
             moved_from: None,
+            undoing: None,
             relocating: Vec::new(),
             applying_step: None,
             forgetting: None,
@@ -567,7 +571,8 @@ impl ShellApp {
                 changed,
                 backup,
                 notes,
-            } => self.applied(plan, changed, backup, notes),
+                undo,
+            } => self.applied(plan, changed, backup, notes, undo),
             Event::Applying { plan, step } => {
                 if self.plan.as_ref().is_some_and(|p| p.id == plan) {
                     self.applying_step = Some(step);
@@ -3183,6 +3188,7 @@ mod tests {
                 changed: true,
                 backup: Some("/data/backups/claude.json.1.bak".to_owned()),
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -3235,6 +3241,7 @@ mod tests {
                 changed: true,
                 backup: Some("b".to_owned()),
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         engine.events.send(Event::Reapplied { plan: 7 }).unwrap();
@@ -3278,6 +3285,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -3349,6 +3357,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -3493,6 +3502,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();
@@ -5225,6 +5235,7 @@ mod tests {
                 changed: true,
                 backup: None,
                 notes: Vec::new(),
+                undo: None,
             })
             .unwrap();
         h.run();

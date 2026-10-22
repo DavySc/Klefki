@@ -356,6 +356,34 @@ pub(crate) fn forget_switches(
     write(backup_dir, &uses.uses).map(|()| true)
 }
 
+/// An undo puts each profile's record back as it was before the change undone, `before`, while it is still as that
+/// change left it, `after`. Whether anything was written, and the profiles left as they are.
+pub(crate) fn put_back(
+    backup_dir: &Path,
+    records: &[crate::undo::Record],
+) -> Result<(bool, Vec<String>), String> {
+    let read = load(backup_dir);
+    let (fits, left): (Vec<_>, Vec<_>) = records
+        .iter()
+        .partition(|r| read.problem.is_none() && read.of(&r.profile) == r.after.as_slice());
+    let left = left.into_iter().map(|r| r.profile.clone()).collect();
+    if fits.is_empty() {
+        return Ok((false, left));
+    }
+    let mut uses = writable(backup_dir)?;
+    for record in fits {
+        match uses.uses.iter_mut().find(|u| u.profile == record.profile) {
+            Some(used) => used.switches.clone_from(&record.before),
+            None => uses.uses.push(ProfileUse {
+                profile: record.profile.clone(),
+                switches: record.before.clone(),
+            }),
+        }
+    }
+    uses.uses.retain(|u| !u.switches.is_empty());
+    write(backup_dir, &uses.uses).map(|()| (true, left))
+}
+
 /// The profile `profile` is deleted without putting its switches back: they are forgotten. Nothing to do when it
 /// was never used.
 pub(crate) fn forget(backup_dir: &Path, profile: &str) -> Result<bool, String> {
