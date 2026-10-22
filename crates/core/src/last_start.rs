@@ -13,8 +13,8 @@
 //! is sanitised, and the server's own environment and header values and anything that looks like a secret are hidden.
 use crate::api::{LastStart, LastStarts, StartOutcome};
 use crate::config::inventory::normalise_project;
-use crate::diagnose::{hints::hints_for, redact::redact, report::STDERR_MARKERS};
-use crate::sanitize::{clip, sanitize, sanitize_line};
+use crate::diagnose::{hints::hints_for, report::STDERR_MARKERS};
+use crate::sanitize::{clip, sanitize_line};
 use regex::Regex;
 use serde_json::Value;
 use std::fs::File;
@@ -37,8 +37,6 @@ const MAX_SAID: usize = 20;
 const MAX_LINE: usize = 300;
 /// Claude Code cuts a folder name here (2.1.308).
 const MAX_NAME: usize = 200;
-/// A value this short is too common to hide wherever it appears (`true`, `8080`).
-const MIN_SECRET: usize = 6;
 
 /// Claude Code's log folder in the cache folder `cache` (`directories`' `cache_dir`): `env-paths`' cache folder for
 /// `claude-cli`, which on Windows has a `Cache` folder of its own.
@@ -408,23 +406,8 @@ fn native(project: &str) -> String {
 }
 
 /// Untrusted text made safe to show: the server's own values hidden, then anything that looks like a secret.
-/// A value's last word counts on its own too: a header such as `Bearer <token>` or `Basic <credentials>`, whose
-/// token a server may print without its scheme. The longest go first, so a whole value is hidden in one piece.
 fn scrub(text: &str, secrets: &[String]) -> String {
-    let mut hidden: Vec<&str> = secrets
-        .iter()
-        .flat_map(|s| [s.as_str(), s.split_whitespace().last().unwrap_or("")])
-        .filter(|s| s.chars().count() >= MIN_SECRET)
-        .collect();
-    hidden.sort_by_key(|s| (std::cmp::Reverse(s.len()), *s));
-    hidden.dedup();
-    let mut text = text.to_owned();
-    for secret in hidden {
-        if text.contains(secret) {
-            text = text.replace(secret, "***");
-        }
-    }
-    redact(&sanitize(&text))
+    crate::diagnose::redact::scrubbed(text, secrets)
 }
 
 fn millis(m: Option<regex::Match<'_>>) -> Option<Duration> {

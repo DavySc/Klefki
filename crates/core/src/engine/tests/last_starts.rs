@@ -124,3 +124,48 @@ fn without_a_log_folder_or_a_server_it_says_why() {
     let gone = starts_of(&core, &ServerId::new(Scope::User, None, "gone"));
     assert!(gone.problem.unwrap().contains("no longer"));
 }
+
+/// What Claude Code filled a `${NAME}` in with is what the server prints, so that is hidden as well (P1 follow-up).
+#[test]
+fn a_value_filled_in_for_a_reference_is_hidden_in_what_the_server_said() {
+    let env = Env::new(
+        &serde_json::json!({
+            "mcpServers": {
+                "db": {"type": "stdio", "command": "node", "args": ["--url", "${DB_HOST}"],
+                       "env": {"AUTH": "Bearer ${DB_TOKEN}", "KEY": "${DB_KEY}"}},
+            }
+        }),
+        r#"{"rules":[{"args":["--version"]}]}"#,
+        &[],
+    );
+    let root = env.dir.path().join("logs");
+    log(
+        &root,
+        "/work/b",
+        "db",
+        "2026-10-22T07-32-16-377Z",
+        FAIL,
+        "to db-host-1234 as tok-abcdef with key-qrstuv-99",
+    );
+    let core = start_with(
+        EngineConfig {
+            claude_logs: Some(root),
+            background_checks: false,
+            vars: std::sync::Arc::new(|name: &str| match name {
+                "DB_HOST" => Some("db-host-1234".into()),
+                "DB_TOKEN" => Some("tok-abcdef".into()),
+                "DB_KEY" => Some("key-qrstuv-99".into()),
+                _ => None,
+            }),
+            ..env.config()
+        },
+        || {},
+    );
+    collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+    let starts = starts_of(&core, &ServerId::new(Scope::User, None, "db"));
+    let said = format!("{:?}", starts.starts);
+    for secret in ["db-host-1234", "tok-abcdef", "key-qrstuv-99"] {
+        assert!(!said.contains(secret), "{secret} shown in {said}");
+    }
+    assert!(said.contains("to *** as *** with ***"), "{said}");
+}

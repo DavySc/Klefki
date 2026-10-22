@@ -66,8 +66,14 @@ fn opened(starts: &[LastStart]) -> usize {
 
 /// Plain text to paste into a support request. Already sanitised and redacted by the engine.
 pub(super) fn report(row: &ServerRow, last: &LastStarts) -> String {
-    use std::fmt::Write;
     let mut out = format!("Last starts of {} by Claude Code\n", row.name);
+    starts_text(&mut out, row, last);
+    out
+}
+
+/// Each start as plain text: when, where, how it went, the likely causes, what the server printed and the log file.
+pub(super) fn starts_text(out: &mut String, row: &ServerRow, last: &LastStarts) {
+    use std::fmt::Write;
     for start in &last.starts {
         let _ = writeln!(out, "\n{}", headline(start));
         if !start.exact.is_empty() {
@@ -90,7 +96,6 @@ pub(super) fn report(row: &ServerRow, last: &LastStarts) -> String {
         }
         let _ = writeln!(out, "  log: {}", start.file);
     }
-    out
 }
 
 fn said(outcome: &StartOutcome) -> Option<&str> {
