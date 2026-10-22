@@ -55,6 +55,9 @@ pub enum Command {
     /// The line that opens this server in the MCP Inspector, to copy (see [`Event::InspectorCommand`], decision
     /// 014). Reads the definition; starts nothing and writes nothing.
     InspectorCommand(ServerId),
+    /// The server's definition with every value that may be secret replaced, for a debug report (see
+    /// [`Event::RedactedDefinition`]). Reads the definition; starts nothing and writes nothing.
+    RedactedDefinition(ServerId),
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
@@ -424,6 +427,12 @@ pub enum Event {
     InspectorCommand {
         id: ServerId,
         line: Result<crate::inspector::InspectorCommand, String>,
+    },
+    /// The definition [`Command::RedactedDefinition`] asked for, as an export writes it (values that may be secrets
+    /// are `${VAR}` references), or why there is none (sanitised).
+    RedactedDefinition {
+        id: ServerId,
+        result: Result<crate::export::Exported, String>,
     },
     PlanReady(PlanView),
     /// The changes could not be turned into a plan (nothing was written).

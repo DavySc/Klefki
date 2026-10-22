@@ -33,6 +33,102 @@ pub(crate) fn values(entry: &Value) -> Vec<String> {
         .collect()
 }
 
+/// What [`values`] gives, and what each `${NAME}` reference stands for where Klefki can see it. Claude Code fills the
+/// references in from its own environment, so the server may print the filled-in value (`Bearer abc123` for
+/// `Bearer ${TOKEN}`) and not the text the file holds. `vars` is Klefki's own environment, the best it knows of
+/// Claude Code's. A reference with a `:-default` stands for its default when nothing is set.
+pub(crate) fn values_filled_in(
+    entry: &Value,
+    vars: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<String> {
+    let mut out = values(entry);
+    for key in MASKED_KEYS {
+        if let Some(values) = entry.get(key).and_then(Value::as_object) {
+            for text in values.values().filter_map(Value::as_str) {
+                let filled = filled_in(text, vars);
+                if filled != text {
+                    out.push(filled);
+                }
+            }
+        }
+    }
+    let mut named = Vec::new();
+    strings(entry, &mut |text| {
+        for (name, default) in references(text) {
+            if !named.contains(&name) {
+                named.push(name);
+            }
+            if let Some(default) = default {
+                out.push(default);
+            }
+        }
+    });
+    out.extend(
+        named
+            .iter()
+            .filter_map(|name| vars(name)?.into_string().ok()),
+    );
+    out.retain(|value| !value.is_empty());
+    out.dedup();
+    out
+}
+
+/// `text` with each `${NAME}` and `${NAME:-default}` replaced by what is set, or by the default. One that is not
+/// set and has no default is kept as written, as Claude Code passes it on.
+fn filled_in(text: &str, vars: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[at..]);
+            return out;
+        };
+        let (name, default) = split_reference(&after[..end]);
+        match vars(name).and_then(|v| v.into_string().ok()).or(default) {
+            Some(value) => out.push_str(&value),
+            None => out.push_str(&rest[at..at + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The name and the default of each `${NAME}` or `${NAME:-default}` in `text`.
+fn references(text: &str) -> Vec<(String, Option<String>)> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("${") {
+        let after = &rest[at + 2..];
+        let Some(end) = after.find('}') else { break };
+        let (name, default) = split_reference(&after[..end]);
+        if !name.is_empty() {
+            found.push((name.to_owned(), default));
+        }
+        rest = &after[end + 1..];
+    }
+    found
+}
+
+fn split_reference(inner: &str) -> (&str, Option<String>) {
+    match inner.split_once(":-") {
+        Some((name, default)) => (name, Some(default.to_owned())),
+        None => (inner, None),
+    }
+}
+
+/// Calls `visit` with every string in `value`, however deep.
+fn strings(value: &Value, visit: &mut dyn FnMut(&str)) {
+    match value {
+        Value::String(s) => visit(s),
+        Value::Array(items) => items.iter().for_each(|v| strings(v, visit)),
+        Value::Object(map) => map.values().for_each(|v| strings(v, visit)),
+        _ => {}
+    }
+}
+
 /// Puts the values back that the user left as [`MASK`], from `old`. A mask for a name that had no value is an error:
 /// there is nothing to keep.
 pub(crate) fn unmasked(new: &Value, old: &Value) -> Result<Value, String> {
@@ -304,6 +400,63 @@ mod tests {
         assert_eq!(back["env"], json!({"TOKEN": "s3cret", "MODE": "y"}));
         assert_eq!(back["headers"], json!({"A": "b"}));
         assert_eq!(back["args"], json!(["a.js"]));
+    }
+
+    fn vars(
+        set: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |name| {
+            set.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        }
+    }
+
+    #[test]
+    fn what_a_reference_stands_for_is_a_value_to_hide_too() {
+        let entry = json!({
+            "command": "node",
+            "args": ["--db", "${DB_URL}", "--mode=${MODE:-fast}"],
+            "env": {"API_KEY": "${API_KEY}", "AUTH": "Bearer ${TOKEN}", "PLAIN": "x"},
+            "headers": {"X-Key": "${KEY:-fallback-key}"},
+        });
+        let hidden = values_filled_in(
+            &entry,
+            &vars(&[
+                ("API_KEY", "key-from-env"),
+                ("TOKEN", "tok-123456"),
+                ("DB_URL", "pg://u:pw@h/db"),
+            ]),
+        );
+        for wanted in [
+            "${API_KEY}",
+            "key-from-env",
+            "Bearer tok-123456",
+            "tok-123456",
+            "pg://u:pw@h/db",
+            "fallback-key",
+            "fast",
+        ] {
+            assert!(
+                hidden.iter().any(|v| v == wanted),
+                "{wanted:?} not in {hidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_nothing_sets_is_kept_as_written_and_adds_nothing() {
+        let entry = json!({"env": {"A": "x-${UNSET}-y", "B": "${BROKEN"}});
+        let hidden = values_filled_in(&entry, &vars(&[]));
+        assert_eq!(hidden, ["x-${UNSET}-y", "${BROKEN"]);
+    }
+
+    #[test]
+    fn a_default_is_used_only_when_nothing_is_set() {
+        let entry = json!({"env": {"A": "${V:-dflt}"}});
+        assert!(values_filled_in(&entry, &vars(&[])).contains(&"dflt".to_owned()));
+        let set = values_filled_in(&entry, &vars(&[("V", "real-value")]));
+        assert!(set.contains(&"real-value".to_owned()), "{set:?}");
     }
 
     #[test]

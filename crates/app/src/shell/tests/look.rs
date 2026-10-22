@@ -726,3 +726,27 @@ fn the_inspector_command_under_the_actions() {
     h.run();
     shot(&mut h, "inspector-command");
 }
+
+/// The Status tab of a server with no definition here, after "Copy debug report": the section and "Copied".
+#[test]
+fn the_debug_report_section_after_copying() {
+    let (mut h, engine) = app_at(PAGE);
+    select(&mut h, "company-wiki", Scope::Managed);
+    h.state_mut().tab = DetailTab::Status;
+    h.run();
+    let id = {
+        let i = row(&h, "company-wiki", Scope::Managed);
+        h.state().snapshot.servers[i].id()
+    };
+    h.state_mut().copy_debug_report(id.clone());
+    engine
+        .events
+        .send(Event::RedactedDefinition {
+            id,
+            result: Err("your organisation sets it, for everyone on this machine".to_owned()),
+        })
+        .unwrap();
+    h.run();
+    h.step();
+    shot(&mut h, "debug-report-copied");
+}

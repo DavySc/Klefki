@@ -16,6 +16,8 @@ pub(crate) enum Action {
     Diagnose,
     /// Copy the line that opens the selected server in the MCP Inspector.
     CopyInspector,
+    /// Copy the selected server's debug report.
+    CopyDebugReport,
     Approve,
     Refresh,
     Search,

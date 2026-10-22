@@ -740,6 +740,7 @@ mod approvals;
 mod changes;
 mod checks;
 mod client_secrets;
+mod debug_report;
 mod diagnose;
 mod edits;
 mod export;

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 mod add;
 mod casing;
+mod debug_report;
 mod detail;
 mod duplicate;
 mod editor;
@@ -162,6 +163,7 @@ pub(crate) struct ShellApp {
     last_starts: HashMap<ServerId, LastStartsSeen>,
     /// The line that opens a server in the MCP Inspector, for the one server it was asked for.
     inspector: Option<inspector::InspectorSeen>,
+    debug_report: Option<debug_report::DebugSeen>,
     /// A diagnosis that came in for the server shown on its Status tab, to bring into view once drawn.
     reveal_diagnosis: Option<ServerId>,
     /// The server checked with more time, and when that was asked for (egui's clock, in seconds): the Status tab
@@ -292,6 +294,7 @@ impl ShellApp {
             diagnoses: HashMap::new(),
             last_starts: HashMap::new(),
             inspector: None,
+            debug_report: None,
             reveal_diagnosis: None,
             longer_since: None,
             save_bar_wanted: false,
@@ -548,6 +551,9 @@ impl ShellApp {
                 }
             }
             Event::InspectorCommand { id, line } => self.inspector_arrived(&id, line),
+            Event::RedactedDefinition { id, result } => {
+                self.redacted_definition_arrived(&id, &result);
+            }
             Event::PlanReady(plan) => self.plan_ready(plan),
             Event::PlanFailed(why) => self.plan_failed(why),
             Event::Applied {
@@ -698,6 +704,7 @@ impl ShellApp {
         }
         // The definition may have changed.
         self.inspector = None;
+        self.debug_report = None;
         self.selected = selected;
         self.live = live;
         // Positions now mean other servers: tell the engine again.
@@ -1212,6 +1219,15 @@ impl ShellApp {
                     None,
                     command::Action::Diagnose,
                 );
+                if self.core.is_some() {
+                    add(
+                        icon::CLIPBOARD_TEXT,
+                        format!("Copy debug report for {}", s.name),
+                        "Copies its status, definition and logs as text; secrets replaced".into(),
+                        None,
+                        command::Action::CopyDebugReport,
+                    );
+                }
                 if self.core.is_some() && inspector::offers(s) {
                     add(
                         icon::TERMINAL_WINDOW,
@@ -1404,6 +1420,12 @@ impl ShellApp {
                             self.send(Command::Prepare(vec![Change::Approve { id }]));
                         }
                     }
+                }
+            }
+            A::CopyDebugReport => {
+                if let Some(id) = self.single_selected().map(ServerRow::id) {
+                    self.tab = DetailTab::Status;
+                    self.copy_debug_report(id);
                 }
             }
             A::CopyInspector => {
@@ -6119,6 +6141,7 @@ mod tests {
 
     mod add;
     mod casing;
+    mod debug_report;
     mod detail;
     mod duplicate;
     mod editor;

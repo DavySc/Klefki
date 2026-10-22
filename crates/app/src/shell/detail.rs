@@ -34,6 +34,13 @@ pub(super) fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
         Some(detail) => writeln!(out, "status: {}: {detail}", d.status.label()),
         None => writeln!(out, "status: {}", d.status.label()),
     };
+    diagnosis_details(&mut out, row, d);
+    out
+}
+
+/// What a diagnosis found, as plain text: its note, the likely causes, what the server printed and the client's log.
+pub(super) fn diagnosis_details(out: &mut String, row: &ServerRow, d: &Diagnosis) {
+    use std::fmt::Write;
     if let Some(note) = &d.note {
         let _ = writeln!(out, "note: {note}");
     }
@@ -57,7 +64,6 @@ pub(super) fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
             let _ = writeln!(out, "  {line}");
         }
     }
-    out
 }
 
 /// What the client's debug output said, in the order a person needs it: the likely cause, what the server
@@ -104,12 +110,26 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
             });
     }
     ui.add_space(6.0);
-    if ui
-        .button("Copy report")
-        .on_hover_text("Copy this explanation as plain text. Secrets are already removed.")
-        .clicked()
-    {
+    // Says "Copied" for a few seconds, as the other Copy buttons do, and a screen reader hears it.
+    let copied_id = egui::Id::new(("diagnosis copied", row.id()));
+    let now = ui.input(|i| i.time);
+    let copied = ui
+        .data(|data| data.get_temp::<f64>(copied_id))
+        .is_some_and(|at| now - at < super::export::COPIED_SECS);
+    let button = ui
+        .button(if copied { "Copied" } else { "Copy report" })
+        .on_hover_text(
+            "Copy this explanation as plain text. Known secrets are hidden; check it before you share it. \
+             \"Copy debug report\" below adds the definition and Claude Code's own logs.",
+        );
+    super::export::announce(ui.ctx(), button.id);
+    if button.clicked() {
         ui.ctx().copy_text(diagnosis_report(row, d));
+        ui.data_mut(|data| data.insert_temp(copied_id, now));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(
+                super::export::COPIED_SECS,
+            ));
     }
 }
 
@@ -614,6 +634,7 @@ impl ShellApp {
                     ui.add(egui::Label::new(RichText::new(why).color(pal.text_muted)).wrap());
                     self.last_starts_section(ui, s);
                     self.inspector_section(ui, s);
+                    self.debug_report_section(ui, s);
                     return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
@@ -713,6 +734,7 @@ impl ShellApp {
                 }
                 // Last: the diagnosis reads as part of the status above it, not of this section.
                 self.inspector_section(ui, s);
+                self.debug_report_section(ui, s);
             }
             DetailTab::Auth => {
                 let muted = |ui: &mut Ui, text: &str| {
