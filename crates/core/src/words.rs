@@ -86,6 +86,29 @@ pub fn sentence(text: &str) -> String {
     out
 }
 
+/// A time as Claude Code's limits are talked about: `60 ms`, `2.5 s`, `41 s`, `2 minutes`.
+pub fn duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    if ms < 10_000 && !ms.is_multiple_of(1000) {
+        // Tenths, rounded: 2.45 s is 2.5 s.
+        let tenths = (ms + 50) / 100;
+        return if tenths.is_multiple_of(10) {
+            format!("{} s", tenths / 10)
+        } else {
+            format!("{}.{} s", tenths / 10, tenths % 10)
+        };
+    }
+    let secs = (ms + 500) / 1000;
+    if secs >= 120 && secs.is_multiple_of(60) {
+        format!("{} minutes", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
 fn joined<S: AsRef<str>>(items: &[S]) -> String {
     items
         .iter()
@@ -162,6 +185,30 @@ mod tests {
         assert_eq!(and_more(&names(2), 5), "s0, s1 and 3 more");
         assert_eq!(and_more(&names(0), 0), "");
         assert_eq!(and_more(&["a"], 2), "a and 1 more");
+    }
+
+    #[test]
+    fn durations_read_as_milliseconds_seconds_or_whole_minutes() {
+        let ms = std::time::Duration::from_millis;
+        for (d, want) in [
+            (ms(0), "0 ms"),
+            (ms(60), "60 ms"),
+            (ms(999), "999 ms"),
+            (ms(1000), "1 s"),
+            (ms(2449), "2.4 s"),
+            (ms(2450), "2.5 s"),
+            (ms(9960), "10 s"),
+            (ms(10_000), "10 s"),
+            (ms(28_700), "29 s"),
+            (ms(30_000), "30 s"),
+            (ms(60_000), "60 s"),
+            (ms(119_400), "119 s"),
+            (ms(120_000), "2 minutes"),
+            (ms(150_000), "150 s"),
+            (ms(300_000), "5 minutes"),
+        ] {
+            assert_eq!(duration(d), want, "{d:?}");
+        }
     }
 
     #[test]

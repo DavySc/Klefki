@@ -1,8 +1,8 @@
 //! Diagnose: one server run with Claude Code's debug output, and what it says explained.
-use super::checks::{Job, check_env, interpret};
+use super::checks::{Job, check_env, interpret, run_timeout, time_limit, timing};
 use super::claude_program;
 use super::{Diagnosis, MAX_CHECK_OUTPUT, Shared, hint};
-use crate::api::Status;
+use crate::api::{Status, Timing};
 use crate::cli::runner::{self, RunSpec};
 use crate::config::fsx;
 use crate::diagnose::report;
@@ -11,8 +11,9 @@ use crate::sanitize::sanitize;
 const MAX_DEBUG_FILE: u64 = 1024 * 1024;
 
 /// Runs the check again with the client's own debug output and turns that into a safe, readable diagnosis.
-/// The debug file lives in a private temporary folder that is removed when this function returns.
-pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
+/// The debug file lives in a private temporary folder that is removed when this function returns. Comes with a timing
+/// when the server ran out of time.
+pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> (Diagnosis, Option<Timing>) {
     let nothing = |note: String| Diagnosis {
         status: Status::Unknown,
         detail: None,
@@ -22,7 +23,7 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
         note: Some(note),
     };
     let Some(program) = claude_program(shared) else {
-        return nothing("the claude CLI is not available".to_owned());
+        return (nothing("the claude CLI is not available".to_owned()), None);
     };
     let dir = match tempfile::Builder::new()
         .prefix("klefki-diagnose-")
@@ -30,17 +31,23 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
     {
         Ok(dir) => dir,
         Err(e) => {
-            return nothing(format!(
+            let note = format!(
                 "could not create a private temporary folder: {}",
                 sanitize(&e.to_string())
-            ));
+            );
+            return (nothing(note), None);
         }
     };
     let file = dir.path().join("debug.log");
     let Some(file_arg) = file.to_str() else {
-        return nothing("the temporary path is not valid text".to_owned());
+        return (
+            nothing("the temporary path is not valid text".to_owned()),
+            None,
+        );
     };
-    let timeout = shared.config.check_timeout;
+    let limit = time_limit(shared, job);
+    let timeout = run_timeout(shared, &limit, false);
+    let started = std::time::Instant::now();
     let result = runner::run(&RunSpec {
         program: &program,
         args: &[
@@ -63,8 +70,10 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
         .ok()
         .map(|o| o.stderr.clone())
         .unwrap_or_default();
+    let took = started.elapsed();
     let timed_out = matches!(&result, Ok(o) if o.timed_out);
     let (status, detail) = interpret(result, timeout);
+    let timing = timing(false, status, detail.as_deref(), timed_out, took, limit);
 
     let (debug_text, read_note) = match fsx::read_limited(&file, MAX_DEBUG_FILE) {
         Ok(Some(text)) => (text, None),
@@ -83,7 +92,7 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
     let note = if timed_out { detail.clone() } else { read_note };
     let said = format!("{}\n{}", detail.as_deref().unwrap_or(""), stderr);
     let report = report::build(&debug_text, job.name.as_str(), &said);
-    Diagnosis {
+    let diagnosis = Diagnosis {
         status,
         detail,
         hints: report
@@ -94,5 +103,6 @@ pub(super) fn run_diagnose(shared: &Shared, job: &Job) -> Diagnosis {
         server_said: report.server_said,
         client_log: report.client_log,
         note,
-    }
+    };
+    (diagnosis, timing)
 }

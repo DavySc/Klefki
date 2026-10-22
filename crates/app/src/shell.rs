@@ -8,8 +8,8 @@ use egui::{Frame, Margin, RichText, Sense, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
     Approval, Change, Command, ConnectionId, Core, Diagnosis, Event, Hint, ImportFile, PlanView,
-    Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, TransportKind,
-    UpdateDownload, same_project,
+    Scope, Secret, ServerId, ServerName, ServerRow, Snapshot, Status, Target, Timing,
+    TransportKind, UpdateDownload, same_project,
     words::{self, capitalized},
 };
 use std::collections::{BTreeSet, HashMap};
@@ -615,12 +615,14 @@ impl ShellApp {
                 status,
                 detail,
                 hint,
+                timing,
             } => {
                 if let Some(i) = self.snapshot.servers.iter().position(|r| r.is(&id)) {
                     self.live[i] = Some(Live {
                         status,
                         detail,
                         hint,
+                        timing,
                     });
                     self.live_gen += 1;
                 }
@@ -690,6 +692,12 @@ impl ShellApp {
     /// What the engine's latest answer for row `i` most likely means, in plain words.
     fn hint(&self, i: usize) -> Option<&Hint> {
         self.live.get(i)?.as_ref()?.hint.as_ref()
+    }
+
+    /// How long the row's last check took against Claude Code's time limit, when it ran out of time or was given
+    /// more.
+    fn timing(&self, i: usize) -> Option<&Timing> {
+        self.live.get(i)?.as_ref()?.timing.as_ref()
     }
 
     /// Indices into the snapshot matching the search, ordered by scope, project and name.
@@ -1930,6 +1938,7 @@ struct Live {
     status: Status,
     detail: Option<String>,
     hint: Option<Hint>,
+    timing: Option<Timing>,
 }
 
 #[cfg(test)]
@@ -2157,6 +2166,7 @@ mod tests {
             status,
             detail: detail.map(str::to_owned),
             hint: None,
+            timing: None,
         }
     }
 
@@ -2177,6 +2187,7 @@ mod tests {
                     "this name could not be looked up".to_owned(),
                 )),
             }),
+            timing: None,
         }
     }
 

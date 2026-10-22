@@ -16,7 +16,7 @@ must leave every test, golden file and baseline as it was.
   - `crates/cli/tests/golden/`: every `klefki-cli` command's stdout, stderr and exit code.
   - A difference fails with a diff. When a change is meant, run the tests with `UPDATE_EXPECT=1` and review the
     golden files in the pull request. **In a refactor, a golden file that changes means behaviour changed: stop.**
-- Look tests (`crates/app/src/shell/tests/look.rs`, Linux only): 58 pictures in `crates/app/src/shell/tests/look/`,
+- Look tests (`crates/app/src/shell/tests/look.rs`, Linux only): 62 pictures in `crates/app/src/shell/tests/look/`,
   compared pixel for pixel (threshold 0). Pages, detail tabs, statuses (checking, failed, a diagnosis), empty and
   error states and the update in the top bar at 1100×800; every dialog (Add in each mode, Import, Duplicate, Move,
   Export, casing, profiles, sign-in, the reviews including Delete and "nothing to do", and the outcome messages) at

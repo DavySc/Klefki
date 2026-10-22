@@ -650,13 +650,16 @@ fn shown(path: &Path, source: Source) -> String {
             let name = path.file_name().map(|n| n.to_string_lossy());
             format!(".claude/{}", name.unwrap_or_default())
         }
-        Source::User | Source::Organisation => {
-            let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
-            match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
-                Some(rest) => show(&Path::new("~").join(rest)),
-                None => show(path),
-            }
-        }
+        Source::User | Source::Organisation => home_as_tilde(path),
+    }
+}
+
+/// A path as a message names it, with the home folder as `~`. Sanitised.
+pub(crate) fn home_as_tilde(path: &Path) -> String {
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) => show(&Path::new("~").join(rest)),
+        None => show(path),
     }
 }
 

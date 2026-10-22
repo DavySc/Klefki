@@ -750,4 +750,5 @@ mod renames;
 mod restore;
 mod sign_in;
 mod spelling;
+mod timing;
 mod updates;

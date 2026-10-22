@@ -1,7 +1,7 @@
 //! The engine thread: it takes the UI's commands one at a time and reads the configuration again when it
 //! changes, queueing the checks that calls for.
 use super::changes::{Plans, apply, prepare};
-use super::checks::{Folders, JobKind, Queue, build_job, worker};
+use super::checks::{Folders, Job, JobKind, Queue, build_job, worker};
 use super::client_secrets::{SecretOp, SecretsAsk, secret, secrets};
 use super::reload::{profiles_changed, refresh, reload_after_change};
 use super::{
@@ -83,8 +83,9 @@ pub(super) fn engine_main(
                 queue.visible = rows.into_iter().collect();
                 queue.order();
             }
-            Command::Check(id) => enqueue_now(&shared, &state, &id, JobKind::Check),
-            Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose),
+            Command::Check(id) => enqueue_now(&shared, &state, &id, JobKind::Check, false),
+            Command::CheckLonger(id) => enqueue_now(&shared, &state, &id, JobKind::Check, true),
+            Command::Diagnose(id) => enqueue_now(&shared, &state, &id, JobKind::Diagnose, false),
             Command::Inspect(id) => inspect(&shared, &state, id),
             Command::Export(ids) => {
                 let sources = crate::export::sources(
@@ -386,12 +387,12 @@ fn saved_name<'a>(saved: &'a crate::profiles::Profiles, typed: &'a str) -> &'a s
 }
 
 /// A check or diagnosis the user asked for: ahead of the background checks.
-fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind) {
+fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind, longer: bool) {
     let Some((row, file)) = inventory::locate(&state.snapshot, &state.keys, id) else {
         return;
     };
     if let Some(job) = build_job(shared, &mut Folders::default(), row, Some(file), kind, true) {
-        lock(&shared.queue).push_now(job);
+        lock(&shared.queue).push_now(Job { longer, ..job });
         shared.wake_workers.notify_one();
     }
 }

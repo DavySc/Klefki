@@ -28,8 +28,8 @@ pub use crate::update::{UpdateCheck, Version};
 /// How lists, counts, folders and sentences are put in words, as the engine says them.
 pub mod words {
     pub use crate::words::{
-        and_list, and_list_upto, and_more, capitalized, comma_list_upto, count, folder_name,
-        parent_folder, sentence,
+        and_list, and_list_upto, and_more, capitalized, comma_list_upto, count, duration,
+        folder_name, parent_folder, sentence,
     };
 }
 
@@ -291,6 +291,50 @@ pub enum PreflightKind {
     UnsetVariable,
     /// An environment variable set to nothing.
     EmptyValue,
+}
+
+/// How long a check given more time ([`Command::CheckLonger`]) lets the server take to connect.
+pub const LONGER_CHECK: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long Claude Code waits for a server to connect before it gives up (`MCP_TIMEOUT`), in the folder a check ran
+/// in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeLimit {
+    pub limit: std::time::Duration,
+    pub set_in: LimitSetIn,
+    /// `MCP_TIMEOUT` is set there, but to nothing Claude Code reads as a time (`abc`, `0`), so it waits its default.
+    pub unreadable: bool,
+    /// The settings file to set `MCP_TIMEOUT` in to change the limit, as a message names it: the one that sets it
+    /// now, or the user's `settings.json`. `None` when the organisation sets it, or Claude's folder is unknown.
+    pub change_in: Option<String>,
+}
+
+/// Where the time limit Claude Code uses comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LimitSetIn {
+    /// Nowhere: Claude Code's own 30 s.
+    Default,
+    /// The environment Klefki was started with, which the Claude Code it starts gets too.
+    Environment,
+    /// `env` in a settings file the user can change, as a message names it (`~/.claude/settings.json`,
+    /// `.claude/settings.local.json`). Sanitised.
+    File(String),
+    /// `env` in the organisation's settings, which the user cannot change. Sanitised.
+    Organisation(String),
+}
+
+/// How long a check took against the time limit: for a check that ran out of time, and for every check given more
+/// time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timing {
+    /// From starting Claude Code to its answer, or to giving up on it.
+    pub took: std::time::Duration,
+    /// The limit Claude Code uses there in a session.
+    pub limit: TimeLimit,
+    /// The check was given this long instead ([`Command::CheckLonger`]).
+    pub given: Option<std::time::Duration>,
+    /// It ran out of time: Claude Code gave up on the server, or Klefki on Claude Code.
+    pub timed_out: bool,
 }
 
 /// Where policy keeps a server from loading, and why. Sanitised.

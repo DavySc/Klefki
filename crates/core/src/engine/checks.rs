@@ -5,10 +5,12 @@ use super::{
     Diagnosis, Event, MAX_CHECK_OUTPUT, MAX_DETAIL_CHARS, ProgramStamp, Shared, claude_program,
     lock,
 };
-use crate::api::{Scope, ServerId, ServerRow, Status};
+use crate::api::{LONGER_CHECK, Scope, ServerId, ServerRow, Status, TimeLimit, Timing};
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::inventory::{self, FileKey};
+use crate::config::timeout;
+use crate::diagnose::hints::{HintKind, hints_for};
 use crate::model::ServerName;
 use crate::sanitize::{clip, sanitize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,7 +19,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -42,6 +44,8 @@ pub(super) struct Job {
     pub(super) now: bool,
     /// A `claude mcp list` had no clear answer for it: it is checked on its own, not through another list.
     pub(super) alone: bool,
+    /// The user asked to give the server [`LONGER_CHECK`] to connect ([`super::Command::CheckLonger`]).
+    pub(super) longer: bool,
 }
 
 #[derive(Default)]
@@ -273,6 +277,7 @@ pub(super) fn build_job(
         background: false,
         now: false,
         alone: false,
+        longer: false,
     })
 }
 
@@ -357,9 +362,15 @@ fn begin<'a>(shared: &'a Shared, job: &Job) -> (Option<Announced<'a>>, u64) {
         .announce
         .then(|| Announced::new(&shared.queue, &job.id.connection));
     if job.announce {
+        let detail = job.longer.then(|| {
+            format!(
+                "giving it up to {} to connect",
+                crate::words::duration(LONGER_CHECK)
+            )
+        });
         shared
             .emitter
-            .status(job.id.clone(), Status::Checking, None);
+            .status(job.id.clone(), Status::Checking, detail);
     }
     let started = lock(&shared.changes).count;
     if let Some(a) = &announced {
@@ -379,22 +390,27 @@ fn run(shared: &Shared, job: &Job) {
             } else {
                 ListedCheck::Not
             };
-            let (status, detail) = match listed {
-                ListedCheck::Answer(answer) => answer,
+            let (status, detail, timing) = match listed {
+                ListedCheck::Answer((status, detail)) => (status, detail, None),
                 ListedCheck::Not => execute(shared, job),
                 // Its `get` goes in the queue behind those of the servers that were only slow.
                 ListedCheck::Later => return,
             };
             if current() {
-                shared.emitter.status(job.id.clone(), status, detail);
+                shared
+                    .emitter
+                    .status_timed(job.id.clone(), status, detail, timing);
             }
         }
         JobKind::Diagnose => {
-            let diagnosis = run_diagnose(shared, job);
+            let (diagnosis, timing) = run_diagnose(shared, job);
             if current() {
-                shared
-                    .emitter
-                    .status(job.id.clone(), diagnosis.status, diagnosis.detail.clone());
+                shared.emitter.status_timed(
+                    job.id.clone(),
+                    diagnosis.status,
+                    diagnosis.detail.clone(),
+                    timing,
+                );
                 shared.emitter.emit(Event::Diagnosis {
                     id: job.id.clone(),
                     diagnosis,
@@ -589,24 +605,77 @@ fn queue_again(shared: &Shared, mut again: Vec<(Job, bool)>, then: ListedCheck) 
     then
 }
 
-fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>) {
+fn execute(shared: &Shared, job: &Job) -> (Status, Option<String>, Option<Timing>) {
     let Some(program) = claude_program(shared) else {
         return (
             Status::Unknown,
             Some("the claude CLI is not available".to_owned()),
+            None,
         );
     };
-    let timeout = shared.config.check_timeout;
+    let limit = time_limit(shared, job);
+    let timeout = run_timeout(shared, &limit, job.longer);
+    let name = job.name.as_str();
+    let args: &[&str] = if job.longer {
+        &["--settings", LONGER_SETTINGS, "mcp", "get", name]
+    } else {
+        &["mcp", "get", name]
+    };
+    let started = Instant::now();
     let result = runner::run(&RunSpec {
         program: &program,
-        args: &["mcp", "get", job.name.as_str()],
+        args,
         cwd: Some(&job.cwd),
         env: &check_env(shared),
         timeout,
         max_output: MAX_CHECK_OUTPUT,
         end_leftovers: true,
     });
-    interpret(result, timeout)
+    let took = started.elapsed();
+    let ran_out = matches!(&result, Ok(out) if out.timed_out);
+    let (status, detail) = interpret(result, timeout);
+    let timing = timing(job.longer, status, detail.as_deref(), ran_out, took, limit);
+    (status, detail, timing)
+}
+
+/// The settings a check given more time runs with: passed as `--settings`, which wins over the user's and the
+/// project's own `MCP_TIMEOUT` (measured with Claude Code 2.1.308), not over the organisation's.
+pub(super) const LONGER_SETTINGS: &str = r#"{"env":{"MCP_TIMEOUT":"120000"}}"#;
+
+/// Claude Code's time limit for connecting in the folder a job runs in.
+pub(super) fn time_limit(shared: &Shared, job: &Job) -> TimeLimit {
+    timeout::limit(
+        shared.config.paths.as_ref(),
+        Some(&job.cwd),
+        &*shared.config.vars,
+    )
+}
+
+/// How long to wait for Claude Code's answer: the usual wait, longer by as much as the limit there is above Claude
+/// Code's own, so that a server given more time is answered for by Claude Code and not cut off by Klefki.
+pub(super) fn run_timeout(shared: &Shared, limit: &TimeLimit, longer: bool) -> Duration {
+    let limit = if longer { LONGER_CHECK } else { limit.limit };
+    shared.config.check_timeout + limit.saturating_sub(timeout::DEFAULT)
+}
+
+/// The timing to show with an answer: for a check that ran out of time, Claude Code's (`Request timed out`) or
+/// Klefki's own, and for every check given more time.
+pub(super) fn timing(
+    longer: bool,
+    status: Status,
+    detail: Option<&str>,
+    ran_out: bool,
+    took: Duration,
+    limit: TimeLimit,
+) -> Option<Timing> {
+    let timed_out = status == Status::Failed
+        && detail.is_some_and(|d| hints_for(d).contains(&HintKind::TimedOut));
+    (longer || ran_out || timed_out).then(|| Timing {
+        took,
+        limit,
+        given: longer.then_some(LONGER_CHECK),
+        timed_out: ran_out || timed_out,
+    })
 }
 
 /// What a finished `claude mcp get` means: a status, and a reason when there is no verdict.
