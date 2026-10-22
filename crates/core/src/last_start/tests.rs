@@ -578,3 +578,20 @@ fn the_log_folder_is_where_claude_code_keeps_it() {
         assert_eq!(root(cache), Path::new("/c/claude-cli-nodejs"));
     }
 }
+
+#[test]
+fn folders_under_home_keep_their_own_separator() {
+    // Found on Windows CI: a folder logged as `/home/u/a` was shown as `~\a`.
+    let home = Some(Path::new("/home/u"));
+    assert_eq!(shown_path(Path::new("/home/u/a/b"), home), "~/a/b");
+    assert_eq!(shown_path(Path::new("/home/u"), home), "~");
+    assert_eq!(shown_path(Path::new("/elsewhere/a"), home), "/elsewhere/a");
+    #[cfg(windows)]
+    {
+        let home = Some(Path::new("C:\\Users\\Ana"));
+        assert_eq!(
+            shown_path(Path::new("C:\\Users\\Ana\\code\\app"), home),
+            "~\\code\\app"
+        );
+    }
+}

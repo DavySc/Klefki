@@ -455,12 +455,18 @@ fn to_ms(y: u32, mo: u32, d: u32, h: u32, mi: u32, s: u32, ms: u32) -> Option<u6
         .checked_add(u64::from(ms))
 }
 
-/// A path as shown: `~` for the home folder, cleaned and cut.
+/// A path as shown: `~` for the home folder, cleaned and cut. The rest keeps the path's own separator: a folder
+/// logged as `/home/u/app` stays `~/app` on Windows too.
 fn shown_path(path: &Path, home: Option<&Path>) -> String {
+    let whole = path.to_string_lossy();
     let text = match home.and_then(|h| path.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
-        Some(rest) => Path::new("~").join(rest).to_string_lossy().into_owned(),
-        None => path.to_string_lossy().into_owned(),
+        Some(rest) => {
+            let sep = if whole.contains('\\') { '\\' } else { '/' };
+            let parts: Vec<_> = rest.iter().map(|p| p.to_string_lossy()).collect();
+            format!("~{sep}{}", parts.join(&sep.to_string()))
+        }
+        None => whole.into_owned(),
     };
     clip(&sanitize_line(&text), crate::sanitize::MAX_SHOWN_CHARS)
 }
