@@ -24,7 +24,7 @@ pub use crate::profile_uses::{ProfileUse, ProfileUses, Switch};
 pub use crate::profiles::{Profile, Profiles};
 pub use crate::secret_uses::{Place, SecretKind, SecretUse, Secrets, ServerSecrets, UnusedSecret};
 pub use crate::secrets::{Secret, SecretError};
-pub use crate::start::StartPlan;
+pub use crate::start::{NOT_HERE as START_NOT_HERE, StartPlan};
 pub use crate::undo::{Record as UndoRecord, Undo};
 pub use crate::update::{UpdateCheck, Version};
 
@@ -711,9 +711,12 @@ pub fn start_plan(
 }
 
 /// Starts Claude Code as `plan` says, attached to this terminal: the one named `claude`, or the one the app would use.
-/// On Unix this process becomes Claude Code and this returns only when it could not be started; elsewhere it answers
-/// Claude Code's exit code.
-pub fn run_claude(plan: &StartPlan, claude: Option<&std::path::Path>) -> Result<i32, String> {
+/// On Unix this process becomes Claude Code, so this returns only why it could not be started; elsewhere it starts
+/// nothing yet ([`START_NOT_HERE`]).
+pub fn run_claude(
+    plan: &StartPlan,
+    claude: Option<&std::path::Path>,
+) -> Result<std::convert::Infallible, String> {
     let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
     let path_var = std::env::var_os("PATH");
     let program = crate::cli::locate::locate(&crate::cli::locate::Search {

@@ -276,7 +276,7 @@ fn on_windows_the_line_is_for_powershell_and_says_where_to_run_it() {
     let plan = plan(&p.paths(), "Work", &[user("a")], &p.project(), true).unwrap();
     assert_eq!(
         plan.line,
-        r#"claude --% --settings "{\"allowedMcpServers\":[{\"serverName\":\"a\"}]}""#
+        r#"claude.exe --% --settings "{\"allowedMcpServers\":[{\"serverName\":\"a\"}]}""#
     );
     assert_eq!(plan.to_do.len(), 1);
     assert!(
@@ -354,4 +354,25 @@ fn only_a_line_klefki_could_have_made_is_started() {
     );
     // A good line gets as far as looking for the program.
     assert!(!run(&good, &missing).unwrap_err().contains("Klefki made"));
+}
+
+/// Review of #106 (S3): the project's own server of a name the profile lets in loads in the profile's place, and the
+/// reason says so rather than "loads too".
+#[test]
+fn the_projects_own_server_of_a_profiles_name_is_said_as_such() {
+    let p = Place::new();
+    let path = p.file("cfg/.claude.json");
+    let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    doc["mcpServers"]["loc"] = stdio("user-loc");
+    p.write("cfg/.claude.json", &doc);
+    let plan = p.plan(&[user("a"), user("loc")]).unwrap();
+    assert_eq!(plan.loads, ["a"]);
+    assert!(
+        about(&plan.missing, "loc").contains("has its name there"),
+        "{plan:?}"
+    );
+    assert_eq!(
+        about(&plan.extra, "loc"),
+        "loc: this project's own server of that name loads, as Claude Code prefers it to the profile's."
+    );
 }

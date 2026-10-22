@@ -225,7 +225,14 @@ pub(crate) fn plan(
         if members.contains(&row.connection) || !loads_in(&after[j]) {
             continue;
         }
-        extra.push(if row.scope == Scope::Managed {
+        let same_name = ConnectionId::parse(row.connection.as_str())
+            .is_some_and(|(_, _, name)| names.contains(&name));
+        extra.push(if same_name {
+            format!(
+                "{}: this project's own server of that name loads, as Claude Code prefers it to the profile's.",
+                row.name
+            )
+        } else if row.scope == Scope::Managed {
             format!(
                 "{}: your organisation's servers load without being on an allowed list.",
                 row.name
@@ -256,11 +263,12 @@ pub(crate) fn plan(
     .to_string();
     let (line, to_do) = if windows {
         // PowerShell passes what follows `--%` on as written, so Claude Code reads the quotes as the JSON's own
-        // (Windows PowerShell 5.1 and PowerShell 7 alike); a folder change on the same line would not stop when it
-        // fails, so where to run it is said instead.
+        // (Windows PowerShell 5.1 and PowerShell 7 alike), but only to a program: npm's `claude.ps1` would get `--%`
+        // itself, so the line names `claude.exe`, which PowerShell finds only as a program. A folder change on the
+        // same line would not stop when it fails, so where to run it is said instead.
         (
             format!(
-                "{PROGRAM} --% --settings \"{}\"",
+                "{PROGRAM}.exe --% --settings \"{}\"",
                 settings.replace('"', "\\\"")
             ),
             vec![format!(
@@ -287,11 +295,17 @@ pub(crate) fn plan(
     })
 }
 
+/// Why `run` starts nothing on this system: the line is for pasting instead.
+pub const NOT_HERE: &str = "On Windows, klefki-cli does not start Claude Code itself yet: paste the line above in PowerShell.";
+
 /// Starts Claude Code (`program`) in the plan's project with the plan's arguments, attached to this terminal. On Unix
-/// this process becomes Claude Code, so it returns only when Claude Code could not be started; elsewhere it waits and
-/// answers Claude Code's exit code. No shell: each argument is its own; the arguments are checked again here, as a
+/// this process becomes Claude Code, so it returns only when Claude Code could not be started; elsewhere it starts
+/// nothing and says [`NOT_HERE`]. No shell: each argument is its own; the arguments are checked again here, as a
 /// plan's fields can be set by anyone.
-pub(crate) fn run(plan: &StartPlan, program: &std::path::Path) -> Result<i32, String> {
+pub(crate) fn run(
+    plan: &StartPlan,
+    program: &std::path::Path,
+) -> Result<std::convert::Infallible, String> {
     let [flag, settings] = plan.args.as_slice() else {
         return Err("the start command is not one Klefki made".to_owned());
     };
@@ -338,12 +352,12 @@ pub(crate) fn run(plan: &StartPlan, program: &std::path::Path) -> Result<i32, St
         let e = command.exec();
         Err(format!("Claude Code could not be started: {e}"))
     }
+    // Waiting on Claude Code here would leave it running in the console when the first Ctrl+C, which reaches every
+    // process there, ends Klefki (review of #106): not started until that is handled.
     #[cfg(not(unix))]
     {
-        let status = command
-            .status()
-            .map_err(|e| format!("Claude Code could not be started: {e}"))?;
-        Ok(status.code().unwrap_or(1))
+        drop(command);
+        Err(NOT_HERE.to_owned())
     }
 }
 

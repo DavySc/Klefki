@@ -140,7 +140,8 @@ Commands:
            other sessions keep theirs. Says first which of the profile's
            servers would still not load, and which others would load too (a
            server off there, a rule in a settings file), and asks before
-           starting then. --print shows the line to paste instead.
+           starting then. --print shows the line to paste instead; on
+           Windows run prints it too, for now, and starts nothing.
 
 Options:
   NAME           Only these servers (by name, in every scope).

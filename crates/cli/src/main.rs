@@ -252,6 +252,11 @@ fn run_profile(
     if print {
         return out(&format!("{}\n", plan.line));
     }
+    if cfg!(windows) {
+        let code = out(&format!("{}\n", plan.line));
+        eprintln!("{}", api::START_NOT_HERE);
+        return if code == OK { NOT_WRITTEN } else { code };
+    }
     if !plan.exact() && !yes {
         if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
             eprintln!("Nothing started: add --yes to start it anyway.");
@@ -266,9 +271,9 @@ fn run_profile(
             return NOT_WRITTEN;
         }
     }
+    // On success this process is Claude Code from here on, and its exit status is Claude Code's.
     match api::run_claude(&plan, claude) {
-        // Claude Code's own exit code, as a shell would pass it on.
-        Ok(code) => u8::try_from(code.rem_euclid(256)).unwrap_or(PROBLEM),
+        Ok(never) => match never {},
         Err(why) => {
             eprintln!("klefki-cli: {why}");
             UNAVAILABLE

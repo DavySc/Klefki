@@ -85,8 +85,10 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
 - Start command (on/off plan S5, 2026-10-22, findings 1 and 6; approved by the owner): a session can start with a
   profile's servers without writing anything, so nothing goes stale, nothing needs putting back, and sessions side by
   side can differ. On a card with one project chosen, "Copy start command" copies `cd <project> && claude --settings
-  '{"allowedMcpServers":[{"serverName":…}]}'` (on Windows a PowerShell line with `--%`, and where to run it), and
-  `klefki-cli run` starts it. Checked with Claude Code 2.1.308 (`claude --settings … mcp list`, and an interactive
+  '{"allowedMcpServers":[{"serverName":…}]}'` (on Windows a PowerShell line, `claude.exe --% --settings "…"`, and
+  where to run it: `--%` reaches only a program, not npm's `claude.ps1`), and `klefki-cli run` starts it (on Linux
+  and macOS). When that session would not load just the profile's servers, the card copies only from "Copy anyway",
+  under what differs, as `run` asks first. Checked with Claude Code 2.1.308 (`claude --settings … mcp list`, and an interactive
   session): that list is **added** to the `allowedMcpServers` of every settings file (the user's, the project's
   `.claude/settings.json` and `settings.local.json`, the organisation's); a `serverCommand` (`serverUrl`) rule in any
   of them makes a name count for no local (remote) server; a denied rule anywhere still wins; the organisation's

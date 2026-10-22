@@ -124,15 +124,75 @@ fn what_would_still_differ_from_the_profile_is_said() {
             &["beta: allowedMcpServers in .claude/settings.local.json lets it load too."],
         )),
     );
+    // Not copied before what differs was seen: as `klefki-cli run` asks first.
+    assert!(copied(&h).is_empty());
     h.run();
+    h.get_by_label("Claude Code loads from the profile: alpha.");
     h.get_by_label("Not loaded, though in the profile:");
     h.get_by_label_contains("gone is off in notes");
     h.get_by_label("Loaded too, though not in the profile:");
     h.get_by_label_contains("beta: allowedMcpServers in .claude/settings.local.json");
-    h.get_by_label("Loaded from the profile: alpha.");
     assert!(
         h.query_by_label_contains("loads only these servers")
             .is_none()
+    );
+    h.get_by_label("Copy anyway").click();
+    h.step();
+    assert_eq!(copied(&h), [LINE]);
+}
+
+/// Review of #106 (B3): after the profile was edited, the panel kept the old line and said it loads only the old
+/// servers. The profile is asked for again, with its servers as they are now, and nothing is copied.
+#[test]
+fn an_edited_profile_is_asked_for_again() {
+    let (mut h, engine) = work_in_notes();
+    click(&mut h, COPY);
+    answer(&mut h, &engine, Ok(plan(&[], &[])));
+    h.run();
+    sent(&engine);
+    let mut edited = work_profile();
+    edited.profiles[0]
+        .members
+        .push(id_of("beta", Scope::User, None));
+    let members = edited.profiles[0].members.clone();
+    engine.events.send(Event::Profiles(edited)).unwrap();
+    h.run();
+    let again = sent(&engine);
+    assert!(
+        again.contains(&Command::StartCommand {
+            profile: "Work".to_owned(),
+            members,
+            project: NOTES.to_owned(),
+        }),
+        "{again:?}"
+    );
+    answer(&mut h, &engine, Ok(plan(&[], &["beta loads too."])));
+    assert!(copied(&h).is_empty());
+    h.run();
+    h.get_by_label("• beta loads too.");
+    assert!(
+        h.query_by_label_contains("loads only these servers")
+            .is_none()
+    );
+}
+
+/// Nearby: a profile renamed or deleted while its panel is open takes the panel with it.
+#[test]
+fn a_renamed_profile_takes_its_start_command_with_it() {
+    let (mut h, engine) = work_in_notes();
+    click(&mut h, COPY);
+    answer(&mut h, &engine, Ok(plan(&[], &[])));
+    h.run();
+    sent(&engine);
+    let mut renamed = work_profile();
+    renamed.profiles[0].name = "Writing".to_owned();
+    engine.events.send(Event::Profiles(renamed)).unwrap();
+    h.run();
+    assert!(h.query_by_label(LINE).is_none());
+    assert!(
+        sent(&engine)
+            .iter()
+            .all(|c| !matches!(c, Command::StartCommand { .. }))
     );
 }
 

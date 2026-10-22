@@ -86,8 +86,10 @@ Pre-flight findings (decision of P3, `api::ServerRow::preflight`) are shown unde
   paste on stdout instead and starts nothing (0). No start command at all (no server of the profile can be named, or
   the organisation's `allowManagedMcpServersOnly`) is 1. Claude Code is found like `status` finds it, started with
   no shell in the project's folder, attached to the terminal; on Linux and macOS `klefki-cli` becomes it (`exec`),
-  so the exit status is Claude Code's, and on Windows it waits and passes the status on. Not found is 3. `--all` and
-  `--only` are refused.
+  so the exit status is Claude Code's. On Windows it prints the line and exits 4 for now: waiting on Claude Code
+  there, the first Ctrl+C (which reaches every process in the console) would end `klefki-cli` and leave Claude Code
+  running under the shell (review of #106); a console control handler would need more `unsafe` in core, an open
+  decision. Not found is 3. `--all` and `--only` are refused.
 - `KLEFKI_DATA_DIR` names Klefki's own folder (backups, profiles, the Activity log) instead of the machine's, like
   `KLEFKI_MANAGED_DIR`, so tests and try-outs never touch it.
 

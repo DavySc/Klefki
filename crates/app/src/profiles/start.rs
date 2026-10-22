@@ -8,6 +8,8 @@ use egui::{Frame, Margin, RichText, Ui};
 use klefki_core::api::StartPlan;
 
 pub(super) const COPY: &str = "Copy start command";
+/// For a line whose session would not load just the profile's servers: copied only once that was read.
+pub(super) const COPY_ANYWAY: &str = "Copy anyway";
 
 /// The start command asked for last, for one profile in one project.
 pub(crate) struct Seen {
@@ -59,6 +61,12 @@ impl Seen {
         self.stale = self.plan.is_some();
     }
 
+    /// The profiles were read again (after an edit, say): the profile's servers may have changed, so it is asked for
+    /// again, with an answer on its way too, which may be about the servers before.
+    pub(super) fn profiles_changed(&mut self) {
+        self.stale = true;
+    }
+
     /// Whether to ask again now, once, for the files as they are.
     pub(super) fn take_stale(&mut self) -> bool {
         std::mem::take(&mut self.stale)
@@ -85,7 +93,8 @@ pub(super) fn button(ui: &mut Ui, seen: Option<&Seen>, shown_project: &str) -> b
 }
 
 /// The line and what it does, under the card's buttons, once it was asked for. Copies the line the frame it is first
-/// drawn.
+/// drawn when its session loads just the profile's servers; otherwise only from "Copy anyway", under what differs, as
+/// `klefki-cli run` asks first (review of #106).
 pub(super) fn panel(ui: &mut Ui, seen: &mut Seen) {
     let pal = theme::palette(ui.ctx());
     let Some(plan) = &seen.plan else {
@@ -95,16 +104,11 @@ pub(super) fn panel(ui: &mut Ui, seen: &mut Seen) {
     };
     ui.add_space(6.0);
     let reveal = std::mem::take(&mut seen.reveal);
+    let now = ui.input(|i| i.time);
+    let copied = seen.copied(now);
     let shown = ui.scope(|ui| match plan {
         Ok(plan) => {
-            if std::mem::take(&mut seen.copy) {
-                ui.ctx().copy_text(plan.line.clone());
-                seen.copied = Some(ui.input(|i| i.time));
-                // The button above was drawn before this: it says "Copied" in the next frame.
-                ui.ctx().request_repaint();
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
-            }
+            let mut copy = std::mem::take(&mut seen.copy) && plan.exact();
             Frame::new()
                 .fill(pal.field)
                 .inner_margin(Margin::same(8))
@@ -117,19 +121,25 @@ pub(super) fn panel(ui: &mut Ui, seen: &mut Seen) {
                 ui.add(egui::Label::new(format!("• {item}")).wrap());
             }
             ui.add_space(2.0);
+            let loads = klefki_core::api::words::and_list(&plan.loads);
             if plan.exact() {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(egui_phosphor::regular::CHECK_CIRCLE).color(pal.success));
                     ui.add(
-                        egui::Label::new(format!(
-                            "Claude Code loads only these servers there: {}.",
-                            klefki_core::api::words::and_list(&plan.loads)
-                        ))
-                        .wrap(),
+                        egui::Label::new(format!("Claude Code loads only these servers there: {loads}."))
+                            .wrap(),
                     );
                 });
             } else {
-                // What differs from the profile comes first, in the warning colour: the line alone does not say it.
+                // What loads first, as `klefki-cli run` says it; then what differs, in the warning colour.
+                ui.add(
+                    egui::Label::new(if plan.loads.is_empty() {
+                        "Claude Code loads none of the profile's servers there.".to_owned()
+                    } else {
+                        format!("Claude Code loads from the profile: {loads}.")
+                    })
+                    .wrap(),
+                );
                 let warn = |ui: &mut Ui, text: &str| {
                     ui.add(egui::Label::new(RichText::new(text).color(pal.warn)).wrap());
                 };
@@ -145,15 +155,20 @@ pub(super) fn panel(ui: &mut Ui, seen: &mut Seen) {
                         ui.add(egui::Label::new(format!("• {e}")).wrap());
                     }
                 }
-                if !plan.loads.is_empty() {
-                    muted(
-                        ui,
-                        &format!(
-                            "Loaded from the profile: {}.",
-                            klefki_core::api::words::and_list(&plan.loads)
-                        ),
-                    );
-                }
+                ui.add_space(4.0);
+                let anyway = ui
+                    .button(if copied { "Copied" } else { COPY_ANYWAY })
+                    .on_hover_text("Copy the line as it is: Claude Code started with it loads what is said above.");
+                announce(ui.ctx(), anyway.id);
+                copy |= anyway.clicked();
+            }
+            if copy {
+                ui.ctx().copy_text(plan.line.clone());
+                seen.copied = Some(now);
+                // A button above was drawn before this: it says "Copied" in the next frame.
+                ui.ctx().request_repaint();
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(COPIED_SECS));
             }
             muted(
                 ui,

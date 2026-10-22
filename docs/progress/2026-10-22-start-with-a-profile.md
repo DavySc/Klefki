@@ -33,12 +33,12 @@ server loc, each a tiny stdio server that logs its start; `claude --settings 'â€
   no longer configured. Extra: the organisation's servers, and servers another file's allowed list lets in (naming
   the files). No line when no server can be named (organisation servers alone give `[]`) or with
   `allowManagedMcpServersOnly`. The line: POSIX `cd <project> && claude --settings '<json>'`; Windows
-  `claude --% --settings "<json with \">"` for PowerShell, plus "Run it in PowerShell, in <folder>." (no `cd`: a
+  `claude.exe --% --settings "<json with \">"` for PowerShell, plus "Run it in PowerShell, in <folder>." (no `cd`: a
   failed `Set-Location` would not stop the line). Only names go in the line, never commands or addresses, so no
   secret lands in a clipboard or shell history.
 - Core `start::run` / `api::run_claude`: checks the arguments again (only `--settings` with only `serverName` rules
   of allowed names), the project folder, and the program (`locate::check`: no `.cmd`/`.bat`), then starts Claude
-  Code with no shell in the project folder, without `MCP_CLIENT_SECRET`; `exec` on Unix, wait on Windows.
+  Code with no shell in the project folder, without `MCP_CLIENT_SECRET`; `exec` on Unix; on Windows nothing is started yet (review round 1).
   `api::start_plan` for the CLI.
 - Engine: `Command::StartCommand { profile, members, project }` â†’ `Event::StartCommand { profile, project, plan }`.
 - App (`profiles/start.rs`): with one project chosen on a card, "Copy start command" asks the engine; the line is
@@ -68,6 +68,22 @@ server loc, each a tiny stdio server that logs its start; `claude --settings 'â€
 - `cargo deny check`: advisories ok, bans ok, licenses ok, sources ok.
 - Not run here: macOS and Windows (CI); the PowerShell line on a real Windows; connector names with a signed-in
   account; a plugin's server under a start command.
+
+## Review round 1 (cross-review on #106)
+- B1: on Windows, `run` waited on Claude Code with no console control handler, so the first Ctrl+C would end
+  `klefki-cli` and leave Claude Code running under the shell. Now `run` on Windows prints the line, says to paste it
+  in PowerShell, and exits 4 (`start::run` starts nothing there, `api::START_NOT_HERE`). A handler (as cargo's
+  `exec_replace`) would need more `unsafe` in core, still an open decision for the owner.
+- B2: PowerShell runs npm's `claude.ps1` for a bare `claude`, and `--%` reaches only a program: the line now names
+  `claude.exe`. Core, CLI tests updated.
+- B3: after a profile edit the panel kept the old line and "loads onlyâ€¦". `ProfilesPage::set` now asks again (without
+  copying) for a profile still there, and drops the panel of one renamed or deleted. Regression test
+  `an_edited_profile_is_asked_for_again` (seen failing with the re-ask removed), variant
+  `a_renamed_profile_takes_its_start_command_with_it`.
+- S1: when the session would not load just the profile's servers, nothing is copied until "Copy anyway", under what
+  differs (as `run` asks first). S2: the card says what loads first, in normal text. S3: the project's own server of
+  a name the profile lets in is said as such (core test).
+- Pictures `profile-start-command(-800x480)` changed (Copy anyway, summary first). Not tried on a real Windows.
 
 ## Open / next
 - A plugin's server can only be let in by its command; left out on purpose (see above). Said on the card.

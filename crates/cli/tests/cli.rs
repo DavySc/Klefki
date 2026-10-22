@@ -2238,7 +2238,8 @@ fn run_starts_claude_code_in_the_project_with_only_the_profiles_servers() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     let line = text(&out.stdout);
     if cfg!(windows) {
-        assert!(line.starts_with("claude --% --settings \""), "{line}");
+        // A program only: npm's claude.ps1 would get `--%` itself.
+        assert!(line.starts_with("claude.exe --% --settings \""), "{line}");
     } else {
         assert!(
             line.ends_with(&format!("claude --settings '{settings}'\n")),
@@ -2264,6 +2265,19 @@ fn run_starts_claude_code_in_the_project_with_only_the_profiles_servers() {
         "{}",
         text(&out.stderr)
     );
+    if cfg!(windows) {
+        // Not started yet on Windows (review of #106: Ctrl+C would end klefki-cli and leave Claude Code running):
+        // the line is printed to paste instead.
+        assert_eq!(out.status.code(), Some(4));
+        assert!(
+            text(&out.stdout).starts_with("claude.exe --% "),
+            "{}",
+            text(&out.stdout)
+        );
+        assert!(text(&out.stderr).contains("paste the line above in PowerShell"));
+        assert!(sessions(&env).is_empty());
+        return;
+    }
     let started = sessions(&env);
     assert_eq!(started.len(), 1, "{started:?}");
     assert_eq!(started[0].0, ["--settings", settings]);
@@ -2320,7 +2334,7 @@ fn run_says_what_differs_from_the_profile_and_starts_only_when_confirmed() {
         "--claude",
         &claude,
     ]);
-    assert_eq!(sessions(&env).len(), 1);
+    assert_eq!(sessions(&env).len(), usize::from(!cfg!(windows)));
 }
 
 #[test]

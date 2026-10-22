@@ -150,6 +150,19 @@ impl ProfilesPage {
     /// The profiles as the engine has them. After a save, the profile being made or edited is done; the first
     /// answer on opening the page leaves a draft carried over from before.
     pub(crate) fn set(&mut self, profiles: Profiles) {
+        // A start command shown for a profile that is gone (deleted, renamed) goes; one still there is asked again,
+        // as its servers may have changed.
+        let kept = self
+            .start
+            .as_ref()
+            .is_some_and(|seen| profiles.profiles.iter().any(|p| p.name == seen.profile));
+        if kept {
+            if let Some(seen) = &mut self.start {
+                seen.profiles_changed();
+            }
+        } else {
+            self.start = None;
+        }
         self.profiles = Some(profiles);
         self.alone = None;
         self.in_use = None;
