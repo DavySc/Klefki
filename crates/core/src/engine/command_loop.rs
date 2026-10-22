@@ -90,6 +90,23 @@ pub(super) fn engine_main(
             Command::Inspect(id) => inspect(&shared, &state, id),
             Command::LastStarts(id) => last_starts(&shared, &state, id),
             Command::InspectorCommand(id) => inspector_command(&shared, &state, id),
+            Command::StartCommand {
+                profile,
+                members,
+                project,
+            } => {
+                let plan = match shared.config.paths.as_ref() {
+                    Some(paths) => {
+                        crate::start::plan(paths, &profile, &members, &project, cfg!(windows))
+                    }
+                    None => Err("Claude Code's configuration folder is unknown.".to_owned()),
+                };
+                shared.emitter.emit(Event::StartCommand {
+                    profile,
+                    project,
+                    plan,
+                });
+            }
             Command::RedactedDefinition { id, also } => {
                 redacted_definition(&shared, &state, id, &also);
             }

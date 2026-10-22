@@ -10,6 +10,8 @@ use klefki_core::api::words::{self, parent_folder};
 use klefki_core::api::{Change, ConnectionId, Profile, Profiles, Scope, ServerRow, Snapshot};
 use std::collections::HashMap;
 
+mod start;
+
 /// A profile's servers named on its card; the rest are counted.
 const NAMED: usize = 5;
 /// Above this many projects, the project list has a box to type in.
@@ -47,6 +49,8 @@ pub(crate) struct ProfilesPage {
     /// New profile was asked for from the palette: the editor opens once the profiles are read, if they can be
     /// changed.
     new_asked: bool,
+    /// The start command asked for last (on/off plan S5).
+    start: Option<start::Seen>,
 }
 
 /// Using a profile would write nothing: what is already so, and what would still keep a server from loading.
@@ -109,6 +113,14 @@ pub(crate) enum Asked {
     Delete(String),
     /// Prepare this change for review. Boxed: a change is large next to the other asks.
     Use(Box<Change>),
+    /// The line that starts Claude Code in `project` with only the profile's servers ([`Command::StartCommand`]).
+    ///
+    /// [`Command::StartCommand`]: klefki_core::api::Command::StartCommand
+    StartCommand {
+        profile: String,
+        members: Vec<ConnectionId>,
+        project: String,
+    },
 }
 
 enum Edited {
@@ -138,6 +150,19 @@ impl ProfilesPage {
     /// The profiles as the engine has them. After a save, the profile being made or edited is done; the first
     /// answer on opening the page leaves a draft carried over from before.
     pub(crate) fn set(&mut self, profiles: Profiles) {
+        // A start command shown for a profile that is gone (deleted, renamed) goes; one still there is asked again,
+        // as its servers may have changed.
+        let kept = self
+            .start
+            .as_ref()
+            .is_some_and(|seen| profiles.profiles.iter().any(|p| p.name == seen.profile));
+        if kept {
+            if let Some(seen) = &mut self.start {
+                seen.profiles_changed();
+            }
+        } else {
+            self.start = None;
+        }
         self.profiles = Some(profiles);
         self.alone = None;
         self.in_use = None;
@@ -174,6 +199,9 @@ impl ProfilesPage {
     pub(crate) fn snapshot_changed(&mut self) {
         self.alone = None;
         self.in_use = None;
+        if let Some(seen) = &mut self.start {
+            seen.snapshot_changed();
+        }
         // What a Use found already so was true of the files then: another change may have made it false since.
         for choice in self.choices.values_mut() {
             choice.unchanged = None;
@@ -199,6 +227,18 @@ impl ProfilesPage {
         }
         self.filter.clear();
         self.reveal = Some(name);
+    }
+
+    /// The start command the engine made, or why there is none.
+    pub(crate) fn start_arrived(
+        &mut self,
+        profile: &str,
+        project: &str,
+        plan: Result<klefki_core::api::StartPlan, String>,
+    ) {
+        if let Some(seen) = &mut self.start {
+            seen.arrived(profile, project, plan);
+        }
     }
 
     pub(crate) fn refused(&mut self, why: String) {
@@ -394,6 +434,8 @@ impl ProfilesPage {
                             in_use_all: &in_use_all,
                             reveal,
                             editable,
+                            live,
+                            start: &mut self.start,
                         },
                         choice,
                         &mut self.confirm,
@@ -441,6 +483,10 @@ struct Context<'a> {
     /// Bring it into view, with where to use it taking the keyboard.
     reveal: bool,
     editable: bool,
+    /// Real files, not sample data: a start command can be made.
+    live: bool,
+    /// The start command asked for last, whichever card asked.
+    start: &'a mut Option<start::Seen>,
 }
 
 /// One profile: its name, its servers, where to use it, and its buttons.
@@ -453,6 +499,7 @@ fn card(
     confirm: &mut Option<String>,
     project_filter: &mut String,
 ) -> Option<Card> {
+    let start = cx.start;
     let editable = cx.editable;
     let pal = theme::palette(ui.ctx());
     let mut out = None;
@@ -740,7 +787,31 @@ fn card(
                         }
                     }
                 }
+                // One project: a session there can start with only these servers, without saving anything.
+                if let (true, Some(Some(project))) = (cx.live, &choice.place) {
+                    let seen = start.as_ref().filter(|s| s.is_for(&profile.name, project));
+                    if start::button(ui, seen, &shown_project(project, snapshot)) {
+                        *start = Some(start::Seen::asked(&profile.name, project));
+                        out = Some(Card::Asked(Asked::StartCommand {
+                            profile: profile.name.clone(),
+                            members: profile.members.clone(),
+                            project: project.clone(),
+                        }));
+                    }
+                }
             });
+            if let Some(Some(project)) = &choice.place
+                && let Some(seen) = start.as_mut().filter(|s| s.is_for(&profile.name, project))
+            {
+                if out.is_none() && seen.take_stale() {
+                    out = Some(Card::Asked(Asked::StartCommand {
+                        profile: profile.name.clone(),
+                        members: profile.members.clone(),
+                        project: project.clone(),
+                    }));
+                }
+                start::panel(ui, seen);
+            }
             if let Some(Some(project)) = &choice.place {
                 let others = in_use_at(cx.in_use_all, project, &profile.name);
                 if !others.is_empty() {

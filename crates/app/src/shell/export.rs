@@ -86,12 +86,12 @@ fn select_file_stem(ctx: &egui::Context, id: egui::Id, path: &str) {
 
 /// Makes the widget `id` a polite live region: a screen reader reads out a change to it ("Copied", "Saved to …")
 /// when it is next idle, without moving the keyboard focus (WCAG 2.2, 4.1.3 Status Messages).
-pub(super) fn announce(ctx: &egui::Context, id: egui::Id) {
+pub(crate) fn announce(ctx: &egui::Context, id: egui::Id) {
     ctx.accesskit_node_builder(id, |node| node.set_live(egui::accesskit::Live::Polite));
 }
 
 /// How long the Copy button says "Copied".
-pub(super) const COPIED_SECS: f64 = 4.0;
+pub(crate) const COPIED_SECS: f64 = 4.0;
 
 impl ShellApp {
     /// The rows Export takes, in the list's order: the selection (all of it, even rows the search hides now), or

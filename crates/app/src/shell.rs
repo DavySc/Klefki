@@ -23,6 +23,7 @@ mod diagnose_in;
 mod duplicate;
 mod editor;
 mod export;
+pub(crate) use export::{COPIED_SECS, announce};
 mod inspector;
 mod last_starts;
 mod list;
@@ -579,6 +580,15 @@ impl ShellApp {
                 self.debug_report_starts_arrived(&id);
             }
             Event::InspectorCommand { id, line } => self.inspector_arrived(&id, line),
+            Event::StartCommand {
+                profile,
+                project,
+                plan,
+            } => {
+                if let Some(page) = &mut self.profiles {
+                    page.start_arrived(&profile, &project, plan);
+                }
+            }
             Event::RedactedDefinition { id, result, also } => {
                 self.redacted_definition_arrived(&id, result, also);
             }
@@ -1066,6 +1076,15 @@ impl ShellApp {
                         Some(crate::profiles::Asked::Delete(name)) => {
                             self.send(Command::DeleteProfile(name));
                         }
+                        Some(crate::profiles::Asked::StartCommand {
+                            profile,
+                            members,
+                            project,
+                        }) => self.send(Command::StartCommand {
+                            profile,
+                            members,
+                            project,
+                        }),
                         Some(crate::profiles::Asked::Use(change)) => {
                             if self.can_prepare()
                                 && let Change::UseProfile { name, .. }
@@ -6337,6 +6356,7 @@ mod tests {
     mod outcome;
     mod review;
     mod settings;
+    mod start_command;
     mod switch_profile;
     mod toolbar;
     mod top_bar;

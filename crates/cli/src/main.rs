@@ -1,6 +1,6 @@
 //! `klefki-cli`: Klefki without a window. `list` shows the configured MCP servers, `status` asks Claude Code whether
 //! they connect, `export` prints their definitions, `profiles`, `use`, `switch` and `stop` list, use and stop Klefki's
-//! profiles. Output and
+//! profiles, and `run` starts Claude Code with only a profile's servers. Output and
 //! exit codes: docs/decisions/006-cli-output.md.
 #![cfg_attr(
     test,
@@ -46,6 +46,8 @@ const SWITCH_USAGE: &str =
     "Usage: klefki-cli switch PROFILE [--project DIR] [--only] [--yes]. See `klefki-cli help`.";
 const STOP_USAGE: &str =
     "Usage: klefki-cli stop PROFILE [--project DIR | --all] [--yes]. See `klefki-cli help`.";
+const RUN_USAGE: &str = "Usage: klefki-cli run PROFILE [--project DIR] [--print] [--yes] [--claude PATH]. See \
+                         `klefki-cli help`.";
 
 fn main() -> ExitCode {
     let code = match args::parse(std::env::args_os().skip(1)) {
@@ -80,6 +82,13 @@ fn main() -> ExitCode {
             place,
             yes,
         }) => stop_profile(&profile, &place, yes),
+        Ok(Cmd::Run {
+            profile,
+            place,
+            print,
+            yes,
+            claude,
+        }) => run_profile(&profile, &place, print, yes, claude.as_deref()),
         Err(Usage::NoCommand) => {
             eprint!("{}", args::HELP);
             USAGE
@@ -93,6 +102,9 @@ fn main() -> ExitCode {
         }
         Err(Usage::Bad(why)) if std::env::args_os().nth(1).is_some_and(|c| c == "stop") => {
             usage_of(&why, STOP_USAGE)
+        }
+        Err(Usage::Bad(why)) if std::env::args_os().nth(1).is_some_and(|c| c == "run") => {
+            usage_of(&why, RUN_USAGE)
         }
         Err(Usage::Bad(why)) => usage(&why),
     };
@@ -207,6 +219,66 @@ fn stop_profile(typed: &str, place: &args::Place, yes: bool) -> u8 {
         },
         yes,
     ))
+}
+
+/// Starts Claude Code in the project of `place` with only the servers of `typed`, saving nothing (on/off plan S5).
+/// What that session would load other than the profile's servers is said first, and asked about at a terminal; with
+/// `print`, the line to paste is printed instead.
+fn run_profile(
+    typed: &str,
+    place: &args::Place,
+    print: bool,
+    yes: bool,
+    claude: Option<&std::path::Path>,
+) -> u8 {
+    let snapshot = api::load_snapshot();
+    warn(&snapshot);
+    let profiles = api::load_profiles();
+    let found =
+        profile::find(&profiles, typed).and_then(|p| Ok((p, profile::project(&snapshot, place)?)));
+    let (chosen, project) = match found {
+        Ok((chosen, Some(project))) => (chosen, project),
+        Ok((_, None)) => return usage_of("run starts one session in one project", RUN_USAGE),
+        Err(why) => return usage_of(&why, RUN_USAGE),
+    };
+    let plan = match api::start_plan(&chosen.name, &chosen.members, &project) {
+        Ok(plan) => plan,
+        Err(why) => {
+            eprintln!("klefki-cli: {why}");
+            return PROBLEM;
+        }
+    };
+    eprint!("{}", render::start_text(&plan, home().as_deref()));
+    if print {
+        return out(&format!("{}\n", plan.line));
+    }
+    if cfg!(windows) {
+        let code = out(&format!("{}\n", plan.line));
+        eprintln!("{}", api::START_NOT_HERE);
+        return if code == OK { NOT_WRITTEN } else { code };
+    }
+    if !plan.exact() && !yes {
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            eprintln!("Nothing started: add --yes to start it anyway.");
+            return NOT_WRITTEN;
+        }
+        eprint!("Start Claude Code anyway? [y/N] ");
+        let mut answer = String::new();
+        let yes = std::io::stdin().read_line(&mut answer).is_ok()
+            && matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");
+        if !yes {
+            eprintln!("Nothing started.");
+            return NOT_WRITTEN;
+        }
+    }
+    // On success this process is Claude Code from here on, and its exit status is Claude Code's.
+    match api::run_claude(&plan, claude) {
+        Ok(never) => match never {},
+        Err(why) => {
+            eprintln!("klefki-cli: {why}");
+            UNAVAILABLE
+        }
+    }
 }
 
 /// The exit code for how a profile's change ended.

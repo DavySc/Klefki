@@ -29,6 +29,9 @@ enum Source {
     Project,
     ProjectLocal,
     Organisation,
+    /// The `--settings` a session is started with: Klefki's start command (on/off plan S5). Its list counts like the
+    /// user's.
+    Flag,
 }
 
 /// What one rule matches.
@@ -411,6 +414,7 @@ impl Rules {
                     "Your organisation's policy",
                     "Your administrator can change this.",
                 ),
+                Source::Flag => ("The start command", "Leave the server out of it."),
             };
             return Some(format!(
                 "{who} blocks {}. {next} (deniedMcpServers in {}: {})",
@@ -480,6 +484,31 @@ impl Rules {
         };
         (files(false), files(true))
     }
+
+    /// The settings files whose `allowedMcpServers` counts here, as shown, the user's first: what lets more servers
+    /// load than a start command names. A start command's own list is left out.
+    pub(crate) fn allowed_files(&self) -> Vec<String> {
+        let (own, theirs) = self.allowed_lists();
+        own.into_iter()
+            .chain(theirs)
+            .filter(|f| f != "the start command")
+            .collect()
+    }
+
+    /// Whether the allowed lists that count here hold a `serverCommand` rule and a `serverUrl` rule: then a local
+    /// server, or a remote one, is let in by those alone, and a name counts for none of that kind.
+    pub(crate) fn allowed_kinds(&self) -> (bool, bool) {
+        let has = |f: fn(&Match) -> bool| {
+            self.allowed
+                .iter()
+                .flatten()
+                .any(|r| r.source != Source::Flag && f(&r.what))
+        };
+        (
+            has(|m| matches!(m, Match::Command(_))),
+            has(|m| matches!(m, Match::Url(_))),
+        )
+    }
 }
 
 impl Rules {
@@ -544,6 +573,7 @@ fn connectors_off_why(off: Off, file: &Path, source: Source) -> String {
         Source::Project => ("The project's settings", false),
         Source::ProjectLocal => ("The project's local settings", false),
         Source::Organisation => ("Your organisation's settings", true),
+        Source::Flag => ("The start command's settings", false),
     };
     let (what, setting) = match off {
         Off::Setting => (
@@ -592,13 +622,19 @@ fn connectors_off_why(off: Off, file: &Path, source: Source) -> String {
 pub(crate) struct Policy {
     /// Outside every project first, then each project asked for, in that order.
     pub places: Vec<Rules>,
+    /// The organisation sets `allowManagedMcpServersOnly`: only its own allowed lists count, a start command's too
+    /// (checked with Claude Code 2.1.308).
+    pub only_organisation: bool,
 }
 
 /// Reads the rules for outside every project and for each of `projects` (raw keys; one that is not a local absolute
-/// path adds nothing of its own).
+/// path adds nothing of its own). `started_with`: the names a session is started with in `allowedMcpServers` through
+/// `--settings`, which Claude Code adds to the lists of the files (checked with 2.1.308); `None` for a session
+/// started without.
 pub(crate) fn load(
     paths: &super::ConfigPaths,
     projects: &[&str],
+    started_with: Option<&[String]>,
     warnings: &mut Vec<String>,
 ) -> Policy {
     let user_file = paths.claude_dir.join("settings.json");
@@ -618,6 +654,26 @@ pub(crate) fn load(
         outside.add(file, Source::Organisation, rules, true);
     }
     outside.add(&user_file, Source::User, &user, !only_organisation);
+    if let Some(names) = started_with {
+        let file = PathBuf::from("--settings");
+        let flag = FileRules {
+            allowed: Some(
+                names
+                    .iter()
+                    .filter_map(|n| {
+                        Rule::read(
+                            &serde_json::json!({ "serverName": n }),
+                            &file,
+                            Source::Flag,
+                            true,
+                        )
+                    })
+                    .collect(),
+            ),
+            ..FileRules::default()
+        };
+        outside.add(&file, Source::Flag, &flag, !only_organisation);
+    }
 
     let mut places = vec![outside.clone()];
     for project in projects {
@@ -635,7 +691,10 @@ pub(crate) fn load(
         }
         places.push(here);
     }
-    Policy { places }
+    Policy {
+        places,
+        only_organisation,
+    }
 }
 
 fn show(path: &Path) -> String {
@@ -651,6 +710,7 @@ fn shown(path: &Path, source: Source) -> String {
             format!(".claude/{}", name.unwrap_or_default())
         }
         Source::User | Source::Organisation => home_as_tilde(path),
+        Source::Flag => "the start command".to_owned(),
     }
 }
 
@@ -860,7 +920,7 @@ mod tests {
             let mut paths = super::super::ConfigPaths::in_dir(self.dir.path().join("cfg"));
             paths.managed_dir = Some(self.dir.path().join("org"));
             let mut warnings = Vec::new();
-            (load(&paths, projects, &mut warnings), warnings)
+            (load(&paths, projects, None, &mut warnings), warnings)
         }
     }
 

@@ -34,6 +34,7 @@ mod restore;
 mod sanitize;
 mod secret_uses;
 mod secrets;
+mod start;
 mod swap;
 mod undo;
 mod update;

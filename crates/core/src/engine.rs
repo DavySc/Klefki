@@ -55,6 +55,14 @@ pub enum Command {
     /// The line that opens this server in the MCP Inspector, to copy (see [`Event::InspectorCommand`], decision
     /// 014). Reads the definition; starts nothing and writes nothing.
     InspectorCommand(ServerId),
+    /// The line that starts Claude Code in `project` with only the servers `members` of the profile `profile`, and
+    /// what it would load there (see [`Event::StartCommand`], on/off plan S5). Reads the files; starts nothing and
+    /// writes nothing.
+    StartCommand {
+        profile: String,
+        members: Vec<crate::model::ConnectionId>,
+        project: String,
+    },
     /// The server's definition with every value that may be secret replaced, for a debug report (see
     /// [`Event::RedactedDefinition`]). Reads the definition; starts nothing and writes nothing.
     RedactedDefinition {
@@ -468,6 +476,13 @@ pub enum Event {
     InspectorCommand {
         id: ServerId,
         line: Result<crate::inspector::InspectorCommand, String>,
+    },
+    /// The plan [`Command::StartCommand`] asked for, or why there is none (sanitised). `profile` and `project` as
+    /// asked.
+    StartCommand {
+        profile: String,
+        project: String,
+        plan: Result<crate::start::StartPlan, String>,
     },
     /// The definition [`Command::RedactedDefinition`] asked for, as an export writes it (values that may be secrets
     /// are `${VAR}` references), or why there is none (sanitised).
