@@ -45,6 +45,10 @@ pub enum Command {
     /// Check one server now. This is the only way a project (`.mcp.json`) server is checked, because checking
     /// it runs the repository's command.
     Check(ServerId),
+    /// Check one server now, letting it take [`crate::api::LONGER_CHECK`] to connect, more than Claude Code's usual
+    /// limit, to tell a server that is slow to start from one that never answers. Its answer always comes with a
+    /// [`crate::api::Timing`].
+    CheckLonger(ServerId),
     /// Check one server again with the client's own debug output and explain what went wrong. Like `Check`,
     /// this runs a project server's command, so it only happens on request.
     Diagnose(ServerId),
@@ -398,6 +402,8 @@ pub enum Event {
         detail: Option<String>,
         /// What `detail` most likely means, in plain language. `None` when it matches no known failure.
         hint: Option<Hint>,
+        /// How long the check took against Claude Code's time limit, when it ran out of time or was given more.
+        timing: Option<crate::api::Timing>,
     },
     Diagnosis {
         id: ServerId,
@@ -760,6 +766,16 @@ impl Emitter {
     }
 
     fn status(&self, id: ServerId, status: Status, detail: Option<String>) {
+        self.status_timed(id, status, detail, None);
+    }
+
+    fn status_timed(
+        &self,
+        id: ServerId,
+        status: Status,
+        detail: Option<String>,
+        timing: Option<crate::api::Timing>,
+    ) {
         let hint = match status {
             Status::Failed | Status::Degraded | Status::NeedsAuth => detail
                 .as_deref()
@@ -771,6 +787,7 @@ impl Emitter {
             status,
             detail,
             hint,
+            timing,
         });
     }
 }

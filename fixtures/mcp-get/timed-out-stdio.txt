@@ -1,0 +1,9 @@
+slow-start:
+  Scope: User config (available in all your projects)
+  Status: × Failed to connect
+  Issue: Request timed out
+  Type: stdio
+  Command: node
+  Args: /home/me/slow-server/index.js 5
+
+To remove this server, run: claude mcp remove slow-start -s user

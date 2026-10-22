@@ -1,13 +1,13 @@
 //! The server list: rows grouped by where they live, each row's name, badges and status, and the words they use.
 
 use super::{ShellApp, folder_name};
-use crate::explain::Explanation;
+use crate::explain::{self, Explanation};
 use crate::theme;
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
 use egui_extras::{Column, TableBuilder};
 use klefki_core::api::words::parent_folder;
 use klefki_core::api::{
-    Approval, Command, Hint, Preflight, PreflightKind, Scope, ServerRow, Status, words,
+    Approval, Command, Hint, Preflight, PreflightKind, Scope, ServerRow, Status, Timing, words,
 };
 use std::sync::Arc;
 
@@ -392,6 +392,7 @@ fn status_cell(
     status: Status,
     detail: Option<&str>,
     hint: Option<&Hint>,
+    timing: Option<&Timing>,
     last_known: bool,
 ) {
     let pal = theme::palette(ui.ctx());
@@ -423,12 +424,20 @@ fn status_cell(
             .on_hover_text(why);
         return;
     }
+    let slow = explain::slow_start(status, timing);
     let color = match status {
+        // It connected only with more time than a session gives it: in Claude Code it still fails.
+        Status::Connected if slow => pal.warn,
         Status::Connected => pal.success,
         Status::Degraded | Status::NeedsAuth | Status::PendingApproval => pal.warn,
         Status::Failed => pal.danger,
         Status::Checking => pal.primary,
         Status::NotConfigured | Status::Unknown => pal.text_muted,
+    };
+    let label = if slow {
+        explain::SLOW_START
+    } else {
+        status.label()
     };
     let response = if last_known {
         // A status from Claude's cache: a ring in the status colour and muted words, not a dot. The column has no
@@ -440,37 +449,36 @@ fn status_cell(
             0.0,
             egui::TextFormat::simple(font.clone(), color),
         );
-        job.append(
-            status.label(),
-            0.0,
-            egui::TextFormat::simple(font, pal.text_muted),
-        );
+        job.append(label, 0.0, egui::TextFormat::simple(font, pal.text_muted));
         ui.label(job)
     } else {
-        ui.label(RichText::new(format!("\u{25CF} {}", status.label())).color(color))
+        ui.label(RichText::new(format!("\u{25CF} {label}")).color(color))
     };
-    match status {
-        Status::Failed | Status::NeedsAuth | Status::Degraded => {
-            // Not egui's tooltip, which waits half a second for a perfectly still pointer over the words alone:
-            // the whole cell answers, moving or not, after a moment that lets a sweep down the column pass by.
-            if hovered_for(ui, response.id, ui.max_rect(), EXPLAIN_AFTER) {
-                // Built only while shown, not every frame.
-                response.show_tooltip_ui(|ui| {
-                    if let Some(explanation) = Explanation::for_status(s, status, detail, hint) {
-                        ui.set_max_width(560.0);
-                        explanation.show(ui, ui.id().with("tooltip"));
-                    }
-                    if last_known {
-                        ui.label(RichText::new(LAST_KNOWN).color(pal.text_muted));
-                    }
-                });
-            }
+    let explained = slow
+        || timing.is_some_and(|t| t.timed_out)
+        || matches!(
+            status,
+            Status::Failed | Status::NeedsAuth | Status::Degraded
+        );
+    if explained {
+        // Not egui's tooltip, which waits half a second for a perfectly still pointer over the words alone:
+        // the whole cell answers, moving or not, after a moment that lets a sweep down the column pass by.
+        if hovered_for(ui, response.id, ui.max_rect(), EXPLAIN_AFTER) {
+            // Built only while shown, not every frame.
+            response.show_tooltip_ui(|ui| {
+                if let Some(explanation) =
+                    Explanation::for_status_timed(s, status, detail, hint, timing)
+                {
+                    ui.set_max_width(560.0);
+                    explanation.show(ui, ui.id().with("tooltip"));
+                }
+                if last_known {
+                    ui.label(RichText::new(LAST_KNOWN).color(pal.text_muted));
+                }
+            });
         }
-        _ => {
-            if let Some(text) = detail.or(last_known.then_some(LAST_KNOWN)) {
-                response.on_hover_text(text);
-            }
-        }
+    } else if let Some(text) = detail.or(last_known.then_some(LAST_KNOWN)) {
+        response.on_hover_text(text);
     }
 }
 
@@ -816,8 +824,11 @@ impl ShellApp {
                             ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
                         });
                         let hint = self.hint(*i);
+                        let timing = self.timing(*i);
                         let last_known = self.last_known(*i);
-                        row.col(|ui| status_cell(ui, s, status, detail, hint, last_known));
+                        row.col(|ui| {
+                            status_cell(ui, s, status, detail, hint, timing, last_known);
+                        });
                         row.col(|ui| {
                             ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
                         });

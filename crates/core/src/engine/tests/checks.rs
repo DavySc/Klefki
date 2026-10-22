@@ -1515,6 +1515,7 @@ fn only_the_waiting_background_checks_of_edited_servers_are_dropped() {
         background,
         now: false,
         alone: false,
+        longer: false,
     };
     let mut queue = Queue {
         jobs: [

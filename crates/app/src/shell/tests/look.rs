@@ -294,6 +294,69 @@ fn what_keeps_a_server_from_starting() {
     shot(&mut h, "preflight-findings");
 }
 
+/// `azure-devops` timed out after `took` s, or connected given more time.
+fn timed(took: u64, given: bool) -> (Harness<'static, ShellApp>, klefki_core::api::Detached) {
+    use klefki_core::api::{Hint, LONGER_CHECK, LimitSetIn, TimeLimit, Timing};
+    use std::time::Duration;
+    let (mut h, engine) = app_at(PAGE);
+    let i = row(&h, "azure-devops", Scope::User);
+    let id = h.state().snapshot.servers[i].id();
+    // As the engine reports them; the hint is Claude Code's "timed out", put in words by the engine.
+    let (status, detail, hint) = if given {
+        (Status::Connected, None, None)
+    } else {
+        let hint = Hint {
+            title: "The server took too long to answer".to_owned(),
+            code: None,
+            help: vec![
+                "The server may be slow to start, or blocked by a firewall or proxy.".to_owned(),
+                "Try again, and check the server's own logs.".to_owned(),
+            ],
+            points_at: None,
+        };
+        (
+            Status::Failed,
+            Some("Request timed out".to_owned()),
+            Some(hint),
+        )
+    };
+    engine
+        .events
+        .send(Event::Status {
+            id,
+            status,
+            detail,
+            hint,
+            timing: Some(Timing {
+                took: Duration::from_secs(took),
+                limit: TimeLimit {
+                    limit: Duration::from_secs(30),
+                    set_in: LimitSetIn::Default,
+                    unreadable: false,
+                    change_in: Some("~/.claude/settings.json".to_owned()),
+                },
+                given: given.then_some(LONGER_CHECK),
+                timed_out: !given,
+            }),
+        })
+        .unwrap();
+    select(&mut h, "azure-devops", Scope::User);
+    h.state_mut().tab = DetailTab::Status;
+    (h, engine)
+}
+
+#[test]
+fn a_timeout_explained() {
+    let (mut h, _engine) = timed(28, false);
+    shot(&mut h, "timeout-explained");
+}
+
+#[test]
+fn a_server_that_needs_more_time() {
+    let (mut h, _engine) = timed(41, true);
+    shot(&mut h, "timeout-needs-more-time");
+}
+
 #[test]
 fn a_diagnosis() {
     let (mut h, engine) = app_at(PAGE);

@@ -21,6 +21,9 @@ use egui::{Color32, FontId, RichText, Ui};
 use klefki_core::api::{Hint, ServerRow, Status};
 use std::fmt::Write;
 
+mod timing;
+pub(crate) use timing::{SLOW_START, longer_button, offers_longer, slow_start, snippet};
+
 const ARROW: &str = "  --> ";
 const BAR: &str = "   |";
 const EQ: &str = "   = ";

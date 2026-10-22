@@ -74,6 +74,7 @@ pub(crate) fn run(
             status,
             detail,
             hint,
+            ..
         } = event
             && status != Status::Checking
             && waiting.remove(&id.connection)

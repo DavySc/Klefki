@@ -13,6 +13,7 @@ pub(crate) mod policy;
 pub(crate) mod preflight;
 pub(crate) mod relative;
 pub(crate) mod secretlike;
+pub(crate) mod timeout;
 
 use std::path::PathBuf;
 

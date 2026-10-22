@@ -9,13 +9,14 @@ use super::list::{
 };
 use super::{DetailTab, ShellApp, flat_items};
 use crate::command::shortcut;
-use crate::explain::Explanation;
+use crate::explain::{self, Explanation};
 use crate::sign_in;
 use crate::theme;
 use egui::{Align, Frame, Margin, RichText, Ui};
 use egui_phosphor::regular as icon;
 use klefki_core::api::{
-    Approval, Change, Command, Diagnosis, Scope, ServerRow, Status, TransportKind,
+    Approval, Change, Command, Diagnosis, LONGER_CHECK, Scope, ServerRow, Status, TransportKind,
+    words,
 };
 use std::sync::Arc;
 
@@ -203,8 +204,14 @@ impl ShellApp {
         let explanation = match &self.explained {
             Some((key, built)) if *key == (i, self.live_gen) => built.clone(),
             _ => {
-                let built = Explanation::for_status(s, status, detail.as_deref(), self.hint(i))
-                    .map(Arc::new);
+                let built = Explanation::for_status_timed(
+                    s,
+                    status,
+                    detail.as_deref(),
+                    self.hint(i),
+                    self.timing(i),
+                )
+                .map(Arc::new);
                 self.explained = Some(((i, self.live_gen), built.clone()));
                 built
             }
@@ -556,6 +563,8 @@ impl ShellApp {
                             ui.label(PLUGIN_STATUS);
                         } else if self.last_known(i) {
                             ui.label(format!("{} (last known)", status.label()));
+                        } else if explain::slow_start(status, self.timing(i)) {
+                            ui.label(RichText::new(explain::SLOW_START).color(pal.warn));
                         } else {
                             ui.label(status.label());
                         }
@@ -580,6 +589,7 @@ impl ShellApp {
                     return;
                 }
                 let can_check = self.core.is_some() && status != Status::Checking;
+                let timing = self.timing(i).cloned();
                 ui.horizontal_wrapped(|ui| {
                 if self.core.is_some() && sign_in::offers_sign_in(s, status) {
                     // The way out of "Needs auth", so it leads; otherwise it is one action among others.
@@ -612,7 +622,55 @@ impl ShellApp {
                 {
                     self.send(Command::Diagnose(s.id()));
                 }
+                if let Some(timing) = timing.as_ref().filter(|t| explain::offers_longer(t))
+                    && ui
+                        .add_enabled(can_check, egui::Button::new(explain::longer_button()))
+                        .on_hover_text(format!(
+                            "Check once more, letting it take up to {} to connect instead of {}",
+                            words::duration(LONGER_CHECK),
+                            words::duration(timing.limit.limit)
+                        ))
+                        .clicked()
+                {
+                    self.longer_since = Some((s.id(), ui.input(|input| input.time)));
+                    self.send(Command::CheckLonger(s.id()));
+                }
+                if let Some(snippet) = explain::snippet(status, timing.as_ref())
+                    && ui
+                        .button("Copy setting")
+                        .on_hover_text(format!("Copy {snippet}, to paste under \"env\""))
+                        .clicked()
+                {
+                    ui.ctx().copy_text(snippet);
+                }
                 });
+                // A check given more time can take minutes: the seconds go by while it runs, and only then.
+                if let Some((id, since)) = &self.longer_since
+                    && s.is(id)
+                    && status == Status::Checking
+                {
+                    let now = ui.input(|input| input.time);
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "whole seconds since a moment in the past, never negative"
+                    )]
+                    let waited = (now - since).max(0.0) as u64;
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Waiting: {waited} s of up to {}",
+                            words::duration(LONGER_CHECK)
+                        ))
+                        .color(pal.text_muted),
+                    );
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_secs(1));
+                }
+                if let Some(note) = Explanation::timing_note(status, timing.as_ref()) {
+                    ui.add_space(6.0);
+                    ui.add(egui::Label::new(RichText::new(note).color(pal.text_muted)).wrap());
+                }
                 // Under the actions, so they are in view without scrolling, even at the smallest window.
                 if let Some(explanation) = &explanation {
                     ui.add_space(10.0);

@@ -263,6 +263,7 @@ fn failed_with_steps(row: &ServerRow) -> klefki_core::api::Event {
             ],
             points_at: None,
         }),
+        timing: None,
     }
 }
 
@@ -943,4 +944,169 @@ fn a_name_is_taken_in_the_ticked_places_that_have_it_however_the_project_is_spel
     assert_eq!(places.taken("alpha", &rows).as_deref(), Some("in a"));
     places.projects[2].1 = false;
     assert_eq!(places.taken("alpha", &rows), None);
+}
+
+/// A check of `row` that ended as `status`, with how long it took.
+fn timed_event(
+    row: &ServerRow,
+    status: Status,
+    detail: Option<&str>,
+    took: u64,
+    set_in: klefki_core::api::LimitSetIn,
+    given: bool,
+) -> klefki_core::api::Event {
+    use std::time::Duration;
+    let given = given.then_some(klefki_core::api::LONGER_CHECK);
+    klefki_core::api::Event::Status {
+        id: row.id(),
+        status,
+        detail: detail.map(str::to_owned),
+        hint: None,
+        timing: Some(klefki_core::api::Timing {
+            took: Duration::from_secs(took),
+            limit: klefki_core::api::TimeLimit {
+                limit: Duration::from_secs(30),
+                change_in: match &set_in {
+                    klefki_core::api::LimitSetIn::Organisation(_) => None,
+                    _ => Some("~/.claude/settings.json".to_owned()),
+                },
+                set_in,
+                unreadable: false,
+            },
+            timed_out: matches!(status, Status::Failed | Status::Unknown),
+            given,
+        }),
+    }
+}
+
+const LONGER: &str = "Check again, waiting up to 2 minutes";
+
+#[test]
+fn a_timeout_says_how_long_claude_code_waits_and_offers_more_time() {
+    let (mut h, engine) = live_harness();
+    let row = live_row("slow", Scope::User, None);
+    show_rows(&mut h, &engine, vec![row.clone()]);
+    let default = klefki_core::api::LimitSetIn::Default;
+    engine
+        .events
+        .send(timed_event(
+            &row,
+            Status::Failed,
+            Some("Request timed out"),
+            28,
+            default,
+            false,
+        ))
+        .unwrap();
+    h.run();
+    open_status_tab(&mut h, "slow");
+    h.get_by_label_contains("It gave up after 28 s; Claude Code's limit for connecting is 30 s");
+    click(&mut h, LONGER);
+    assert_eq!(
+        next_command(&engine).unwrap(),
+        klefki_core::api::Command::CheckLonger(row.id())
+    );
+    assert!(next_command(&engine).is_none(), "exactly one command");
+    // While it runs, it says why it takes longer, and is not offered again.
+    engine
+        .events
+        .send(status_event(
+            &row,
+            Status::Checking,
+            Some("giving it up to 2 minutes to connect"),
+        ))
+        .unwrap();
+    h.run();
+    h.get_by_label_contains("giving it up to 2 minutes to connect");
+    // The harness runs frames until nothing more is asked, so some seconds may have gone by.
+    h.get_by_label_contains("Waiting: ");
+    h.get_by_label_contains(" s of up to 2 minutes");
+    assert!(h.query_by_label(LONGER).is_none());
+    // The answer stops the seconds.
+    let default = klefki_core::api::LimitSetIn::Default;
+    engine
+        .events
+        .send(timed_event(&row, Status::Connected, None, 8, default, true))
+        .unwrap();
+    h.run();
+    assert!(h.query_by_label_contains("Waiting:").is_none());
+    assert!(h.state().longer_since.is_none());
+}
+
+#[test]
+fn a_server_that_connects_given_more_time_says_where_to_give_it_that_time() {
+    let (mut h, engine) = live_harness();
+    let row = live_row("slow", Scope::User, None);
+    show_rows(&mut h, &engine, vec![row.clone()]);
+    let default = klefki_core::api::LimitSetIn::Default;
+    engine
+        .events
+        .send(timed_event(
+            &row,
+            Status::Connected,
+            None,
+            41,
+            default,
+            true,
+        ))
+        .unwrap();
+    h.run();
+    open_status_tab(&mut h, "slow");
+    h.get_by_label_contains("It needs more time to start than Claude Code gives it");
+    h.get_by_label_contains(
+        "set \"MCP_TIMEOUT\": \"70000\" (70 s) under \"env\" in ~/.claude/settings.json",
+    );
+    assert!(h.query_by_label(LONGER).is_none(), "it was given more time");
+    // Not a green "Connected" beside a warning: in Claude Code it still fails.
+    assert!(h.query_by_label_contains("Connected").is_none());
+    assert!(
+        h.query_all_by_label_contains("Slow to start").count() >= 2,
+        "in the list and on the Status line"
+    );
+    h.get_by_label("Copy setting").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().any(
+        |c| matches!(c, egui::OutputCommand::CopyText(t) if t == "\"MCP_TIMEOUT\": \"70000\""),
+    );
+    assert!(copied, "{:?}", h.output().platform_output.commands);
+}
+
+#[test]
+fn a_server_that_connects_in_time_given_more_has_a_quiet_note() {
+    let (mut h, engine) = live_harness();
+    let row = live_row("slow", Scope::User, None);
+    show_rows(&mut h, &engine, vec![row.clone()]);
+    let default = klefki_core::api::LimitSetIn::Default;
+    engine
+        .events
+        .send(timed_event(&row, Status::Connected, None, 8, default, true))
+        .unwrap();
+    h.run();
+    open_status_tab(&mut h, "slow");
+    h.get_by_label_contains("It connected after 8 s, within the 30 s Claude Code waits");
+    assert!(h.query_by_label_contains("needs more time").is_none());
+}
+
+#[test]
+fn a_limit_the_organisation_sets_is_not_offered_more_time() {
+    let (mut h, engine) = live_harness();
+    let row = live_row("slow", Scope::User, None);
+    show_rows(&mut h, &engine, vec![row.clone()]);
+    let org =
+        klefki_core::api::LimitSetIn::Organisation("/etc/claude-code/managed-settings.json".into());
+    engine
+        .events
+        .send(timed_event(
+            &row,
+            Status::Failed,
+            Some("Request timed out"),
+            28,
+            org,
+            false,
+        ))
+        .unwrap();
+    h.run();
+    open_status_tab(&mut h, "slow");
+    h.get_by_label_contains("so only it can raise it");
+    assert!(h.query_by_label(LONGER).is_none());
 }
