@@ -57,7 +57,15 @@ as `cmd C:/`, an empty environment variable. Does not read Claude Code's log fol
   PATH is its own decision.
 
 ## Checks
-See the pull request description.
+- `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`: exit 0
+  (app 448, core 1003, cli 26 + 43). `cargo deny check`: only the yanked tokio 1.54.0 already in main's lock.
+- CI green on Linux, Windows and macOS (62a6f94, 76504d2). Start-up numbers: see the pull request description.
+- Mutants (`quality` run 39729443166, `crates/core/src/config/preflight.rs`, at 76504d2): 87 tested, 72 caught,
+  8 unviable, 7 missed. Five now have tests, each seen failing against its mutant: `candidates`' ending filter
+  (`&&` to `||`, `>` to `>=`), `local_folder` (to `true`, `&&` to `||`: a relative PATH folder is not searched)
+  and the `trusted && windows` guard on a server's own `PATHEXT` (a repository's is not used). Two are
+  equivalent: `run + 1` to `run * 1` in `no_input` (the extra word looked at is `run` itself, never `-i`) and
+  `end + 1` to `end * 1` in `unset` (the next search starts at the `}`, which is not `${`).
 
 ## Next
 Pull request, cross-review, merge; then P2 (timeout explainer).

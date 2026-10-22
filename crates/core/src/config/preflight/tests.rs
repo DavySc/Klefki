@@ -441,3 +441,53 @@ fn broken_and_remote_definitions_without_variables_have_none() {
         assert!(found(&m, entry.clone()).is_empty(), "{entry}");
     }
 }
+
+#[test]
+fn only_pathext_endings_that_are_endings_are_tried() {
+    // Found by mutation testing: an empty ending, a lone dot or one without its dot names no other file.
+    let m = machine();
+    let own = folder_with(&m.root.join("own"), &["tool.", "toolEXE"]);
+    let f = found_as(
+        &m,
+        json!({"command": "tool", "env": {"PATH": own.to_string_lossy(), "PATHEXT": ";.;EXE;.CMD"}}),
+        true,
+        true,
+    );
+    assert_eq!(kinds(&f), [PreflightKind::NotFound], "{f:?}");
+}
+
+#[test]
+fn a_repository_never_sets_the_endings_looked_for() {
+    // Found by mutation testing: a `.mcp.json`'s PATHEXT is not used either, only Klefki's.
+    let m = machine();
+    let f = found_as(
+        &m,
+        json!({"command": "node", "env": {"PATHEXT": ".NOTHING"}}),
+        false,
+        true,
+    );
+    assert!(f.is_empty(), "{f:?}");
+    // The user's own definition may set them.
+    let own = found_as(
+        &m,
+        json!({"command": "node", "env": {"PATHEXT": ".NOTHING"}}),
+        true,
+        true,
+    );
+    assert_eq!(kinds(&own), [PreflightKind::NotFound], "{own:?}");
+}
+
+#[test]
+fn a_relative_folder_on_the_path_is_not_searched() {
+    // Found by mutation testing. Tests run in the crate's folder, which has `src/lib.rs`; Windows' lookup needs no
+    // executable bit, so only the rule keeps it from being found.
+    let m = machine();
+    assert!(Path::new("src").join("lib.rs").is_file());
+    let f = found_as(
+        &m,
+        json!({"command": "lib.rs", "env": {"PATH": "src"}}),
+        true,
+        true,
+    );
+    assert_eq!(kinds(&f), [PreflightKind::NotFound], "{f:?}");
+}
