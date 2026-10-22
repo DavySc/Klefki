@@ -8,8 +8,8 @@ use klefki_core::api::{LastStart, LastStarts, ServerRow, StartOutcome, Status, w
 
 pub(super) const HEADING: &str = "Last starts by Claude Code";
 /// Said under the heading, not only in a hover: it decides how a start in the home folder reads.
-pub(super) const ABOUT: &str =
-    "Newest first, one per folder. Klefki's own checks are listed too (in ~ for user servers).";
+pub(super) const ABOUT: &str = "Newest first, one per folder. Klefki's own checks are listed too (in ~ for user servers, unless diagnosed in \
+     a project).";
 /// Claude Code removes its logs after 30 days unless `cleanupPeriodDays` says otherwise.
 const NONE: &str =
     "Claude Code has no log of starting it (it keeps logs for 30 days unless set otherwise)";

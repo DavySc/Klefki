@@ -758,3 +758,40 @@ fn the_debug_report_section_after_copying() {
     h.step();
     shot(&mut h, "debug-report-copied");
 }
+
+/// `azure-devops`, a user server, offered to be diagnosed from a project's folder, then diagnosed there.
+#[test]
+fn a_user_server_diagnosed_in_a_project() {
+    let (mut h, engine) = app_at(PAGE);
+    let mut snapshot = (*h.state().snapshot).clone();
+    snapshot.projects = ["C:/Repos/Gateway", "C:/Repos/WebApp", "C:/Repos/shop"]
+        .map(str::to_owned)
+        .to_vec();
+    h.state_mut().snapshot = Arc::new(snapshot);
+    select(&mut h, "azure-devops", Scope::User);
+    h.state_mut().tab = DetailTab::Status;
+    shot(&mut h, "diagnose-in-project");
+    let i = row(&h, "azure-devops", Scope::User);
+    let id = h.state().snapshot.servers[i].id();
+    engine
+        .events
+        .send(Event::Diagnosis {
+            id,
+            diagnosis: Diagnosis {
+                folder: Some("C:/Repos/Gateway".to_owned()),
+                detail: Some("CONNECTION_CLOSED: Connection closed".to_owned()),
+                ..diagnosis(
+                    Status::Failed,
+                    &[(
+                        "A file or module is missing",
+                        "The server's command names a file that is not in this folder.",
+                    )],
+                    &["Error: Cannot find module 'C:\\Repos\\Gateway\\server.js'"],
+                    &[],
+                    None,
+                )
+            },
+        })
+        .unwrap();
+    shot(&mut h, "diagnosed-in-project");
+}

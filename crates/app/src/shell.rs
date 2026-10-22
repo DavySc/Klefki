@@ -19,6 +19,7 @@ mod add;
 mod casing;
 mod debug_report;
 mod detail;
+mod diagnose_in;
 mod duplicate;
 mod editor;
 mod export;
@@ -159,6 +160,8 @@ pub(crate) struct ShellApp {
     on_screen_now: Vec<usize>,
     /// The latest explanation per server, from the Diagnose action.
     diagnoses: HashMap<ServerId, Diagnosis>,
+    /// "Diagnose in a project" on the Status tab.
+    diagnose_in: diagnose_in::DiagnoseIn,
     /// What Claude Code's logs say about each server's last starts, asked for when its Status tab is shown.
     last_starts: HashMap<ServerId, LastStartsSeen>,
     /// The line that opens a server in the MCP Inspector, for the one server it was asked for.
@@ -292,6 +295,7 @@ impl ShellApp {
             explained: None,
             legacy_cache: None,
             diagnoses: HashMap::new(),
+            diagnose_in: diagnose_in::DiagnoseIn::default(),
             last_starts: HashMap::new(),
             inspector: None,
             debug_report: None,
@@ -534,6 +538,7 @@ impl ShellApp {
             }
             Event::Snapshot(snapshot) => self.take_snapshot(snapshot),
             Event::Diagnosis { id, diagnosis } => {
+                self.diagnosed_in(&id);
                 if self.snapshot.servers.iter().any(|r| r.is(&id)) {
                     // It is drawn under the status and its explanation, often below the window: brought into view
                     // when it is for the server being looked at, and left where it is otherwise.
@@ -2823,6 +2828,7 @@ mod tests {
             server_said: said.iter().map(|l| (*l).to_owned()).collect(),
             client_log: log.iter().map(|l| (*l).to_owned()).collect(),
             note: note.map(str::to_owned),
+            folder: None,
         }
     }
 
@@ -6144,6 +6150,7 @@ mod tests {
     mod casing;
     mod debug_report;
     mod detail;
+    mod diagnose_in;
     mod duplicate;
     mod editor;
     mod export;

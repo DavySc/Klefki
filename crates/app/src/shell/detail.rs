@@ -41,6 +41,9 @@ pub(super) fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
 /// What a diagnosis found, as plain text: its note, the likely causes, what the server printed and the client's log.
 pub(super) fn diagnosis_details(out: &mut String, row: &ServerRow, d: &Diagnosis) {
     use std::fmt::Write;
+    if let Some(folder) = &d.folder {
+        let _ = writeln!(out, "diagnosed in: {folder}");
+    }
     if let Some(note) = &d.note {
         let _ = writeln!(out, "note: {note}");
     }
@@ -72,6 +75,20 @@ fn diagnosis_panel(ui: &mut Ui, row: &ServerRow, d: &Diagnosis) {
     let pal = theme::palette(ui.ctx());
     ui.add_space(10.0);
     ui.separator();
+    // Run from a project: where, and how it went there, as the status above is the home folder's.
+    if let Some(folder) = &d.folder {
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("Diagnosed in {folder}: {}", d.status.label()))
+                    .family(theme::bold_family())
+                    .size(16.0),
+            )
+            .wrap(),
+        );
+        if let Some(detail) = &d.detail {
+            ui.add(egui::Label::new(detail.as_str()).wrap());
+        }
+    }
     if let Some(note) = &d.note {
         ui.label(RichText::new(note).color(pal.warn));
     }
@@ -537,7 +554,8 @@ impl ShellApp {
                         egui::Label::new(
                             RichText::new(
                                 "Claude Code starts user servers in each session's folder. Klefki checks them \
-                                 from your home folder, so the check can pass here.",
+                                 from your home folder, so the check can pass here. Diagnose in a project, on the \
+                                 Status tab, runs it from a project's folder.",
                             )
                             .color(pal.text_muted),
                         )
@@ -725,6 +743,7 @@ impl ShellApp {
                     ui.add_space(10.0);
                     explanation.show(ui, ui.id().with("status"));
                 }
+                self.diagnose_in_section(ui, s, can_check);
                 self.last_starts_section(ui, s);
                 if let Some(d) = self.diagnoses.get(&s.id()) {
                     let shown = ui.scope(|ui| diagnosis_panel(ui, s, d)).response;

@@ -46,6 +46,9 @@ pub(super) struct Job {
     pub(super) alone: bool,
     /// The user asked to give the server [`LONGER_CHECK`] to connect ([`super::Command::CheckLonger`]).
     pub(super) longer: bool,
+    /// A user server run in this project, as shown, instead of the home folder ([`super::Command::DiagnoseIn`]): its
+    /// answer says where it ran and leaves the server's status alone.
+    pub(super) folder: Option<String>,
 }
 
 #[derive(Default)]
@@ -84,10 +87,13 @@ impl Queue {
     /// Puts a job the user asked for in front, behind those asked for the same way before it, so that they run in the
     /// order asked. A check of the same server still waiting is dropped: it would run the server again, and its later
     /// answer would replace this one.
+    /// A run in a project ([`Job::folder`]) leaves those alone: its answer is not the server's status.
     pub(super) fn push_now(&mut self, job: Job) {
         let connection = &job.id.connection;
-        self.jobs
-            .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
+        if job.folder.is_none() {
+            self.jobs
+                .retain(|q| !(q.kind == JobKind::Check && q.id.connection == *connection));
+        }
         let at = self.jobs.iter().take_while(|q| q.now).count();
         self.jobs.insert(at, Job { now: true, ..job });
     }
@@ -259,6 +265,7 @@ pub(super) fn build_job(
                     server_said: Vec::new(),
                     client_log: Vec::new(),
                     note: Some(format!("not diagnosed: {why}")),
+                    folder: None,
                 },
             }),
         }
@@ -278,6 +285,7 @@ pub(super) fn build_job(
         now: false,
         alone: false,
         longer: false,
+        folder: None,
     })
 }
 
@@ -319,7 +327,7 @@ pub(super) fn where_to_run(
 pub(super) struct Folders(HashMap<String, bool>);
 
 impl Folders {
-    fn usable(&mut self, project: &str) -> bool {
+    pub(super) fn usable(&mut self, project: &str) -> bool {
         if let Some(&usable) = self.0.get(project) {
             return usable;
         }
@@ -405,12 +413,15 @@ fn run(shared: &Shared, job: &Job) {
         JobKind::Diagnose => {
             let (diagnosis, timing) = run_diagnose(shared, job);
             if current() {
-                shared.emitter.status_timed(
-                    job.id.clone(),
-                    diagnosis.status,
-                    diagnosis.detail.clone(),
-                    timing,
-                );
+                // The status is the home folder's; a run in a project only answers the user who asked.
+                if job.folder.is_none() {
+                    shared.emitter.status_timed(
+                        job.id.clone(),
+                        diagnosis.status,
+                        diagnosis.detail.clone(),
+                        timing,
+                    );
+                }
                 shared.emitter.emit(Event::Diagnosis {
                     id: job.id.clone(),
                     diagnosis,
@@ -429,6 +440,7 @@ fn run(shared: &Shared, job: &Job) {
                             "not diagnosed: the server changed while it ran; diagnose it again"
                                 .to_owned(),
                         ),
+                        folder: job.folder.clone(),
                     },
                 });
             }

@@ -712,9 +712,34 @@ fn places(
     choice: &Choice,
     filter: &mut String,
 ) -> Option<Option<String>> {
+    let chosen = match &choice.place {
+        Some(Some(p)) => Some(p.as_str()),
+        _ => None,
+    };
+    let all: Vec<&String> = snapshot.projects.iter().collect();
+    let mut picked = project_choices(ui, &all, chosen, filter).map(Some);
+    ui.separator();
+    if ui
+        .selectable_label(choice.place == Some(None), "Every project")
+        .on_hover_text("Each project Claude Code knows today.")
+        .clicked()
+    {
+        picked = Some(None);
+    }
+    picked
+}
+
+/// `projects` to choose from in a drop-down, by folder name with the folder each is in, under a box to find one when
+/// there are many: the one clicked.
+pub(crate) fn project_choices(
+    ui: &mut Ui,
+    projects: &[&String],
+    chosen: Option<&str>,
+    filter: &mut String,
+) -> Option<String> {
     let pal = theme::palette(ui.ctx());
     let mut picked = None;
-    if snapshot.projects.len() > FILTER_FROM {
+    if projects.len() > FILTER_FROM {
         ui.add(
             egui::TextEdit::singleline(filter)
                 .hint_text(format!("{} Type to find a project", icon::MAGNIFYING_GLASS))
@@ -723,9 +748,9 @@ fn places(
         .request_focus();
     }
     let query = filter.trim().to_lowercase();
-    let mut projects: Vec<&String> = snapshot
-        .projects
+    let mut projects: Vec<&String> = projects
         .iter()
+        .copied()
         .filter(|p| query.is_empty() || p.to_lowercase().contains(&query))
         .collect();
     projects.sort_by_cached_key(|p| (folder_name(p).to_lowercase(), p.to_lowercase()));
@@ -748,22 +773,13 @@ fn places(
                 ),
             );
         }
-        let this = Some(project.clone());
         if ui
-            .selectable_label(choice.place == Some(this.clone()), job)
+            .selectable_label(chosen == Some(project.as_str()), job)
             .on_hover_text(project.as_str())
             .clicked()
         {
-            picked = Some(this);
+            picked = Some(project.clone());
         }
-    }
-    ui.separator();
-    if ui
-        .selectable_label(choice.place == Some(None), "Every project")
-        .on_hover_text("Each project Claude Code knows today.")
-        .clicked()
-    {
-        picked = Some(None);
     }
     picked
 }
@@ -1022,7 +1038,7 @@ fn matches(profile: &Profile, snapshot: &Snapshot, query: &str) -> bool {
 }
 
 /// A project by its folder's name, with the folder that holds it when another project's folder has that name too.
-fn shown_project(path: &str, snapshot: &Snapshot) -> String {
+pub(crate) fn shown_project(path: &str, snapshot: &Snapshot) -> String {
     let name = folder_name(path);
     let shared = snapshot
         .projects

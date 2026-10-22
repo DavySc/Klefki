@@ -173,7 +173,7 @@ Ideas from an outside brainstorm, compared with this plan and checked on a real 
 4. **Scope visibility hint for the VS Code extension** ("this server is project-scoped; the extension may not see it"). Only after an experiment confirms the extension really behaves that way: it is installed on the owner's machine (2.1.301) but the claim is unverified.
 
 5. **Network probe for HTTP servers** (decision 004): DNS, TLS (including a TLS-inspecting proxy) and the HTTP status of the URL, on the planned `net/` module, to explain what Claude reports as a bare `ECONNREFUSED` or `Needs authentication`.
-6. **Relative-path lint** for user-scope stdio servers: the working directory a client uses is not your project folder, and a check run from the home folder can pass where a real session fails.
+6. **Relative-path lint** for user-scope stdio servers: the working directory a client uses is not your project folder, and a check run from the home folder can pass where a real session fails. Built (a badge and a note), and with it the Status tab's "Diagnose in a project": on request, the user server's diagnose run from a project's folder, refused where Claude Code would not start it there.
 7. **Copy the MCP Inspector command** for a server (never run it automatically: `npx` downloads code, and the Inspector keeps OAuth tokens and `env:` values in its own store, so no secrets are passed).
 
 Not planned, with the reasons recorded in decision 003: `cmd /c` validation (a plain `npx` entry works with the current native Claude Code), and cleanup of old MCP logs (a current install shows 14 MB in 659 files, so the reported runaway growth did not reproduce, and deleting files needs its own safety design).

@@ -168,7 +168,7 @@ fn build(
     // The projects as shown, in the inventory's order.
     let shown_projects: Vec<String> = projects
         .values()
-        .map(|p| clip(&sanitize(&p.display)))
+        .map(|p| shown_project(&p.display))
         .collect();
 
     // Policy (decision 010), per place: outside every project (0), then each project in the inventory's order.
@@ -1232,6 +1232,12 @@ pub(crate) fn display_url(raw: &str, schemes: &[&str]) -> Result<String, &'stati
         shown.push_str("?…");
     }
     Ok(clip(&sanitize(&shown)))
+}
+
+/// A project as rows name it ([`ServerRow::disabled_projects`], [`ServerRow::shadowed_in`]), from its key in
+/// [`Snapshot::projects`].
+pub(crate) fn shown_project(key: &str) -> String {
+    clip(&sanitize(key))
 }
 
 fn clip(s: &str) -> String {
