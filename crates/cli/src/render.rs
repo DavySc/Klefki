@@ -823,6 +823,7 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
     let mut counts: Vec<(&'static str, usize)> = Vec::new();
     let mut skipped = 0;
     for (_, outcome) in rows {
+        // Why Claude Code does not run it is said apart from "not checked": named, it is why the run failed.
         let label = match outcome {
             Outcome::Checked(c) if c.refused().is_some() => "could not be checked",
             Outcome::Checked(c) if c.failed() => "check failed",
@@ -836,13 +837,13 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
                 Status::Checking | Status::Unknown => "check failed",
             },
             Outcome::NoAnswer => "no answer",
-            Outcome::Off
-            | Outcome::Rejected
-            | Outcome::ProjectServer
+            Outcome::Off => "off",
+            Outcome::Rejected => "rejected",
+            Outcome::NotLoaded(_) => "not loaded",
+            Outcome::ProjectServer
             | Outcome::Plugin
             | Outcome::Organisation
-            | Outcome::ClaudeAi
-            | Outcome::NotLoaded(_) => {
+            | Outcome::ClaudeAi => {
                 skipped += 1;
                 continue;
             }
@@ -852,6 +853,8 @@ fn summary(rows: &[(&ServerRow, Outcome)]) -> String {
             None => counts.push((label, 1)),
         }
     }
+    // What the checks found first, then what was not run, in that order.
+    counts.sort_by_key(|&(label, _)| matches!(label, "off" | "rejected" | "not loaded"));
     let mut parts: Vec<String> = counts
         .iter()
         .map(|&(label, n)| match label {
@@ -1430,6 +1433,21 @@ mod tests {
     fn skipped_servers_are_not_problems() {
         for o in [Outcome::Off, Outcome::Rejected, Outcome::ProjectServer] {
             assert!(!o.is_problem() && !o.tool_failed() && !o.was_checked());
+        }
+    }
+
+    #[test]
+    fn preflight_kinds_have_stable_json_names() {
+        // Scripts match on these: a rename is a schema change.
+        let all = [
+            (PreflightKind::NotFound, "not_found"),
+            (PreflightKind::MangledSwitch, "mangled_switch"),
+            (PreflightKind::NoInput, "no_input"),
+            (PreflightKind::UnsetVariable, "unset_variable"),
+            (PreflightKind::EmptyValue, "empty_value"),
+        ];
+        for (kind, key) in all {
+            assert_eq!(preflight_key(kind), key);
         }
     }
 

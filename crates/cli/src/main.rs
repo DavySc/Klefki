@@ -299,12 +299,14 @@ fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u
         .collect();
     // Named, a server is a question a script asks: one Claude Code does not run fails, one Klefki cannot check is
     // its own answer. Unnamed, only what was checked counts.
-    let named_rows = || rows.iter().map(|(_, o)| o).filter(|_| named);
+    let named_rows = || rows.iter().filter(|_| named);
     let code = if !checked.is_empty() && checked.iter().all(|o| o.tool_failed()) {
         UNAVAILABLE
-    } else if checked.iter().any(|o| o.is_problem()) || named_rows().any(Outcome::will_not_run) {
+    } else if checked.iter().any(|o| o.is_problem())
+        || named_rows().any(|(row, o)| o.will_not_run() && !replaced_by_organisation(row, o, &rows))
+    {
         PROBLEM
-    } else if named_rows().any(Outcome::not_checkable) {
+    } else if named_rows().any(|(_, o)| o.not_checkable()) {
         NOT_CHECKED
     } else {
         OK
@@ -318,6 +320,19 @@ fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u
         OK => code,
         failed => failed,
     }
+}
+
+/// Whether `row` is not loaded because the organisation's server of its name, also among `rows`, loads instead:
+/// Claude Code then runs a server of that name after all, and that row answers for the name.
+fn replaced_by_organisation(
+    row: &ServerRow,
+    outcome: &Outcome,
+    rows: &[(&ServerRow, Outcome)],
+) -> bool {
+    matches!(outcome, Outcome::NotLoaded(_))
+        && rows
+            .iter()
+            .any(|(other, o)| matches!(o, Outcome::Organisation) && other.name == row.name)
 }
 
 /// The rows named (all when none are), in the order they are shown. A name that matches nothing is an error that

@@ -68,6 +68,7 @@ Exit status:
      use saved nothing: not confirmed, or nobody at a terminal and no --yes.
   5  status was given a NAME that Klefki does not check (a plugin's, the
      organisation's, a claude.ai connector), so nothing is known about it.
+     Like any code but 0, `&&` and `set -e` treat it as a failure.
 
 Reads CLAUDE_CONFIG_DIR like Claude Code does.
 --- stderr

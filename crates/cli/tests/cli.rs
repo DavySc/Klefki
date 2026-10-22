@@ -447,14 +447,34 @@ fn a_named_server_klefki_does_not_check_has_its_own_exit_code() {
     // Beside one that connects, still 5: one named was not checked.
     let out = env.status(&["wiki", "alpha"]);
     assert_eq!(out.status.code(), Some(5), "{}", text(&out.stdout));
-    // The user's beta is not loaded: that one will not work in Claude Code, which is a failure, and a failure
-    // outranks "not checked".
+    // Review of #100: `beta` names the organisation's server and the user's it replaces. Claude Code runs the
+    // organisation's, which Klefki does not check, so the answer is 5, not a failure for the replaced one.
     let out = env.status(&["beta"]);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out.stdout));
     let out = env.status(&["beta", "--json"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(5));
     assert!(!env.gets().contains(&"wiki".to_owned()), "{:?}", env.gets());
     assert!(!env.gets().contains(&"beta".to_owned()), "{:?}", env.gets());
+}
+
+#[test]
+fn a_named_server_the_organisation_does_not_allow_fails_the_run() {
+    // The nearby variant: the organisation's allowed list leaves beta out, and no server of its name loads in its
+    // place. Claude Code runs no beta at all, so naming it fails the run.
+    let env = Env::new();
+    let org = env.root().join("org");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(
+        org.join("managed-settings.json"),
+        r#"{"allowedMcpServers": [{"serverName": "alpha"}]}"#,
+    )
+    .unwrap();
+    let out = env.status(&["beta"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{}", text(&out.stderr));
+    assert!(line_of(&stdout, "beta").contains("Not loaded"), "{stdout}");
+    assert!(stdout.ends_with("1 not loaded.\n"), "{stdout}");
+    assert!(env.gets().is_empty(), "{:?}", env.gets());
 }
 
 /// Adds a user server `eps` that reads an unset variable, failing when checked.
@@ -845,6 +865,8 @@ fn a_named_server_that_is_off_is_not_checked_and_fails_the_run() {
         "{stdout}"
     );
     assert!(!stdout.contains("Connected"), "{stdout}");
+    // The summary says why the run failed, not only that nothing was checked.
+    assert!(stdout.ends_with("\n1 off.\n"), "{stdout}");
     let out = env.status(&["delta", "--json"]);
     assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();

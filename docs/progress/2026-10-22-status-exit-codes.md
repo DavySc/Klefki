@@ -35,6 +35,16 @@ a claude.ai connector) left the run at 0: `klefki-cli status delta` with `delta`
   not run (`a_named_server_that_is_off…` text and JSON, `a_rejected_project_server…`, and the terminal test's
   `status delta`). P9 changes exactly that behaviour, so they now expect 1. Nothing else was loosened.
 
+## Review (#100)
+- B1: `status beta` with the organisation's `beta` and the user's replaced one exited 1 (the user's row is not
+  loaded), though Claude Code runs the organisation's `beta`. A not-loaded row now does not fail the run when the
+  organisation's row of that name is among those named (`main.rs::replaced_by_organisation`): exit 5. Test changed to
+  expect 5 (seen failing first); variant `a_named_server_the_organisation_does_not_allow_fails_the_run` (allowed list
+  leaves `beta` out, nothing loads in its place: 1).
+- Folded in: the summary counts `off`, `rejected` and `not loaded` apart from `not checked`, after what the checks
+  found (golden `status.txt`: `… 1 needs auth, 1 off, 1 not checked.`); help and decision 006 say `&&` and `set -e`
+  treat 5 as a failure; a unit test pins the five pre-flight kind names.
+
 ## Not in this slice (CLI leftovers from other progress files)
 - `list` has no pre-flight notes: `api::load_snapshot` reads without looking on the PATH, and `list` is the fast one.
 - No timing / `MCP_TIMEOUT` retry in the CLI (P2), no last starts (P1), no `klefki-cli inspector NAME` (P6), no
@@ -43,9 +53,10 @@ a claude.ai connector) left the run at 0: `klefki-cli status delta` with `delta`
 
 ## Checks
 - `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`: exit 0
-  (app 514, core 1094, cli 27 + 47).
+  (app 514, core 1094, cli 28 + 48 after the review fixes).
 - `cargo deny check`: fails only on the yanked tokio 1.54.0 already in main's lock (its fix is #99, in flight).
 - Start-up, RAM: `status` reads nothing new (the findings are in the engine's snapshot already); `list` unchanged.
 
 ## Next
-Pull request, cross-review, merge.
+Re-review, merge. Release notes line: "`klefki-cli status NAME` now fails (exit 1) for a named server Claude Code
+does not run, exits 5 for one Klefki does not check, and says what in a failing definition keeps it from starting."
