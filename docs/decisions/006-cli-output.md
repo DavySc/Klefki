@@ -33,10 +33,15 @@ Written for people first, with `--json` for scripts (clig.dev: "Human-readable o
 | Code | Meaning |
 |---|---|
 | 0 | Done. For `status`: every server checked is connected. |
-| 1 | `status` found a checked server that is not connected (failed, needs auth, tools failed, pending approval, could not be checked). |
+| 1 | `status` found a checked server that is not connected (failed, needs auth, tools failed, pending approval, could not be checked), or was given the name of a server Claude Code does not run (off, rejected for its project, not loaded). |
 | 2 | Usage error: unknown command or option, a name that matches no server, no command at all. |
 | 3 | Claude Code could not be used: not found, refused (a script shim), or no check got an answer (all timed out or gave output Klefki does not understand). A broken tool, not a broken server, so monitoring can tell them apart (clig.dev: map exit codes to the main failure modes). |
 | 4 | `export --output` wrote nothing: the file is there and replacing it was not confirmed, or Klefki does not write there (see below). |
+| 5 | `status` was given the name of a server Klefki does not check (a plugin's, the organisation's, a claude.ai connector): nothing is known about it, which is neither a pass nor a failure. |
+
+`status` exit codes for named servers (2026-10-22, debugging proposal P9): a name on the command line is a question a script asks ("does this server work in Claude Code?"), so a named server that is off, rejected or not loaded fails the run (1) though nothing ran, and one Klefki leaves to Claude Code's `/mcp` gives 5 rather than a false 0. Without names, only the servers checked count, as before: one switched off is not a failure. When several apply, 3 (every check broke down) comes first, then 1, then 5. Before, a named server that was off exited 0. A user or local server that is not loaded because the organisation's server of the same name loads instead does not fail a run that names it: Claude Code does run a server of that name, the organisation's, which gives 5 (review of #100). Like every code but 0, 5 is a failure to `&&` and `set -e`; a script that accepts "not checked" tests for it (`[ $? -eq 5 ]`). The summary line counts `off`, `rejected` and `not loaded` apart from `not checked`, so the text says why a named run failed.
+
+Pre-flight findings (decision of P3, `api::ServerRow::preflight`) are shown under a `status` row that is not connected, `<name>: <problem>` then `- <fix>`, after the hint, and are in the JSON as `"preflight": [{"kind", "problem", "fix"}]` (`kind`: `not_found`, `mangled_switch`, `no_input`, `unset_variable`, `empty_value`). As in the app, "not found" is left out once the server started (connected, tools failed, needs auth). `list` does not look on the PATH, so it has none.
 
 ## `export` (2026-10-19)
 - Prints the servers (all, or those named) as one `{"mcpServers": {…}}` block on stdout: the shape a `.mcp.json` has, and what the app's Add reads back when pasted. It is the same block the app's Export dialog shows, made by core (`export.rs`). It reads the configuration only: no process, no write.

@@ -427,6 +427,131 @@ fn list_and_status_show_what_the_organisation_sets_and_what_it_replaces() {
 }
 
 #[test]
+fn a_named_server_klefki_does_not_check_has_its_own_exit_code() {
+    // P9: an organisation's server is one Klefki leaves to Claude Code's /mcp. Named, nothing is known about it: not
+    // a pass (0), not a failure (1), but 5, so a script can tell "not checked" from both.
+    let env = Env::new();
+    let org = env.root().join("org");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(
+        org.join("managed-settings.json"),
+        r#"{"managedMcpServers": {
+            "beta": {"type": "http", "url": "https://beta.example.com/mcp"},
+            "wiki": {"type": "sse", "url": "https://wiki.example.com/sse"}}}"#,
+    )
+    .unwrap();
+    let out = env.status(&["wiki"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(5), "{stdout}{}", text(&out.stderr));
+    assert!(line_of(&stdout, "wiki").contains("not checked"), "{stdout}");
+    // Beside one that connects, still 5: one named was not checked.
+    let out = env.status(&["wiki", "alpha"]);
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out.stdout));
+    // Review of #100: `beta` names the organisation's server and the user's it replaces. Claude Code runs the
+    // organisation's, which Klefki does not check, so the answer is 5, not a failure for the replaced one.
+    let out = env.status(&["beta"]);
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out.stdout));
+    let out = env.status(&["beta", "--json"]);
+    assert_eq!(out.status.code(), Some(5));
+    assert!(!env.gets().contains(&"wiki".to_owned()), "{:?}", env.gets());
+    assert!(!env.gets().contains(&"beta".to_owned()), "{:?}", env.gets());
+}
+
+#[test]
+fn a_named_server_the_organisation_does_not_allow_fails_the_run() {
+    // The nearby variant: the organisation's allowed list leaves beta out, and no server of its name loads in its
+    // place. Claude Code runs no beta at all, so naming it fails the run.
+    let env = Env::new();
+    let org = env.root().join("org");
+    std::fs::create_dir_all(&org).unwrap();
+    std::fs::write(
+        org.join("managed-settings.json"),
+        r#"{"allowedMcpServers": [{"serverName": "alpha"}]}"#,
+    )
+    .unwrap();
+    let out = env.status(&["beta"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}{}", text(&out.stderr));
+    assert!(line_of(&stdout, "beta").contains("Not loaded"), "{stdout}");
+    assert!(stdout.ends_with("1 not loaded.\n"), "{stdout}");
+    assert!(env.gets().is_empty(), "{:?}", env.gets());
+}
+
+/// Adds a user server `eps` that reads an unset variable, failing when checked.
+fn with_unset_variable(env: &Env) {
+    let file = env.root().join("cfg").join(".claude.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    v["mcpServers"]["eps"] = serde_json::json!({
+        "type": "http",
+        "url": "http://127.0.0.1:9/mcp",
+        "headers": {"X-Team": "${KLEFKI_TEST_NEVER_SET_EPS}"},
+    });
+    std::fs::write(&file, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let failed = get_output("eps", "✘ Failed to connect", "");
+    std::fs::write(env.root().join("eps.txt"), failed).unwrap();
+    std::fs::write(
+        env.root().join("scenario.json"),
+        r#"{"rules":[{"args":["--version"],"stdout_file":"version.txt"},
+            {"args":["mcp","get","eps"],"stdout_file":"eps.txt"},
+            {"args":["mcp","get"],"stdout_file":"alpha.txt"}]}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn status_says_what_in_a_failing_definition_keeps_it_from_starting() {
+    // P3's pre-flight findings, which the app shows beside a row, under a server that did not connect.
+    let env = Env::new();
+    with_unset_variable(&env);
+    let out = env.status(&["eps"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    let under: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with("eps "))
+        .skip(1)
+        .take_while(|l| l.starts_with("    "))
+        .collect();
+    let problem = under
+        .iter()
+        .position(|l| {
+            l.trim_start().starts_with("eps: ") && l.contains("KLEFKI_TEST_NEVER_SET_EPS")
+        })
+        .unwrap_or_else(|| panic!("no finding under eps:\n{stdout}"));
+    assert!(
+        under
+            .get(problem + 1)
+            .is_some_and(|l| l.trim_start().starts_with("- ")),
+        "the fix follows the problem:\n{stdout}"
+    );
+    let out = env.status(&["eps", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    let found = &v["servers"][0]["preflight"][0];
+    assert_eq!(found["kind"], "unset_variable", "{v:#}");
+    assert!(
+        found["problem"]
+            .as_str()
+            .unwrap()
+            .contains("KLEFKI_TEST_NEVER_SET_EPS")
+    );
+    assert!(found["fix"].is_string(), "{v:#}");
+}
+
+#[test]
+fn a_server_that_connects_shows_no_pre_flight_finding() {
+    // alpha's program, npx, is not on the test's PATH, yet Claude Code started it: saying it is not there would
+    // contradict "Connected" beside it, as in the app. A connected row keeps the table to one line.
+    let env = Env::new();
+    let out = env.status(&["alpha"]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(!stdout.contains("alpha: "), "{stdout}");
+    let out = env.status(&["alpha", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(v["servers"][0]["preflight"], serde_json::json!([]), "{v:#}");
+}
+
+#[test]
 fn list_with_names_shows_only_those() {
     let env = Env::new();
     let out = env.run(&["list", "gamma", "alpha"]);
@@ -727,11 +852,12 @@ fn secrets_in_a_stdio_servers_arguments_are_never_printed() {
 }
 
 #[test]
-fn a_named_server_that_is_off_is_not_checked() {
+fn a_named_server_that_is_off_is_not_checked_and_fails_the_run() {
     // Review of #25: `status delta` checked a server Claude Code does not start, and said "Connected".
+    // P9: a script that names it asks whether it works in Claude Code; off, it does not, so the run fails (1).
     let env = Env::new();
     let out = env.status(&["delta"]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     let delta = line_of(&stdout, "delta");
     assert!(
@@ -739,12 +865,34 @@ fn a_named_server_that_is_off_is_not_checked() {
         "{stdout}"
     );
     assert!(!stdout.contains("Connected"), "{stdout}");
+    // The summary says why the run failed, not only that nothing was checked.
+    assert!(stdout.ends_with("\n1 off.\n"), "{stdout}");
     let out = env.status(&["delta", "--json"]);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(1));
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["servers"][0]["skipped"], "off");
     assert_eq!(v["servers"][0]["checked"], false);
     assert!(env.gets().is_empty(), "{:?}", env.gets());
+    // Beside a server that connects, still a failure: one of those named does not work.
+    let out = env.status(&["alpha", "delta"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert_eq!(env.gets(), ["alpha"]);
+}
+
+#[test]
+fn an_unnamed_server_that_is_off_does_not_fail_the_run() {
+    // Without names, `status` answers for the servers Claude Code runs: one switched off is not a failure.
+    let env = Env::new();
+    std::fs::write(
+        env.root().join("scenario.json"),
+        r#"{"rules":[{"args":["--version"],"stdout_file":"version.txt"},
+            {"args":["mcp","get"],"stdout_file":"alpha.txt"}]}"#,
+    )
+    .unwrap();
+    let out = env.status(&[]);
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(line_of(&stdout, "delta").contains("Off"), "{stdout}");
 }
 
 #[test]
@@ -758,7 +906,8 @@ fn a_rejected_project_server_is_not_checked_even_when_named() {
     )
     .unwrap();
     let out = env.status(&["docs"]);
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    // Claude Code does not run it, so a script asking about it learns it does not work.
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
     let stdout = text(&out.stdout);
     let docs = line_of(&stdout, "docs");
     assert!(
@@ -1668,10 +1817,10 @@ fn status_at_a_terminal_shows_its_progress_then_clears_it() {
         "{shown:?}"
     );
 
-    // Nothing to check: no progress, and nothing to clear.
+    // Nothing to check: no progress, and nothing to clear. Named and off, delta fails the run (P9).
     let term = Terminal::start(&env, klefki_cli(), &["status", "--claude", &fake, "delta"]);
     let (code, shown) = term.finish();
-    assert_eq!(code, 0, "{shown:?}");
+    assert_eq!(code, 1, "{shown:?}");
     assert!(!shown.contains("Check"), "{shown:?}");
     assert!(
         !shown.contains("\r\r") && !shown.contains("\r "),

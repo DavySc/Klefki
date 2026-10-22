@@ -35,6 +35,9 @@ const USAGE: u8 = 2;
 const UNAVAILABLE: u8 = 3;
 /// `export --output` wrote nothing: the file is there, or Klefki does not write there.
 const NOT_WRITTEN: u8 = 4;
+/// `status` was asked about a server Klefki does not check (a plugin's, the organisation's, a claude.ai connector),
+/// so nothing is known about it.
+const NOT_CHECKED: u8 = 5;
 
 const SHORT_USAGE: &str = "Usage: klefki-cli list|status|export|profiles|use [NAME...] [--json] [--claude PATH]. See `klefki-cli help`.";
 const USE_USAGE: &str = "Usage: klefki-cli use PROFILE [--project DIR | --all] [--only] [--yes]. See `klefki-cli help`.";
@@ -294,10 +297,17 @@ fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u
         .map(|(_, o)| o)
         .filter(|o| o.was_checked())
         .collect();
+    // Named, a server is a question a script asks: one Claude Code does not run fails, one Klefki cannot check is
+    // its own answer. Unnamed, only what was checked counts.
+    let named_rows = || rows.iter().filter(|_| named);
     let code = if !checked.is_empty() && checked.iter().all(|o| o.tool_failed()) {
         UNAVAILABLE
-    } else if checked.iter().any(|o| o.is_problem()) {
+    } else if checked.iter().any(|o| o.is_problem())
+        || named_rows().any(|(row, o)| o.will_not_run() && !replaced_by_organisation(row, o, &rows))
+    {
         PROBLEM
+    } else if named_rows().any(|(_, o)| o.not_checkable()) {
+        NOT_CHECKED
     } else {
         OK
     };
@@ -310,6 +320,19 @@ fn status(names: &[String], json: bool, claude: Option<std::path::PathBuf>) -> u
         OK => code,
         failed => failed,
     }
+}
+
+/// Whether `row` is not loaded because the organisation's server of its name, also among `rows`, loads instead:
+/// Claude Code then runs a server of that name after all, and that row answers for the name.
+fn replaced_by_organisation(
+    row: &ServerRow,
+    outcome: &Outcome,
+    rows: &[(&ServerRow, Outcome)],
+) -> bool {
+    matches!(outcome, Outcome::NotLoaded(_))
+        && rows
+            .iter()
+            .any(|(other, o)| matches!(o, Outcome::Organisation) && other.name == row.name)
 }
 
 /// The rows named (all when none are), in the order they are shown. A name that matches nothing is an error that
