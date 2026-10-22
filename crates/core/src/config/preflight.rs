@@ -7,6 +7,7 @@
 //! Looking for a program reads only file metadata. A `.mcp.json` comes from a repository and is untrusted, so for a
 //! project server only a bare program name is looked up, in the folders of Klefki's own PATH; a path it names, or a
 //! PATH it sets, is never looked at. No definition makes Klefki touch a network path (`\\host\share`, `//host`).
+use super::secretlike;
 use crate::api::{Preflight, PreflightKind};
 use crate::sanitize::{clip, sanitize_line};
 use serde_json::{Map, Value};
@@ -104,12 +105,14 @@ fn local_folder(dir: &Path) -> bool {
     dir.is_absolute() && !network_path(&dir.to_string_lossy())
 }
 
-/// `\\host\share`, `//host/share`, and Windows' `\\?\` and `\\.\` forms: looking at one can reach another machine.
+/// `\\host\share`, `//host/share`, and Windows' `\\?\`, `\\.\` and NT `\??\` forms (`\??\UNC\host\share`): looking at
+/// one can reach another machine.
 fn network_path(path: &str) -> bool {
-    path.starts_with("\\\\")
-        || path.starts_with("//")
-        || path.starts_with("\\/")
-        || path.starts_with("/\\")
+    [
+        "\\\\", "//", "\\/", "/\\", "\\??\\", "/??/", "\\??/", "/??\\",
+    ]
+    .iter()
+    .any(|start| path.starts_with(start))
 }
 
 /// What keeps the server `entry` defines from starting. `trusted`: the definition is in the user's own files, not a
@@ -341,28 +344,43 @@ fn unset(texts: &[&str], probe: &Probe<'_>) -> Option<Preflight> {
             }
         }
     }
-    let first = *names.first()?;
+    if names.is_empty() {
+        return None;
+    }
     let refs: Vec<String> = names.iter().map(|n| format!("${{{n}}}")).collect();
+    // Klefki knows only its own environment: Claude Code started from a terminal may have them.
     let problem = if names.len() == 1 {
         format!(
-            "{} isn't set, so Claude Code passes it on as written.",
+            "{} isn't set where Klefki was started. Unless it is set where Claude Code starts, Claude Code passes it \
+             on as written.",
             shown(&refs[0])
         )
     } else {
         format!(
-            "{} aren't set, so Claude Code passes them on as written.",
+            "{} aren't set where Klefki was started. Unless they are set where Claude Code starts, Claude Code \
+             passes them on as written.",
             listed(&refs)
         )
     };
-    Some(finding(
-        PreflightKind::UnsetVariable,
-        problem,
-        &format!(
-            "Set {} before you start Claude Code and Klefki, or give a default: ${{{}:-value}}.",
-            if names.len() == 1 { "it" } else { "them" },
-            shown(first)
-        ),
-    ))
+    let set = format!(
+        "Set {} before you start Claude Code and Klefki",
+        if names.len() == 1 { "it" } else { "them" }
+    );
+    // A default is written in the file as it stands: never suggested for a secret, which belongs in the environment.
+    let fix = match names.iter().find(|n| !secret_name(n)) {
+        Some(plain) => format!("{set}, or give a default: ${{{}:-value}}.", shown(plain)),
+        None => format!("{set}."),
+    };
+    Some(finding(PreflightKind::UnsetVariable, problem, &fix))
+}
+
+/// Whether a variable's name says it holds a secret: as [`secretlike::sounds_secret`] says, or a personal access
+/// token (`AZURE_DEVOPS_PAT`), which that leaves out. Only here, where it only holds back a suggestion.
+fn secret_name(name: &str) -> bool {
+    secretlike::sounds_secret(name)
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|w| w.eq_ignore_ascii_case("pat"))
 }
 
 /// Environment variables set to nothing.

@@ -283,9 +283,10 @@ fn what_keeps_a_server_from_starting() {
         },
         Preflight {
             kind: PreflightKind::UnsetVariable,
-            problem: "${AZURE_DEVOPS_PAT} isn't set, so Claude Code passes it on as written.".to_owned(),
-            fix: "Set it before you start Claude Code and Klefki, or give a default: ${AZURE_DEVOPS_PAT:-value}."
+            problem: "${AZURE_DEVOPS_PAT} isn't set where Klefki was started. Unless it is set where Claude \
+                      Code starts, Claude Code passes it on as written."
                 .to_owned(),
+            fix: "Set it before you start Claude Code and Klefki.".to_owned(),
         },
     ];
     let (mut h, _engine) = app_showing(Arc::new(snapshot), PAGE, ThemeChoice::Dark, Tone::Cool);

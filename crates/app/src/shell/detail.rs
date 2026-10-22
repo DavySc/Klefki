@@ -491,9 +491,14 @@ impl ShellApp {
                         .wrap(),
                     );
                 }
-                // What keeps it from starting, each with what to do about it.
-                for found in preflight_shown(s, status) {
+                // What keeps it from starting, each with what to do about it, under a heading of their own.
+                let preflight = preflight_shown(s, status);
+                if !preflight.is_empty() {
                     ui.add_space(8.0);
+                    ui.label(RichText::new("Before it can start").color(pal.text_muted));
+                }
+                for found in preflight {
+                    ui.add_space(4.0);
                     ui.add(egui::Label::new(RichText::new(&found.problem).color(pal.warn)).wrap());
                     ui.add(egui::Label::new(RichText::new(&found.fix).color(pal.text)).wrap());
                 }

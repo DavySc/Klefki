@@ -21,20 +21,34 @@ as `cmd C:/`, an empty environment variable. Does not read Claude Code's log fol
     `$` in it is left to the unset-variable check.
   - Safety: only file metadata is read. A `.mcp.json` is untrusted, so for a project server only a bare name is
     looked up, in Klefki's own PATH; a full path or a PATH it sets is never looked at. Network paths (`\\host`,
-    `//host`, `\\?\`, `\\.\`) are never looked at, in a command or a PATH folder, for any server.
+    `//host`, `\\?\`, `\\.\`, `\??\`) are never looked at, in a command or a PATH folder, for any server.
   - Git Bash's `C:/` for `/c` after `cmd`: shares `paste::git_bash_drive` with paste, which already puts it back.
   - `docker`/`podman` `run` (or `container run`) with no `-i`, `--interactive` or short group with `i` after it.
   - `${NAME}` with no `:-default` and no such variable in Klefki's environment, in a stdio server's command, args
-    and env, or a remote server's URL and headers.
+    and env, or a remote server's URL and headers. The text says it is unset where Klefki was started. A default
+    (`${NAME:-value}`) is suggested only for a name that is not a secret's (`secretlike::sounds_secret`, or a
+    word `PAT`), since it would be written in the file in plain text.
   - Environment variables that are empty or only spaces.
 - `api::ServerRow::preflight: Vec<Preflight>` (`kind`, `problem`, `fix`). Filled by `inventory::load_probed` for
   user, local and project servers; `inventory::load` (preparing a change, export) looks nothing up. The engine passes
   its PATH and a new `EngineConfig::vars` (the process's variables; tests give their own).
-- App: one badge beside the name, named after the first finding (`not found`, `C:/ for /c`, `no -i`, `unset
-  variable`, `empty value`), every problem on hover; the details' General tab lists each problem with its fix.
+- App: one badge beside the name, named after the first finding (`no program`, `Git Bash /c`, `missing -i`,
+  `unset variable`; an empty variable gets no badge, as one is often meant), every problem on hover; the details'
+  General tab lists each problem with its fix under "Before it can start".
   Not shown on a row Claude Code loads nowhere. "Not found" is not shown once the server started (Connected,
   tools failed, Needs auth): Claude Code found the program after all, on another PATH.
 - New look picture `preflight-findings.png`; no other picture or golden file changed.
+
+## Review (#93)
+- A1: no `${NAME:-value}` suggestion for a secret's name (test with four secret names, one plain among secrets,
+  and `PATTERN`, which is not `PAT`). A2: the NT forms `\??\` and `/??/` count as network paths (test cases).
+- Folded in B1 to B4: "isn't set where Klefki was started", clearer badge labels ("program missing" did not fit
+  beside the name in the 1100 px list and fell into "+1", so `no program`), no badge for an empty variable, a
+  heading over the findings.
+- Follow-up named by the review, not done: whether native-Windows Claude Code needs `cmd /c` for a program found only
+  as `.cmd`/`.bat` (decision 003 found plain `npx` works); needs a check with real Claude Code on Windows.
+- `secretlike::sounds_secret` does not know `PAT`; teaching it changes masking elsewhere, so it is left for its own
+  slice.
 
 ## Not in this slice
 - `klefki-cli`: its notes would change the `list` and `status` golden files; P9 (exit codes) is the natural place.

@@ -182,12 +182,10 @@ fn name_cell(ui: &mut Ui, s: &ServerRow, status: Status, project_count: usize) {
         badges.push(loud("rejected", pal.danger, None));
     }
     let preflight = preflight_shown(s, status);
-    if let (Some(first), None) = (preflight.first(), &s.not_loaded) {
-        badges.push(loud(
-            preflight_label(first.kind),
-            pal.warn,
-            Some(&preflight_hover(&preflight)),
-        ));
+    // An empty variable is often meant (one cleared on purpose), so it is in the details only.
+    let first = preflight.iter().find_map(|f| preflight_label(f.kind));
+    if let (Some(label), None) = (first, &s.not_loaded) {
+        badges.push(loud(label, pal.warn, Some(&preflight_hover(&preflight))));
     }
     let same_as = s.plugin.as_ref().and_then(|p| p.same_as.as_deref());
     if let (true, Some(same)) = (s.shadowed, same_as) {
@@ -578,14 +576,14 @@ pub(super) fn relative_job(ui: &Ui, paths: &[String], color: Color32) -> egui::t
     job
 }
 
-/// A pre-flight finding on a badge, in a word or two.
-fn preflight_label(kind: PreflightKind) -> &'static str {
+/// A pre-flight finding on a badge, in a word or two; `None` for one the list leaves to the details.
+fn preflight_label(kind: PreflightKind) -> Option<&'static str> {
     match kind {
-        PreflightKind::NotFound => "not found",
-        PreflightKind::MangledSwitch => "C:/ for /c",
-        PreflightKind::NoInput => "no -i",
-        PreflightKind::UnsetVariable => "unset variable",
-        PreflightKind::EmptyValue => "empty value",
+        PreflightKind::NotFound => Some("no program"),
+        PreflightKind::MangledSwitch => Some("Git Bash /c"),
+        PreflightKind::NoInput => Some("missing -i"),
+        PreflightKind::UnsetVariable => Some("unset variable"),
+        PreflightKind::EmptyValue => None,
     }
 }
 

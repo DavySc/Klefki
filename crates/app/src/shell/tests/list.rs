@@ -194,18 +194,19 @@ fn what_keeps_a_server_from_starting_is_a_badge_and_its_details_say_what_to_do()
         .unwrap();
     h.run();
     assert_eq!(
-        h.query_all_by_label("no -i").count(),
+        h.query_all_by_label("missing -i").count(),
         1,
         "the first finding names the badge"
     );
     assert!(
-        h.query_by_label("not found").is_none(),
+        h.query_by_label("no program").is_none(),
         "not on a server that is not loaded"
     );
-    h.get_by_label("no -i").hover();
+    h.get_by_label("missing -i").hover();
     h.run();
     h.get_by_label_contains("docker run has no -i, so the container never reads what Claude Code sends. API_KEY is empty.");
     click(&mut h, "fetch");
+    h.get_by_label("Before it can start");
     h.get_by_label("docker run has no -i, so the container never reads what Claude Code sends.");
     h.get_by_label("Add -i after run.");
     h.get_by_label("API_KEY is empty.");
@@ -234,19 +235,21 @@ fn a_server_that_started_is_not_said_to_be_missing_its_program() {
         .send(snapshot_with_projects(1, vec![row.clone()]))
         .unwrap();
     h.run();
-    h.get_by_label("not found");
-    // Claude Code found it after all (another PATH): only what still holds is said.
+    h.get_by_label("no program");
+    // Claude Code found it after all (another PATH): only what still holds is said, and an empty variable is the
+    // details' to say, not the list's.
     for status in [Status::Connected, Status::Degraded, Status::NeedsAuth] {
         engine
             .events
             .send(status_event(&row, status, None))
             .unwrap();
         h.run();
-        assert!(h.query_by_label("not found").is_none(), "{status:?}");
-        h.get_by_label("empty value");
+        assert!(h.query_by_label("no program").is_none(), "{status:?}");
+        assert!(h.query_by_label("empty value").is_none(), "{status:?}");
     }
     click(&mut h, "npx-server");
     assert!(h.query_by_label_contains("Can't find npx").is_none());
+    h.get_by_label("Before it can start");
     h.get_by_label("LEVEL is empty.");
 }
 

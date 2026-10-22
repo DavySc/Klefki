@@ -194,6 +194,10 @@ fn network_paths_are_never_looked_at() {
         "//nas/share/mcp",
         "\\\\?\\C:\\x.exe",
         "\\\\.\\pipe\\x",
+        // The NT form Win32 passes through: `\??\UNC\host\share`, with either slash.
+        "\\??\\UNC\\nas\\share\\mcp.exe",
+        "/??/UNC/nas/share/mcp.exe",
+        "\\??/UNC/nas/share/mcp.exe",
     ] {
         assert!(
             found(&m, json!({"command": command})).is_empty(),
@@ -310,12 +314,14 @@ fn unset_variables_are_named_once_with_a_default_meaning_none() {
     assert_eq!(kinds(&f), [PreflightKind::UnsetVariable], "{f:?}");
     assert_eq!(
         f[0].problem,
-        "${API_URL} and ${API_KEY} aren't set, so Claude Code passes them on as written."
+        "${API_URL} and ${API_KEY} aren't set where Klefki was started. Unless they are set where Claude Code \
+         starts, Claude Code passes them on as written."
     );
     let one = found(&m, json!({"type": "http", "url": "https://${HOST}/mcp"}));
     assert_eq!(
         one[0].problem,
-        "${HOST} isn't set, so Claude Code passes it on as written."
+        "${HOST} isn't set where Klefki was started. Unless it is set where Claude Code starts, Claude Code \
+         passes it on as written."
     );
     assert!(one[0].fix.contains("${HOST:-value}"), "{one:?}");
     let header = found(
@@ -334,13 +340,56 @@ fn unset_variables_are_named_once_with_a_default_meaning_none() {
 }
 
 #[test]
+fn a_secret_is_never_offered_a_default_written_in_the_file() {
+    // Review A1: `${TOKEN:-value}` would put the token in `.claude.json` in plain text.
+    let m = machine();
+    for name in [
+        "AZURE_DEVOPS_PAT",
+        "API_KEY",
+        "GITLAB_TOKEN",
+        "CLIENT_SECRET",
+    ] {
+        let f = found(
+            &m,
+            json!({"command": "node", "env": {"X": format!("${{{name}}}")}}),
+        );
+        assert_eq!(kinds(&f), [PreflightKind::UnsetVariable], "{name}");
+        assert_eq!(
+            f[0].fix, "Set it before you start Claude Code and Klefki.",
+            "{name}"
+        );
+    }
+    // Several: the default is offered for one that is not a secret, never named after one that is.
+    let f = found(
+        &m,
+        json!({"command": "node", "args": ["${API_KEY}", "${REGION}"]}),
+    );
+    assert_eq!(
+        f[0].fix,
+        "Set them before you start Claude Code and Klefki, or give a default: ${REGION:-value}."
+    );
+    // Not a word of its own: no secret.
+    let path = found(&m, json!({"command": "node", "args": ["${PATTERN}"]}));
+    assert!(path[0].fix.contains("${PATTERN:-value}"), "{path:?}");
+    let both = found(
+        &m,
+        json!({"command": "node", "args": ["${API_KEY}", "${SECRET_TOKEN}"]}),
+    );
+    assert_eq!(
+        both[0].fix,
+        "Set them before you start Claude Code and Klefki."
+    );
+}
+
+#[test]
 fn many_unset_variables_are_counted_after_a_few() {
     let m = machine();
     let args: Vec<String> = (0..9).map(|i| format!("${{V{i}}}")).collect();
     let f = found(&m, json!({"command": "node", "args": args}));
     assert_eq!(
         f[0].problem,
-        "${V0}, ${V1}, ${V2}, ${V3}, ${V4} and 4 more aren't set, so Claude Code passes them on as written."
+        "${V0}, ${V1}, ${V2}, ${V3}, ${V4} and 4 more aren't set where Klefki was started. Unless they are set \
+         where Claude Code starts, Claude Code passes them on as written."
     );
 }
 
