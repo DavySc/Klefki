@@ -756,6 +756,7 @@ mod renames;
 mod restore;
 mod sign_in;
 mod spelling;
+mod switch_profile;
 mod timing;
 mod undo;
 mod updates;

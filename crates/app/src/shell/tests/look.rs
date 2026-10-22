@@ -855,3 +855,43 @@ fn the_list_seen_from_one_project() {
     shot(&mut h, "switched-in-one-project");
     all.extend_harness(&mut h);
 }
+
+/// Switching profiles (on/off plan S4): a profile's card where another is in use, and the profile menu of the list
+/// seen from one project, open, at the default size and the smallest window.
+#[test]
+fn switching_profiles() {
+    let Event::Snapshot(snapshot) = snapshot_with_work_in_use_in_notes() else {
+        unreachable!()
+    };
+    let mut snapshot = (*snapshot).clone();
+    let mut profiles = work_profile();
+    profiles.profiles.push(klefki_core::api::Profile {
+        name: "Notes".to_owned(),
+        members: vec![snapshot.servers[1].connection.clone()],
+    });
+    snapshot.profiles = profiles.profiles.clone();
+    let snapshot = Arc::new(snapshot);
+    let mut all = SnapshotResults::new();
+    let (mut h, engine) = app_showing(Arc::clone(&snapshot), SMALL, ThemeChoice::Dark, Tone::Cool);
+    open_profiles(&mut h, &engine, profiles);
+    h.state_mut().profiles.as_mut().unwrap().filter = "Notes".to_owned();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::ComboBox, "Use in")
+        .click();
+    h.run();
+    h.get_by_label_contains("notes").click();
+    shot(&mut h, "profile-switch-from");
+    all.extend_harness(&mut h);
+    for (size, name) in [
+        (PAGE, "connections-profile-menu"),
+        (SMALL, "connections-profile-menu-800x480"),
+    ] {
+        let (mut h, _engine) =
+            app_showing(Arc::clone(&snapshot), size, ThemeChoice::Dark, Tone::Cool);
+        h.state_mut().look_in(Some("/home/notes".to_owned()));
+        h.run();
+        h.get_by_label_contains("Work").click();
+        shot(&mut h, name);
+        all.extend_harness(&mut h);
+    }
+}

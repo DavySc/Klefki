@@ -55,7 +55,8 @@ Pre-flight findings (decision of P3, `api::ServerRow::preflight`) are shown unde
 - **`profiles [--json]`** lists the profiles made in Klefki, read like the app reads them: each with its servers
   (`User`, `Local in <project>`, or `no longer configured`) and the projects where its servers are the only ones on.
   It reads only. JSON: `{"schema": 1, "profiles": [{"name", "servers": [{"name", "scope", "project", "configured"}],
-  "alone_in": [paths]}], "warnings": [...]}`; a profiles file Klefki cannot read in full is a warning, and what could
+  "in_use": [paths], "alone_in": [paths]}], "warnings": [...]}` (`in_use` and its "In use in" line since 2026-10-22: the
+  projects where stopping it would put something back); a profiles file Klefki cannot read in full is a warning, and what could
   be read is listed.
 - **`use PROFILE [--project DIR | --all] [--only] [--yes]`** is the first command that changes Claude Code's
   configuration. It makes the same plan as the app's "Use profile…" (`Change::UseProfile`, Prepare → diff → Apply
@@ -71,6 +72,12 @@ Pre-flight findings (decision of P3, `api::ServerRow::preflight`) are shown unde
 - `use` exits 0 when saved or when nothing needs changing, 4 when nothing was saved (not confirmed), 1 when the plan
   could not be made or saved, 2 for a profile or folder that is not there. It runs no Claude Code command beyond the
   `--version` the engine asks for when it starts. `--json` is refused: the plan is for people.
+- **`switch PROFILE [--project DIR] [--only] [--yes]`** and **`stop PROFILE [--project DIR | --all] [--yes]`**
+  (2026-10-22, on/off plan S4) work like `use`: one plan through the engine, printed, asked about, the same exit codes
+  and their own usage line. `switch` stops every profile in use in that one project and uses `PROFILE` there, as one
+  change (`Change::SwitchProfile`), so stopping it later goes back to before all of them; with none in use it is
+  `use`. `--all` is refused for `switch`, `--only` for `stop`. `stop` makes `Change::StopProfile` (never deletes).
+  In a git worktree, the project is the main checkout's: Claude Code uses its entry there (the audit's L8).
 - `KLEFKI_DATA_DIR` names Klefki's own folder (backups, profiles, the Activity log) instead of the machine's, like
   `KLEFKI_MANAGED_DIR`, so tests and try-outs never touch it.
 

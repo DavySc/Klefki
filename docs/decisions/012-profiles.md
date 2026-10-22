@@ -72,10 +72,19 @@ switches each server per project, by name, in `disabledMcpServers` (decision 002
   `profiles.json` changed by hand) drops that record first: the profile never takes over switches it did not make,
   and the file never holds a name twice. A record that cannot be forgotten or carried over is said on the page.
 - In use in more than one project, "Stop using in…" asks where: one project, or all of them.
+- Switch (on/off plan S4, 2026-10-22, `docs/proposals/on-off-audit.md` findings 6, 9, 10): using a profile over
+  another stacked them, and nothing said so. `Change::SwitchProfile { from, name, project, .. }` stops each profile of
+  `from` in that one project, one after another on the files as the one before leaves them, then uses `name` there on
+  the files as they will be by then: one plan, one review, one Undo, and stopping `name` later goes back to before
+  all of them. A switch that a stop puts back and the use sets again is written once, as it ends, and "This also turns
+  off" names only servers on now. Applied, the stops are forgotten before the use is recorded. Where another profile
+  is in use in the project chosen, a card's main button is "Switch from …"; "Use as well…" keeps stacking. The list
+  seen from one project (S3) shows the profile in use there as a menu: Switch to / Use / Stop using, each reviewed
+  (it can turn many servers off; the one-project exception is for single switches). `klefki-cli switch` and `stop`
+  do the same; `profiles` says "In use in"; in a git worktree the CLI uses the main checkout's project.
 
 ## Not yet
 - Which profiles a project is on alone in, shown on the Connections page too.
-- `klefki-cli` showing where a profile is in use, and stopping it.
 - A backup of `profiles.json` before a profile is deleted.
 - A rename or move made outside Klefki (by Claude Code's own commands, or by hand) leaves the profile naming the old
   server, shown as no longer configured.
