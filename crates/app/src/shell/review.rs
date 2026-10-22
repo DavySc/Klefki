@@ -365,11 +365,17 @@ impl ShellApp {
                 return;
             }
             if plan.warnings.is_empty() && plan.reviews.is_empty() && !plan.destructive {
-                let done = if done.is_empty() {
+                let mut done = if done.is_empty() {
                     said_done(&plan.summary)
                 } else {
                     done
                 };
+                // What the review would have said quietly (a profile that will no longer put a switch back, say)
+                // is said on the outcome instead: nothing a review shows is lost by skipping it.
+                for note in &plan.notes {
+                    done.push(' ');
+                    done.push_str(note);
+                }
                 self.quiet_plan = Some((plan.id, done));
                 self.applying = true;
                 self.send(Command::Apply(plan.id));

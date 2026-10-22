@@ -452,3 +452,133 @@ fn an_undo_found_already_done_is_not_offered_again() {
     assert!(h.state().undoing.is_none());
     assert!(h.state().outcome.as_ref().is_some_and(|o| o.undo.is_none()));
 }
+
+/// Found in review of #104: what the review would have said quietly is said on the outcome when the review is
+/// skipped (here, a profile that will no longer put the switch back).
+#[test]
+fn a_quiet_switch_says_the_reviews_notes_on_its_outcome() {
+    let (mut h, engine) = live_harness();
+    two_projects(&mut h, &engine);
+    seen_from(&mut h, A);
+    click(&mut h, "gw");
+    press(&mut h, Tool::TurnOff);
+    let note = "Writing switched gw in a; after this, stopping Writing leaves it as you set it.";
+    let mut with_note = plan(7, &[]);
+    with_note.notes = vec![note.to_owned()];
+    ready(&mut h, &engine, with_note);
+    applied(&mut h, &engine, 7, Some(gw_off_in_a()));
+    let text = h.state().outcome.as_ref().unwrap().text.clone();
+    assert!(text.starts_with("Turned off gw in a."), "{text}");
+    assert!(text.contains(note), "{text}");
+    // Its Undo the same way.
+    drain(&engine);
+    click(&mut h, "Undo");
+    let mut back = plan(8, &[]);
+    back.summary = vec!["Turn gw back on in a".to_owned()];
+    back.notes = vec!["Klefki's record of what Writing switched goes back as it was.".to_owned()];
+    ready(&mut h, &engine, back);
+    applied(&mut h, &engine, 8, None);
+    let text = h.state().outcome.as_ref().unwrap().text.clone();
+    assert!(text.contains("record of what Writing switched"), "{text}");
+}
+
+/// `key` goes down (and stays down until [`release`]): egui counts a second one as the system's repeat.
+fn key(h: &mut Harness<'static, ShellApp>, key: egui::Key, modifiers: egui::Modifiers) {
+    h.event(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    });
+    h.run();
+}
+
+fn release(h: &mut Harness<'static, ShellApp>, key: egui::Key) {
+    h.event(egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: false,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run();
+}
+
+/// Found in review of #104: a key held down repeats; once the first switch is saved, a repeat must not save again.
+#[test]
+fn a_held_space_switches_once_and_shift_or_ctrl_space_not_at_all() {
+    let (mut h, engine) = live_harness();
+    two_projects(&mut h, &engine);
+    seen_from(&mut h, A);
+    click(&mut h, "gw");
+    key(&mut h, egui::Key::Space, egui::Modifiers::NONE);
+    assert_eq!(drain(&engine).len(), 1);
+    ready(&mut h, &engine, plan(7, &[]));
+    applied(&mut h, &engine, 7, Some(gw_off_in_a()));
+    drain(&engine);
+    // Still held: the system repeats it.
+    key(&mut h, egui::Key::Space, egui::Modifiers::NONE);
+    key(&mut h, egui::Key::Space, egui::Modifiers::NONE);
+    assert!(drain(&engine).is_empty(), "a repeat is not a press");
+    release(&mut h, egui::Key::Space);
+    // Shift+Space and Ctrl+Space are other keys (the grid's, the system's).
+    key(&mut h, egui::Key::Space, egui::Modifiers::SHIFT);
+    release(&mut h, egui::Key::Space);
+    key(&mut h, egui::Key::Space, egui::Modifiers::COMMAND);
+    release(&mut h, egui::Key::Space);
+    assert!(drain(&engine).is_empty());
+}
+
+#[test]
+fn a_held_ctrl_z_undoes_once() {
+    let (mut h, engine) = live_harness();
+    two_projects(&mut h, &engine);
+    seen_from(&mut h, A);
+    click(&mut h, "gw");
+    press(&mut h, Tool::TurnOff);
+    ready(&mut h, &engine, plan(7, &[]));
+    applied(&mut h, &engine, 7, Some(gw_off_in_a()));
+    drain(&engine);
+    // Ctrl+Shift+Z is redo elsewhere, not this.
+    key(
+        &mut h,
+        egui::Key::Z,
+        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+    );
+    release(&mut h, egui::Key::Z);
+    assert!(drain(&engine).is_empty());
+    key(&mut h, egui::Key::Z, egui::Modifiers::COMMAND);
+    assert_eq!(drain(&engine).len(), 1, "the undo asked for");
+    let mut back = plan(8, &[]);
+    back.summary = vec!["Turn gw back on in a".to_owned()];
+    ready(&mut h, &engine, back);
+    assert_eq!(drain(&engine), vec![Command::Apply(8)]);
+    applied(&mut h, &engine, 8, Some(gw_off_in_a()));
+    drain(&engine);
+    // Still held: the redo it now offers is not taken.
+    key(&mut h, egui::Key::Z, egui::Modifiers::COMMAND);
+    key(&mut h, egui::Key::Z, egui::Modifiers::COMMAND);
+    assert!(drain(&engine).is_empty(), "a repeat is not a press");
+}
+
+#[test]
+fn turn_on_and_off_say_where_and_how_they_save() {
+    let (mut h, engine) = live_harness();
+    two_projects(&mut h, &engine);
+    seen_from(&mut h, A);
+    click(&mut h, "gw");
+    for (which, tip) in [
+        (
+            Tool::TurnOn,
+            "Turn on in a (Space), saved at once with Undo",
+        ),
+        (
+            Tool::TurnOff,
+            "Turn off in a (Space), saved at once with Undo",
+        ),
+    ] {
+        let description = tool(&h, which).accesskit_node().description();
+        assert_eq!(description.as_deref(), Some(tip));
+    }
+}

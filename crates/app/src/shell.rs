@@ -888,7 +888,9 @@ impl ShellApp {
                 self.prepare_delete();
             }
             // Not while a button has the keyboard (then egui wants it): Space is the button's to press.
-            if !self.selected.is_empty() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
+            if !self.selected.is_empty()
+                && ui.input(|i| pressed_once(i, egui::Key::Space, egui::Modifiers::NONE))
+            {
                 self.toggle_selected();
             }
             if self.selected.len() == 1
@@ -918,8 +920,7 @@ impl ShellApp {
         // The outcome's Undo, from the keyboard; never while a text field has it, where it undoes typing.
         if idle
             && self.core.is_some()
-            && ui
-                .input(|i| i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z))
+            && ui.input(|i| pressed_once(i, egui::Key::Z, egui::Modifiers::COMMAND))
         {
             self.undo_outcome();
         }
@@ -2067,6 +2068,18 @@ fn name_problem(name: &str) -> Option<String> {
     ServerName::parse(name)
         .err()
         .map(|e| capitalized(&e.to_string()))
+}
+
+/// `key` was pressed in this frame with exactly `modifiers` (Ctrl or ⌘ as the command key), not repeated by the
+/// system while held: holding a key that saves must not save again and again.
+fn pressed_once(input: &egui::InputState, key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    input.events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::Key { key: k, pressed: true, repeat: false, modifiers: m, .. }
+                if *k == key && m.matches_exact(modifiers)
+        )
+    })
 }
 
 /// `a`, `a and b`, `a, b and c`; more than three are counted: `5 projects`.

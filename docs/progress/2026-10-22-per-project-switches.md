@@ -62,3 +62,18 @@ Also from S2: Ctrl/⌘+Z for the outcome's Undo.
 - The choice is not remembered between runs.
 - The palette has no "Undo" entry yet (Ctrl/⌘+Z and the card's button do it).
 - Next: S4 Profiles "switch to" + `klefki-cli` stop/switch and the worktree fix.
+
+## Review round 1 (cross-review on #104)
+- B1: a one-project switch saved without the review dropped the review's notes (a profile that no longer puts the
+  switch back, say). They are now said on the outcome, for the switch and its Undo. Regression test
+  `a_quiet_switch_says_the_reviews_notes_on_its_outcome` (seen failing before the fix).
+- B2: Space and Ctrl/⌘+Z counted the system's key repeat, so a held key saved again after each save. Both now act
+  on a first press only, with exactly their modifiers (Shift+Space, Ctrl+Space and Ctrl+Shift+Z do nothing here).
+  Regression tests `a_held_space_switches_once_and_shift_or_ctrl_space_not_at_all`, `a_held_ctrl_z_undoes_once`
+  (seen failing before the fix).
+- Polish: Turn on / Turn off hover texts name Space, and in one project say "Turn off in a (Space), saved at once
+  with Undo". The toolbar hover test's expected Turn on / Turn off texts changed to "Turn on (Space)" /
+  "Turn off (Space)" with them (the same check, new wording).
+- Left for later (reviewer's non-blocking): announcing the outcome to screen readers (a live region; the known
+  follow-up from earlier slices), and a "Saving…" sign during a quiet save.
+- Checks: fmt, clippy exit 0; `cargo test --workspace` exit 0 (1115 core, 546 app, 28 + 48 CLI).
