@@ -1,6 +1,6 @@
 # Checks without `claude mcp get` (proposal, 2026-10-25)
 
-Proposal only; no code or invariant changed. Asks the owner for three decisions at the end.
+Proposal only; no code or invariant changed. The owner chose the hybrid on 2026-10-26; two decisions are still open (end).
 
 ## In short
 Today every status check starts Claude Code (`claude mcp get`, or one `claude mcp list` for four or more servers in a
@@ -53,8 +53,10 @@ A server that wrote down its argv, folder, environment and every message it got:
   1. Klefki's own environment (Klefki passes it to `claude`).
   2. The `env` of the settings files: the user's `settings.json`, the organisation's managed settings, and, **only
      when the project's trust dialog was accepted** (`hasTrustDialogAccepted`), the project's `.claude/settings.json`
-     and `.claude/settings.local.json`. Untrusted, they did not reach the server. (P4 measured, with 2.1.308, that
-     they did not reach it either way; with 2.1.310 and trust accepted they do.)
+     and `.claude/settings.local.json`. Untrusted, they never reached the server. Trusted, a real session
+     (`claude -p`, one run) passed them on. `claude mcp get` did in one configuration and did not in another, on
+     every run (the spike below). So for project settings, today's check is not a reliable picture of a session
+     either. (P4 saw them never reach the server with 2.1.308.)
   3. Claude Code's own: `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `CLAUDE_PROJECT_DIR`,
      `CLAUDE_CODE_SESSION_ID` (a new id), `NoDefaultCurrentDirectoryInExePath=1`, `COREPACK_ENABLE_AUTO_PIN=0`,
      `LC_CTYPE`.
@@ -72,10 +74,10 @@ A server that wrote down its argv, folder, environment and every message it got:
 | G2 | Policy (`allowedMcpServers`, `deniedMcpServers`) | **Keeps** | The inventory's blocked-by-policy (decision 010) already gates checks. |
 | G3 | On or off where it runs (`disabledMcpServers`) | **Keeps** | Same: only enabled rows are checked. |
 | G4 | A project server waiting for approval is not run | **Keeps** | Project servers stay check-on-request, approved only, full command shown first. |
-| G5 | The environment Claude Code gives the server | **Recovers**, with care | Build it in core from the same four sources, in the order above. `timeout.rs` already reads the same settings files (for `MCP_TIMEOUT`); it reads only one key today, the whole `env` object is new. The trust rule and Claude Code's own variables are measured facts that can change between versions. |
+| G5 | The environment Claude Code gives the server | **Recovers**, with care | Build it in core from the same four sources, in the order above. The spike agreed with Claude Code on all of them, and on project settings it matches a session better than `mcp get` does. `timeout.rs` already reads the same settings files (for `MCP_TIMEOUT`); it reads only one key today, the whole `env` object is new. The trust rule and Claude Code's own variables are measured facts that can change between versions. |
 | G6 | The program is found the way Claude Code finds it | **Keeps on Linux and macOS**; **Windows open** | Unix: run the program name with the final PATH (Rust's `Command` searches the child's PATH when it is set). Windows: Claude Code runs a bare `npx` (decision 003), which is `npx.cmd`; a direct check would need `cmd.exe`. Proposed: hand `.cmd` and `.bat` to Claude Code until measured on Windows (see safety). |
 | G7 | It starts in the right folder | **Keeps** | The folder Klefki already picks (`checks::where_to_run`). |
-| G8 | The MCP handshake Claude Code does | **Keeps for every server that speaks `initialize`** | Send `initialize` (`2025-11-25`), `notifications/initialized`, `tools/list`. A server that only speaks the newer `server/discover` would not answer: it is not found Connected, so Claude Code checks it (hybrid). |
+| G8 | The MCP handshake Claude Code does | **Keeps** | Send `initialize` (`2025-11-25`), `notifications/initialized`, `tools/list`. A server that speaks only the newer protocol refuses `initialize` (spike: Claude Code connected, the direct check failed); the hybrid then asks Claude Code. Slice 2 should send `server/discover` first, as Claude Code does, so that such a server is found Connected directly. |
 | G9 | Claude Code's time limit (`MCP_TIMEOUT`, where it is set) | **Keeps** | `timeout::limit` already gives it; "Check again with 2 minutes" works the same. |
 | G10 | Nothing it started outlives the check | **Keeps, stronger** | `cli/tree.rs` ends the whole process group or job object. Claude Code ends only the server, not what that started. |
 | G11 | HTTP and SSE servers: reachable, signed in (OAuth tokens in Claude Code's store), `headersHelper` | **Loses** | Klefki never reads Claude Code's tokens and makes no network calls of its own outside updates. These stay with Claude Code. The planned network probe (roadmap 6) explains failures but gives no verdict. |
@@ -108,6 +110,54 @@ Klefki" / "Checked by Claude Code") so nobody has to guess.
    "Connected" or "Needs auth" the way Claude Code does. Keep it for explaining failures (roadmap 6).
 6. **Tune what is there.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` for checks saves about 0.1 s but stops
    `policy-limits.json` refreshing (still open from 2026-10-19). Small and does not touch the memory peak.
+
+## Spike results (2026-10-26)
+The owner chose the hybrid with a spike first. The spike was a scratch Rust program (not committed): it reads the
+definition from `.claude.json`, builds the environment by the rules above, starts the command in its own process
+group with no shell, sends `initialize`, `notifications/initialized` and `tools/list` with Claude Code's time limit,
+caps each reply line at 1 MB, then ends the group. It ran next to `claude mcp get` (2.1.310, Linux) on 25 test
+servers. `MCP_TIMEOUT` was 4000 in the user's settings so that the hanging server ends quickly.
+
+| Server | `claude mcp get` | Direct | Agree |
+|---|---|---|---|
+| answers normally | Connected | Connected | yes |
+| exits at once with an error | Failed (`CONNECTION_CLOSED`) | Failed, with its stderr line | yes |
+| refuses `initialize` | Failed (`-32602`) | Failed (`-32602`) | yes |
+| `tools/list` fails | Connected, tools failed | Degraded | yes |
+| exits right after `initialize` | Connected, tools failed (`Connection closed`) | Degraded | yes |
+| answers with an older protocol version | Connected | Connected | yes |
+| prints a non-JSON line first | Connected | Connected | yes |
+| sends a 3 MB line first | Connected | Connected (line skipped) | yes |
+| starts a child that keeps running | Connected | Connected | yes |
+| ignores `server/discover` | Connected (1.8 s) | Connected | yes |
+| speaks only the newer protocol | Connected | **Failed** | no: hybrid asks Claude Code; fixed by sending `server/discover` |
+| answers after 2 s | Connected | Connected | yes |
+| never answers | Failed (timed out) | Timed out after 4 s | yes |
+| needs a variable from the user's `settings.json` | Connected | Connected | yes |
+| needs a variable from managed settings | Connected | Connected | yes |
+| needs `CLAUDECODE=1` | Connected | Connected | yes |
+| `${VAR}` from settings in `args` | Connected | Connected | yes |
+| unset `${VAR}` stays as written | Connected | Connected | yes |
+| `${VAR:-default}` | Connected | Connected | yes |
+| `${HOME}` in its `env` | Connected | Connected | yes |
+| program only on its own `env.PATH` | Connected | Connected | yes |
+| program not found | Failed (`ENOENT`) | Failed (could not start) | yes |
+| local server needing the project's `settings.json` `env`, project trusted | **Failed** | Connected | no: a session passes the value on, so the direct check is the right one |
+| the same with `settings.local.json` | **Failed** | Connected | no: same |
+| both of those, project not trusted | Failed | Failed | yes |
+
+23 of 25 agree. The two that do not are the ones the direct check gets right and `claude mcp get` does not.
+The newer-protocol one is handled by the hybrid until slice 2 sends `server/discover`.
+
+Other things the spike showed:
+- A child the server starts (`sleep 300` here) outlived a plain `claude mcp get` in 3 of 3 runs, and was ended by
+  the direct check in 3 of 3. Klefki's runner already ends the group today, so this changes nothing for users.
+- Time per check: 49-58 ms with the tiny server (`mcp get`: about 0.5 s), 0.21 s with the Node server (first run
+  1.0 s, a cold disk), against 0.69-0.74 s for `mcp get`. Memory: the server's own (70 MB for the Node server); the
+  spike program stayed under the 11 MB the measuring method itself costs. `mcp get` peaked at 199 MB on top of the
+  server.
+- Not done: the owner's own configuration, and Windows and macOS. Slice 3 can carry a hidden "compare both" mode for
+  one run on the owner's machine, showing only the pairs of verdicts.
 
 ## Safety of Klefki starting server commands itself
 
@@ -161,7 +211,7 @@ line under Invariants (flagged for review), next to the existing one:
 Decision 014's sentence would get a note pointing at the new decision.
 
 ## Slice plan
-1. **Spike (S).** A scratch Rust client on `cli/tree.rs` and the environment rules above, not wired into the app.
+1. **Spike (S). Done on Linux, 2026-10-26 (results above).** A scratch Rust client on `cli/tree.rs` and the environment rules above, not wired into the app.
    Run it next to `claude mcp get` on a matrix of test servers (connects, exits at once, bad `initialize`, tools
    fail, slow, hangs, stderr noise, needs a settings-file variable, needs its own `env.PATH`, `${VAR}` set and unset,
    project trusted and not) and on the owner's real configuration (verdict pairs only, no values). Record time and
@@ -178,7 +228,7 @@ Decision 014's sentence would get a note pointing at the new decision.
 5. **Windows `.cmd`** after the owner's measurement; the tools view then reuses the client from slice 2.
 
 ## Decisions for the owner
-1. Direction: **hybrid** (recommended), direct only, or keep `claude mcp get` for every check.
+1. Direction: **decided 2026-10-26: hybrid, spike first.**
 2. The invariant line above (wording can change in slice 3; the principle is what needs approval).
 3. Windows: hand `.cmd`/`.bat` commands to Claude Code at first (recommended), or include them from the start.
 
