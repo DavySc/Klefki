@@ -60,10 +60,14 @@ engine change; the engine takes it up in slice 3, with the CLAUDE.md invariant l
   bounded queue; a full queue counts as closed. Regression tests: `floodping` and the variant `floodroots`.
 - N1: lines that do not start with `{` are skipped before parsing, and the read-ahead queue is 1.
 - N2: a whole-number float in settings is written as JavaScript writes it (`1.0` is `1`, `-0.0` is `0`).
+  Still open for slice 3: a 1 MB line that is an object costs about +49 MB while it is parsed into a `Value`
+  (re-review measurement); before more checks run at once, parse into a narrow typed message instead.
 - N3: commented (reader threads end with the pipe, as G10 accepts). N4: noted above.
 
 ## Checks
-See the pull request for the commands and results.
+After merging main (#110) in: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test
+--workspace && cargo deny check` exit 0 on Linux (core lib 1178 passed; deny all ok). CI green on Linux, Windows and
+macOS for 865320b and c6565c2. Cross-review approved c6565c2.
 
 ## Next
 Slice 3: route eligible checks to `mcp::stdio::check` in the engine, re-check anything else with `claude mcp get`,
