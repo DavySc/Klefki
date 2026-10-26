@@ -1,6 +1,6 @@
 # Checks without `claude mcp get` (proposal, 2026-10-25)
 
-Proposal only; no code or invariant changed. The owner chose the hybrid on 2026-10-26; two decisions are still open (end).
+Proposal only; no code or invariant changed. The owner chose the hybrid on 2026-10-26 and approved the invariant line the same day; next is slice 2.
 
 ## In short
 Today every status check starts Claude Code (`claude mcp get`, or one `claude mcp list` for four or more servers in a
@@ -229,8 +229,8 @@ Decision 014's sentence would get a note pointing at the new decision.
 
 ## Decisions for the owner
 1. Direction: **decided 2026-10-26: hybrid, spike first.**
-2. The invariant line above (wording can change in slice 3; the principle is what needs approval).
-3. Windows: hand `.cmd`/`.bat` commands to Claude Code at first (recommended), or include them from the start.
+2. The invariant line: **approved 2026-10-26** (wording can still change in slice 3, flagged for review there).
+3. Windows: **`.cmd`/`.bat` commands go to Claude Code at first** (chosen with 2); revisit after a Windows measurement.
 
 ## How this was measured
 Scratch scripts, not committed: a Python stdio server that logs argv, folder, environment and messages; a Python
