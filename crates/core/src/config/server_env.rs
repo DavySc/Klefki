@@ -318,27 +318,71 @@ pub(crate) fn launch(inputs: &Inputs<'_>) -> Result<Launch, NotStarted> {
 /// `${NAME}` and `${NAME:-default}` in `text` filled in from `var`, the way Claude Code does it.
 pub(crate) fn expand(text: &str, var: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(text.len());
+    for piece in pieces(text) {
+        match piece {
+            Piece::Text(text) => out.push_str(text),
+            Piece::Reference(r) => match (var(r.name), r.default) {
+                (Some(value), _) => out.push_str(&value),
+                (None, Some(default)) => out.push_str(default),
+                (None, None) => out.push_str(r.written),
+            },
+        }
+    }
+    out
+}
+
+/// A `${NAME}` or `${NAME:-default}` that Claude Code fills in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Reference<'a> {
+    pub name: &'a str,
+    /// The text after `:-`, up to the first `}`.
+    pub default: Option<&'a str>,
+    /// The whole reference, as written.
+    pub written: &'a str,
+}
+
+/// The references in `text` that Claude Code fills in, in order: what [`expand`] replaces and pre-flight looks up.
+pub(crate) fn references(text: &str) -> impl Iterator<Item = Reference<'_>> {
+    pieces(text).into_iter().filter_map(|p| match p {
+        Piece::Reference(r) => Some(r),
+        Piece::Text(_) => None,
+    })
+}
+
+enum Piece<'a> {
+    /// Kept as written, `${…}` that is no reference to fill in included.
+    Text(&'a str),
+    Reference(Reference<'a>),
+}
+
+/// `text` cut into what is kept and the references to fill in.
+fn pieces(text: &str) -> Vec<Piece<'_>> {
+    let mut out = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find("${") {
-        out.push_str(&rest[..at]);
         let after = &rest[at + 2..];
         let Some(end) = after.find('}') else {
-            out.push_str(&rest[at..]);
-            return out;
+            break;
         };
         let inner = &after[..end];
         let (name, default) = match inner.split_once(":-") {
             Some((name, default)) => (name, Some(default)),
             None => (inner, None),
         };
-        match (is_name(name).then(|| var(name)).flatten(), default) {
-            (Some(value), _) => out.push_str(&value),
-            (None, Some(default)) if is_name(name) => out.push_str(default),
-            _ => out.push_str(&rest[at..at + 2 + end + 1]),
+        let written = &rest[at..at + 2 + end + 1];
+        if is_name(name) {
+            out.push(Piece::Text(&rest[..at]));
+            out.push(Piece::Reference(Reference {
+                name,
+                default,
+                written,
+            }));
+        } else {
+            out.push(Piece::Text(&rest[..at + written.len()]));
         }
         rest = &after[end + 1..];
     }
-    out.push_str(rest);
+    out.push(Piece::Text(rest));
     out
 }
 

@@ -35,7 +35,8 @@ and the Inspector keeps the values it is given in its own store.
   `cmd`, so a word that is not plain goes in double quotes (backslashes before the closing quote doubled), and a word
   with `"`, `$`, a backtick, `%`, `^` or `!`, which the two read differently, is refused with a note to write that line
   by hand. A control or bidi character is refused everywhere: it could end the command or disguise it.
-- Klefki does not run, open or download anything; the invariant that only Claude is ever spawned stands.
+- Klefki does not run, open or download anything; the invariant that only Claude is ever spawned stands. (Since decision
+  015 Klefki also starts a user or local stdio server itself to check it; the Inspector line is still only text.)
 
 ## Not done
 - `klefki-cli inspector <name>` (with P9).

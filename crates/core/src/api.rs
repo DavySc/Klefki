@@ -507,8 +507,8 @@ pub struct LegacyDisabled {
 
 /// Starts the engine against the real Claude Code configuration and the real CLI. It loads the snapshot, finds
 /// `claude`, and runs live status checks in the background. `wake` is called whenever events are waiting, so the
-/// UI can repaint.
-pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
+/// UI can repaint. `claude_only`: every check is Claude Code's, as [`Command::CheckWithClaudeOnly`] sets it later.
+pub fn start(claude_only: bool, wake: impl Fn() + Send + Sync + 'static) -> Core {
     // A build without the release key never checks, so it carries no TLS code either (the key is a constant).
     let releases: std::sync::Arc<dyn crate::update::Fetch> = match crate::update::RELEASE_KEY {
         Some(_) => std::sync::Arc::new(crate::update::Https::default()),
@@ -519,6 +519,7 @@ pub fn start(wake: impl Fn() + Send + Sync + 'static) -> Core {
         release_key: crate::update::RELEASE_KEY.map(str::to_owned),
         install: crate::install::this_install(),
         updates_dir: data_dir().map(|d| d.join("updates")),
+        direct_checks: !claude_only,
         ..real_config(None)
     };
     crate::engine::start_with(config, wake)
@@ -549,6 +550,9 @@ fn real_config(claude: Option<std::path::PathBuf>) -> crate::engine::EngineConfi
         cli_env: Vec::new(),
         max_checks: 3,
         check_timeout: std::time::Duration::from_secs(30),
+        // Only the app checks servers itself first ([`start`]); the command-line tool asks Claude Code.
+        direct_checks: false,
+        server_env: std::env::vars_os().collect(),
         background_checks: true,
         watch_interval: Some(std::time::Duration::from_secs(1)),
         watch_settle: std::time::Duration::from_millis(300),

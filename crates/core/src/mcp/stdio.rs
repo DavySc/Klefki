@@ -22,6 +22,7 @@ use crate::cli::tree;
 use crate::config::server_env::Launch;
 use crate::diagnose::redact::scrubbed;
 use crate::sanitize::{clip, sanitize_line};
+use message::{Body, ErrorInfo, Message, Tools};
 use serde_json::{Value, json};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{ChildStdin, Command, Stdio};
@@ -137,14 +138,14 @@ pub(crate) fn check(launch: &Launch, limit: Duration, claude_version: &str) -> O
 struct Talk {
     /// Lines for [`write_messages`]' thread.
     input: Option<SyncSender<Vec<u8>>>,
-    messages: Option<Receiver<Value>>,
+    messages: Option<Receiver<Message>>,
     /// The answer to `roots/list`.
     roots: Value,
 }
 
 /// How waiting for an answer ended.
 enum Wait {
-    Answer(serde_json::Map<String, Value>),
+    Answer(Message),
     /// The server closed its output (or never had one).
     Closed,
     TimedOut,
@@ -175,14 +176,15 @@ impl Talk {
             "params": {"_meta": meta}}),
         );
         let discover_until = deadline.min(Instant::now() + DISCOVER_WAIT);
-        let (tools_id, server_caps, protocol, tools_params) = match self
+        let (tools_id, has_tools, protocol, tools_params) = match self
             .wait(&json!(DISCOVER_ID), discover_until)
         {
             Wait::Answer(a) if modern(&a) => {
-                let caps = a
-                    .get("result")
-                    .map_or(Value::Null, |r| r["capabilities"].clone());
-                (0, caps, MODERN.to_owned(), Some(json!({"_meta": meta})))
+                let tools = a
+                    .result
+                    .and_then(|r| r.capabilities)
+                    .is_some_and(|c| c.tools);
+                (0, tools, MODERN.to_owned(), Some(json!({"_meta": meta})))
             }
             Wait::Closed => return fail(Verdict::Failed, "It closed before it answered.", None),
             Wait::TimedOut if Instant::now() >= deadline => {
@@ -199,22 +201,22 @@ impl Talk {
                     }
                     Wait::TimedOut => return fail(Verdict::TimedOut, &no_answer(limit), None),
                 };
-                if let Some(error) = answer.get("error") {
+                if let Some(error) = &answer.error {
                     return fail(
                         Verdict::Failed,
                         &format!("It refused to start: {}", error_text(error)),
                         None,
                     );
                 }
-                let result = answer.get("result").unwrap_or(&Value::Null);
-                let protocol = result["protocolVersion"].as_str().map(str::to_owned);
-                if let Err(why) = good_hello(result) {
+                let result = answer.result.unwrap_or_default();
+                let protocol = result.protocol_version.clone().flatten();
+                if let Err(why) = good_hello(&result) {
                     return fail(Verdict::Failed, why, protocol);
                 }
                 self.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
                 (
                     1,
-                    result["capabilities"].clone(),
+                    result.capabilities.is_some_and(|c| c.tools),
                     protocol.unwrap_or_default(),
                     None,
                 )
@@ -230,7 +232,7 @@ impl Talk {
             took: Duration::ZERO,
         };
         // Measured: Claude Code asks for no tools from a server that says it has none.
-        if server_caps.get("tools").is_none() {
+        if !has_tools {
             return connected(0);
         }
         let mut request = json!({"method": "tools/list", "jsonrpc": "2.0", "id": tools_id});
@@ -241,10 +243,7 @@ impl Talk {
         let tools_failed =
             |reason: &str| fail(Verdict::ToolsFailed, reason, Some(protocol.clone()));
         match self.wait(&json!(tools_id), Instant::now() + limit) {
-            Wait::Answer(a) => match (
-                a.get("error"),
-                good_tools(a.get("result").unwrap_or(&Value::Null)),
-            ) {
+            Wait::Answer(a) => match (&a.error, good_tools(&a.result.unwrap_or_default())) {
                 (Some(error), _) => {
                     tools_failed(&format!("Listing its tools failed: {}", error_text(error)))
                 }
@@ -278,22 +277,21 @@ impl Talk {
             };
             let left = until.saturating_duration_since(Instant::now());
             let message = match messages.recv_timeout(left) {
-                Ok(Value::Object(m)) => m,
-                Ok(_) => continue,
+                Ok(m) => m,
                 Err(RecvTimeoutError::Timeout) => return Wait::TimedOut,
                 Err(RecvTimeoutError::Disconnected) => {
                     self.messages = None;
                     return Wait::Closed;
                 }
             };
-            match message.get("method").and_then(Value::as_str) {
+            match &message.method {
                 Some(method) => {
-                    if let Some(asked) = message.get("id") {
-                        let reply = self.reply(method, asked.clone());
+                    if let Some(asked) = message.id {
+                        let reply = self.reply(method.as_deref().unwrap_or_default(), asked);
                         self.send(&reply);
                     }
                 }
-                None if message.get("id").is_some_and(|got| same_id(got, id)) => {
+                None if message.id.as_ref().is_some_and(|got| same_id(got, id)) => {
                     return Wait::Answer(message);
                 }
                 None => {}
@@ -329,59 +327,41 @@ fn roots_answer(launch: &Launch) -> Value {
 }
 
 /// Whether a `server/discover` answer means the newer protocol.
-fn modern(answer: &serde_json::Map<String, Value>) -> bool {
-    let result = answer.get("result").unwrap_or(&Value::Null);
-    result["supportedVersions"]
-        .as_array()
-        .is_some_and(|v| v.iter().any(|v| v == MODERN))
-        && result["capabilities"].is_object()
-        && result["serverInfo"].is_object()
+fn modern(answer: &Message) -> bool {
+    answer
+        .result
+        .as_ref()
+        .is_some_and(|r| r.modern && r.capabilities.is_some() && r.server_info.is_some())
 }
 
 /// An `initialize` answer Claude Code accepts.
-fn good_hello(result: &Value) -> Result<(), &'static str> {
-    let Some(version) = result["protocolVersion"].as_str() else {
+fn good_hello(result: &Body) -> Result<(), &'static str> {
+    let Some(version) = &result.protocol_version else {
         return Err("Its answer to the hello names no protocol version.");
     };
-    if !SPOKEN.contains(&version) {
+    if !version.as_deref().is_some_and(|v| SPOKEN.contains(&v)) {
         return Err("It speaks a protocol version Claude Code does not.");
     }
-    if !result["capabilities"].is_object() {
+    if result.capabilities.is_none() {
         return Err("Its answer to the hello has no capabilities.");
     }
-    let info = &result["serverInfo"];
-    if !(info["name"].is_string() && info["version"].is_string()) {
+    if !result
+        .server_info
+        .is_some_and(|i| i.name_is_text && i.version_is_text)
+    {
         return Err("Its answer to the hello does not name the server and its version.");
     }
     Ok(())
 }
 
 /// The number of tools in a `tools/list` result Claude Code accepts.
-fn good_tools(result: &Value) -> Result<usize, &'static str> {
-    let Some(tools) = result["tools"].as_array() else {
-        return Err("Its list of tools is not a list.");
-    };
-    let text_or_absent = |v: &Value| v.is_null() || v.is_string();
-    let schema = |v: &Value| {
-        v["type"] == "object"
-            && (v["properties"].is_null() || v["properties"].is_object())
-            && (v["required"].is_null()
-                || v["required"]
-                    .as_array()
-                    .is_some_and(|r| r.iter().all(Value::is_string)))
-    };
-    let good = |tool: &Value| {
-        tool["name"].is_string()
-            && text_or_absent(&tool["title"])
-            && text_or_absent(&tool["description"])
-            && tool.get("inputSchema").is_some_and(schema)
-            && tool.get("outputSchema").is_none_or(schema)
-            && (tool["annotations"].is_null() || tool["annotations"].is_object())
-    };
-    if tools.iter().all(good) {
-        Ok(tools.len())
-    } else {
-        Err("A tool in its list is not described the way MCP asks.")
+fn good_tools(result: &Body) -> Result<usize, &'static str> {
+    match result.tools {
+        Tools::List { count, good: true } => Ok(count),
+        Tools::List { good: false, .. } => {
+            Err("A tool in its list is not described the way MCP asks.")
+        }
+        Tools::Absent | Tools::NotAList => Err("Its list of tools is not a list."),
     }
 }
 
@@ -396,8 +376,8 @@ fn same_id(got: &Value, id: &Value) -> bool {
                 .is_some_and(|n| id.as_u64() == Some(n)))
 }
 
-fn error_text(error: &Value) -> String {
-    match (error["message"].as_str(), error["code"].as_i64()) {
+fn error_text(error: &ErrorInfo) -> String {
+    match (error.message.as_deref(), error.code) {
         (Some(message), Some(code)) => format!("{message} ({code})"),
         (Some(message), None) => message.to_owned(),
         (None, Some(code)) => format!("error {code}"),
@@ -452,13 +432,13 @@ fn write_messages(mut input: ChildStdin) -> SyncSender<Vec<u8>> {
 /// Reads the server's output on a thread of its own: each line that is a JSON object, at most [`MAX_LINE`] long, in
 /// order. The channel closes when the output does. Like the error output's reader, it ends when the pipe closes: a
 /// process that left the tree (`setsid`) and keeps the pipe open keeps the thread until it ends too.
-fn read_messages<R: Read + Send + 'static>(out: R) -> Receiver<Value> {
+fn read_messages<R: Read + Send + 'static>(out: R) -> Receiver<Message> {
     let (tx, rx) = mpsc::sync_channel(QUEUE);
     std::thread::spawn(move || read_lines(BufReader::new(out), &tx));
     rx
 }
 
-fn read_lines<R: BufRead>(mut reader: R, tx: &SyncSender<Value>) {
+fn read_lines<R: BufRead>(mut reader: R, tx: &SyncSender<Message>) {
     let mut line = Vec::new();
     let mut too_long = false;
     loop {
@@ -485,7 +465,7 @@ fn read_lines<R: BufRead>(mut reader: R, tx: &SyncSender<Value>) {
             let object = line.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
             if !too_long
                 && object
-                && let Ok(message) = serde_json::from_slice::<Value>(&line)
+                && let Some(message) = Message::parse(&line)
                 && tx.send(message).is_err()
             {
                 return;
@@ -523,5 +503,6 @@ fn read_tail<R: Read + Send + 'static>(mut err: R) -> Receiver<Vec<u8>> {
     rx
 }
 
+mod message;
 #[cfg(test)]
 mod tests;

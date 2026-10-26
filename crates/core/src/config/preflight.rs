@@ -28,6 +28,9 @@ pub(crate) struct Probe<'a> {
     /// Klefki's PATH; `None`: not known, so no program is looked up.
     path: Option<&'a OsStr>,
     vars: &'a dyn Fn(&str) -> Option<OsString>,
+    /// The names the user's and the organisation's settings files set in their `env`, which Claude Code fills
+    /// `${NAME}` in from too (`server_env::settings_env`).
+    settings: Vec<String>,
     /// Look for programs the way Windows does (`PATHEXT`, no executable bit).
     windows: bool,
     /// Programs already looked up in this reading, by the PATH searched and the name.
@@ -43,9 +46,16 @@ impl<'a> Probe<'a> {
         Self {
             path,
             vars,
+            settings: Vec::new(),
             windows,
             found: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// [`Probe::settings`]: the names the settings files set.
+    pub(crate) fn with_settings(mut self, names: impl IntoIterator<Item = String>) -> Self {
+        self.settings = names.into_iter().collect();
+        self
     }
 
     /// Whether `name`, a program name with no folder in it, is in one of the folders of `path`.
@@ -325,23 +335,26 @@ fn interactive(arg: &str) -> bool {
     })
 }
 
-/// `${NAME}` references with no default (`${NAME:-value}` has one) and nothing set under that name. Claude Code
-/// passes such a reference on as written.
+/// `${NAME}` references with no default (`${NAME:-value}` has one) and nothing set under that name, where Klefki
+/// was started or in the settings files. Claude Code passes such a reference on as written. Only the references
+/// Claude Code fills in count, read as it reads them (`server_env::references`): `${1X}` is never filled in.
 fn unset(texts: &[&str], probe: &Probe<'_>) -> Option<Preflight> {
     let mut names: Vec<&str> = Vec::new();
-    for text in texts {
-        let mut rest = *text;
-        while let Some(at) = rest.find("${") {
-            rest = &rest[at + 2..];
-            let Some(end) = rest.find('}') else { break };
-            let inner = &rest[..end];
-            rest = &rest[end + 1..];
-            if inner.is_empty() || inner.contains(":-") || names.contains(&inner) {
-                continue;
+    for reference in texts.iter().flat_map(|t| super::server_env::references(t)) {
+        let name = reference.name;
+        if reference.default.is_some() || names.contains(&name) {
+            continue;
+        }
+        // Windows compares names without regard to case, as the environment built for a server does.
+        let set_in_settings = probe.settings.iter().any(|s| {
+            if probe.windows {
+                s.eq_ignore_ascii_case(name)
+            } else {
+                s == name
             }
-            if (probe.vars)(inner).is_none() {
-                names.push(inner);
-            }
+        });
+        if (probe.vars)(name).is_none() && !set_in_settings {
+            names.push(name);
         }
     }
     if names.is_empty() {

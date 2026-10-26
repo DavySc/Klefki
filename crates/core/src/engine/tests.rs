@@ -61,6 +61,9 @@ impl Env {
             verify_delay: Duration::from_millis(50),
             max_checks: 3,
             check_timeout: Duration::from_secs(10),
+            // A test's commands are not real servers: only the tests of direct checks start them.
+            direct_checks: false,
+            server_env: Vec::new(),
             background_checks: true,
             watch_interval: Some(Duration::from_millis(40)),
             watch_settle: Duration::from_millis(120),
@@ -743,6 +746,7 @@ mod client_secrets;
 mod debug_report;
 mod diagnose;
 mod diagnose_in;
+mod direct;
 mod edits;
 mod export;
 mod golden;

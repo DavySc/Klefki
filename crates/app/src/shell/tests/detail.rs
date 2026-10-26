@@ -264,6 +264,7 @@ fn failed_with_steps(row: &ServerRow) -> klefki_core::api::Event {
             points_at: None,
         }),
         timing: None,
+        by_klefki: false,
     }
 }
 
@@ -981,6 +982,7 @@ fn timed_event(
             timed_out: matches!(status, Status::Failed | Status::Unknown),
             given,
         }),
+        by_klefki: false,
     }
 }
 
@@ -1115,4 +1117,37 @@ fn a_limit_the_organisation_sets_is_not_offered_more_time() {
     open_status_tab(&mut h, "slow");
     h.get_by_label_contains("so only it can raise it");
     assert!(h.query_by_label(LONGER).is_none());
+}
+
+#[test]
+fn the_status_tab_says_who_checked_the_server() {
+    let (mut h, engine) = live_harness();
+    let row = live_row("srv", Scope::User, None);
+    engine.events.send(snapshot_of(vec![row.clone()])).unwrap();
+    h.run();
+    open_status_tab(&mut h, "srv");
+    // Not checked yet, and while it is checked: nobody has answered.
+    assert!(h.query_by_label("Checked by").is_none());
+    let answer = |status, by_klefki| klefki_core::api::Event::Status {
+        id: row.id(),
+        status,
+        detail: None,
+        hint: None,
+        timing: None,
+        by_klefki,
+    };
+    engine.events.send(answer(Status::Checking, false)).unwrap();
+    h.run();
+    assert!(h.query_by_label("Checked by").is_none());
+    engine.events.send(answer(Status::Connected, true)).unwrap();
+    h.run();
+    h.get_by_label("Checked by");
+    h.get_by_label("Klefki, which started it as Claude Code would");
+    engine.events.send(answer(Status::Failed, false)).unwrap();
+    h.run();
+    h.get_by_label("Claude Code");
+    assert!(
+        h.query_by_label("Klefki, which started it as Claude Code would")
+            .is_none()
+    );
 }

@@ -363,7 +363,7 @@ fn reading_skips_long_lines_and_what_is_not_a_json_object() {
     let (tx, rx) = mpsc::sync_channel(16);
     // An object line of exactly `len` bytes.
     let object = |len: usize| {
-        let mut line = b"{\"s\": \"".to_vec();
+        let mut line = b"{\"id\": \"".to_vec();
         line.extend(vec![b'y'; len - line.len() - 2]);
         line.extend_from_slice(b"\"}\n");
         line
@@ -371,26 +371,23 @@ fn reading_skips_long_lines_and_what_is_not_a_json_object() {
     let mut input = Vec::new();
     input.extend_from_slice(b"not json\n");
     input.extend(object(MAX_LINE + 1));
-    input.extend_from_slice(b"{\"a\": 1}\n");
+    input.extend_from_slice(b"{\"id\": 1}\n");
     input.extend(object(MAX_LINE));
-    input.extend_from_slice(b"[2]\n\"text\"\n3\n  {\"b\": 2}\n{\"unterminated\": 3}");
+    input.extend_from_slice(b"[2]\n\"text\"\n3\n  {\"id\": 2}\n{\"unterminated\": 3}");
     // A reader with a small buffer, so lines cross its fills.
     read_lines(BufReader::with_capacity(7, input.as_slice()), &tx);
     drop(tx);
-    let got: Vec<Value> = rx.into_iter().collect();
+    let got: Vec<Message> = rx.into_iter().collect();
+    let ids: Vec<Option<Value>> = got.iter().map(|m| m.id.clone()).collect();
     assert_eq!(
-        got.len(),
-        3,
-        "{:?}",
-        got.iter().map(|v| v.to_string().len()).collect::<Vec<_>>()
-    );
-    assert_eq!(got[0], json!({"a": 1}));
-    assert_eq!(
-        got[1]["s"].as_str().map(str::len),
-        Some(MAX_LINE - 9),
+        ids,
+        [
+            Some(json!(1)),
+            Some(json!("y".repeat(MAX_LINE - 10))),
+            Some(json!(2))
+        ],
         "a line of exactly MAX_LINE bytes is read"
     );
-    assert_eq!(got[2], json!({"b": 2}));
 }
 
 #[test]
@@ -426,15 +423,19 @@ fn tools_are_checked_as_claude_code_checks_them() {
         json!({"name": "a", "inputSchema": {"type": "object", "required": [1]}}),
         json!({"name": "a", "inputSchema": ok, "outputSchema": {}}),
     ];
+    let tools = |result: Value| {
+        let message = Message::from_value(json!({"id": 1, "result": result})).unwrap();
+        good_tools(&message.result.unwrap())
+    };
     for tool in good {
-        assert_eq!(good_tools(&json!({"tools": [tool]})), Ok(1), "{tool}");
+        assert_eq!(tools(json!({"tools": [tool]})), Ok(1), "{tool}");
     }
     for tool in bad {
-        assert!(good_tools(&json!({"tools": [tool]})).is_err(), "{tool}");
+        assert!(tools(json!({"tools": [tool]})).is_err(), "{tool}");
     }
-    assert_eq!(good_tools(&json!({"tools": []})), Ok(0));
-    assert!(good_tools(&json!({"tools": {}})).is_err());
-    assert!(good_tools(&json!({})).is_err());
+    assert_eq!(tools(json!({"tools": []})), Ok(0));
+    assert!(tools(json!({"tools": {}})).is_err());
+    assert!(tools(json!({})).is_err());
 }
 
 /// The whole way: what `server_env` builds is what the server gets.
@@ -521,5 +522,100 @@ fn a_server_that_asks_without_reading_its_answers_still_ends_at_the_limit() {
         assert!(out.took < limit + Duration::from_secs(3), "{mode}: {out:?}");
         let server: u32 = s.dumped()["pid"].as_u64().unwrap().try_into().unwrap();
         assert!(gone_soon(server), "{mode}: the server is still running");
+    }
+}
+
+#[test]
+fn a_message_is_read_as_claude_code_reads_it() {
+    let read = |v: Value| Message::from_value(v).unwrap();
+    // The last of two keys of one name wins, as in JavaScript.
+    let m = read(json!({"id": 1, "result": {"tools": 5}}));
+    assert_eq!(m.result.unwrap().tools, Tools::NotAList);
+    let twice = br#"{"id": 1, "result": {"tools": 5, "tools": [{"name": "a", "inputSchema": {"type": "object"}}]}}"#;
+    let m = Message::parse(twice).unwrap();
+    assert_eq!(
+        m.result.unwrap().tools,
+        Tools::List {
+            count: 1,
+            good: true
+        }
+    );
+    // An error of any kind is an error; its message and code when it has them.
+    let m = read(json!({"id": 1, "error": null}));
+    assert_eq!(m.error, Some(ErrorInfo::default()));
+    let m = read(json!({"id": 1, "error": {"message": "no", "code": -32603}}));
+    assert_eq!(error_text(&m.error.unwrap()), "no (-32603)");
+    let long = "é".repeat(2000);
+    let m = read(json!({"id": 1, "error": {"message": long}}));
+    assert_eq!(
+        m.error.unwrap().message.map(|t| t.len()),
+        Some(1024),
+        "cut at a character"
+    );
+    // A result that is no object reads as an empty one: the hello names no protocol version.
+    let m = read(json!({"id": 0, "result": "x"}));
+    assert_eq!(
+        good_hello(&m.result.unwrap()),
+        Err("Its answer to the hello names no protocol version.")
+    );
+    // A long protocol version is text Claude Code does not speak.
+    let m = read(
+        json!({"id": 0, "result": {"protocolVersion": format!("{LEGACY}{}", "x".repeat(100)),
+        "capabilities": {}, "serverInfo": {"name": "a", "version": "1"}}}),
+    );
+    assert_eq!(
+        good_hello(&m.result.unwrap()),
+        Err("It speaks a protocol version Claude Code does not.")
+    );
+    let m = read(
+        json!({"id": 0, "result": {"protocolVersion": LEGACY, "capabilities": {"tools": null},
+        "serverInfo": {"name": "a", "version": "1"}}}),
+    );
+    let result = m.result.unwrap();
+    assert_eq!(good_hello(&result), Ok(()));
+    assert!(
+        result.capabilities.unwrap().tools,
+        "tools: null still says it has tools"
+    );
+    let m = read(
+        json!({"id": 0, "result": {"protocolVersion": LEGACY, "capabilities": {},
+        "serverInfo": {"name": "a", "version": 1}}}),
+    );
+    assert!(good_hello(&m.result.unwrap()).is_err());
+    // Discover: the newer protocol only with capabilities and serverInfo as objects.
+    let discover = |result: Value| modern(&read(json!({"id": DISCOVER_ID, "result": result})));
+    assert!(discover(
+        json!({"supportedVersions": [LEGACY, MODERN], "capabilities": {}, "serverInfo": {}})
+    ));
+    assert!(!discover(
+        json!({"supportedVersions": [LEGACY], "capabilities": {}, "serverInfo": {}})
+    ));
+    assert!(!discover(
+        json!({"supportedVersions": MODERN, "capabilities": {}, "serverInfo": {}})
+    ));
+    assert!(!discover(
+        json!({"supportedVersions": [MODERN], "capabilities": [], "serverInfo": {}})
+    ));
+    // Requests: a method of any length is a request, answered by its id as it came.
+    let m = read(json!({"id": "r-1", "method": "x".repeat(100)}));
+    assert_eq!((m.method, m.id), (Some(None), Some(json!("r-1"))));
+    let m = read(json!({"id": {"a": 1}, "method": 5}));
+    assert_eq!((m.method, m.id), (None, None));
+    assert!(Message::parse(b"[1]").is_none());
+    assert!(Message::parse(b"{\"id\": 1").is_none());
+}
+
+#[test]
+fn a_second_page_of_tools_is_not_asked_for_as_claude_code_does_not() {
+    // Measured with Claude Code 2.1.310: one `tools/list`, whatever `nextCursor` says, and Connected even when the
+    // second page would fail.
+    for mode in ["paged", "pagedfail", "pagedbadtool"] {
+        let s = Server::new();
+        connected(&s.check(&[mode]), LEGACY, 1);
+        assert_eq!(
+            s.methods().iter().filter(|m| *m == "tools/list").count(),
+            1,
+            "{mode}"
+        );
     }
 }

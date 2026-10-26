@@ -340,6 +340,38 @@ fn unset_variables_are_named_once_with_a_default_meaning_none() {
 }
 
 #[test]
+fn a_variable_is_looked_up_as_claude_code_fills_it_in() {
+    let m = machine();
+    // Set in the user's or the organisation's settings: Claude Code fills it in.
+    let entry = json!({"command": "node", "args": ["${FROM_SETTINGS}", "${API_URL}"]});
+    let probe = Probe::new(Some(&m.path), &vars, false).with_settings(["FROM_SETTINGS".to_owned()]);
+    let f = findings(&entry, true, &probe);
+    assert_eq!(
+        f[0].problem,
+        "${API_URL} isn't set where Klefki was started. Unless it is set where Claude Code starts, Claude Code \
+         passes it on as written."
+    );
+    // Windows compares names without regard to case; elsewhere case counts.
+    let entry = json!({"command": "node", "args": ["${from_settings}"]});
+    let windows =
+        Probe::new(Some(&m.path), &vars, true).with_settings(["FROM_SETTINGS".to_owned()]);
+    assert!(findings(&entry, true, &windows).is_empty());
+    let unix = Probe::new(Some(&m.path), &vars, false).with_settings(["FROM_SETTINGS".to_owned()]);
+    assert_eq!(
+        kinds(&findings(&entry, true, &unix)),
+        [PreflightKind::UnsetVariable]
+    );
+    // Claude Code never fills these in, whatever is set: no name, so nothing to set.
+    assert!(
+        found(
+            &m,
+            json!({"command": "node", "args": ["${1X}", "${HO-ME}", "${ A }", "${1X:-d}"]})
+        )
+        .is_empty()
+    );
+}
+
+#[test]
 fn a_secret_is_never_offered_a_default_written_in_the_file() {
     // Review A1: `${TOKEN:-value}` would put the token in `.claude.json` in plain text.
     let m = machine();

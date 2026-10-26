@@ -1,11 +1,14 @@
 //! Live status checks: the queue, the workers that take jobs from it, and how `claude mcp get` and
 //! `claude mcp list` answers are read.
 use super::diagnose::run_diagnose;
+use super::direct;
 use super::{
     Diagnosis, Event, MAX_CHECK_OUTPUT, MAX_DETAIL_CHARS, ProgramStamp, Shared, claude_program,
     lock,
 };
-use crate::api::{LONGER_CHECK, Scope, ServerId, ServerRow, Status, TimeLimit, Timing};
+use crate::api::{
+    LONGER_CHECK, Scope, ServerId, ServerRow, Status, TimeLimit, Timing, TransportKind,
+};
 use crate::cli::parse;
 use crate::cli::runner::{self, RunOutput, RunSpec};
 use crate::config::inventory::{self, FileKey};
@@ -49,13 +52,23 @@ pub(super) struct Job {
     /// A user server run in this project, as shown, instead of the home folder ([`super::Command::DiagnoseIn`]): its
     /// answer says where it ran and leaves the server's status alone.
     pub(super) folder: Option<String>,
+    /// A user or local stdio server's check: Klefki may start the server itself first (decision 015).
+    pub(super) direct: bool,
+    /// The definition's fingerprint when the job was made ([`FileKey::definition`]): Klefki starts the server itself
+    /// only while the file still holds that definition, the one the checks were decided for.
+    pub(super) definition: u64,
+    /// What to say while it is checked, instead of nothing: why Claude Code checks it after Klefki did.
+    pub(super) checking_detail: Option<String>,
 }
 
 #[derive(Default)]
 pub(super) struct Queue {
     pub(super) jobs: VecDeque<Job>,
-    /// Background jobs running now; at most [`BACKGROUND_CHECKS`].
+    /// Background jobs running now; at most [`DIRECT_CHECKS`], and of those at most [`BACKGROUND_CHECKS`] with Claude
+    /// Code ([`Queue::background_claude`]).
     pub(super) background_running: usize,
+    /// Background jobs running now that may start Claude Code: those that are not [`Job::direct`].
+    pub(super) background_claude: usize,
     /// The servers on screen, from [`super::Command::Visible`]: their background jobs go first.
     pub(super) visible: std::collections::HashSet<crate::model::ConnectionId>,
     /// Checks that said they are running and have not answered yet: the app forgets "Checking…" on every
@@ -109,8 +122,10 @@ impl Queue {
     /// Takes the other background checks waiting to run in `cwd`, to be answered by one `claude mcp list`. None when
     /// there are too few for a list to pay off: it starts every server of the folder, those not asked about too.
     fn take_mates(&mut self, cwd: &Path) -> Vec<Job> {
-        let is_mate =
-            |j: &Job| j.background && j.kind == JobKind::Check && !j.alone && j.cwd == cwd;
+        // A server Klefki checks itself first is not started by a list until it has been.
+        let is_mate = |j: &Job| {
+            j.background && j.kind == JobKind::Check && !j.alone && !j.direct && j.cwd == cwd
+        };
         if self.jobs.iter().filter(|j| is_mate(j)).count() + 1 < MIN_LIST_BATCH {
             return Vec::new();
         }
@@ -121,12 +136,17 @@ impl Queue {
         mates
     }
 
-    fn take(&mut self) -> Option<Job> {
-        let room = self.background_running < BACKGROUND_CHECKS;
-        let at = self.jobs.iter().position(|j| room || !j.background)?;
+    pub(super) fn take(&mut self) -> Option<Job> {
+        let room = self.background_running < DIRECT_CHECKS;
+        let claude_room = room && self.background_claude < BACKGROUND_CHECKS;
+        let at = self
+            .jobs
+            .iter()
+            .position(|j| !j.background || claude_room || (room && j.direct))?;
         let job = self.jobs.remove(at)?;
         if job.background {
             self.background_running += 1;
+            self.background_claude += usize::from(!job.direct);
         }
         Some(job)
     }
@@ -152,11 +172,16 @@ impl Queue {
 pub(super) struct BackgroundSlot<'a> {
     pub(super) queue: &'a Mutex<Queue>,
     pub(super) wake: &'a Condvar,
+    /// The job may start Claude Code ([`Queue::background_claude`]).
+    pub(super) claude: bool,
 }
 
 impl Drop for BackgroundSlot<'_> {
     fn drop(&mut self) {
-        lock(self.queue).background_running -= 1;
+        let mut queue = lock(self.queue);
+        queue.background_running -= 1;
+        queue.background_claude -= usize::from(self.claude);
+        drop(queue);
         // A worker may be waiting for room to run the next one.
         self.wake.notify_all();
     }
@@ -205,9 +230,14 @@ impl Drop for Announced<'_> {
     }
 }
 
-/// Background checks running at once. Each is a `claude` process, a Node program of about 190 MB: three at once took
-/// klefki from 123 MB to about 700 MB at startup. One keeps it near 300 MB.
+/// Background checks with Claude Code running at once. Each is a `claude` process, a Node program of about 190 MB:
+/// three at once took klefki from 123 MB to about 700 MB at startup. One keeps it near 300 MB.
 const BACKGROUND_CHECKS: usize = 1;
+
+/// Background checks running at once when Klefki starts the servers itself (decision 015): then only the servers run,
+/// with nothing of Claude Code's, so more can run at once. Still a few: a server can be heavy itself (a container, a
+/// JVM). At most one of them is a check with Claude Code ([`BACKGROUND_CHECKS`]).
+const DIRECT_CHECKS: usize = 3;
 
 /// Background checks of one folder that are answered by one `claude mcp list` instead of one `mcp get` each: the
 /// list costs one Claude start and checks all servers at once (30 servers: 2.6 s against 28.5 s), but it starts
@@ -286,6 +316,12 @@ pub(super) fn build_job(
         alone: false,
         longer: false,
         folder: None,
+        direct: kind == JobKind::Check
+            && matches!(row.scope, Scope::User | Scope::Local)
+            && row.transport == TransportKind::Stdio
+            && shared.direct_checks.load(Ordering::Relaxed),
+        definition: file.map_or(0, |f| f.definition),
+        checking_detail: None,
     })
 }
 
@@ -358,6 +394,7 @@ pub(super) fn worker(shared: &Shared) {
         let _slot = job.background.then(|| BackgroundSlot {
             queue: &shared.queue,
             wake: &shared.wake_workers,
+            claude: !job.direct,
         });
         run(shared, &job);
     }
@@ -370,12 +407,15 @@ fn begin<'a>(shared: &'a Shared, job: &Job) -> (Option<Announced<'a>>, u64) {
         .announce
         .then(|| Announced::new(&shared.queue, &job.id.connection));
     if job.announce {
-        let detail = job.longer.then(|| {
-            format!(
-                "giving it up to {} to connect",
-                crate::words::duration(LONGER_CHECK)
-            )
-        });
+        let detail = job
+            .longer
+            .then(|| {
+                format!(
+                    "giving it up to {} to connect",
+                    crate::words::duration(LONGER_CHECK)
+                )
+            })
+            .or_else(|| job.checking_detail.clone());
         shared
             .emitter
             .status(job.id.clone(), Status::Checking, detail);
@@ -393,6 +433,48 @@ fn run(shared: &Shared, job: &Job) {
     let current = || !lock(&shared.changes).since(&job.id.connection, started);
     match job.kind {
         JobKind::Check => {
+            if job.direct {
+                match direct::first(shared, job) {
+                    direct::First::Connected => {
+                        if current() {
+                            shared.emitter.status_from(
+                                job.id.clone(),
+                                Status::Connected,
+                                None,
+                                None,
+                                true,
+                            );
+                        }
+                        return;
+                    }
+                    direct::First::AskClaude { timed_out } => {
+                        // The direct check took Claude Code's whole time limit, and Claude Code's may take it again:
+                        // say so meanwhile, rather than a bare "Checking…" for twice as long.
+                        let checking_detail =
+                            timed_out.map(|reason| format!("{reason} Asking Claude Code…"));
+                        if let Some(detail) = checking_detail
+                            .as_ref()
+                            .filter(|_| job.announce && current())
+                        {
+                            shared.emitter.status(
+                                job.id.clone(),
+                                Status::Checking,
+                                Some(detail.clone()),
+                            );
+                        }
+                        // In the background, it waits for its turn with Claude Code, as any other check.
+                        if job.background {
+                            lock(&shared.queue).add(vec![Job {
+                                direct: false,
+                                checking_detail,
+                                ..job.clone()
+                            }]);
+                            shared.wake_workers.notify_one();
+                            return;
+                        }
+                    }
+                }
+            }
             let listed = if job.background {
                 check_listed(shared, job)
             } else {

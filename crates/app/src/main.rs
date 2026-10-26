@@ -43,10 +43,13 @@ fn main() -> eframe::Result {
                 // The engine loads the configuration and runs live status checks in the background; it wakes
                 // the UI when something new is ready.
                 let ctx = cc.egui_ctx.clone();
-                ShellApp::with_core(
-                    klefki_core::api::start(move || ctx.request_repaint()),
+                let claude_only = shell::load_claude_only(cc.storage);
+                let mut app = ShellApp::with_core(
+                    klefki_core::api::start(claude_only, move || ctx.request_repaint()),
                     choice,
-                )
+                );
+                app.claude_only = claude_only;
+                app
             };
             let mut app = app;
             app.tone = tone;

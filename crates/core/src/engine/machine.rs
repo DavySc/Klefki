@@ -538,6 +538,8 @@ fn start_spelled(delay: Duration, spell: fn(String) -> String) -> Rig {
             cli_env: Vec::new(),
             max_checks: 1,
             check_timeout: Duration::from_secs(5),
+            direct_checks: false,
+            server_env: Vec::new(),
             background_checks: true,
             watch_interval: None,
             watch_settle: Duration::from_millis(50),

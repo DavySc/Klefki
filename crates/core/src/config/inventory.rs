@@ -1393,6 +1393,37 @@ pub(crate) fn server_entry(
         .ok_or_else(|| "the server is no longer in the configuration".to_owned())
 }
 
+/// A user server's definition (`project` is `None`) or a local one's, as [`server_entry`] reads it, and whether the
+/// project entry holding it has its trust dialog accepted, so that Claude Code reads the project's own settings files
+/// there (always `false` for a user server). One read of `.claude.json`.
+pub(crate) fn launch_entry(
+    paths: &ConfigPaths,
+    project: Option<&str>,
+    name: &str,
+) -> Result<(Value, bool), String> {
+    let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("{} does not exist", display_path(&paths.claude_json)))?;
+    let root = parse_claude_json(&text)?;
+    let gone = || "the server is no longer in the configuration".to_owned();
+    let Some(project) = project else {
+        return entry_in(&root, None, name)
+            .map(|e| (e, false))
+            .ok_or_else(gone);
+    };
+    let wanted = normalise_project(project);
+    root.get("projects")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| normalise_project(key) == wanted)
+        .find_map(|(key, entry)| {
+            let server = entry.get("mcpServers").and_then(|s| s.get(name))?.clone();
+            Some((server, super::server_env::trusted(&root, key)))
+        })
+        .ok_or_else(gone)
+}
+
 /// The definitions of several servers, as [`server_entry`] reads each one, with every file read once: `.claude.json`
 /// for user and local servers, and each project's `.mcp.json` for its project servers (`in_repository`).
 pub(crate) fn server_entries(
@@ -1699,6 +1730,8 @@ const ENTRY_KEYS: &[&str] = &[
     "enabledMcpjsonServers",
     "disabledMcpjsonServers",
     "enableAllProjectMcpServers",
+    // Whether Claude Code reads the project's own settings files, for a server Klefki starts itself.
+    "hasTrustDialogAccepted",
 ];
 
 /// Parses `.claude.json` keeping only what the inventory uses: `mcpServers`, and in `projects` the entries' server

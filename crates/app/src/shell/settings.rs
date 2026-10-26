@@ -5,6 +5,21 @@ use crate::theme::{self, ThemeChoice, Tone};
 use egui::{RichText, Ui};
 use klefki_core::api::{Command, UpdateCheck};
 
+/// Where [`ShellApp::claude_only`] is kept.
+const CLAUDE_ONLY_KEY: &str = "checks.claude_only";
+
+/// Whether every server is to be checked by Claude Code, as last saved. Off unless it was turned on.
+pub(crate) fn load_claude_only(storage: Option<&dyn eframe::Storage>) -> bool {
+    storage
+        .and_then(|s| s.get_string(CLAUDE_ONLY_KEY))
+        .as_deref()
+        == Some("on")
+}
+
+pub(super) fn save_claude_only(storage: &mut dyn eframe::Storage, on: bool) {
+    storage.set_string(CLAUDE_ONLY_KEY, if on { "on" } else { "off" }.to_owned());
+}
+
 impl ShellApp {
     /// Settings. For now, how Klefki looks: light or dark, and which family of greys.
     pub(super) fn settings(&mut self, ui: &mut Ui) {
@@ -88,7 +103,34 @@ impl ShellApp {
             );
             ui.add(egui::Label::new(RichText::new(problem).small().color(pal.text_muted)).wrap());
         }
+        self.check_settings(ui);
         self.update_settings(ui);
+    }
+
+    /// Who checks the servers: Klefki first, or Claude Code only (decision 015).
+    fn check_settings(&mut self, ui: &mut Ui) {
+        let pal = theme::palette(ui.ctx());
+        ui.add_space(14.0);
+        if theme::checkbox(
+            ui,
+            &mut self.claude_only,
+            "Check servers with Claude Code only",
+        )
+        .changed()
+        {
+            self.send(Command::CheckWithClaudeOnly(self.claude_only));
+        }
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "Otherwise Klefki starts a server on your computer the way Claude Code would and asks it for \
+                     its tools, which is quicker and uses less memory. Claude Code checks every server that does not \
+                     connect that way, and every server that is reached by its address.",
+                )
+                .color(pal.text_muted),
+            )
+            .wrap(),
+        );
     }
 
     fn update_settings(&mut self, ui: &mut Ui) {

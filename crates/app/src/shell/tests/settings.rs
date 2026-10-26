@@ -145,3 +145,28 @@ fn the_palette_changes_the_greys_too() {
     assert_eq!(h.state().tone, Tone::Warm);
     assert_eq!(theme::palette(&h.ctx).panel, theme::WARM_DARK.panel);
 }
+
+#[test]
+fn checking_with_claude_code_only_is_told_to_the_engine_and_remembered() {
+    let (mut h, engine) = live_harness();
+    h.run();
+    h.state_mut().go(Page::Settings);
+    h.run();
+    drain(&engine);
+    h.get_by_label("Check servers with Claude Code only")
+        .click();
+    h.run();
+    assert_eq!(drain(&engine), [Command::CheckWithClaudeOnly(true)]);
+    assert!(h.state().claude_only);
+    let mut storage = theme::tests::MemoryStorage::default();
+    eframe::App::save(h.state_mut(), &mut storage);
+    assert!(crate::shell::load_claude_only(Some(&storage)));
+    h.get_by_label("Check servers with Claude Code only")
+        .click();
+    h.run();
+    assert_eq!(drain(&engine), [Command::CheckWithClaudeOnly(false)]);
+    eframe::App::save(h.state_mut(), &mut storage);
+    assert!(!crate::shell::load_claude_only(Some(&storage)));
+    // Never saved: off.
+    assert!(!crate::shell::load_claude_only(None));
+}

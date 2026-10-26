@@ -13,7 +13,7 @@ use crate::config::entry;
 use crate::config::inventory::{self, FileKeys};
 use crate::sanitize::sanitize;
 use crate::watch::Watch;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -25,6 +25,7 @@ pub(super) fn engine_main(
     updating: Arc<Mutex<Updating>>,
 ) {
     let workers = config.max_checks.max(1);
+    let direct_checks = config.direct_checks;
     let shared = Arc::new(Shared {
         config,
         queue: Mutex::new(Queue::default()),
@@ -35,6 +36,7 @@ pub(super) fn engine_main(
         journals: Arc::default(),
         secret_store: Mutex::new(None),
         list_works: AtomicBool::new(true),
+        direct_checks: AtomicBool::new(direct_checks),
         secrets_listed: Mutex::new(None),
         emitter,
         input: input_tx.clone(),
@@ -82,6 +84,9 @@ pub(super) fn engine_main(
                 let mut queue = lock(&shared.queue);
                 queue.visible = rows.into_iter().collect();
                 queue.order();
+            }
+            Command::CheckWithClaudeOnly(only) => {
+                shared.direct_checks.store(!only, Ordering::Relaxed);
             }
             Command::Check(id) => enqueue_now(&shared, &state, &id, JobKind::Check, false),
             Command::CheckLonger(id) => enqueue_now(&shared, &state, &id, JobKind::Check, true),
@@ -551,7 +556,12 @@ fn enqueue_now(shared: &Shared, state: &State, id: &ServerId, kind: JobKind, lon
         return;
     };
     if let Some(job) = build_job(shared, &mut Folders::default(), row, Some(file), kind, true) {
-        lock(&shared.queue).push_now(Job { longer, ..job });
+        // A check given more time is Claude Code's: it is asked for when Claude Code ran out of time.
+        lock(&shared.queue).push_now(Job {
+            longer,
+            direct: job.direct && !longer,
+            ..job
+        });
         shared.wake_workers.notify_one();
     }
 }
@@ -640,6 +650,9 @@ fn diagnose_in(shared: &Shared, state: &State, id: &ServerId, project: &str) {
         alone: false,
         longer: false,
         folder: Some(shown),
+        direct: false,
+        definition: 0,
+        checking_detail: None,
     });
     shared.wake_workers.notify_one();
 }

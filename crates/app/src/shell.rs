@@ -24,6 +24,7 @@ mod duplicate;
 mod editor;
 mod export;
 pub(crate) use export::{COPIED_SECS, announce};
+pub(crate) use settings::load_claude_only;
 mod inspector;
 mod last_starts;
 mod list;
@@ -295,6 +296,8 @@ pub(crate) struct ShellApp {
     pub tone: Tone,
     /// Klefki's own updates: when to look, and what was found.
     pub updates: crate::updates::Updates,
+    /// Every server is checked by Claude Code, never started by Klefki itself first (decision 015).
+    pub claude_only: bool,
     /// This build can check for updates (it has a release key).
     checks_for_updates: bool,
     /// Why this copy of Klefki is updated by hand (the MSI, the zip, the `.deb`); `None` when it installs updates
@@ -382,6 +385,7 @@ impl ShellApp {
             theme,
             tone: Tone::default(),
             updates: crate::updates::Updates::default(),
+            claude_only: false,
             checks_for_updates: false,
             updated_by_hand: None,
         }
@@ -680,6 +684,7 @@ impl ShellApp {
                 detail,
                 hint,
                 timing,
+                by_klefki,
             } => {
                 // The check given more time has answered (or another has): the seconds stop.
                 if status != Status::Checking
@@ -701,6 +706,7 @@ impl ShellApp {
                         detail,
                         hint,
                         timing,
+                        by_klefki,
                     });
                     self.live_gen += 1;
                 }
@@ -834,6 +840,13 @@ impl ShellApp {
     /// more.
     fn timing(&self, i: usize) -> Option<&Timing> {
         self.live.get(i)?.as_ref()?.timing.as_ref()
+    }
+
+    /// Who gave row `i`'s answer: `Some(true)` Klefki, `Some(false)` Claude Code, `None` when there is no answer of
+    /// this run (not checked yet, still checking, or only last known from Claude Code's cache).
+    fn checked_by_klefki(&self, i: usize) -> Option<bool> {
+        let live = self.live.get(i)?.as_ref()?;
+        (!matches!(live.status, Status::Checking | Status::Unknown)).then_some(live.by_klefki)
     }
 
     /// Indices into the snapshot matching the search, ordered by scope, project and name.
@@ -2005,6 +2018,7 @@ impl eframe::App for ShellApp {
         theme::save_choice(storage, self.theme);
         theme::save_tone(storage, self.tone);
         self.updates.save(storage);
+        settings::save_claude_only(storage, self.claude_only);
     }
 
     /// A downloaded update installs as Klefki closes, unless the user restarted into it already.
@@ -2195,6 +2209,8 @@ struct Live {
     detail: Option<String>,
     hint: Option<Hint>,
     timing: Option<Timing>,
+    /// Klefki gave the answer itself: it started the server as Claude Code does, and it connected.
+    by_klefki: bool,
 }
 
 /// A server's last starts as last read, and whether they have been asked for since they could have changed (a check
@@ -2434,6 +2450,7 @@ mod tests {
             detail: detail.map(str::to_owned),
             hint: None,
             timing: None,
+            by_klefki: false,
         }
     }
 
@@ -2455,6 +2472,7 @@ mod tests {
                 )),
             }),
             timing: None,
+            by_klefki: false,
         }
     }
 

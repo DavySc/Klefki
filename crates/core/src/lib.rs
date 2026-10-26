@@ -25,8 +25,6 @@ mod import_file;
 mod inspector;
 mod install;
 mod last_start;
-// The direct check, which the engine takes up in the next slice (`docs/proposals/checks-without-claude.md`).
-#[cfg(test)]
 mod mcp;
 mod model;
 mod ops;

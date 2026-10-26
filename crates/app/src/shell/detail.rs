@@ -654,6 +654,20 @@ impl ShellApp {
                             ui.label(status.label());
                         }
                         ui.end_row();
+                        // Which of the two checked it (decision 015): a failure is always Claude Code's word.
+                        if let Some(by_klefki) = self.checked_by_klefki(i) {
+                            ui.label(RichText::new("Checked by").color(pal.text_muted));
+                            if by_klefki {
+                                ui.label("Klefki, which started it as Claude Code would").on_hover_text(
+                                    "Klefki started the server itself, with the folder and environment Claude Code \
+                                     gives it, and it answered with its tools. Claude Code checks every server that \
+                                     does not connect this way.",
+                                );
+                            } else {
+                                ui.label("Claude Code");
+                            }
+                            ui.end_row();
+                        }
                         if explanation.is_none() {
                             ui.label(RichText::new("Detail").color(pal.text_muted));
                             ui.add(egui::Label::new(detail.unwrap_or("-")).wrap());

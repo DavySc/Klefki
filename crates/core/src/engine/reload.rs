@@ -42,7 +42,11 @@ impl State {
                     watch.rebase(watch::watched_files(paths, &self.snapshot));
                 }
                 let vars = &*shared.config.vars;
-                let probe = Probe::new(shared.config.path_var.as_deref(), vars, cfg!(windows));
+                // Claude Code fills `${NAME}` in from the settings files' `env` too. A project's own settings count
+                // only where it is trusted, and only for its servers: left out here.
+                let settings = crate::config::server_env::settings_env(paths, None);
+                let probe = Probe::new(shared.config.path_var.as_deref(), vars, cfg!(windows))
+                    .with_settings(settings.into_iter().map(|(name, _)| name));
                 let next = inventory::load_probed(paths, Some(&probe));
                 if let Some(watch) = &self.watch {
                     // Projects that just appeared start being watched from now.
