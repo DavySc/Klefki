@@ -29,6 +29,7 @@ mod checks;
 mod client_secrets;
 mod command_loop;
 mod diagnose;
+mod direct;
 #[cfg(test)]
 mod machine;
 mod reload;
@@ -42,6 +43,10 @@ pub enum Command {
     Refresh { live_all: bool },
     /// The servers the user can see now. Background checks of these go first.
     Visible(Vec<crate::model::ConnectionId>),
+    /// Check every server with Claude Code (`true`), or let Klefki start a user or local stdio server itself first,
+    /// the way Claude Code would, and ask Claude Code only when it does not connect (`false`, decision 015). Takes
+    /// effect from the next check.
+    CheckWithClaudeOnly(bool),
     /// Check one server now. This is the only way a project (`.mcp.json`) server is checked, because checking
     /// it runs the repository's command.
     Check(ServerId),
@@ -462,6 +467,9 @@ pub enum Event {
         hint: Option<Hint>,
         /// How long the check took against Claude Code's time limit, when it ran out of time or was given more.
         timing: Option<crate::api::Timing>,
+        /// Klefki gave this answer itself: it started the server the way Claude Code does, and it connected. Every
+        /// other answer is Claude Code's (decision 015).
+        by_klefki: bool,
     },
     Diagnosis {
         id: ServerId,
@@ -738,6 +746,13 @@ pub(crate) struct EngineConfig {
     pub cli_env: Vec<(String, OsString)>,
     pub max_checks: usize,
     pub check_timeout: Duration,
+    /// Check a user or local stdio server by starting it the way Claude Code does, before asking Claude Code
+    /// (decision 015); [`Command::CheckWithClaudeOnly`] changes it. Off for tests that do not ask for it, so a test
+    /// configuration's command never runs.
+    pub direct_checks: bool,
+    /// Klefki's own environment, which a server it starts itself is given as Claude Code would pass it on
+    /// (`config/server_env.rs`). Tests give their own.
+    pub server_env: Vec<(OsString, OsString)>,
     /// Check, in the background, the servers with no status of their own (the app). Off for a command-line run,
     /// which checks only the servers it is asked about.
     pub background_checks: bool,
@@ -864,6 +879,18 @@ impl Emitter {
         detail: Option<String>,
         timing: Option<crate::api::Timing>,
     ) {
+        self.status_from(id, status, detail, timing, false);
+    }
+
+    /// A status, `by_klefki` when Klefki gave it itself ([`Event::Status::by_klefki`]).
+    fn status_from(
+        &self,
+        id: ServerId,
+        status: Status,
+        detail: Option<String>,
+        timing: Option<crate::api::Timing>,
+        by_klefki: bool,
+    ) {
         let hint = match status {
             Status::Failed | Status::Degraded | Status::NeedsAuth => detail
                 .as_deref()
@@ -876,6 +903,7 @@ impl Emitter {
             detail,
             hint,
             timing,
+            by_klefki,
         });
     }
 }
@@ -896,6 +924,8 @@ struct Shared {
     /// Cleared when a `claude mcp list` gave no answer at all (it failed, or its output is not what is read): every
     /// check is then a `get`, as before, until klefki is started again.
     list_works: AtomicBool,
+    /// [`EngineConfig::direct_checks`], as [`Command::CheckWithClaudeOnly`] last set it.
+    direct_checks: AtomicBool,
     /// What the system's store last listed for the Secrets page, or why it could not.
     secrets_listed: Mutex<Option<Result<Vec<crate::model::ConnectionId>, String>>>,
     /// Per file, the redo log of klefki's changes whose check is still due.

@@ -187,6 +187,22 @@ fn serve(mode: &str, args: &[String]) {
                     "roots" if !asked_roots => say(&error(-32603, "roots were not answered")),
                     "badtool" => say(&answer(json!({"tools": [{"name": "a"}]}))),
                     "notools" | "modernnotools" => say(&answer(json!({"tools": 5}))),
+                    // Two pages: the second (asked for with the cursor) answered well, with an error, or with a
+                    // tool that is not described the way MCP asks.
+                    "paged" | "pagedfail" | "pagedbadtool" => {
+                        let tool =
+                            |name: &str| json!({"name": name, "inputSchema": {"type": "object"}});
+                        match (mode, m["params"]["cursor"].as_str()) {
+                            (_, None) => {
+                                say(&answer(json!({"tools": [tool("t1")], "nextCursor": "c2"})))
+                            }
+                            ("pagedfail", Some(_)) => say(&error(-32603, "no second page")),
+                            ("pagedbadtool", Some(_)) => {
+                                say(&answer(json!({"tools": [{"name": "t2"}]})))
+                            }
+                            (_, Some(_)) => say(&answer(json!({"tools": [tool("t2")]}))),
+                        }
+                    }
                     "manytools" => {
                         let tools: Vec<Value> = (0..args.get(1).and_then(|n| n.parse().ok()).unwrap_or(3))
                             .map(|i| json!({"name": format!("t{i}"), "inputSchema": {"type": "object"}}))

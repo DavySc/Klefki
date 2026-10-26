@@ -13,8 +13,6 @@ pub(crate) mod policy;
 pub(crate) mod preflight;
 pub(crate) mod relative;
 pub(crate) mod secretlike;
-// Used by the direct check (`mcp/stdio.rs`), which the engine takes up in the next slice.
-#[cfg(test)]
 pub(crate) mod server_env;
 pub(crate) mod timeout;
 

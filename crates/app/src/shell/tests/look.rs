@@ -342,6 +342,7 @@ fn timed(took: u64, given: bool) -> (Harness<'static, ShellApp>, klefki_core::ap
                 given: given.then_some(LONGER_CHECK),
                 timed_out: !given,
             }),
+            by_klefki: false,
         })
         .unwrap();
     select(&mut h, "azure-devops", Scope::User);
@@ -359,6 +360,28 @@ fn a_timeout_explained() {
 fn a_server_that_needs_more_time() {
     let (mut h, _engine) = timed(41, true);
     shot(&mut h, "timeout-needs-more-time");
+}
+
+/// A server Klefki started itself, and that connected (decision 015).
+#[test]
+fn a_server_klefki_checked_itself() {
+    let (mut h, engine) = app_at(PAGE);
+    let i = row(&h, "azure-devops", Scope::User);
+    let id = h.state().snapshot.servers[i].id();
+    engine
+        .events
+        .send(Event::Status {
+            id,
+            status: Status::Connected,
+            detail: None,
+            hint: None,
+            timing: None,
+            by_klefki: true,
+        })
+        .unwrap();
+    select(&mut h, "azure-devops", Scope::User);
+    h.state_mut().tab = DetailTab::Status;
+    shot(&mut h, "detail-checked-by-klefki");
 }
 
 #[test]

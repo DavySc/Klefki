@@ -1,6 +1,7 @@
 # Checks without `claude mcp get` (proposal, 2026-10-25)
 
-Proposal only; no code or invariant changed. The owner chose the hybrid on 2026-10-26 and approved the invariant line the same day; next is slice 2.
+The owner chose the hybrid on 2026-10-26 and approved the invariant line the same day. Slice 2 (the client) and
+slice 3 (the engine, decision 015) are built; next is slice 4 (remember verdicts).
 
 ## In short
 Today every status check starts Claude Code (`claude mcp get`, or one `claude mcp list` for four or more servers in a

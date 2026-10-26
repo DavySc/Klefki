@@ -1133,15 +1133,18 @@ fn a_background_check_that_panics_gives_its_slot_back() {
     let queue = Mutex::new(Queue::default());
     let wake = Condvar::new();
     lock(&queue).background_running = 1;
+    lock(&queue).background_claude = 1;
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _slot = BackgroundSlot {
             queue: &queue,
             wake: &wake,
+            claude: true,
         };
         panic!("a check went wrong");
     }));
     assert!(caught.is_err());
     assert_eq!(lock(&queue).background_running, 0);
+    assert_eq!(lock(&queue).background_claude, 0);
 }
 
 #[test]
@@ -1517,6 +1520,9 @@ fn only_the_waiting_background_checks_of_edited_servers_are_dropped() {
         alone: false,
         longer: false,
         folder: None,
+        direct: false,
+        definition: 0,
+        checking_detail: None,
     };
     let mut queue = Queue {
         jobs: [
@@ -1559,6 +1565,9 @@ fn a_diagnose_in_a_project_keeps_the_servers_waiting_check() {
         alone: false,
         longer: false,
         folder: folder.map(str::to_owned),
+        direct: false,
+        definition: 0,
+        checking_detail: None,
     };
     let mut queue = Queue {
         jobs: [job(JobKind::Check, None)].into(),
