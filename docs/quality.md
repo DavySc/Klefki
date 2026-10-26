@@ -28,9 +28,12 @@ must leave every test, golden file and baseline as it was.
   - When a change to the look is meant: `UPDATE_SNAPSHOTS=1 cargo test -p klefki look`, and show the pictures in
     the pull request. **In a refactor, a picture that changes means the look changed: stop.**
   - A new screen, dialog or state gets a picture in the same pull request.
-  - Mesa drift: the pictures match Ubuntu 24.04's Mesa (25.2.8), as on CI's `ubuntu-latest`. If the runner image
-    moves to another Mesa, every look test fails at once on unrelated pull requests, with differences scattered over
-    edges and text rather than in one place. Then fix it in its own pull request: take the pictures from that run's
+  - Mesa drift: the pictures match Ubuntu 24.04's Mesa (25.2.8), which is why ci.yml and quality.yml pin
+    `runs-on: ubuntu-24.04`. On 2026-10-26 `ubuntu-latest` moved to Ubuntu 26.04 (Mesa 26.0.8) and 9 look tests
+    failed by a few pixels on every pull request, so Linux jobs stay on 24.04. When GitHub retires the 24.04
+    image, retake the pictures on the new Mesa in their own pull request. If a runner image moves to another Mesa,
+    every look test fails at once on unrelated pull requests, with differences scattered over edges and text
+    rather than in one place. Then fix it in its own pull request: take the pictures from that run's
     `look-changes` artifact (the `.new.png` files, renamed), look at them side by side with the old ones, and say
     which Mesa they come from. Never run `UPDATE_SNAPSHOTS=1` on a machine whose Mesa differs from CI's; the cloud
     sessions' container has the same one.
