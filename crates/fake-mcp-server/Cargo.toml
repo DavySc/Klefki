@@ -1,0 +1,13 @@
+[package]
+name = "fake-mcp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Test-only MCP stdio server whose behaviour the tests pick. Never shipped."
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

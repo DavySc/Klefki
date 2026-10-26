@@ -107,7 +107,7 @@ fn local_folder(dir: &Path) -> bool {
 
 /// `\\host\share`, `//host/share`, and Windows' `\\?\`, `\\.\` and NT `\??\` forms (`\??\UNC\host\share`): looking at
 /// one can reach another machine.
-fn network_path(path: &str) -> bool {
+pub(super) fn network_path(path: &str) -> bool {
     [
         "\\\\", "//", "\\/", "/\\", "\\??\\", "/??/", "\\??/", "/??\\",
     ]

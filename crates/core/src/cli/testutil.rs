@@ -9,21 +9,29 @@ use std::time::{Duration, Instant};
 /// from cargo's JSON output, so `cargo test -p klefki-core` works without building the whole workspace first.
 pub(crate) fn fake_claude() -> &'static Path {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let out = Command::new(cargo)
-            .args(["build", "-p", "fake-claude", "--message-format=json"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .output()
-            .expect("run cargo to build fake-claude");
-        assert!(out.status.success(), "building fake-claude failed");
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter(|v| v["reason"] == "compiler-artifact" && v["target"]["name"] == "fake-claude")
-            .find_map(|v| v["executable"].as_str().map(PathBuf::from))
-            .expect("cargo reported the fake-claude executable")
-    })
+    PATH.get_or_init(|| built("fake-claude"))
+}
+
+/// The built `fake-mcp-server` binary, the test server of `mcp/stdio.rs`, built as [`fake_claude`] is.
+pub(crate) fn fake_mcp_server() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| built("fake-mcp-server"))
+}
+
+fn built(package: &str) -> PathBuf {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let out = Command::new(cargo)
+        .args(["build", "-p", package, "--message-format=json"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap_or_else(|e| panic!("run cargo to build {package}: {e}"));
+    assert!(out.status.success(), "building {package} failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["reason"] == "compiler-artifact" && v["target"]["name"] == package)
+        .find_map(|v| v["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| panic!("cargo reported the {package} executable"))
 }
 
 /// Writes `scenario.json` (and any files it refers to) into `dir`; returns the scenario path.
