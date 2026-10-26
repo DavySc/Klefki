@@ -73,9 +73,11 @@ fn a_user_server_that_connects_is_connected_by_klefki_without_starting_claude_co
     assert!(env.gets().is_empty(), "Claude Code was not asked");
     let dumped: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&dump).unwrap()).unwrap();
+    // The same folder however it is spelled (macOS's temporary folder is a link to `/private/var`).
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap();
     assert_eq!(
-        Path::new(dumped["cwd"].as_str().unwrap()),
-        env.dir.path().join("home"),
+        canonical(Path::new(dumped["cwd"].as_str().unwrap())),
+        canonical(&env.dir.path().join("home")),
         "a user server runs in the home folder, as Claude Code runs it"
     );
     assert_eq!(dumped["env"]["CLAUDECODE"], "1");
