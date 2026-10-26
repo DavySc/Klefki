@@ -30,6 +30,14 @@ several checks at once, measure `tools/list` paging, share the `${VAR}` reading 
   (`Probe::with_settings`, case-insensitive on Windows).
 - App: Status tab row "Checked by" (Klefki / Claude Code) for an answer of this run; Settings: "Check servers with
   Claude Code only" (saved as `checks.claude_only`, read before the engine starts).
+- After the cross-review: a switched-off server is never started directly (`build_job` needs `row.enabled`;
+  `inventory::launch_entry` reads the run folder's `disabledMcpServers` with the definition, so a server switched off
+  after its check was queued is not started either), and background checks leave one worker free for a check the
+  user asks for (`Queue::background_limit`, workers minus one: two in the app). Settings has a "Checks" heading and
+  says what on and off do; the Status tab says "Klefki (started it as Claude Code would)" with what that means as the
+  Detail; with no Claude Code found Klefki starts no server itself (the performance script's `npx` servers would
+  have been started); the CLAUDE.md invariant is split into Which / How / What is sent / Fallback lines; decision 015 notes the
+  peak memory.
 - `fake-mcp-server`: modes `paged`, `pagedfail`, `pagedbadtool`.
 - CLAUDE.md invariant line (one line, as the other bullets; it names `server/discover` first, then `initialize` and
   `notifications/initialized`, one `tools/list`, answers to `ping` and `roots/list`); decision 015; a note in 014; the
@@ -46,6 +54,11 @@ several checks at once, measure `tools/list` paging, share the `${VAR}` reading 
   when trusted; the "Asking Claude Code…" detail on a timeout; three background at once with one Claude Code; five
   servers in one folder never become a `mcp list`. Seen failing with `direct::first` forced to ask Claude Code (6 of 9
   fail; the other 3 check what stays with Claude Code).
+- `engine/tests/direct.rs` after the review: `a_server_switched_off_where_it_runs_is_never_started_by_klefki` (local
+  off in its project, user off in the home entry), `a_server_switched_off_after_the_check_was_queued_is_not_started`
+  (`launch_entry` reads it again; off elsewhere only is still on), `a_check_the_user_asks_for_does_not_wait_behind_
+  background_checks` (three servers that never answer, `MCP_TIMEOUT` 20 s), `without_claude_code_klefki_starts_no_
+  server_itself`. The first, third and fourth seen failing with the fixes taken out (the third took 20 s).
 - `mcp/stdio/tests.rs`: `a_message_is_read_as_claude_code_reads_it`, `a_second_page_of_tools_is_not_asked_for_…`;
   existing tests now read through `Message` (same cases).
 - `config/preflight/tests.rs`: `a_variable_is_looked_up_as_claude_code_fills_it_in`.
@@ -57,7 +70,16 @@ several checks at once, measure `tools/list` paging, share the `${VAR}` reading 
 ## Checks
 See the pull request for the latest run.
 
+Performance baseline (`scripts/perf-baseline.py --runs 5`, release builds, Linux, median, branch vs main): start-up
+within noise (window 238 vs 227 ms small, 244 vs 222 ms large, both with wide ranges; first snapshot 146 vs 150 ms
+small), RSS the same (127.6 vs 127.2 MB small). Private dirty memory read 41 vs 54 MB (small) and 45 vs 58 MB (large)
+in both branch runs; not explained, so not claimed as a gain. The script runs without Claude Code, so no check runs
+in it (now true of the direct check too).
+
 ## Open
+- The row does not say how long a server that never answers will take in all (Klefki's limit, then Claude Code's):
+  it says "Asking Claude Code…" after the first. Left for slice 4, which remembers verdicts and so can skip the
+  direct check for a server that timed out before.
 - Windows `.cmd`/`.bat` (slice 5), remembering verdicts (slice 4), `klefki-cli` direct checks, a local server's
   `${VAR}` from its trusted project's settings in pre-flight, live comparison on the owner's configuration, macOS and
   Windows.

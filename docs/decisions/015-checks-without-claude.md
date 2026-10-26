@@ -21,9 +21,16 @@ environment and program builder (`config/server_env.rs`); this slice routes the 
   sign-in stay with Claude Code. The command-line tool (`klefki-cli`) stays with Claude Code too.
 - **A server that never answers** waits Claude Code's limit twice (once for each check). After the first, its row
   says "It did not answer within 30 s. Asking Claude Code…" while Claude Code checks it.
-- **How many at once.** Background checks run three at once while Klefki starts the servers itself, and still at most
-  one with Claude Code. A server can be heavy itself (a container, a JVM), so it stays a few.
-- **Who answered** is on the Status tab: "Checked by: Klefki, which started it as Claude Code would" or "Claude Code".
+- **How many at once.** Background checks run up to three at once while Klefki starts the servers itself (one fewer
+  than the workers, so a check the user asks for never waits behind them: two in the app), and still at most one with
+  Claude Code. A server can be heavy itself (a container, a JVM), so it stays a few. Peak memory while the app checks
+  in the background is now those servers plus at most one `claude` (about 196 MB), where it was one `claude` and the
+  server it started; a check the user asks for can add one more of either.
+- **Only a server that is on.** A check of a switched-off server ("Check now" on it) stays with Claude Code, which
+  answers "Disabled" without starting it; and the direct check reads the run folder's `disabledMcpServers` again when
+  it starts, so a server switched off after its check was queued is not started either. With no Claude Code found,
+  no check starts a server, as before.
+- **Who answered** is on the Status tab: "Checked by: Klefki (started it as Claude Code would)", with what that means as its Detail, or "Claude Code".
 - **A setting, "Check servers with Claude Code only"**, on the Settings page, off by default, kept with the app's
   other settings, sent to the engine at start and when changed (`Command::CheckWithClaudeOnly`).
 - **Replies are read narrowly** (`mcp/stdio/message.rs`): only the fields the check looks at are kept, long texts are

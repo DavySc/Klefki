@@ -20,6 +20,10 @@ use klefki_core::api::{
 };
 use std::sync::Arc;
 
+/// The Detail of a server Klefki checked itself and that connected (decision 015).
+pub(crate) const CHECKED_BY_KLEFKI: &str =
+    "Started with the folder and environment Claude Code gives it, it answered with its tools.";
+
 /// Plain text a user can paste into a support request. The engine already sanitised and redacted it.
 pub(super) fn diagnosis_report(row: &ServerRow, d: &Diagnosis) -> String {
     use std::fmt::Write;
@@ -657,18 +661,18 @@ impl ShellApp {
                         // Which of the two checked it (decision 015): a failure is always Claude Code's word.
                         if let Some(by_klefki) = self.checked_by_klefki(i) {
                             ui.label(RichText::new("Checked by").color(pal.text_muted));
-                            if by_klefki {
-                                ui.label("Klefki, which started it as Claude Code would").on_hover_text(
-                                    "Klefki started the server itself, with the folder and environment Claude Code \
-                                     gives it, and it answered with its tools. Claude Code checks every server that \
-                                     does not connect this way.",
-                                );
+                            ui.label(if by_klefki {
+                                "Klefki (started it as Claude Code would)"
                             } else {
-                                ui.label("Claude Code");
-                            }
+                                "Claude Code"
+                            });
                             ui.end_row();
                         }
                         if explanation.is_none() {
+                            let detail = detail.or(self
+                                .checked_by_klefki(i)
+                                .is_some_and(|k| k)
+                                .then_some(CHECKED_BY_KLEFKI));
                             ui.label(RichText::new("Detail").color(pal.text_muted));
                             ui.add(egui::Label::new(detail.unwrap_or("-")).wrap());
                             ui.end_row();

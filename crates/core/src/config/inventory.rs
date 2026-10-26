@@ -1393,35 +1393,59 @@ pub(crate) fn server_entry(
         .ok_or_else(|| "the server is no longer in the configuration".to_owned())
 }
 
-/// A user server's definition (`project` is `None`) or a local one's, as [`server_entry`] reads it, and whether the
-/// project entry holding it has its trust dialog accepted, so that Claude Code reads the project's own settings files
-/// there (always `false` for a user server). One read of `.claude.json`.
+/// What a server Klefki starts itself is started from: read once from `.claude.json`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LaunchEntry {
+    /// The definition, as [`server_entry`] reads it.
+    pub definition: Value,
+    /// The trust dialog of `folder`'s entry was accepted: Claude Code reads the project's own settings files there.
+    pub trusted: bool,
+    /// `folder`'s entry lists the server in `disabledMcpServers`: Claude Code does not start it there.
+    pub disabled: bool,
+}
+
+/// A user server's definition, or with `local` the one of `folder`'s local server `name`, and what `folder`'s project
+/// entry says about it: the folder a check runs in (the home folder for a user server, the project for a local one).
 pub(crate) fn launch_entry(
     paths: &ConfigPaths,
-    project: Option<&str>,
+    folder: &str,
+    local: bool,
     name: &str,
-) -> Result<(Value, bool), String> {
+) -> Result<LaunchEntry, String> {
     let text = fsx::read_limited(&paths.claude_json, MAX_CLAUDE_JSON)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("{} does not exist", display_path(&paths.claude_json)))?;
     let root = parse_claude_json(&text)?;
     let gone = || "the server is no longer in the configuration".to_owned();
-    let Some(project) = project else {
-        return entry_in(&root, None, name)
-            .map(|e| (e, false))
-            .ok_or_else(gone);
-    };
-    let wanted = normalise_project(project);
-    root.get("projects")
+    let wanted = normalise_project(folder);
+    let mut entries = root
+        .get("projects")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .filter(|(key, _)| normalise_project(key) == wanted)
-        .find_map(|(key, entry)| {
-            let server = entry.get("mcpServers").and_then(|s| s.get(name))?.clone();
-            Some((server, super::server_env::trusted(&root, key)))
-        })
-        .ok_or_else(gone)
+        .filter(|(key, _)| normalise_project(key) == wanted);
+    // A local server is in the entry that holds it, as [`entry_in`] finds it; a user server in the root.
+    let (definition, key, entry) = if local {
+        entries
+            .find_map(|(key, entry)| {
+                let server = entry.get("mcpServers").and_then(|s| s.get(name))?.clone();
+                Some((server, Some(key), Some(entry)))
+            })
+            .ok_or_else(gone)?
+    } else {
+        let server = entry_in(&root, None, name).ok_or_else(gone)?;
+        let found = entries.next();
+        (server, found.map(|(k, _)| k), found.map(|(_, e)| e))
+    };
+    let disabled = entry
+        .and_then(|e| e.get("disabledMcpServers"))
+        .and_then(Value::as_array)
+        .is_some_and(|list| list.iter().any(|n| n.as_str() == Some(name)));
+    Ok(LaunchEntry {
+        definition,
+        trusted: key.is_some_and(|k| super::server_env::trusted(&root, k)),
+        disabled,
+    })
 }
 
 /// The definitions of several servers, as [`server_entry`] reads each one, with every file read once: `.claude.json`

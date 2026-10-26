@@ -69,6 +69,9 @@ pub(super) struct Queue {
     pub(super) background_running: usize,
     /// Background jobs running now that may start Claude Code: those that are not [`Job::direct`].
     pub(super) background_claude: usize,
+    /// Background jobs that may run at once: [`DIRECT_CHECKS`], and fewer than the workers, so that one is always free
+    /// for a check the user asks for. Set when the workers start.
+    pub(super) background_limit: usize,
     /// The servers on screen, from [`super::Command::Visible`]: their background jobs go first.
     pub(super) visible: std::collections::HashSet<crate::model::ConnectionId>,
     /// Checks that said they are running and have not answered yet: the app forgets "Checking…" on every
@@ -137,7 +140,7 @@ impl Queue {
     }
 
     pub(super) fn take(&mut self) -> Option<Job> {
-        let room = self.background_running < DIRECT_CHECKS;
+        let room = self.background_running < self.background_limit.clamp(1, DIRECT_CHECKS);
         let claude_room = room && self.background_claude < BACKGROUND_CHECKS;
         let at = self
             .jobs
@@ -316,7 +319,9 @@ pub(super) fn build_job(
         alone: false,
         longer: false,
         folder: None,
+        // Only a server that is on: switched off, Claude Code does not start it either ("Disabled").
         direct: kind == JobKind::Check
+            && row.enabled
             && matches!(row.scope, Scope::User | Scope::Local)
             && row.transport == TransportKind::Stdio
             && shared.direct_checks.load(Ordering::Relaxed),

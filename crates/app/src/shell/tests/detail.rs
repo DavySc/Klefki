@@ -1142,12 +1142,18 @@ fn the_status_tab_says_who_checked_the_server() {
     engine.events.send(answer(Status::Connected, true)).unwrap();
     h.run();
     h.get_by_label("Checked by");
-    h.get_by_label("Klefki, which started it as Claude Code would");
+    h.get_by_label("Klefki (started it as Claude Code would)");
+    // What that means is on the page, not only in a hover text.
+    h.get_by_label(crate::shell::detail::CHECKED_BY_KLEFKI);
     engine.events.send(answer(Status::Failed, false)).unwrap();
     h.run();
     h.get_by_label("Claude Code");
     assert!(
-        h.query_by_label("Klefki, which started it as Claude Code would")
+        h.query_by_label("Klefki (started it as Claude Code would)")
+            .is_none()
+    );
+    assert!(
+        h.query_by_label(crate::shell::detail::CHECKED_BY_KLEFKI)
             .is_none()
     );
 }

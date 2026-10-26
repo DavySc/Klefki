@@ -28,7 +28,10 @@ pub(super) fn engine_main(
     let direct_checks = config.direct_checks;
     let shared = Arc::new(Shared {
         config,
-        queue: Mutex::new(Queue::default()),
+        queue: Mutex::new(Queue {
+            background_limit: workers - 1,
+            ..Queue::default()
+        }),
         wake_workers: Condvar::new(),
         changes: Mutex::default(),
         claude: RwLock::new(None),

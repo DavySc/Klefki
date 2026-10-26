@@ -271,6 +271,7 @@ fn background_checks_klefki_runs_itself_run_three_at_once_and_claude_codes_one()
             job("d3", true),
         ]
         .into(),
+        background_limit: 3,
         ..Queue::default()
     };
     let mut taken = Vec::new();
@@ -315,4 +316,121 @@ fn background_checks_of_servers_klefki_starts_are_not_taken_into_a_list() {
         );
     }
     assert!(env.lists().is_empty() && env.gets().is_empty());
+}
+
+#[test]
+fn a_server_switched_off_where_it_runs_is_never_started_by_klefki() {
+    // "Check now" on a switched-off server: Claude Code answers "Disabled" without starting it, so Klefki does not
+    // start it either. A local server off in its project, and a user server off in the home folder's entry.
+    let tmp = tempfile::tempdir().unwrap();
+    let local_dump = tmp.path().join("local.json");
+    let user_dump = tmp.path().join("user.json");
+    let project = tmp.path().join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    let key = project.to_string_lossy().into_owned();
+    let env = env_with(serde_json::json!({}));
+    let home = env.dir.path().join("home").to_string_lossy().into_owned();
+    std::fs::write(
+        env.dir.path().join("cfg").join(".claude.json"),
+        serde_json::json!({
+            "mcpServers": {"u": server("ok", &user_dump)},
+            "projects": {
+                key.clone(): {"mcpServers": {"loc": server("ok", &local_dump)}, "disabledMcpServers": ["loc"]},
+                home: {"disabledMcpServers": ["u"]}}})
+        .to_string(),
+    )
+    .unwrap();
+    let core = start_direct(&env, true);
+    let events = check(&core, local_id("loc", &key));
+    assert!(!answers(&events, "loc").last().unwrap().2);
+    let events = check(&core, user_id("u"));
+    assert!(!answers(&events, "u").last().unwrap().2);
+    assert!(!started(&local_dump), "the local server was not started");
+    assert!(!started(&user_dump), "the user server was not started");
+}
+
+#[test]
+fn a_server_switched_off_after_the_check_was_queued_is_not_started() {
+    // The row was on when the check was made; the file says off by the time it runs.
+    let tmp = tempfile::tempdir().unwrap();
+    let dump = tmp.path().join("dump.json");
+    let env = env_with(serde_json::json!({"mcpServers": {"s": server("ok", &dump)}}));
+    let home = env.dir.path().join("home").to_string_lossy().into_owned();
+    let paths = env.config().paths.unwrap();
+    let found = crate::config::inventory::launch_entry(&paths, &home, false, "s").unwrap();
+    assert!(!found.disabled);
+    let mut json = config_json(&env);
+    json["projects"] = serde_json::json!({home.clone(): {"disabledMcpServers": ["s"]}});
+    std::fs::write(&paths.claude_json, json.to_string()).unwrap();
+    let found = crate::config::inventory::launch_entry(&paths, &home, false, "s").unwrap();
+    assert!(found.disabled, "read again when the check runs");
+    // Off in another folder only: still on where it runs.
+    json["projects"] = serde_json::json!({"/elsewhere": {"disabledMcpServers": ["s"]}});
+    std::fs::write(&paths.claude_json, json.to_string()).unwrap();
+    let found = crate::config::inventory::launch_entry(&paths, &home, false, "s").unwrap();
+    assert!(!found.disabled);
+}
+
+#[test]
+fn a_check_the_user_asks_for_does_not_wait_behind_background_checks() {
+    // Background checks of servers that never answer take every worker but one, so "Check now" starts at once.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut servers: serde_json::Map<String, serde_json::Value> = (0..3)
+        .map(|i| {
+            (
+                format!("h{i}"),
+                server("hang", &tmp.path().join(format!("{i}.json"))),
+            )
+        })
+        .collect();
+    servers.insert("ok".into(), server("ok", &tmp.path().join("ok.json")));
+    let env = env_with(serde_json::json!({"mcpServers": servers}));
+    std::fs::write(
+        env.dir.path().join("cfg").join("settings.json"),
+        r#"{"env": {"MCP_TIMEOUT": "20000"}}"#,
+    )
+    .unwrap();
+    let core = start_with(
+        EngineConfig {
+            direct_checks: true,
+            ..env.config()
+        },
+        || {},
+    );
+    collect(&core, |_| {
+        (0..3)
+            .filter(|i| started(&tmp.path().join(format!("{i}.json"))))
+            .count()
+            >= 2
+    });
+    let asked = Instant::now();
+    let events = check(&core, user_id("ok"));
+    assert_eq!(answers(&events, "ok"), [(Status::Connected, None, true)]);
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+#[test]
+fn without_claude_code_klefki_starts_no_server_itself() {
+    // Claude Code not found: no check starts a server, as before.
+    let tmp = tempfile::tempdir().unwrap();
+    let dump = tmp.path().join("dump.json");
+    let env = env_with(serde_json::json!({"mcpServers": {"s": server("ok", &dump)}}));
+    let core = start_with(
+        EngineConfig {
+            direct_checks: true,
+            background_checks: false,
+            claude: None,
+            path_var: Some(OsString::new()),
+            ..env.config()
+        },
+        || {},
+    );
+    collect(&core, |e| e.iter().any(|x| matches!(x, Event::Snapshot(_))));
+    let events = check(&core, user_id("s"));
+    assert!(!answers(&events, "s").last().unwrap().2);
+    assert!(!started(&dump));
 }

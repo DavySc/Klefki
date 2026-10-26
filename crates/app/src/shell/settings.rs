@@ -110,7 +110,9 @@ impl ShellApp {
     /// Who checks the servers: Klefki first, or Claude Code only (decision 015).
     fn check_settings(&mut self, ui: &mut Ui) {
         let pal = theme::palette(ui.ctx());
-        ui.add_space(14.0);
+        ui.add_space(24.0);
+        ui.label(RichText::new("Checks").strong());
+        ui.add_space(6.0);
         if theme::checkbox(
             ui,
             &mut self.claude_only,
@@ -123,9 +125,10 @@ impl ShellApp {
         ui.add(
             egui::Label::new(
                 RichText::new(
-                    "Otherwise Klefki starts a server on your computer the way Claude Code would and asks it for \
-                     its tools, which is quicker and uses less memory. Claude Code checks every server that does not \
-                     connect that way, and every server that is reached by its address.",
+                    "When this is off, Klefki starts a server that runs on your computer itself, the way Claude \
+                     Code would, and asks it for its tools: quicker, and less memory. Claude Code still checks every \
+                     server that does not connect that way, and every server reached by its address. Turn it on to \
+                     have Claude Code check every server.",
                 )
                 .color(pal.text_muted),
             )

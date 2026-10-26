@@ -30,7 +30,19 @@ If a command can't run, report the work as **unverified**.
 - Never create entries in `project` scope (`Target` is `User | Local` only). Project servers are toggled through `disabledMcpServers` in the project entry of `~/.claude.json`, like every other server. The repository's `.claude/settings.local.json` is written only to approve a project server (`enabledMcpjsonServers`), after showing its full command.
 - Secrets live in the OS keyring, keyed by `ConnectionId`. No plaintext fallback. Never read `~/.claude/.credentials.json`.
 - Claude is spawned with no shell, no `.cmd` or `.bat`, and names matching `^[A-Za-z0-9_-]{1,64}$`. URLs opened are https only. TLS verification is always on.
-- Besides Claude, Klefki starts a user or local stdio server's own command, only to check it (decision 015): the servers its checks would have Claude Code start, as the inventory resolves them (enabled, loaded, not blocked), and only the definition the check was decided for; project servers stay with Claude Code. No shell: Klefki finds the program on the server's PATH itself, never in the working folder, and starts it by full path; on Windows a `.cmd` or `.bat` is checked through Claude. Its environment is Claude Code's (Klefki's minus what Claude Code removes, the settings files' `env`, the definition's with `${VAR}` filled in), never Claude Code's own credentials (`CLAUDE_CODE_OAUTH_TOKEN` and the like), passed only to the child, never in argv or logs. Klefki sends only Claude Code's hello (`server/discover` first, then `initialize` and `notifications/initialized` when the server does not answer it the newer way), one `tools/list`, and answers to the server's `ping` and `roots/list`; replies are untrusted (size-limited, sanitised). The whole process tree ends with the check. Any answer other than Connected is checked again with `claude mcp get`, and that answer is shown. The setting "Check servers with Claude Code only" turns it off.
+- Besides Claude, Klefki starts a user or local stdio server's own command, only to check it (decision 015).
+  Which: the servers its checks would have Claude Code start (enabled, loaded, not blocked, not switched off where it
+  runs, and only when Claude Code is found), only the definition the check was decided for; project servers stay
+  with Claude Code.
+  How: no shell; the program is found on the server's PATH, never in the working folder, and started by full path; on
+  Windows a `.cmd` or `.bat` is checked through Claude. Environment as Claude Code's (Klefki's minus what Claude Code
+  removes, the settings files' `env`, the definition's with `${VAR}` filled in), never Claude Code's own credentials
+  (`CLAUDE_CODE_OAUTH_TOKEN` and the like), only to the child, never in argv or logs. The process tree ends with it.
+  What is sent: only Claude Code's hello (`server/discover` first, then `initialize` and `notifications/initialized`
+  when the server does not answer the newer way), one `tools/list`, and answers to `ping` and `roots/list`; replies
+  are untrusted (size-limited, sanitised).
+  Fallback: any answer other than Connected is checked again with `claude mcp get`, and that answer is shown. The
+  setting "Check servers with Claude Code only" turns it off.
 - Network: only Klefki's own updates in `klefki-core` (decision 009): https to GitHub, and nothing trusted unless signed by the release key built in from `minisign.pub`. A downloaded package is installed or started only if its SHA-256 matches the signed `SHA256SUMS`. That key signs only in the `release` environment, behind the owner's required approval, for `v*` tags only the owner can create (`docs/RELEASING.md`).
 - `.mcp.json`, server metadata and CLI output are untrusted: size-limit, validate and sanitize them (ANSI, control and bidi characters).
 - Claude Code's MCP logs (`claude-cli-nodejs/<folder>/mcp-logs-<server>/`) are read only by `last_start.rs` (decision 013): names listed, at most a few files, only both ends of each, never written or deleted. They are untrusted, and what is shown or copied is sanitised with the server's own values and secret-looking text hidden.
