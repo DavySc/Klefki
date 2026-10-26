@@ -50,20 +50,32 @@ A server that wrote down its argv, folder, environment and every message it got:
 - **Folder:** the folder Claude Code was started in (Klefki: the home folder for user servers, the project for local
   ones).
 - **Environment**, in this order of who wins (later wins):
-  1. Klefki's own environment (Klefki passes it to `claude`).
-  2. The `env` of the settings files: the user's `settings.json`, the organisation's managed settings, and, **only
-     when the project's trust dialog was accepted** (`hasTrustDialogAccepted`), the project's `.claude/settings.json`
-     and `.claude/settings.local.json`. Untrusted, they never reached the server. Trusted, a real session
+  1. Klefki's own environment (Klefki passes it to `claude`), **minus what Claude Code removes** before it starts a
+     server: `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`,
+     `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR` and every `OTEL_*` variable (measured by the cross-review and re-run
+     here: the token was gone, `ANTHROPIC_API_KEY` stayed). Kept: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+     `AWS_BEARER_TOKEN_BEDROCK`, `GITHUB_TOKEN`, `ANTHROPIC_BASE_URL`, other `CLAUDE_CODE_*`, `MCP_TIMEOUT`. This list
+     can grow with each Claude Code version.
+  2. The `env` of the settings files, in this order (later wins): the user's `settings.json`; **only when the
+     project's trust dialog was accepted** (`hasTrustDialogAccepted`), the project's `.claude/settings.json`, then its
+     `.claude/settings.local.json`; then the organisation's managed settings last. (That order is the one
+     `config/timeout.rs` measured for `MCP_TIMEOUT`; for `env` with the same key in two files it is not measured yet,
+     so slice 2 adds that case.) Untrusted, they never reached the server. Trusted, a real session
      (`claude -p`, one run) passed them on. `claude mcp get` did in one configuration and did not in another, on
      every run (the spike below). So for project settings, today's check is not a reliable picture of a session
-     either. (P4 saw them never reach the server with 2.1.308.)
+     either. (P4 saw them never reach the server with 2.1.308.) Open for slice 2: `timeout::limit` reads the
+     project's files without this trust rule; which of the two Claude Code follows for `MCP_TIMEOUT` in an untrusted
+     project needs one measurement, and both should then use the same rule.
   3. Claude Code's own: `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT`, `AI_AGENT`, `CLAUDE_PROJECT_DIR`,
      `CLAUDE_CODE_SESSION_ID` (a new id), `NoDefaultCurrentDirectoryInExePath=1`, `COREPACK_ENABLE_AUTO_PIN=0`,
      `LC_CTYPE`.
-  4. The definition's `env`, with `${VAR}` and `${VAR:-default}` expanded. Expansion sees the settings files' `env`
-     too: `${FROM_USER_SETTINGS}` and `${FROM_MANAGED}` in `args` were filled in. An unset `${VAR}` stays as
-     written (P3).
-- **Program lookup:** on the PATH the server is given, its own `env.PATH` included (P3).
+  4. The definition's `env`, with `${VAR}` and `${VAR:-default}` expanded in command, `args` and `env`. Expansion
+     sees steps 1 and 2 (`${FROM_USER_SETTINGS}` and `${FROM_MANAGED}` in `args` were filled in) but **not** step 3:
+     `${CLAUDECODE:-nope}` and `${CLAUDE_PROJECT_DIR:-nope}` gave `nope`. A variable that is set but empty beats the
+     default (`${EMPTY:-dflt}` gave an empty string, from the environment and from settings). An unset `${VAR}` with
+     no default stays as written (P3).
+- **Program lookup:** on the PATH the server is given, its own `env.PATH` included (P3). A file there without a
+  `#!` line is refused (`ENOEXEC: posix_spawn`); Claude Code never runs it through a shell.
 - `claude mcp get` itself prints the definition's values unexpanded, and `${VAR:-default}` without its default.
 
 ## The guarantees today's check gives, and what a direct check keeps
@@ -74,16 +86,17 @@ A server that wrote down its argv, folder, environment and every message it got:
 | G2 | Policy (`allowedMcpServers`, `deniedMcpServers`) | **Keeps** | The inventory's blocked-by-policy (decision 010) already gates checks. |
 | G3 | On or off where it runs (`disabledMcpServers`) | **Keeps** | Same: only enabled rows are checked. |
 | G4 | A project server waiting for approval is not run | **Keeps** | Project servers stay check-on-request, approved only, full command shown first. |
-| G5 | The environment Claude Code gives the server | **Recovers**, with care | Build it in core from the same four sources, in the order above. The spike agreed with Claude Code on all of them, and on project settings it matches a session better than `mcp get` does. `timeout.rs` already reads the same settings files (for `MCP_TIMEOUT`); it reads only one key today, the whole `env` object is new. The trust rule and Claude Code's own variables are measured facts that can change between versions. |
-| G6 | The program is found the way Claude Code finds it | **Keeps on Linux and macOS**; **Windows open** | Unix: run the program name with the final PATH (Rust's `Command` searches the child's PATH when it is set). Windows: Claude Code runs a bare `npx` (decision 003), which is `npx.cmd`; a direct check would need `cmd.exe`. Proposed: hand `.cmd` and `.bat` to Claude Code until measured on Windows (see safety). |
+| G5 | The environment Claude Code gives the server | **Recovers**, with care | Build it in core from the same four sources, in the order above, with the variables Claude Code removes taken out (a test per name). The spike agreed with Claude Code on all of the cases it tried, and on project settings it matches a session better than `mcp get` does (resting on one `claude -p` run). `timeout.rs` already reads the same settings files (for `MCP_TIMEOUT`); it reads only one key today, the whole `env` object is new. The trust rule and Claude Code's own variables are measured facts that can change between versions. |
+| G6 | The program is found the way Claude Code finds it | **Keeps on Linux and macOS**; **Windows open** | Klefki looks the program up itself on the final PATH (never in the working folder) and starts it by its full path. Not by name: with a name, Rust's `Command` goes through glibc `execvp`, which runs a file without `#!` through `/bin/sh`, where Claude Code refuses it (shown by the cross-review). That would be a shell, and a false green. A full path that is not a valid program fails with `ENOEXEC`, like Claude Code. Windows: Claude Code runs a bare `npx` (decision 003), which is `npx.cmd`; a direct check would need `cmd.exe`. Proposed: hand `.cmd` and `.bat` to Claude Code until measured on Windows (see safety). |
 | G7 | It starts in the right folder | **Keeps** | The folder Klefki already picks (`checks::where_to_run`). |
-| G8 | The MCP handshake Claude Code does | **Keeps** | Send `initialize` (`2025-11-25`), `notifications/initialized`, `tools/list`. A server that speaks only the newer protocol refuses `initialize` (spike: Claude Code connected, the direct check failed); the hybrid then asks Claude Code. Slice 2 should send `server/discover` first, as Claude Code does, so that such a server is found Connected directly. |
+| G8 | The MCP handshake Claude Code does | **Keeps** | As Claude Code: `server/discover` first; with a usable answer (`supportedVersions` holding `2026-07-28`) only `tools/list` with the protocol in `_meta`, otherwise `initialize` (`2025-11-25`), `notifications/initialized`, `tools/list`. The spike sent only the older handshake, so a server that speaks only the newer protocol failed there while Claude Code connected; slice 2 sends `server/discover` first. |
 | G9 | Claude Code's time limit (`MCP_TIMEOUT`, where it is set) | **Keeps** | `timeout::limit` already gives it; "Check again with 2 minutes" works the same. |
-| G10 | Nothing it started outlives the check | **Keeps, stronger** | `cli/tree.rs` ends the whole process group or job object. Claude Code ends only the server, not what that started. |
+| G10 | Nothing it started outlives the check | **Keeps, stronger** | `cli/tree.rs` ends the whole process group or job object. Claude Code ends only the server, not what that started. A child that leaves the group (`setsid`) escapes either way, as today. |
 | G11 | HTTP and SSE servers: reachable, signed in (OAuth tokens in Claude Code's store), `headersHelper` | **Loses** | Klefki never reads Claude Code's tokens and makes no network calls of its own outside updates. These stay with Claude Code. The planned network probe (roadmap 6) explains failures but gives no verdict. |
 | G12 | Plugin servers, organisation servers, claude.ai connectors | **Nothing to lose** | Not checked in the background today either (only user and local rows are). |
 | G13 | The installed Claude Code version can start it (new behaviour in a new version, new variables, new protocol) | **Loses for servers found Connected** | Partly recovered: a failure always goes to Claude Code; "Check with Claude Code", Diagnose and Diagnose in a project stay on Claude Code; the last starts (P1) show how real sessions went. A parity run per Claude Code version (in the spike, then by hand on new versions) catches drift. |
-| G14 | A red or orange status is Claude Code's own word | **Keeps (hybrid only)** | Every answer other than Connected is re-checked with `claude mcp get`, and that answer is shown. Failures are rare, so this costs little. |
+| G14 | A red or orange status is Claude Code's own word | **Keeps (hybrid only)** | Every answer other than Connected is re-checked with `claude mcp get`, and that answer is shown. Failures are rare, so this costs little, except for a server that hangs: it waits the limit twice (60 s at the default, against 30 s today). Slice 3: the row shows the direct answer at once ("No answer in 30 s; asking Claude Code…") while the re-check runs, so the user sees something after the first limit. |
+| G15 | Claude Code's own credentials never reach a server | **Keeps, by rule** | Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN` and the others listed above. The direct check removes the same list (B1 of the review). New Claude Code versions are re-probed for additions as part of the parity run. |
 
 The one guarantee that changes in kind is G13: a green "Connected" would be "it answered when Klefki started it the
 way Claude Code does" and no longer "Claude Code connected to it". The Status tab should say which ("Checked by
@@ -93,7 +106,7 @@ Klefki" / "Checked by Claude Code") so nobody has to guess.
 
 1. **Hybrid: direct check first, Claude Code for everything else.** Direct for enabled, loaded user and local stdio
    servers (and approved project servers on request); Claude Code for every answer other than Connected, HTTP/SSE,
-   `.cmd`/`.bat` on Windows, sign-in, Diagnose and on request. Keeps G1-G10 and G14, loses G11 (unchanged: those stay
+   `.cmd`/`.bat` on Windows, sign-in, Diagnose and on request. Keeps G1-G10, G14 and G15, loses G11 (unchanged: those stay
    on Claude Code) and weakens G13 for green rows only. Gain: the common case (servers that work) never starts
    Claude Code. Cost: an MCP stdio client and an environment builder in core (L, two or three slices). The same
    client is what the tools view (roadmap 3, already approved in full) needs, so that work is shared.
@@ -140,14 +153,18 @@ servers. `MCP_TIMEOUT` was 4000 in the user's settings so that the hanging serve
 | unset `${VAR}` stays as written | Connected | Connected | yes |
 | `${VAR:-default}` | Connected | Connected | yes |
 | `${HOME}` in its `env` | Connected | Connected | yes |
-| program only on its own `env.PATH` | Connected | Connected | yes |
+| program only on its own `env.PATH` (re-run with a `#!` line; the recorded run's file had none, and both failed) | Connected | Connected | yes |
 | program not found | Failed (`ENOENT`) | Failed (could not start) | yes |
 | local server needing the project's `settings.json` `env`, project trusted | **Failed** | Connected | no: a session passes the value on, so the direct check is the right one |
 | the same with `settings.local.json` | **Failed** | Connected | no: same |
 | both of those, project not trusted | Failed | Failed | yes |
 
-23 of 25 agree. The two that do not are the ones the direct check gets right and `claude mcp get` does not.
-The newer-protocol one is handled by the hybrid until slice 2 sends `server/discover`.
+25 rows, 26 runs (the last row is two). 23 runs agree; three do not. Two of those are the trusted-project rows,
+where the direct check gets it right and `claude mcp get` does not. The newer-protocol one is handled by the hybrid
+until slice 2 sends `server/discover`. The spike also had two faults the cross-review found, both fixed in the text
+above before slice 2: it passed on Claude Code's own credentials (G15), and it started programs by name, so a file
+without `#!` could run through `/bin/sh` (G6). Its `${VAR}` expansion also saw Claude Code's own variables, which
+Claude Code's does not.
 
 Other things the spike showed:
 - A child the server starts (`sleep 300` here) outlived a plain `claude mcp get` in 3 of 3 runs, and was ended by
@@ -171,13 +188,19 @@ downloading with `npx -y`) are the same as today. What changes is who builds the
   check takes the same gate as today's (`where_to_run`, `not_loaded`, enabled, scope), one test per refusal, and
   parity tests against Claude Code's verdicts.
 - **No shell.** The command is run directly with its arguments as argv entries, as today's `claude` spawn is. Server
-  names never reach a command line (the direct check does not need the name at all).
+  names never reach a command line (the direct check does not need the name at all). Klefki resolves the program
+  itself and starts it by its full path: started by name, glibc's `execvp` runs a file without `#!` through
+  `/bin/sh`. On Windows the same resolver (with `PATHEXT`) is needed to tell a `.cmd` apart at all, since Rust
+  appends only `.exe` and also searches Klefki's own folder first.
 - **Windows.** `npx`, `pnpm` and the like are `.cmd` files; running one needs `cmd.exe`, the source of the
   argument-injection bugs this project fixed in v1. Rust's standard library now escapes arguments for `.cmd` and
   `.bat` and refuses those it cannot escape safely, but parity with Claude Code there is unmeasured. Proposed for the
   first slices: a command that resolves to `.cmd` or `.bat` is checked by Claude Code. Also, like Claude Code
   (`NoDefaultCurrentDirectoryInExePath=1`), never look for the program in the working folder: a repository could
   plant an `npx.exe` there.
+- **Claude Code's credentials.** Klefki's environment is passed on minus what Claude Code removes
+  (`CLAUDE_CODE_OAUTH_TOKEN`, its file-descriptor twin, `CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR`, `OTEL_*`), so a
+  token from `claude setup-token` never reaches a server. One test per name.
 - **Secrets in the environment.** A stdio server's `env` values are already plain text in `.claude.json`, and the
   settings files' `env` may hold tokens. They go only into the child's environment: never argv, never logs, never
   the Activity log, never shown. `MCP_CLIENT_SECRET` is never passed on (the runner already removes it). The child
@@ -201,11 +224,13 @@ line under Invariants (flagged for review), next to the existing one:
 
 > - Besides Claude, Klefki starts a stdio server's own command, only to check it (and for the tools view): the
 >   servers today's checks have Claude Code start, as the inventory resolves them (enabled, loaded, not blocked; a
->   project server only on request, approved, its full command shown first). No shell, never found in the working
->   folder; on Windows a `.cmd` or `.bat` is checked through Claude. Its environment is Claude Code's (Klefki's, the
->   settings files' `env`, the definition's with `${VAR}` expanded), passed only to the child, never in argv or logs.
->   Only `initialize`, `notifications/initialized` and `tools/list` are sent; replies are untrusted (size-limited,
->   sanitised). The whole process tree ends with the check. Any answer other than Connected is checked again with
+>   project server only on request, approved, its full command shown first). No shell: Klefki finds the program on
+>   the PATH itself, never in the working folder, and starts it by full path; on Windows a `.cmd` or `.bat` is
+>   checked through Claude. Its environment is Claude Code's (Klefki's minus what Claude Code removes, the settings
+>   files' `env`, the definition's with `${VAR}` expanded), never with Claude Code's own credentials
+>   (`CLAUDE_CODE_OAUTH_TOKEN` and the like), passed only to the child, never in argv or logs. Only Claude Code's
+>   handshake (`server/discover`, or `initialize` and `notifications/initialized`) and `tools/list` are sent; replies
+>   are untrusted (size-limited, sanitised). The whole process tree ends with the check. Any answer other than Connected is checked again with
 >   `claude mcp get`, and that answer is shown.
 
 Decision 014's sentence would get a note pointing at the new decision.
@@ -218,8 +243,12 @@ Decision 014's sentence would get a note pointing at the new decision.
    peak memory per check on Linux; ask the owner for one Windows run. Outcome: a verdict-agreement table and a
    go/no-go.
 2. **Core client and environment (M).** `mcp/stdio.rs` (handshake, limits, timeout, tree end) and
-   `config/server_env.rs` (settings `env` in Claude Code's order with the trust rule, Claude Code's own variables,
-   `${VAR}` expansion shared with pre-flight). Tests from the measured facts; fixtures from 2.1.310. No app change.
+   `config/server_env.rs` (settings `env` in Claude Code's order with the trust rule, the variables Claude Code
+   removes, Claude Code's own variables, `${VAR}` expansion against steps 1-2 only, shared with pre-flight), and a
+   program resolver that walks the final PATH (`PATHEXT` on Windows, never the working folder) and returns a full
+   path. `server/discover` before `initialize`. Tests from the measured facts, including one per removed variable, a
+   file without `#!`, and the same key in two settings files; fixtures from 2.1.310. Open: the trust rule for
+   `MCP_TIMEOUT` (G5 note). No app change.
 3. **Hybrid in the engine (M).** Route eligible checks to the direct client, confirm non-Connected answers with
    `claude mcp get` (batched with `mcp list` as today), raise the cap for direct checks, the "Claude Code only"
    setting, "Checked by Klefki/Claude Code" on the Status tab, the CLAUDE.md line and a decision record. Look and

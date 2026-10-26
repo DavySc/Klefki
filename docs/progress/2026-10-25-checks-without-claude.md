@@ -20,6 +20,15 @@ ask the owner to decide. Research only: no code, test or invariant changed.
 - One `claude -p hi` run was made to see a real session's environment; it made one model request through the
   container's sign-in. Not repeated.
 
+## Cross-review of #107
+- B1: Claude Code removes `CLAUDE_CODE_OAUTH_TOKEN`, two `*_FILE_DESCRIPTOR` variables and `OTEL_*` before starting a
+  server (re-run here: token gone, `ANTHROPIC_API_KEY` kept); now in the environment rules, G15, safety and the
+  invariant line. B2: start programs by full path, resolved by Klefki (glibc `execvp` runs a file without `#!` through
+  `/bin/sh`). D1-D5: `ownpath` row re-run with `#!`, 3 of 26 runs disagree, handshake wording, settings order
+  (managed last), `${VAR}` does not see Claude Code's own variables and set-but-empty beats the default. Should-fix:
+  timeout trust rule left open for slice 2, a hang waits twice (slice 3 shows the direct answer meanwhile), one-run
+  caveat, `setsid`.
+
 ## Checks
 - Measurements: scratch Python scripts against `claude mcp get`, `claude mcp list` and a direct handshake, throwaway
   `HOME` and `CLAUDE_CONFIG_DIR`; numbers in the proposal.
