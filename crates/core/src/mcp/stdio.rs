@@ -42,7 +42,9 @@ const MAX_STDERR: usize = 16 * 1024;
 const STDERR_LINES: usize = 3;
 const MAX_REASON: usize = 300;
 /// Messages read ahead of the conversation, at most: each at most [`MAX_LINE`].
-const QUEUE: usize = 4;
+const QUEUE: usize = 1;
+/// Messages waiting to be written, at most. A server that does not read them is treated as closed.
+const OUT_QUEUE: usize = 16;
 
 const MODERN: &str = "2026-07-28";
 const LEGACY: &str = "2025-11-25";
@@ -108,7 +110,7 @@ pub(crate) fn check(launch: &Launch, limit: Duration, claude_version: &str) -> O
     let messages = child.stdout.take().map(read_messages);
     let stderr = child.stderr.take().map(read_tail);
     let mut talk = Talk {
-        input: child.stdin.take(),
+        input: child.stdin.take().map(write_messages),
         messages,
         roots: roots_answer(launch),
     };
@@ -133,7 +135,8 @@ pub(crate) fn check(launch: &Launch, limit: Duration, claude_version: &str) -> O
 
 /// The conversation with one server.
 struct Talk {
-    input: Option<ChildStdin>,
+    /// Lines for [`write_messages`]' thread.
+    input: Option<SyncSender<Vec<u8>>>,
     messages: Option<Receiver<Value>>,
     /// The answer to `roots/list`.
     roots: Value,
@@ -256,16 +259,13 @@ impl Talk {
         }
     }
 
-    /// Writes one message. A server that stopped reading shows as closed when its answer is waited for.
+    /// Writes one message, never waiting: a server that stopped reading (its pipe and [`OUT_QUEUE`] full) or went
+    /// away gets nothing more, and its answer is waited for until the limit.
     fn send(&mut self, message: &Value) {
-        let Some(input) = &mut self.input else { return };
-        let mut text = message.to_string();
-        text.push('\n');
-        if input
-            .write_all(text.as_bytes())
-            .and_then(|()| input.flush())
-            .is_err()
-        {
+        let Some(input) = &self.input else { return };
+        let mut text = message.to_string().into_bytes();
+        text.push(b'\n');
+        if input.try_send(text).is_err() {
             self.input = None;
         }
     }
@@ -434,8 +434,24 @@ fn last_lines(tail: &[u8], hidden: &[String]) -> String {
     lines[lines.len().saturating_sub(STDERR_LINES)..].join("\n")
 }
 
-/// Reads the server's output on a thread of its own: each line that is a JSON value, at most [`MAX_LINE`] long, in
-/// order. The channel closes when the output does.
+/// Writes to the server's input on a thread of its own, so that a full pipe never holds up the check. The input is
+/// closed once the sender is dropped and what was queued is written, or when a write fails (the server is gone or
+/// its tree was ended).
+fn write_messages(mut input: ChildStdin) -> SyncSender<Vec<u8>> {
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUT_QUEUE);
+    std::thread::spawn(move || {
+        for line in rx {
+            if input.write_all(&line).and_then(|()| input.flush()).is_err() {
+                return;
+            }
+        }
+    });
+    tx
+}
+
+/// Reads the server's output on a thread of its own: each line that is a JSON object, at most [`MAX_LINE`] long, in
+/// order. The channel closes when the output does. Like the error output's reader, it ends when the pipe closes: a
+/// process that left the tree (`setsid`) and keeps the pipe open keeps the thread until it ends too.
 fn read_messages<R: Read + Send + 'static>(out: R) -> Receiver<Value> {
     let (tx, rx) = mpsc::sync_channel(QUEUE);
     std::thread::spawn(move || read_lines(BufReader::new(out), &tx));
@@ -465,7 +481,10 @@ fn read_lines<R: BufRead>(mut reader: R, tx: &SyncSender<Value>) {
         }
         reader.consume(used);
         if done {
+            // Only an object can be a message: anything else is skipped before it costs a parse.
+            let object = line.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
             if !too_long
+                && object
                 && let Ok(message) = serde_json::from_slice::<Value>(&line)
                 && tx.send(message).is_err()
             {

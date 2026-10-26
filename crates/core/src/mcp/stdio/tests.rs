@@ -359,25 +359,38 @@ fn a_program_that_cannot_be_started_failed() {
 }
 
 #[test]
-fn reading_skips_long_lines_and_what_is_not_json() {
+fn reading_skips_long_lines_and_what_is_not_a_json_object() {
     let (tx, rx) = mpsc::sync_channel(16);
+    // An object line of exactly `len` bytes.
+    let object = |len: usize| {
+        let mut line = b"{\"s\": \"".to_vec();
+        line.extend(vec![b'y'; len - line.len() - 2]);
+        line.extend_from_slice(b"\"}\n");
+        line
+    };
     let mut input = Vec::new();
     input.extend_from_slice(b"not json\n");
-    input.extend_from_slice(&vec![b'x'; MAX_LINE + 1]);
-    input.extend_from_slice(b"\n{\"a\": 1}\n");
-    let mut long = b"\"".to_vec();
-    long.extend(vec![b'y'; MAX_LINE - 2]);
-    long.extend_from_slice(b"\"\n");
-    input.extend_from_slice(&long);
-    input.extend_from_slice(b"[2]\n{\"unterminated\": 3}");
+    input.extend(object(MAX_LINE + 1));
+    input.extend_from_slice(b"{\"a\": 1}\n");
+    input.extend(object(MAX_LINE));
+    input.extend_from_slice(b"[2]\n\"text\"\n3\n  {\"b\": 2}\n{\"unterminated\": 3}");
     // A reader with a small buffer, so lines cross its fills.
     read_lines(BufReader::with_capacity(7, input.as_slice()), &tx);
     drop(tx);
     let got: Vec<Value> = rx.into_iter().collect();
-    assert_eq!(got.len(), 3, "the line of exactly MAX_LINE bytes is read");
+    assert_eq!(
+        got.len(),
+        3,
+        "{:?}",
+        got.iter().map(|v| v.to_string().len()).collect::<Vec<_>>()
+    );
     assert_eq!(got[0], json!({"a": 1}));
-    assert_eq!(got[1].as_str().map(str::len), Some(MAX_LINE - 2));
-    assert_eq!(got[2], json!([2]));
+    assert_eq!(
+        got[1]["s"].as_str().map(str::len),
+        Some(MAX_LINE - 9),
+        "a line of exactly MAX_LINE bytes is read"
+    );
+    assert_eq!(got[2], json!({"b": 2}));
 }
 
 #[test]
@@ -494,4 +507,19 @@ fn a_server_started_from_its_definition_gets_claude_codes_environment_and_folder
         os: Os::HERE,
     });
     assert_eq!(refused.err(), Some(NotStarted::NotStdio));
+}
+
+/// Found in review: answers to a server that asks and never reads filled the pipe, the write blocked, and the check
+/// never ended.
+#[test]
+fn a_server_that_asks_without_reading_its_answers_still_ends_at_the_limit() {
+    for mode in ["floodping", "floodroots"] {
+        let s = Server::new();
+        let limit = Duration::from_millis(1500);
+        let out = check(&s.launch(&[mode]), limit, "2.1.310");
+        verdict(&out, Verdict::TimedOut, "did not answer within 1.5 s");
+        assert!(out.took < limit + Duration::from_secs(3), "{mode}: {out:?}");
+        let server: u32 = s.dumped()["pid"].as_u64().unwrap().try_into().unwrap();
+        assert!(gone_soon(server), "{mode}: the server is still running");
+    }
 }

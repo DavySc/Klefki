@@ -59,6 +59,25 @@ fn main() {
             }
             std::process::exit(3);
         }
+        "floodping" | "floodroots" => {
+            // Asks again and again and never reads its input, so the answers fill the pipe.
+            let method = if mode == "floodping" {
+                "ping"
+            } else {
+                "roots/list"
+            };
+            let mut out = std::io::stdout().lock();
+            for i in 0..200_000 {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    json!({"jsonrpc": "2.0", "id": i, "method": method})
+                );
+            }
+            let _ = out.flush();
+            std::thread::sleep(Duration::from_secs(300));
+            return;
+        }
         "spam" => {
             for i in 0..2000 {
                 say(

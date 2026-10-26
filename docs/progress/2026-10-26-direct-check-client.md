@@ -51,6 +51,17 @@ engine change; the engine takes it up in slice 3, with the CLAUDE.md invariant l
   warns about `${1X}`-style references, which Claude Code never fills in. Changing that changes pre-flight findings,
   so it belongs with slice 3's engine work.
 
+- Only the first `tools/list` page is read. Whether Claude Code follows `nextCursor` (and fails on a bad second
+  page) is unmeasured; slice 3 or the tools view should measure it.
+
+## Review (round 1, Opus cross-review)
+- B1 fixed: a server that asks (`ping`, `roots/list`) and never reads its input filled the pipe, the write blocked
+  and the check never ended (reproduced: the new test hung until killed). Writes now go through a thread with a
+  bounded queue; a full queue counts as closed. Regression tests: `floodping` and the variant `floodroots`.
+- N1: lines that do not start with `{` are skipped before parsing, and the read-ahead queue is 1.
+- N2: a whole-number float in settings is written as JavaScript writes it (`1.0` is `1`, `-0.0` is `0`).
+- N3: commented (reader threads end with the pipe, as G10 accepts). N4: noted above.
+
 ## Checks
 See the pull request for the commands and results.
 

@@ -116,7 +116,13 @@ fn js_string(value: &Value) -> String {
         Value::String(s) => s.clone(),
         Value::Null => "null".to_owned(),
         Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
+        Value::Number(n) => match n.as_f64() {
+            // A whole number below 1e21 has no fraction in JavaScript: `1.0` is `1`.
+            // `-0` too is `0`.
+            Some(f) if n.is_f64() && f == 0.0 => "0".to_owned(),
+            Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < 1e21 => format!("{f:.0}"),
+            _ => n.to_string(),
+        },
         Value::Object(_) => "[object Object]".to_owned(),
         // An array's items are joined with commas, `null` as nothing.
         Value::Array(items) => items

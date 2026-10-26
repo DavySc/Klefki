@@ -195,13 +195,17 @@ fn a_settings_value_that_is_not_text_is_passed_as_javascript_writes_it() {
     let p = Place::new();
     p.write(
         "cfg/settings.json",
-        &json!({"env": {"N": 5, "F": 2.5, "B": true, "Z": null, "O": {"a": 1}, "L": [1, null, "x"]}}),
+        &json!({"env": {"N": 5, "F": 2.5, "W": 1.0, "M": -3.0, "Z0": -0.0, "E": 1e21, "B": true, "Z": null, "O": {"a": 1}, "L": [1, null, "x"]}}),
     );
     assert_eq!(
         settings_env(&p.paths(), None),
         strings(&[
             ("N", "5"),
             ("F", "2.5"),
+            ("W", "1"),
+            ("M", "-3"),
+            ("Z0", "0"),
+            ("E", "1e+21"),
             ("B", "true"),
             ("Z", "null"),
             ("O", "[object Object]"),
