@@ -413,8 +413,6 @@ impl ShellApp {
         }
     }
 
-    /// Shows `page`. The Activity log, Claude Desktop's servers and the Secrets page are read each time they are
-    /// opened and let go when they are left.
     /// egui keeps a text selection by the label's place, and the detail panel's labels keep their places when another
     /// server is picked: ↓ would leave the selection (or a click's empty one) on the next server's text, unseen, and
     /// Ctrl+C would copy that label whole. So the selection goes when the page, the servers picked or the tab change.
@@ -429,6 +427,8 @@ impl ShellApp {
         self.shown_for_selection = (self.page, self.selected.clone(), self.tab);
     }
 
+    /// Shows `page`. The Activity log, Claude Desktop's servers and the Secrets page are read each time they are
+    /// opened and let go when they are left.
     fn go(&mut self, page: Page) {
         if page == Page::ActivityLog {
             if self.activity.is_none() {
