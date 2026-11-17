@@ -97,15 +97,12 @@ impl<'a> Probe<'a> {
         let Ok(meta) = std::fs::metadata(path) else {
             return false;
         };
-        if !meta.is_file() {
-            return false;
-        }
         #[cfg(unix)]
         if !self.windows {
             use std::os::unix::fs::PermissionsExt;
-            return meta.permissions().mode() & 0o111 != 0;
+            return meta.is_file() && meta.permissions().mode() & 0o111 != 0;
         }
-        true
+        meta.is_file()
     }
 }
 

@@ -46,3 +46,5 @@ before.
 - Ctrl+A selects all of one label (egui's behaviour), not a whole page or dialog.
 - No right-click Copy on selected text (egui has no such menu for labels); Ctrl+C and ⌘C work.
 - Tooltips hold selectable text, so egui keeps a tooltip open while the pointer is on it (as WCAG 1.4.13 asks).
+- CI on Windows: clippy 1.100 (`stable` moved) flags `needless_bool` in `preflight.rs` `is_program`, where the
+  `#[cfg(unix)]` block disappears; main has the same failure. Rewritten to end in `meta.is_file()`, same behaviour.
