@@ -107,10 +107,156 @@ fn right_clicking_a_row_offers_its_name_and_target_to_copy() {
         show_rows(&mut h, &engine, vec![a, b]);
         h.get_by_label("beta").click_secondary();
         h.run();
+        assert_eq!(
+            h.state().menu_row,
+            Some(1),
+            "{item}: the row the menu is for is marked"
+        );
         h.get_by_label(item).click();
         h.step();
         assert_eq!(copied(&h), [expected], "{item}");
         h.run();
         assert!(h.query_by_label(item).is_none(), "{item}: the menu closes");
+        assert_eq!(
+            h.state().menu_row,
+            None,
+            "{item}: and the mark goes with it"
+        );
+        let what = if item == "Copy name" {
+            "name"
+        } else {
+            "target"
+        };
+        h.get_by_label_contains(&format!("Copied the {what} of beta."));
     }
+}
+
+/// The palette copies them too, for whoever works from the keyboard: typed and run with Enter, or clicked.
+#[test]
+fn the_palette_copies_the_selected_servers_name_and_target() {
+    for (entry, what, expected) in [
+        ("Copy name of beta", "name", "beta"),
+        ("Copy target of beta", "target", "npx something"),
+    ] {
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        show_rows(&mut h, &engine, vec![a, b]);
+        click(&mut h, "beta");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        h.run();
+        *h.state_mut().command.query_mut() = entry.to_owned();
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        assert!(!h.state().command.is_open());
+        h.get_by_label_contains(&format!("Copied the {what} of beta."));
+
+        let (mut h, engine) = live_harness();
+        let (a, b) = two_rows();
+        show_rows(&mut h, &engine, vec![a, b]);
+        click(&mut h, "beta");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+        h.run();
+        h.event(egui::Event::Text("of beta".to_owned()));
+        h.run();
+        h.get_by_label(entry).click();
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            h.step();
+            got.extend(copied(&h));
+        }
+        assert_eq!(got, [expected], "{entry}");
+    }
+}
+
+/// Saying "Copied" never takes the place of a message that offers something, such as Undo.
+#[test]
+fn copying_keeps_a_message_that_offers_undo() {
+    let (mut h, engine) = live_harness();
+    let (a, b) = two_rows();
+    show_rows(&mut h, &engine, vec![a, b]);
+    let offer = Outcome {
+        undo: Some(Change::Delete {
+            id: h.state().snapshot.servers[0].id(),
+        }),
+        ..Outcome::done("Turned off alpha.".to_owned())
+    };
+    h.state_mut().outcome = Some(offer.clone());
+    h.get_by_label("beta").click_secondary();
+    h.run();
+    h.get_by_label("Copy name").click();
+    h.step();
+    assert_eq!(copied(&h), ["beta"]);
+    assert_eq!(
+        h.state().outcome.as_ref().map(|o| &o.text),
+        Some(&offer.text)
+    );
+}
+
+/// Clicks the middle of `rect`: a single click on text, which puts egui's text caret there.
+fn click_at(h: &mut Harness<'static, ShellApp>, rect: egui::Rect) {
+    h.hover_at(rect.center());
+    h.run();
+    h.drag_at(rect.center());
+    h.run();
+    h.drop_at(rect.center());
+    h.run();
+}
+
+fn copy(h: &mut Harness<'static, ShellApp>) -> String {
+    h.event(egui::Event::Copy);
+    h.step();
+    copied(h).concat()
+}
+
+/// A click (or a selection) in the detail panel, then the list moves on with ↓ or ↑: the next server's panel shows
+/// nothing selected, so Ctrl+C must copy nothing, not one of its texts unseen.
+#[test]
+fn moving_to_another_server_drops_the_text_selection() {
+    for (key, start, other) in [
+        (egui::Key::ArrowDown, "alpha", "beta"),
+        (egui::Key::ArrowUp, "beta", "alpha"),
+    ] {
+        for drag in [false, true] {
+            let (mut h, engine) = live_harness();
+            let (a, b) = two_rows();
+            show_rows(&mut h, &engine, vec![a, b]);
+            click(&mut h, start);
+            let target = text_rect(&h, "npx something");
+            if drag {
+                assert_eq!(drag_and_copy(&mut h, target), "npx something");
+            } else {
+                click_at(&mut h, target);
+            }
+            h.key_press(key);
+            h.run();
+            let want = usize::from(other == "beta");
+            assert_eq!(
+                h.state().selected.iter().copied().collect::<Vec<_>>(),
+                [want],
+                "{key:?} moved the list"
+            );
+            assert_eq!(
+                copy(&mut h),
+                "",
+                "{key:?}, drag {drag}: nothing is selected"
+            );
+        }
+    }
+}
+
+/// The same after going to another page and back.
+#[test]
+fn going_to_another_page_drops_the_text_selection() {
+    let (mut h, engine) = live_harness();
+    let (a, b) = two_rows();
+    show_rows(&mut h, &engine, vec![a, b]);
+    click(&mut h, "alpha");
+    let target = text_rect(&h, "npx something");
+    assert_eq!(drag_and_copy(&mut h, target), "npx something");
+    h.state_mut().go(Page::Settings);
+    h.run();
+    h.state_mut().go(Page::Connections);
+    h.run();
+    assert_eq!(copy(&mut h), "");
 }

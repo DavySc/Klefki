@@ -16,6 +16,8 @@ pub(crate) enum Action {
     Diagnose,
     /// Copy the line that opens the selected server in the MCP Inspector.
     CopyInspector,
+    /// Copy the selected server's name or target.
+    Copy(RowText),
     /// Copy the selected server's debug report.
     CopyDebugReport,
     Approve,
@@ -46,6 +48,13 @@ pub(crate) enum Action {
     NewProfile,
     /// The Profiles page, with where to use this profile taking the keyboard.
     UseProfile(String),
+}
+
+/// A server's text that can be copied whole from its row's menu or the palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowText {
+    Name,
+    Target,
 }
 
 pub(crate) struct Entry {

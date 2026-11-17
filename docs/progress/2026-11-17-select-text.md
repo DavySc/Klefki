@@ -42,6 +42,26 @@ before.
 - `cargo deny check`: exit 1, `advisories FAILED` on a yanked `async-executor` in Cargo.lock; this branch does not
   touch Cargo.lock, so main has the same failure. Bans, licenses, sources ok. Left for its own slice.
 
+## After the cross-review (review on f0ff129)
+- B1 (blocking, fixed): a click or selection in the detail panel, then ↓/↑ in the list, left egui's selection on
+  the next server's label (same place, same id; the arrow also moved its caret, so the range was empty) and Ctrl+C
+  copied that label whole, unseen. `ShellApp::drop_stale_text_selection` clears egui's `LabelSelectionState` when
+  the page, the servers picked or the detail tab change. Tests: `moving_to_another_server_drops_the_text_selection`
+  (↓ and ↑, after a click and after a drag; failed before: copied "npx something"),
+  `going_to_another_page_drops_the_text_selection`.
+- Polish folded in: the right-clicked row is drawn hovered while its menu is open (`menu_row`); Copy name / Copy
+  target say "Copied the name of beta." on the outcome message, unless that message offers something (Undo, sign
+  in) or is a problem (`copying_keeps_a_message_that_offers_undo`, seen failing with the guard removed); the
+  palette has "Copy name of X" and "Copy target of X" for the selected server, after the debug report and Inspector
+  entries so those stay in the first rows.
+- Left as follow-ups: icon glyphs (Private Use Area) end up in text copied from labels that start with an icon
+  (banner, notes, outcome titles); drawing them as separate labels moves text by the item spacing, so every look
+  picture with one changes. Copied key/value rows read "Project-" (egui joins labels without a space before
+  punctuation); a "Copy details" action would give clean lines.
+- Test gotcha: setting the palette's query with `command.query_mut()` and then clicking an entry closes the palette
+  without running it in kittest; typing with `Event::Text` works (as on main). Enter works either way.
+- Checks after: fmt, clippy (exit 0), `cargo test --workspace` 1849 passed, 0 failed.
+
 ## Not done / next
 - Ctrl+A selects all of one label (egui's behaviour), not a whole page or dialog.
 - No right-click Copy on selected text (egui has no such menu for labels); Ctrl+C and ⌘C work.
