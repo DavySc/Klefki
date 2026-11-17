@@ -441,8 +441,23 @@ pub(crate) fn style(style: &mut egui::Style) {
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.spacing.interact_size = egui::vec2(40.0, 34.0);
     style.spacing.text_edit_width = 240.0;
-    // Selectable labels swallow clicks meant for table rows.
-    style.interaction.selectable_labels = false;
+    // Any text can be selected with the mouse and copied, as in a browser. Places a click picks something (the
+    // list's rows, a header that opens) turn it off for their own text.
+    style.interaction.selectable_labels = true;
+}
+
+/// Draws `add` with text that cannot be selected: for places where a click picks something, so the text does not take
+/// the click (or a drag) for selecting.
+pub(crate) fn unselectable<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let was = std::mem::replace(&mut ui.style_mut().interaction.selectable_labels, false);
+    let inner = add(ui);
+    ui.style_mut().interaction.selectable_labels = was;
+    inner
+}
+
+/// A link. Its text is not selectable: it is clicked, and egui reads a selectable link out as plain text.
+pub(crate) fn link(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    unselectable(ui, |ui| ui.link(text))
 }
 
 /// Fonts, sizing and both themes' visuals. Done once at start-up.

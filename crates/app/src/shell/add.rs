@@ -897,7 +897,7 @@ impl AddForm {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new("Or").color(pal.text_muted));
-                    if ui.link(format!("import it as {free}")).clicked() {
+                    if theme::link(ui, format!("import it as {free}")).clicked() {
                         rename = Some((i, free));
                     }
                 });

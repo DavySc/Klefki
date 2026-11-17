@@ -1,6 +1,7 @@
 //! The server list: rows grouped by where they live, each row's name, badges and status, and the words they use.
 
 use super::{ShellApp, folder_name};
+use crate::command::RowText;
 use crate::explain::{self, Explanation};
 use crate::theme;
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Sense, Ui};
@@ -838,6 +839,8 @@ impl ShellApp {
         let ctrl = ui.input(|i| i.modifiers.command);
         let project_count = self.snapshot.project_count;
         let mut clicked = None;
+        let mut copy = None;
+        let mut menu_open = None;
         // Group headers may run across the row's empty cells, but no further than the table itself.
         let right = ui.max_rect().right();
         // Only the rows in view are drawn, so the ones drawn are the ones on screen.
@@ -847,58 +850,90 @@ impl ShellApp {
             rows.iter()
                 .position(|r| matches!(r, GridRow::Server(s) if *s == i))
         });
-        let mut table = TableBuilder::new(ui);
-        if let Some(at) = reveal {
-            table = table.scroll_to_row(at, Some(Align::Center));
-        }
-        table
-            .striped(true)
-            .sense(Sense::click())
-            .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::initial(220.0).at_least(120.0))
-            .column(Column::exact(64.0))
-            .column(Column::exact(176.0))
-            .column(Column::remainder().clip(true))
-            .header(32.0, |mut h| {
-                for t in ["Name", "Type", "Status", "Target"] {
-                    h.col(|ui| {
-                        ui.label(RichText::new(t).strong().color(pal.text_muted));
+        // A row is one click target: text in it would take the click (and a drag) for selecting. Its text is
+        // offered on a right click instead, and the detail panel shows it all, selectable.
+        theme::unselectable(ui, |ui| {
+            let mut table = TableBuilder::new(ui);
+            if let Some(at) = reveal {
+                table = table.scroll_to_row(at, Some(Align::Center));
+            }
+            table
+                .striped(true)
+                .sense(Sense::click())
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::initial(220.0).at_least(120.0))
+                .column(Column::exact(64.0))
+                .column(Column::exact(176.0))
+                .column(Column::remainder().clip(true))
+                .header(32.0, |mut h| {
+                    for t in ["Name", "Type", "Status", "Target"] {
+                        h.col(|ui| {
+                            ui.label(RichText::new(t).strong().color(pal.text_muted));
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(36.0, rows.len(), |mut row| match &rows[row.index()] {
+                        GridRow::Group(group) => {
+                            row.col(|ui| group_header(ui, group, right));
+                            for _ in 0..3 {
+                                row.col(|_| {});
+                            }
+                        }
+                        GridRow::Server(i) => {
+                            shown.push(*i);
+                            let s = &self.snapshot.servers[*i];
+                            row.set_selected(self.selected.contains(i));
+                            // The row a right-click menu is open for is marked, as it may not be the selected one.
+                            row.set_hovered(self.menu_row == Some(*i));
+                            let (status, detail) = self.effective(*i);
+                            let here = self.here(*i);
+                            row.col(|ui| name_cell(ui, s, status, project_count, here));
+                            row.col(|ui| {
+                                ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
+                            });
+                            let hint = self.hint(*i);
+                            let timing = self.timing(*i);
+                            let last_known = self.last_known(*i);
+                            row.col(|ui| {
+                                status_cell(
+                                    ui,
+                                    s,
+                                    (status, detail),
+                                    hint,
+                                    timing,
+                                    last_known,
+                                    here,
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.label(
+                                    RichText::new(&s.target).monospace().color(pal.text_muted),
+                                );
+                            });
+                            let response = row.response();
+                            if response.clicked() {
+                                clicked = Some(*i);
+                            }
+                            response.context_menu(|ui| {
+                                if let Some(asked) = copy_menu(ui) {
+                                    copy = Some((*i, asked));
+                                }
+                            });
+                            if response.context_menu_opened() {
+                                menu_open = Some(*i);
+                            }
+                        }
                     });
-                }
-            })
-            .body(|body| {
-                body.rows(36.0, rows.len(), |mut row| match &rows[row.index()] {
-                    GridRow::Group(group) => {
-                        row.col(|ui| group_header(ui, group, right));
-                        for _ in 0..3 {
-                            row.col(|_| {});
-                        }
-                    }
-                    GridRow::Server(i) => {
-                        shown.push(*i);
-                        let s = &self.snapshot.servers[*i];
-                        row.set_selected(self.selected.contains(i));
-                        let (status, detail) = self.effective(*i);
-                        let here = self.here(*i);
-                        row.col(|ui| name_cell(ui, s, status, project_count, here));
-                        row.col(|ui| {
-                            ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
-                        });
-                        let hint = self.hint(*i);
-                        let timing = self.timing(*i);
-                        let last_known = self.last_known(*i);
-                        row.col(|ui| {
-                            status_cell(ui, s, (status, detail), hint, timing, last_known, here);
-                        });
-                        row.col(|ui| {
-                            ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
-                        });
-                        if row.response().clicked() {
-                            clicked = Some(*i);
-                        }
-                    }
                 });
-            });
+        });
+        if menu_open != self.menu_row {
+            self.menu_row = menu_open;
+            ui.ctx().request_repaint();
+        }
+        if let Some((i, what)) = copy {
+            self.copy_row_text(ui.ctx(), i, what);
+        }
         if shown == self.on_screen {
             self.on_screen_now = shown;
         } else {
@@ -920,6 +955,39 @@ impl ShellApp {
                 self.selected.clear();
                 self.selected.insert(i);
             }
+        }
+    }
+}
+
+/// A row's right-click menu: its name and target to copy.
+fn copy_menu(ui: &mut Ui) -> Option<RowText> {
+    if ui.button("Copy name").clicked() {
+        return Some(RowText::Name);
+    }
+    if ui.button("Copy target").clicked() {
+        return Some(RowText::Target);
+    }
+    None
+}
+
+impl ShellApp {
+    /// Copies the name or target of server `i`, and says so on the outcome message, as the Copy buttons say "Copied".
+    /// A message that offers something (Undo, sign in) or a problem is not replaced: the copy still happens.
+    pub(super) fn copy_row_text(&mut self, ctx: &egui::Context, i: usize, what: RowText) {
+        let Some(s) = self.snapshot.servers.get(i) else {
+            return;
+        };
+        let (text, words) = match what {
+            RowText::Name => (&s.name, "name"),
+            RowText::Target => (&s.target, "target"),
+        };
+        ctx.copy_text(text.clone());
+        let said = format!("Copied the {words} of {}.", s.name);
+        let replaceable = self.outcome.as_ref().is_none_or(|o| {
+            o.ok && !o.warn && o.undo.is_none() && o.sign_in.is_none() && !o.logged && !o.type_path
+        });
+        if replaceable {
+            self.outcome = Some(super::outcome::Outcome::done(said));
         }
     }
 }

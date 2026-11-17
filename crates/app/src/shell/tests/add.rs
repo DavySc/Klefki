@@ -1541,6 +1541,13 @@ fn a_server_that_exists_is_kept_replaced_or_imported_under_another_name() {
 
     // Nearby: under a free name it is added like the others.
     let (mut h, engine) = import_open(IMPORTED);
+    assert_eq!(
+        h.get_by_label("import it as alpha_2")
+            .accesskit_node()
+            .role(),
+        egui::accesskit::Role::Link,
+        "read out as a link, though text around it can be selected"
+    );
     click(&mut h, "import it as alpha_2");
     h.get_by_label_contains("Adds alpha_2, docs and notion for the user.");
     click(&mut h, "Review");

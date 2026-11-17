@@ -314,3 +314,23 @@ fn the_copied_report_points_at_the_whole_program_claude_code_named() {
         "{text}"
     );
 }
+
+/// A line is clicked to open or close, so dragging over it selects nothing; what is shown under it can be selected.
+#[test]
+fn a_lines_text_is_not_selected_but_what_it_shows_is() {
+    use super::select_text::{drag_and_copy, text_rect};
+    let (mut h, _engine, _row) = shown(LastStarts {
+        starts: vec![failed_in_proj()],
+        ..LastStarts::default()
+    });
+    let line = h
+        .get_by_role_and_label(
+            egui::accesskit::Role::Label,
+            "Today 07:32 in ~/proj: failed (CONNECTION_CLOSED)",
+        )
+        .rect();
+    assert_eq!(drag_and_copy(&mut h, line), "");
+    let said = "Error: Cannot find module 'foo'";
+    let rect = text_rect(&h, said);
+    assert_eq!(drag_and_copy(&mut h, rect), said);
+}

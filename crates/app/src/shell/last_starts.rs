@@ -163,8 +163,10 @@ pub(super) fn panel(ui: &mut Ui, row: &ServerRow, last: &LastStarts) {
         )
         .show_header(ui, |ui| {
             ui.add(
+                // Clicked to open or close, so not for selecting; the same words are in the copied report.
                 egui::Label::new(RichText::new(&line).color(color))
                     .wrap()
+                    .selectable(false)
                     .sense(egui::Sense::click()),
             )
         })

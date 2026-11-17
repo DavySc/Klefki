@@ -395,7 +395,7 @@ impl ShellApp {
                     ui.horizontal_wrapped(|ui| {
                         let said = ui.label(RichText::new("Not saved.").color(pal.text_muted));
                         announce(ui.ctx(), said.id);
-                        type_instead |= ui.link("Type a path instead").clicked();
+                        type_instead |= theme::link(ui, "Type a path instead").clicked();
                     });
                 }
                 Saving::Exists { path, .. } => {

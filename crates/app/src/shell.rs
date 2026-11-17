@@ -292,6 +292,11 @@ pub(crate) struct ShellApp {
     pub search: String,
     pub selected: BTreeSet<usize>,
     pub tab: DetailTab,
+    /// What was shown when text was last selectable there: the page, the servers picked and the detail tab. When it
+    /// changes, a text selection is dropped (see [`Self::drop_stale_text_selection`]).
+    shown_for_selection: (Page, BTreeSet<usize>, DetailTab),
+    /// The list's row whose right-click menu is open, marked while it is.
+    menu_row: Option<usize>,
     pub theme: ThemeChoice,
     pub tone: Tone,
     /// Klefki's own updates: when to look, and what was found.
@@ -382,6 +387,8 @@ impl ShellApp {
             search: String::new(),
             selected: BTreeSet::new(),
             tab: DetailTab::General,
+            shown_for_selection: (Page::Connections, BTreeSet::new(), DetailTab::General),
+            menu_row: None,
             theme,
             tone: Tone::default(),
             updates: crate::updates::Updates::default(),
@@ -404,6 +411,20 @@ impl ShellApp {
         if let Some(core) = &self.core {
             core.send(command);
         }
+    }
+
+    /// egui keeps a text selection by the label's place, and the detail panel's labels keep their places when another
+    /// server is picked: ↓ would leave the selection (or a click's empty one) on the next server's text, unseen, and
+    /// Ctrl+C would copy that label whole. So the selection goes when the page, the servers picked or the tab change.
+    fn drop_stale_text_selection(&mut self, ctx: &egui::Context) {
+        let (page, selected, tab) = &self.shown_for_selection;
+        if *page == self.page && *selected == self.selected && *tab == self.tab {
+            return;
+        }
+        ctx.plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .clear_selection();
+        self.shown_for_selection = (self.page, self.selected.clone(), self.tab);
     }
 
     /// Shows `page`. The Activity log, Claude Desktop's servers and the Secrets page are read each time they are
@@ -1377,6 +1398,20 @@ impl ShellApp {
                         command::Action::CopyInspector,
                     );
                 }
+                add(
+                    icon::COPY,
+                    format!("Copy name of {}", s.name),
+                    String::new(),
+                    None,
+                    command::Action::Copy(command::RowText::Name),
+                );
+                add(
+                    icon::COPY,
+                    format!("Copy target of {}", s.name),
+                    s.target.clone(),
+                    None,
+                    command::Action::Copy(command::RowText::Target),
+                );
                 if s.scope == Scope::Project && s.approval.is_some_and(|a| a != Approval::Approved)
                 {
                     add(
@@ -1560,6 +1595,11 @@ impl ShellApp {
                             self.send(Command::Prepare(vec![Change::Approve { id }]));
                         }
                     }
+                }
+            }
+            A::Copy(what) => {
+                if let [i] = self.selected.iter().copied().collect::<Vec<_>>()[..] {
+                    self.copy_row_text(ctx, i, what);
                 }
             }
             A::CopyDebugReport => {
@@ -1999,6 +2039,7 @@ impl ShellApp {
 impl eframe::App for ShellApp {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         self.show(ui);
+        self.drop_stale_text_selection(ui.ctx());
         // The save dialog opens over Klefki's window, which only this thread may touch, and belongs to it: a click
         // on Klefki cannot send it behind, and on macOS it is the window's sheet.
         if let Some(name) = self.export_choice_asked.take()
@@ -6373,6 +6414,7 @@ mod tests {
     mod one_project;
     mod outcome;
     mod review;
+    mod select_text;
     mod settings;
     mod start_command;
     mod switch_profile;

@@ -424,6 +424,13 @@ fn after_the_dialog_closes_without_a_file_a_path_can_still_be_typed() {
     );
     let said = h.get_by_label("Not saved.");
     assert_eq!(said.accesskit_node().live(), egui::accesskit::Live::Polite);
+    assert_eq!(
+        h.get_by_label("Type a path instead")
+            .accesskit_node()
+            .role(),
+        egui::accesskit::Role::Link,
+        "read out as a link, though text around it can be selected"
+    );
     click(&mut h, "Type a path instead");
     let field = h.get_by_label("Save to");
     assert_eq!(
