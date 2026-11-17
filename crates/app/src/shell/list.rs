@@ -847,58 +847,74 @@ impl ShellApp {
             rows.iter()
                 .position(|r| matches!(r, GridRow::Server(s) if *s == i))
         });
-        let mut table = TableBuilder::new(ui);
-        if let Some(at) = reveal {
-            table = table.scroll_to_row(at, Some(Align::Center));
-        }
-        table
-            .striped(true)
-            .sense(Sense::click())
-            .cell_layout(Layout::left_to_right(Align::Center))
-            .column(Column::initial(220.0).at_least(120.0))
-            .column(Column::exact(64.0))
-            .column(Column::exact(176.0))
-            .column(Column::remainder().clip(true))
-            .header(32.0, |mut h| {
-                for t in ["Name", "Type", "Status", "Target"] {
-                    h.col(|ui| {
-                        ui.label(RichText::new(t).strong().color(pal.text_muted));
+        // A row is one click target: text in it would take the click (and a drag) for selecting. Its text is
+        // offered on a right click instead, and the detail panel shows it all, selectable.
+        theme::unselectable(ui, |ui| {
+            let mut table = TableBuilder::new(ui);
+            if let Some(at) = reveal {
+                table = table.scroll_to_row(at, Some(Align::Center));
+            }
+            table
+                .striped(true)
+                .sense(Sense::click())
+                .cell_layout(Layout::left_to_right(Align::Center))
+                .column(Column::initial(220.0).at_least(120.0))
+                .column(Column::exact(64.0))
+                .column(Column::exact(176.0))
+                .column(Column::remainder().clip(true))
+                .header(32.0, |mut h| {
+                    for t in ["Name", "Type", "Status", "Target"] {
+                        h.col(|ui| {
+                            ui.label(RichText::new(t).strong().color(pal.text_muted));
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(36.0, rows.len(), |mut row| match &rows[row.index()] {
+                        GridRow::Group(group) => {
+                            row.col(|ui| group_header(ui, group, right));
+                            for _ in 0..3 {
+                                row.col(|_| {});
+                            }
+                        }
+                        GridRow::Server(i) => {
+                            shown.push(*i);
+                            let s = &self.snapshot.servers[*i];
+                            row.set_selected(self.selected.contains(i));
+                            let (status, detail) = self.effective(*i);
+                            let here = self.here(*i);
+                            row.col(|ui| name_cell(ui, s, status, project_count, here));
+                            row.col(|ui| {
+                                ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
+                            });
+                            let hint = self.hint(*i);
+                            let timing = self.timing(*i);
+                            let last_known = self.last_known(*i);
+                            row.col(|ui| {
+                                status_cell(
+                                    ui,
+                                    s,
+                                    (status, detail),
+                                    hint,
+                                    timing,
+                                    last_known,
+                                    here,
+                                );
+                            });
+                            row.col(|ui| {
+                                ui.label(
+                                    RichText::new(&s.target).monospace().color(pal.text_muted),
+                                );
+                            });
+                            let response = row.response();
+                            if response.clicked() {
+                                clicked = Some(*i);
+                            }
+                            response.context_menu(|ui| copy_menu(ui, s));
+                        }
                     });
-                }
-            })
-            .body(|body| {
-                body.rows(36.0, rows.len(), |mut row| match &rows[row.index()] {
-                    GridRow::Group(group) => {
-                        row.col(|ui| group_header(ui, group, right));
-                        for _ in 0..3 {
-                            row.col(|_| {});
-                        }
-                    }
-                    GridRow::Server(i) => {
-                        shown.push(*i);
-                        let s = &self.snapshot.servers[*i];
-                        row.set_selected(self.selected.contains(i));
-                        let (status, detail) = self.effective(*i);
-                        let here = self.here(*i);
-                        row.col(|ui| name_cell(ui, s, status, project_count, here));
-                        row.col(|ui| {
-                            ui.label(RichText::new(s.transport.label()).color(pal.text_muted));
-                        });
-                        let hint = self.hint(*i);
-                        let timing = self.timing(*i);
-                        let last_known = self.last_known(*i);
-                        row.col(|ui| {
-                            status_cell(ui, s, (status, detail), hint, timing, last_known, here);
-                        });
-                        row.col(|ui| {
-                            ui.label(RichText::new(&s.target).monospace().color(pal.text_muted));
-                        });
-                        if row.response().clicked() {
-                            clicked = Some(*i);
-                        }
-                    }
                 });
-            });
+        });
         if shown == self.on_screen {
             self.on_screen_now = shown;
         } else {
@@ -921,6 +937,16 @@ impl ShellApp {
                 self.selected.insert(i);
             }
         }
+    }
+}
+
+/// A row's right-click menu: its name and target to copy.
+fn copy_menu(ui: &mut Ui, s: &ServerRow) {
+    if ui.button("Copy name").clicked() {
+        ui.ctx().copy_text(s.name.clone());
+    }
+    if ui.button("Copy target").clicked() {
+        ui.ctx().copy_text(s.target.clone());
     }
 }
 

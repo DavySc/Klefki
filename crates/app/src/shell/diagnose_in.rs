@@ -197,7 +197,7 @@ impl ShellApp {
                     } else {
                         format!("{} in {}: see below", d.status.label(), folder_name(folder))
                     };
-                    if ui.link(outcome).clicked() {
+                    if theme::link(ui, outcome).clicked() {
                         self.reveal_diagnosis = Some(id.clone());
                     }
                 }

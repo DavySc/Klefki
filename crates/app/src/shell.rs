@@ -6373,6 +6373,7 @@ mod tests {
     mod one_project;
     mod outcome;
     mod review;
+    mod select_text;
     mod settings;
     mod start_command;
     mod switch_profile;
