@@ -100,7 +100,7 @@ impl<'a> Probe<'a> {
         #[cfg(unix)]
         if !self.windows && meta.is_file() {
             use std::os::unix::fs::PermissionsExt;
-            return meta.is_file() && meta.permissions().mode() & 0o111 != 0;
+            return meta.permissions().mode() & 0o111 != 0;
         }
         meta.is_file()
     }
