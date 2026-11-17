@@ -60,7 +60,8 @@ before.
   punctuation); a "Copy details" action would give clean lines.
 - Test gotcha: setting the palette's query with `command.query_mut()` and then clicking an entry closes the palette
   without running it in kittest; typing with `Event::Text` works (as on main). Enter works either way.
-- Checks after: fmt, clippy (exit 0), `cargo test --workspace` 1849 passed, 0 failed.
+- Checks after merging main (0e221bb): fmt, clippy (exit 0), `cargo test --workspace` 1849 passed, 0 failed,
+  `cargo deny check` advisories, bans, licenses, sources ok.
 
 ## Not done / next
 - Ctrl+A selects all of one label (egui's behaviour), not a whole page or dialog.
